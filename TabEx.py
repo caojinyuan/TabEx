@@ -68,6 +68,15 @@ from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import Qt, QDir  # QModelIndex removed (unused)
 # from PyQt5.QtGui import QIcon  # unused
 
+# Optional native hit-test support (Windows)
+try:
+    import ctypes
+    import win32gui
+    import win32con
+    HAS_PYWIN = True
+except Exception:
+    HAS_PYWIN = False
+
 class BookmarkManager:
     def __init__(self, config_file="bookmarks.json"):
         self.config_file = config_file
@@ -208,6 +217,8 @@ class FileExplorerTab(QWidget):
         self.path_bar = QLineEdit(self)
         self.path_bar.setReadOnly(False)
         self.path_bar.returnPressed.connect(self.on_path_enter)
+        # 双击路径栏等效上一级按钮
+        self.path_bar.mouseDoubleClickEvent = lambda e: self.go_up(force=True)
         layout.addWidget(self.path_bar)
 
         # 嵌入Explorer控件
@@ -276,11 +287,18 @@ class FileExplorerTab(QWidget):
         layout.addWidget(self.drive_list)
         # 兼容原有空白双击
         self.blank = QLabel()
+        # 保持空白区域为固定高度，避免其扩展占满右侧空间
         self.blank.setFixedHeight(10)
         self.blank.setStyleSheet("background: transparent;")
         self.blank.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         self.blank.mouseDoubleClickEvent = self.blank_double_click
         layout.addWidget(self.blank)
+
+        # 安装事件过滤器以捕获 Explorer 的鼠标按下与双击事件
+        try:
+            self.explorer.installEventFilter(self)
+        except Exception:
+            pass
 
     def event(self, e):
         # 捕获QAxWidget的NavigateComplete2事件
@@ -297,6 +315,45 @@ class FileExplorerTab(QWidget):
                         if hasattr(self, 'path_bar'):
                             self.path_bar.setText(local_path)
         return super().event(e)
+
+    def explorer_double_click(self, event):
+        # 使用短延迟再检查选中项数量以避免竞态：
+        # 如果在检查时没有选中项，则视为点击空白区并返回上一级。
+        from PyQt5.QtCore import QTimer
+        def _check_and_go_up():
+            # 如果按下时已有选中项，认为双击是针对该项，跳过 go_up
+            before = getattr(self, '_selected_before_click', None)
+            if before is not None:
+                try:
+                    if int(before) > 0:
+                        self._selected_before_click = None
+                        return
+                except Exception:
+                    pass
+                cnt = self.explorer.dynamicCall('SelectedItems().Count')
+            try:
+                cnt = self.explorer.dynamicCall('SelectedItems().Count')
+            except Exception:
+                try:
+                    sel = self.explorer.dynamicCall('SelectedItems()')
+                    if sel is not None:
+                        cnt = sel.property('Count') if hasattr(sel, 'property') else None
+                except Exception:
+                    cnt = None
+            if cnt is None:
+                # 无法确定，按原先约定触发 go_up()
+                try:
+                    self.go_up(force=True)
+                except Exception:
+                    pass
+                return
+            try:
+                if int(cnt) == 0:
+                        self.go_up(force=True)
+            except Exception:
+                pass
+
+        QTimer.singleShot(50, _check_and_go_up)
 
     def on_path_enter(self):
         path = self.path_bar.text().strip()
@@ -319,13 +376,274 @@ class FileExplorerTab(QWidget):
         else:
             QMessageBox.warning(self, "路径错误", f"路径不存在: {path}")
 
+    def explorer_mouse_press(self, event):
+        # 在鼠标按下时记录当时的选中项数量，用于后续双击判断
+        try:
+            cnt = None
+            try:
+                cnt = self.explorer.dynamicCall('SelectedItems().Count')
+            except Exception:
+                try:
+                    sel = self.explorer.dynamicCall('SelectedItems()')
+                    if sel is not None:
+                        cnt = sel.property('Count') if hasattr(sel, 'property') else None
+                except Exception:
+                    cnt = None
+            self._selected_before_click = int(cnt) if cnt is not None else None
+        except Exception:
+            self._selected_before_click = None
+        # 继续默认处理（不阻止控件行为）
+        # 直接返回 None — 不尝试调用 ActiveX 的原始处理（事件仍会被控件处理）
+        return None
+
+    # --- Windows native helpers for listview hit-testing ---
+    def _find_syslistview_hwnd(self):
+        if not HAS_PYWIN:
+            return None
+        try:
+            parent = int(self.explorer.winId())
+        except Exception:
+            return None
+
+        def find_in_tree(hwnd):
+            try:
+                cls = win32gui.GetClassName(hwnd)
+            except Exception:
+                return None
+            if cls == 'SysListView32':
+                return hwnd
+            result = None
+            try:
+                def cb(h, lparam):
+                    nonlocal result
+                    if result:
+                        return False
+                    found = find_in_tree(h)
+                    if found:
+                        result = found
+                        return False
+                    return True
+                win32gui.EnumChildWindows(hwnd, cb, None)
+            except Exception:
+                return None
+            return result
+
+        return find_in_tree(parent)
+
+    def _native_listview_hit_test(self, screen_x, screen_y):
+        if not HAS_PYWIN:
+            return False
+        try:
+            lv = self._find_syslistview_hwnd()
+            if not lv:
+                return False
+            # convert screen -> client
+            pt = (int(screen_x), int(screen_y))
+            try:
+                cx, cy = win32gui.ScreenToClient(lv, pt)
+            except Exception:
+                return False
+
+            class POINT(ctypes.Structure):
+                _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
+            class LVHITTESTINFO(ctypes.Structure):
+                _fields_ = [('pt', POINT), ('flags', ctypes.c_uint), ('iItem', ctypes.c_int), ('iSubItem', ctypes.c_int)]
+
+            info = LVHITTESTINFO()
+            info.pt.x = int(cx)
+            info.pt.y = int(cy)
+            LVM_FIRST = 0x1000
+            LVM_HITTEST = LVM_FIRST + 18
+            res = ctypes.windll.user32.SendMessageW(lv, LVM_HITTEST, 0, ctypes.byref(info))
+            try:
+                if int(res) == -1:
+                    return False
+                return True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    def eventFilter(self, obj, event):
+        # 通过事件过滤器捕获 Explorer 的鼠标按下与双击事件
+        from PyQt5.QtCore import QEvent, QTimer
+        try:
+            if obj is self.explorer:
+                if event.type() == QEvent.MouseButtonPress:
+                    # 记录按下时的选中项数
+                    try:
+                        cnt = None
+                        try:
+                            cnt = self.explorer.dynamicCall('SelectedItems().Count')
+                        except Exception:
+                            try:
+                                sel = self.explorer.dynamicCall('SelectedItems()')
+                                if sel is not None:
+                                    cnt = sel.property('Count') if hasattr(sel, 'property') else None
+                            except Exception:
+                                cnt = None
+                        self._selected_before_click = int(cnt) if cnt is not None else None
+                    except Exception:
+                        self._selected_before_click = None
+                elif event.type() == QEvent.MouseButtonDblClick:
+                    # 延迟检查，避免与控件自身处理产生竞态
+                    # 记录双击发生前的路径，以便判断双击是否触发了导航
+                    try:
+                        self._path_before_double = getattr(self, 'current_path', None)
+                    except Exception:
+                        self._path_before_double = None
+
+                    def _check_and_go_up():
+                        # 如果双击期间发生了导航（进入文件夹或打开文件），则跳过 go_up
+                        try:
+                            before_path = getattr(self, '_path_before_double', None)
+                            cur_path = getattr(self, 'current_path', None)
+                            if before_path is not None and cur_path is not None and cur_path != before_path:
+                                # 导航已发生，跳过上一级
+                                self._path_before_double = None
+                                return
+                        except Exception:
+                            pass
+                        # 继续原有判断
+                        # 如果按下时已有选中项，则认为是对项的双击
+                        before = getattr(self, '_selected_before_click', None)
+                        if before is not None:
+                            try:
+                                if int(before) > 0:
+                                    self._selected_before_click = None
+                                    return
+                            except Exception:
+                                pass
+                        # 原生 HitTest：如果命中某个项，则认为双击是针对项的，跳过 go_up
+                        if HAS_PYWIN:
+                            try:
+                                from PyQt5.QtGui import QCursor
+                                gx = QCursor.pos().x()
+                                gy = QCursor.pos().y()
+                                if self._native_listview_hit_test(gx, gy):
+                                    self._selected_before_click = None
+                                    return
+                            except Exception:
+                                pass
+                        # 尝试读取当前选中项数量
+                        cnt = None
+                        try:
+                            cnt = self.explorer.dynamicCall('SelectedItems().Count')
+                        except Exception:
+                            try:
+                                sel = self.explorer.dynamicCall('SelectedItems()')
+                                if sel is not None:
+                                    cnt = sel.property('Count') if hasattr(sel, 'property') else None
+                            except Exception:
+                                cnt = None
+                        # 如果无法确定选中项，或选中为0，则视为空白双击
+                        if cnt is None:
+                            try:
+                                self.go_up(force=True)
+                            except Exception:
+                                pass
+                            return
+                        try:
+                            if int(cnt) == 0:
+                                self.go_up(force=True)
+                        except Exception:
+                            pass
+                        finally:
+                            self._selected_before_click = None
+
+                    # try multiple times because folder navigation can be slower;
+                    # perform checks at 150ms, 300ms, 600ms before giving up
+                    delays = [150, 300, 600]
+                    def attempt(idx=0):
+                        handled = False
+                        try:
+                            # reuse the same logic as _check_and_go_up body
+                            # check path change first
+                            try:
+                                before_path = getattr(self, '_path_before_double', None)
+                                cur_path = getattr(self, 'current_path', None)
+                                if before_path is not None and cur_path is not None and cur_path != before_path:
+                                    self._path_before_double = None
+                                    return
+                            except Exception:
+                                pass
+                            # if press-time selection existed, skip
+                            before = getattr(self, '_selected_before_click', None)
+                            if before is not None:
+                                try:
+                                    if int(before) > 0:
+                                        self._selected_before_click = None
+                                        return
+                                except Exception:
+                                    pass
+                            # native hit-test
+                            if HAS_PYWIN:
+                                try:
+                                    from PyQt5.QtGui import QCursor
+                                    gx = QCursor.pos().x()
+                                    gy = QCursor.pos().y()
+                                    if self._native_listview_hit_test(gx, gy):
+                                        self._selected_before_click = None
+                                        return
+                                except Exception:
+                                    pass
+                            # finally check SelectedItems
+                            cnt = None
+                            try:
+                                cnt = self.explorer.dynamicCall('SelectedItems().Count')
+                            except Exception:
+                                try:
+                                    sel = self.explorer.dynamicCall('SelectedItems()')
+                                    if sel is not None:
+                                        cnt = sel.property('Count') if hasattr(sel, 'property') else None
+                                except Exception:
+                                    cnt = None
+                            if cnt is None:
+                                # if there are more attempts left, retry; else treat as blank
+                                if idx < len(delays) - 1:
+                                    QTimer.singleShot(delays[idx+1] - delays[idx], lambda: attempt(idx+1))
+                                    return
+                                try:
+                                    self.go_up(force=True)
+                                except Exception:
+                                    pass
+                                return
+                            try:
+                                if int(cnt) == 0:
+                                    self.go_up(force=True)
+                                return
+                            except Exception:
+                                pass
+                        finally:
+                            self._selected_before_click = None
+
+                    QTimer.singleShot(delays[0], lambda: attempt(0))
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
     def blank_double_click(self, event):
-        self.go_up()
+        self.go_up(force=True)
 
     # 移除 on_document_complete 和 eventFilter 相关内容
 
-    def go_up(self):
+    def go_up(self, force=False):
         # 返回上一级目录，盘符根目录时显示所有盘符列表
+        # 如果 force=True，则绕过鼠标位置检查（用于按钮或程序化调用）
+        if not force:
+            # 仅在明确来自空白区域或路径栏的触发时执行，避免误由文件双击触发
+            try:
+                from PyQt5.QtWidgets import QApplication
+                from PyQt5.QtGui import QCursor
+                pos = QCursor.pos()
+                w = QApplication.widgetAt(pos.x(), pos.y())
+                # 允许的触发源：底部空白标签或路径栏
+                if w is not self.blank and w is not getattr(self, 'path_bar', None):
+                    return
+            except Exception:
+                # 如果无法判断，保守退出，避免误导航
+                return
         if not self.current_path:
             return
         path = self.current_path
@@ -438,7 +756,7 @@ class MainWindow(QMainWindow):
     def go_up_current_tab(self):
         current_tab = self.tab_widget.currentWidget()
         if hasattr(current_tab, 'go_up'):
-            current_tab.go_up()
+            current_tab.go_up(force=True)
 
 
     def add_new_tab(self, path="", is_shell=False):
@@ -763,6 +1081,8 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.add_tab_button)
         btn_layout.addStretch(1)
         self.tab_widget.setCornerWidget(btn_widget)
+        # 双击角落（标签区与按钮之间的空白）等效返回上一级
+        btn_widget.mouseDoubleClickEvent = lambda e: self.go_up_current_tab()
 
         right_layout.addWidget(self.tab_widget)
         self.splitter.addWidget(right_widget)
