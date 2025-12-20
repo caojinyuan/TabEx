@@ -53,20 +53,20 @@ class BookmarkDialog(QDialog):
             else:
                 QMessageBox.warning(self, "路径错误", f"路径不存在: {local_path}")
 import sys
-import ctypes
-import win32con
-import win32gui
-import win32api
-import win32com.shell.shell as shell
-import win32com.shell.shellcon as shellcon
-import comtypes
-import comtypes.client
+# import ctypes  # unused
+# import win32con  # unused
+# import win32gui  # unused
+# import win32api  # unused
+# import win32com.shell.shell as shell  # unused
+# import win32com.shell.shellcon as shellcon  # unused
+# import comtypes
+# import comtypes.client
 import os
 import json
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QDockWidget)
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog)  # QDockWidget removed (unused)
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import Qt, QDir, QModelIndex
-from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import Qt, QDir  # QModelIndex removed (unused)
+# from PyQt5.QtGui import QIcon  # unused
 
 class BookmarkManager:
     def __init__(self, config_file="bookmarks.json"):
