@@ -53,22 +53,17 @@ class BookmarkDialog(QDialog):
             else:
                 QMessageBox.warning(self, "路径错误", f"路径不存在: {local_path}")
 import sys
-# import ctypes  # unused
-# import win32con  # unused
-# import win32gui  # unused
-# import win32api  # unused
-# import win32com.shell.shell as shell  # unused
-# import win32com.shell.shellcon as shellcon  # unused
-# import comtypes
-# import comtypes.client
 import os
 import json
 import subprocess
+import string
+import time
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog)  # QDockWidget removed (unused)
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import Qt, QDir, QUrl  # QModelIndex removed (unused)
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent
+from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal  # QModelIndex removed (unused)
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent
 # from PyQt5.QtGui import QIcon  # unused
+
 
 # Optional native hit-test support (Windows)
 try:
@@ -78,6 +73,193 @@ try:
     HAS_PYWIN = True
 except Exception:
     HAS_PYWIN = False
+
+# 面包屑导航路径栏
+class BreadcrumbPathBar(QWidget):
+    """类似Windows资源管理器的面包屑路径栏，支持点击层级跳转"""
+    pathChanged = pyqtSignal(str)  # 当路径改变时发出信号
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_path = ""
+        self.edit_mode = False
+        self.init_ui()
+    
+    def init_ui(self):
+        self.layout = QHBoxLayout(self)
+        self.layout.setContentsMargins(3, 0, 3, 0)
+        self.layout.setSpacing(0)
+        
+        # 路径编辑框（编辑模式时显示）
+        self.path_edit = QLineEdit(self)
+        self.path_edit.setFixedHeight(30)
+        self.path_edit.setStyleSheet("QLineEdit { font-size: 12pt; padding: 3px; border: 1px solid #ccc; }")
+        self.path_edit.hide()
+        self.path_edit.returnPressed.connect(self.on_edit_finished)
+        self.path_edit.editingFinished.connect(self.exit_edit_mode)
+        
+        # 面包屑容器（显示模式时显示）
+        self.breadcrumb_widget = QWidget(self)
+        self.breadcrumb_layout = QHBoxLayout(self.breadcrumb_widget)
+        self.breadcrumb_layout.setContentsMargins(0, 0, 0, 0)
+        self.breadcrumb_layout.setSpacing(0)
+        self.breadcrumb_layout.addStretch(1)
+        
+        self.layout.addWidget(self.breadcrumb_widget)
+        self.layout.addWidget(self.path_edit)
+        
+        # 设置整体样式
+        self.setStyleSheet("""
+            BreadcrumbPathBar {
+                background: white;
+                border: 1px solid #ccc;
+                border-radius: 2px;
+            }
+        """)
+        self.setFixedHeight(30)
+    
+    def set_path(self, path):
+        """设置并显示路径"""
+        self.current_path = path
+        if not self.edit_mode:
+            self.update_breadcrumbs()
+    
+    def update_breadcrumbs(self):
+        """更新面包屑显示"""
+        # 清空现有的面包屑
+        while self.breadcrumb_layout.count() > 1:  # 保留最后的stretch
+            item = self.breadcrumb_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        if not self.current_path:
+            return
+        
+        # 处理特殊路径
+        if self.current_path.startswith('shell:'):
+            # shell路径直接显示为一个标签
+            label = ClickableLabel(self.current_path, self.current_path)
+            label.clicked.connect(self.on_segment_clicked)
+            self.breadcrumb_layout.insertWidget(0, label)
+            return
+        
+        # 分割路径
+        parts = []
+        if os.name == 'nt':
+            # Windows路径
+            path = self.current_path.replace('/', '\\')
+            segments = path.split('\\')
+            
+            # 构建累积路径
+            accumulated = ""
+            for i, segment in enumerate(segments):
+                if not segment:
+                    continue
+                
+                if i == 0 and ':' in segment:
+                    # 盘符
+                    accumulated = segment + '\\'
+                    parts.append((segment, accumulated))
+                else:
+                    if accumulated and not accumulated.endswith('\\'):
+                        accumulated += '\\'
+                    accumulated += segment
+                    parts.append((segment, accumulated))
+        else:
+            # Unix路径
+            segments = self.current_path.split('/')
+            accumulated = ""
+            for segment in segments:
+                if not segment:
+                    continue
+                accumulated += '/' + segment
+                parts.append((segment, accumulated))
+        
+        # 创建面包屑标签
+        for i, (name, full_path) in enumerate(parts):
+            # 创建可点击的标签
+            label = ClickableLabel(name, full_path)
+            label.clicked.connect(self.on_segment_clicked)
+            self.breadcrumb_layout.insertWidget(i * 2, label)
+            
+            # 添加分隔符（除了最后一个）
+            if i < len(parts) - 1:
+                separator = QLabel(">")
+                separator.setStyleSheet("QLabel { color: #888; font-size: 11pt; padding: 0 2px; }")
+                self.breadcrumb_layout.insertWidget(i * 2 + 1, separator)
+    
+    def on_segment_clicked(self, path):
+        """点击某个层级时触发"""
+        self.current_path = path
+        self.pathChanged.emit(path)
+        self.update_breadcrumbs()
+    
+    def enter_edit_mode(self):
+        """进入编辑模式"""
+        self.edit_mode = True
+        self.breadcrumb_widget.hide()
+        self.path_edit.setText(self.current_path)
+        self.path_edit.show()
+        self.path_edit.setFocus()
+        self.path_edit.selectAll()
+    
+    def exit_edit_mode(self):
+        """退出编辑模式"""
+        if self.edit_mode:
+            self.edit_mode = False
+            self.path_edit.hide()
+            self.breadcrumb_widget.show()
+            self.update_breadcrumbs()
+    
+    def on_edit_finished(self):
+        """编辑完成时触发"""
+        new_path = self.path_edit.text().strip()
+        if new_path and new_path != self.current_path:
+            self.current_path = new_path
+            self.pathChanged.emit(new_path)
+        self.exit_edit_mode()
+    
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        """双击进入编辑模式"""
+        self.enter_edit_mode()
+        super().mouseDoubleClickEvent(event)
+    
+    def mousePressEvent(self, event: QMouseEvent):
+        """单击也可以进入编辑模式（点击空白处）"""
+        if event.button() == Qt.LeftButton:
+            # 检查是否点击在面包屑标签上
+            child = self.childAt(event.pos())
+            if child is None or child == self.breadcrumb_widget:
+                self.enter_edit_mode()
+        super().mousePressEvent(event)
+
+
+class ClickableLabel(QLabel):
+    """可点击的标签，用于面包屑导航"""
+    clicked = pyqtSignal(str)
+    
+    def __init__(self, text, path, parent=None):
+        super().__init__(text, parent)
+        self.path = path
+        self.setStyleSheet("""
+            QLabel {
+                color: #0066cc;
+                font-size: 11pt;
+                padding: 2px 2px;
+                border-radius: 2px;
+            }
+            QLabel:hover {
+                background-color: #e5f3ff;
+                text-decoration: underline;
+            }
+        """)
+        self.setCursor(Qt.PointingHandCursor)
+    
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.path)
+        super().mousePressEvent(event)
+
 
 class BookmarkManager:
     def __init__(self, config_file="bookmarks.json"):
@@ -203,7 +385,7 @@ class FileExplorerTab(QWidget):
                 if local_path != self.current_path:
                     self.current_path = local_path
                     if hasattr(self, 'path_bar'):
-                        self.path_bar.setText(local_path)
+                        self.path_bar.set_path(local_path)
                     self.update_tab_title()
                     # 同步左侧目录树
                     if self.main_window and hasattr(self.main_window, 'expand_dir_tree_to_path'):
@@ -215,12 +397,9 @@ class FileExplorerTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # 路径栏
-        self.path_bar = QLineEdit(self)
-        self.path_bar.setReadOnly(False)
-        self.path_bar.returnPressed.connect(self.on_path_enter)
-        # 双击路径栏等效上一级按钮
-        self.path_bar.mouseDoubleClickEvent = lambda e: self.go_up(force=True)
+        # 面包屑路径栏
+        self.path_bar = BreadcrumbPathBar(self)
+        self.path_bar.pathChanged.connect(self.on_path_bar_changed)
         layout.addWidget(self.path_bar)
 
         # 嵌入Explorer控件
@@ -315,7 +494,7 @@ class FileExplorerTab(QWidget):
                             local_path = local_path[1:]
                         self.current_path = local_path
                         if hasattr(self, 'path_bar'):
-                            self.path_bar.setText(local_path)
+                            self.path_bar.set_path(local_path)
         return super().event(e)
 
     def explorer_double_click(self, event):
@@ -357,8 +536,9 @@ class FileExplorerTab(QWidget):
 
         QTimer.singleShot(50, _check_and_go_up)
 
-    def on_path_enter(self):
-        path = self.path_bar.text().strip()
+    def on_path_bar_changed(self, path):
+        """处理面包屑路径栏的路径变化"""
+        path = path.strip()
         # 处理cmd命令
         if path.lower() == 'cmd':
             try:
@@ -366,7 +546,7 @@ class FileExplorerTab(QWidget):
                 if current_dir and os.path.exists(current_dir):
                     subprocess.Popen(['cmd', '/K', 'cd', '/d', current_dir], creationflags=subprocess.CREATE_NEW_CONSOLE)
                     # 恢复路径栏显示当前路径
-                    self.path_bar.setText(current_dir)
+                    self.path_bar.set_path(current_dir)
                 else:
                     QMessageBox.warning(self, "错误", "当前路径无效，无法打开命令行")
             except Exception as e:
@@ -708,14 +888,14 @@ class FileExplorerTab(QWidget):
             self.explorer.dynamicCall("Navigate(const QString&)", path)
             self.current_path = path
             if hasattr(self, 'path_bar'):
-                self.path_bar.setText(path)
+                self.path_bar.set_path(path)
             self.update_tab_title()
         elif os.path.exists(path):
             url = QDir.toNativeSeparators(path)
             self.explorer.dynamicCall("Navigate(const QString&)", url)
             self.current_path = path
             if hasattr(self, 'path_bar'):
-                self.path_bar.setText(path)
+                self.path_bar.set_path(path)
             self.update_tab_title()
 
 
@@ -1120,11 +1300,13 @@ class MainWindow(QMainWindow):
         self.up_button = QPushButton("⬆️")
         self.up_button.setToolTip("上一级目录")
         self.up_button.setFixedHeight(35)
+        self.up_button.setFixedWidth(35)
         self.up_button.clicked.connect(self.go_up_current_tab)
         btn_layout.addWidget(self.up_button)
         self.add_tab_button = QPushButton("➕")
         self.add_tab_button.setToolTip("新建标签页")
         self.add_tab_button.setFixedHeight(35)
+        self.add_tab_button.setFixedWidth(35)
         self.add_tab_button.clicked.connect(self.add_new_tab)
         btn_layout.addWidget(self.add_tab_button)
         btn_layout.addStretch(1)
