@@ -6,6 +6,7 @@ Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 2.标签功能，标签固定
 3.导航树
 4.双击空白处，回退上一级目录
+5.拖拽文件夹到标签区，自动打开文件夹
 
 
 界面布局（中文说明）
@@ -20,8 +21,8 @@ Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 
 （以上为界面与交互的简要说明，已同步到代码 `TabEx.py` 中的相关实现。）
 
-运行环境：
 
+运行环境：
 首次运行前需要双击 0_install_requirements.bat ， 安装必要软件。
 然后双击运行 1_TabEx.bat 。
 

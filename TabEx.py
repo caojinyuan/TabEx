@@ -65,7 +65,8 @@ import os
 import json
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog)  # QDockWidget removed (unused)
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import Qt, QDir  # QModelIndex removed (unused)
+from PyQt5.QtCore import Qt, QDir, QUrl  # QModelIndex removed (unused)
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 # from PyQt5.QtGui import QIcon  # unused
 
 # Optional native hit-test support (Windows)
@@ -704,6 +705,39 @@ class FileExplorerTab(QWidget):
             self.update_tab_title()
 
 
+class DragDropTabWidget(QTabWidget):
+    """支持拖放文件夹的自定义QTabWidget"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.main_window = parent
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            for url in urls:
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                    if os.path.isdir(path):
+                        # 如果是文件夹，打开新标签页
+                        if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+                            self.main_window.add_new_tab(path)
+                    elif os.path.isfile(path):
+                        # 如果是文件，打开其所在文件夹
+                        folder = os.path.dirname(path)
+                        if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+                            self.main_window.add_new_tab(folder)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
 class MainWindow(QMainWindow):
     def ensure_default_icons_on_bookmark_bar(self):
         """确保四个常用书签（带图标）始终在最左侧且不会被覆盖。"""
@@ -1042,8 +1076,8 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 创建标签页控件
-        self.tab_widget = QTabWidget()
+        # 创建标签页控件（支持拖放）
+        self.tab_widget = DragDropTabWidget(self)
         self.tab_widget.setTabsClosable(True)
         self.tab_widget.tabCloseRequested.connect(self.close_tab)
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
