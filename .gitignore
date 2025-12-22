@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# build files
+create_icon.py
+create_icon_simple.py
+
 # Configuration
 *.json
 

@@ -32,3 +32,8 @@ Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 我本地环境：
 python 3.9.6
 
+打包步骤：
+pip install pyinstaller
+pyinstaller --onefile --windowed --name TabExplorer TabEx.py
+或者
+2_build_exe.bat

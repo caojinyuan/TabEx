@@ -63,6 +63,7 @@ import sys
 # import comtypes.client
 import os
 import json
+import subprocess
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog)  # QDockWidget removed (unused)
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import Qt, QDir, QUrl  # QModelIndex removed (unused)
@@ -358,6 +359,19 @@ class FileExplorerTab(QWidget):
 
     def on_path_enter(self):
         path = self.path_bar.text().strip()
+        # 处理cmd命令
+        if path.lower() == 'cmd':
+            try:
+                current_dir = self.current_path
+                if current_dir and os.path.exists(current_dir):
+                    subprocess.Popen(['cmd', '/K', 'cd', '/d', current_dir], creationflags=subprocess.CREATE_NEW_CONSOLE)
+                    # 恢复路径栏显示当前路径
+                    self.path_bar.setText(current_dir)
+                else:
+                    QMessageBox.warning(self, "错误", "当前路径无效，无法打开命令行")
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"无法打开命令行: {e}")
+            return
         # 支持中文特殊路径
         special_map = {
             '回收站': 'shell:RecycleBinFolder',
