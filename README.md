@@ -7,6 +7,7 @@ Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 3.导航树
 4.双击空白处，回退上一级目录
 5.拖拽文件夹到标签区，自动打开文件夹
+6.生成独立运行文件 TabExplorer.exe
 
 
 界面布局（中文说明）
