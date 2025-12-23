@@ -52,6 +52,426 @@ class BookmarkDialog(QDialog):
                     self.parent().add_new_tab(local_path)
             else:
                 QMessageBox.warning(self, "路径错误", f"路径不存在: {local_path}")
+
+# 自定义委托：在文件名列实现省略号在开头
+from PyQt5.QtWidgets import QStyledItemDelegate
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QPainter
+
+class ElideLeftDelegate(QStyledItemDelegate):
+    """自定义委托，文本过长时在开头显示省略号"""
+    def paint(self, painter, option, index):
+        if index.column() == 0:  # 只对第一列（文件名列）应用
+            painter.save()
+            # 获取完整文本
+            text = index.data(Qt.DisplayRole)
+            # 使用字体度量计算省略文本
+            fm = painter.fontMetrics()
+            elided_text = fm.elidedText(text, Qt.ElideLeft, option.rect.width() - 10)
+            # 绘制文本
+            painter.drawText(option.rect.adjusted(5, 0, -5, 0), Qt.AlignLeft | Qt.AlignVCenter, elided_text)
+            painter.restore()
+        else:
+            super().paint(painter, option, index)
+
+# 搜索对话框
+from PyQt5.QtCore import pyqtSignal as _pyqtSignal
+class SearchDialog(QDialog):    
+    def __init__(self, search_path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"搜索 - {search_path}")
+        self.resize(800, 500)
+        # 设置窗口标志：可调整大小，带最大化/最小化按钮
+        from PyQt5.QtCore import Qt
+        self.setWindowFlags(Qt.Window | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
+        self.search_path = search_path
+        self.main_window = parent
+        self.search_thread = None
+        self.is_searching = False
+        
+        # 线程安全的结果队列
+        import queue
+        self.result_queue = queue.Queue()
+        self.ui_update_timer = None
+        
+        layout = QVBoxLayout(self)
+        
+        # 搜索选项区域
+        search_options = QHBoxLayout()
+        
+        # 搜索关键词
+        search_options.addWidget(QLabel("搜索:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("输入搜索关键词...")
+        self.search_input.returnPressed.connect(self.start_search)
+        search_options.addWidget(self.search_input)
+        
+        # 搜索按钮
+        self.search_btn = QPushButton("🔍 搜索")
+        self.search_btn.clicked.connect(self.start_search)
+        search_options.addWidget(self.search_btn)
+        
+        # 停止按钮
+        self.stop_btn = QPushButton("⏹ 停止")
+        self.stop_btn.clicked.connect(self.stop_search)
+        self.stop_btn.setEnabled(False)
+        search_options.addWidget(self.stop_btn)
+        
+        layout.addLayout(search_options)
+        
+        # 搜索路径输入框（可编辑）
+        path_layout = QHBoxLayout()
+        path_layout.addWidget(QLabel("搜索路径:"))
+        self.path_input = QLineEdit(search_path)
+        self.path_input.setStyleSheet("QLineEdit { color: #0066cc; font-weight: bold; padding: 5px; }")
+        self.path_input.setPlaceholderText("输入要搜索的文件夹路径...")
+        path_layout.addWidget(self.path_input)
+        layout.addLayout(path_layout)
+        
+        # 搜索类型选择
+        type_options = QHBoxLayout()
+        self.search_filename_cb = QCheckBox("搜索文件名")
+        self.search_filename_cb.setChecked(True)
+        type_options.addWidget(self.search_filename_cb)
+        
+        self.search_content_cb = QCheckBox("搜索文件内容")
+        type_options.addWidget(self.search_content_cb)
+        
+        type_options.addStretch(1)
+        layout.addLayout(type_options)
+        
+        # 状态标签
+        self.status_label = QLabel("就绪")
+        layout.addWidget(self.status_label)
+        
+        # 结果表格
+        self.result_list = QTableWidget()
+        self.result_list.setColumnCount(4)
+        self.result_list.setHorizontalHeaderLabels(["文件名", "类型", "修改日期", "大小"])
+        self.result_list.horizontalHeader().setStretchLastSection(False)
+        self.result_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.result_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.result_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.result_list.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.result_list.setSelectionBehavior(QTableWidget.SelectRows)
+        self.result_list.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.result_list.cellDoubleClicked.connect(self.on_result_double_clicked)
+        # 启用排序功能
+        self.result_list.setSortingEnabled(True)
+        # 设置自定义委托，让文件名列的省略号显示在开头
+        self.result_list.setItemDelegateForColumn(0, ElideLeftDelegate(self.result_list))
+        # 设置行高和网格线
+        self.result_list.verticalHeader().setDefaultSectionSize(24)  # 设置默认行高为24像素
+        self.result_list.setShowGrid(True)  # 显示网格线
+        self.result_list.setAlternatingRowColors(True)  # 启用交替行颜色
+        # 设置表头样式
+        self.result_list.setStyleSheet("""
+            QHeaderView::section {
+                background-color: #E0E0E0;
+                padding: 4px;
+                border: 1px solid #C0C0C0;
+                font-weight: bold;
+            }
+        """)
+        layout.addWidget(self.result_list)
+        
+        # 启动UI更新定时器
+        from PyQt5.QtCore import QTimer
+        self.ui_update_timer = QTimer(self)
+        self.ui_update_timer.timeout.connect(self.update_ui_from_queue)
+        self.ui_update_timer.start(100)  # 每100ms检查一次队列
+    
+    def update_ui_from_queue(self):
+        """从队列中取出结果并更新UI（在主线程中调用）"""
+        try:
+            while True:
+                item = self.result_queue.get_nowait()
+                if item['type'] == 'result':
+                    # 添加表格行（排序时暂时禁用以提高性能）
+                    sorting_enabled = self.result_list.isSortingEnabled()
+                    self.result_list.setSortingEnabled(False)
+                    
+                    row = self.result_list.rowCount()
+                    self.result_list.insertRow(row)
+                    # 文件名项 - 使用省略号在开头
+                    name_item = QTableWidgetItem(item['name'])
+                    # 设置文本省略模式：在开头显示省略号，优先显示文件名
+                    from PyQt5.QtCore import Qt
+                    name_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                    name_item.setToolTip(item['full_path'])  # 添加完整路径的提示
+                    self.result_list.setItem(row, 0, name_item)
+                    self.result_list.setItem(row, 1, QTableWidgetItem(item['file_type']))
+                    self.result_list.setItem(row, 2, QTableWidgetItem(item['date']))
+                    self.result_list.setItem(row, 3, QTableWidgetItem(item['size']))
+                    # 存储完整路径到第一列的data中
+                    self.result_list.item(row, 0).setData(256, item['path'])
+                    
+                    # 恢复排序状态
+                    self.result_list.setSortingEnabled(sorting_enabled)
+                elif item['type'] == 'status':
+                    self.status_label.setText(item['text'])
+                elif item['type'] == 'button':
+                    if item['button'] == 'search':
+                        self.search_btn.setEnabled(item['enabled'])
+                    elif item['button'] == 'stop':
+                        self.stop_btn.setEnabled(item['enabled'])
+        except:
+            pass  # 队列为空
+    
+    def add_search_result(self, text):
+        """添加搜索结果项（通过队列，线程安全）"""
+        self.result_queue.put({'type': 'result', 'text': text})
+    
+    def start_search(self):
+        keyword = self.search_input.text().strip()
+        if not keyword:
+            QMessageBox.warning(self, "提示", "请输入搜索关键词")
+            return
+        
+        if not self.search_filename_cb.isChecked() and not self.search_content_cb.isChecked():
+            QMessageBox.warning(self, "提示", "请至少选择一种搜索类型")
+            return
+        
+        # 获取并验证搜索路径
+        search_path = self.path_input.text().strip()
+        if not search_path:
+            QMessageBox.warning(self, "提示", "请输入搜索路径")
+            return
+        
+        # 检查路径是否存在
+        if not os.path.exists(search_path):
+            QMessageBox.warning(self, "路径错误", f"路径不存在:\n{search_path}")
+            return
+        
+        # 检查是否是目录
+        if not os.path.isdir(search_path):
+            QMessageBox.warning(self, "路径错误", f"路径不是文件夹:\n{search_path}")
+            return
+        
+        # 检查是否是特殊路径（不支持搜索）
+        if search_path.startswith('shell:'):
+            QMessageBox.warning(self, "不支持", "不支持搜索特殊路径（shell:）")
+            return
+        
+        # 更新搜索路径
+        self.search_path = search_path
+        
+        # 清空之前的结果
+        self.result_list.setRowCount(0)
+        self.is_searching = True
+        self.search_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.status_label.setText("搜索中...")
+        
+        # 在后台线程执行搜索
+        import threading
+        self.search_thread = threading.Thread(
+            target=self.do_search,
+            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked())
+        )
+        self.search_thread.daemon = True
+        self.search_thread.start()
+    
+    def stop_search(self):
+        self.is_searching = False
+        self.search_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.status_label.setText("已停止")
+    
+    def do_search(self, keyword, search_filename, search_content):
+        found_count = 0
+        keyword_lower = keyword.lower()
+        results_buffer = []  # 结果缓冲区
+        buffer_size = 20  # 每20个结果批量更新一次
+        
+        # 调试信息：输出搜索路径
+        print(f"[Search] 开始搜索路径: {self.search_path}")
+        print(f"[Search] 搜索关键词: {keyword}")
+        print(f"[Search] 搜索文件名: {search_filename}, 搜索内容: {search_content}")
+        
+        try:
+            scanned_files = 0
+            folder_count = 0
+            for root, dirs, files in os.walk(self.search_path):
+                if not self.is_searching:
+                    print("[Search] 搜索被中断")
+                    break
+                
+                folder_count += 1
+                # 每处理10个文件夹更新一次状态（减少更新频率）
+                if folder_count % 10 == 0:
+                    # 通过队列更新状态
+                    status_text = f"搜索中... 已扫描 {scanned_files} 个文件，找到 {found_count} 个结果"
+                    self.result_queue.put({'type': 'status', 'text': status_text})
+                
+                # 搜索文件夹名
+                if search_filename:
+                    for dirname in dirs:
+                        if not self.is_searching:
+                            break
+                        
+                        if keyword_lower in dirname.lower():
+                            found_count += 1
+                            dir_path = os.path.join(root, dirname)
+                            
+                            # 获取文件夹信息
+                            try:
+                                stat_info = os.stat(dir_path)
+                                mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
+                                size_str = "-"  # 文件夹不显示大小
+                            except:
+                                mtime = "-"
+                                size_str = "-"
+                            
+                            results_buffer.append({
+                                'path': dir_path,
+                                'name': f"📁 {dirname}",
+                                'full_path': f"📁 {dir_path}",
+                                'file_type': '文件夹',
+                                'date': mtime,
+                                'size': size_str
+                            })
+                            
+                            # 批量更新UI
+                            if len(results_buffer) >= buffer_size:
+                                for item in results_buffer:
+                                    self.result_queue.put({'type': 'result', **item})
+                                results_buffer.clear()
+                
+                # 搜索文件名和文件内容
+                for filename in files:
+                    if not self.is_searching:
+                        print("[Search] 搜索被中断（文件循环）")
+                        break
+                        break
+                    
+                    scanned_files += 1
+                    file_path = os.path.join(root, filename)
+                    matched = False
+                    match_type = ""
+                    
+                    # 搜索文件名
+                    if search_filename and keyword_lower in filename.lower():
+                        matched = True
+                        match_type = "📄"
+                    
+                    # 搜索文件内容
+                    if search_content and not matched:
+                        try:
+                            # 分块读取大文件，每次读取100MB
+                            chunk_size = 100 * 1024 * 1024  # 100MB
+                            file_size = os.path.getsize(file_path)
+                            
+                            # 尝试以文本方式读取文件内容
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                if file_size <= chunk_size:
+                                    # 小文件直接全部读取
+                                    content = f.read()
+                                    if keyword_lower in content.lower():
+                                        matched = True
+                                        match_type = "📄"
+                                else:
+                                    # 大文件分块读取
+                                    overlap = len(keyword) * 2  # 重叠区域，防止关键词被分割
+                                    while True:
+                                        chunk = f.read(chunk_size)
+                                        if not chunk:
+                                            break
+                                        if keyword_lower in chunk.lower():
+                                            matched = True
+                                            match_type = "📄"
+                                            break
+                                        # 回退overlap字节，避免关键词跨块
+                                        if len(chunk) == chunk_size:
+                                            f.seek(f.tell() - overlap)
+                        except Exception:
+                            # 如果无法以文本方式读取，跳过该文件
+                            pass
+                    
+                    if matched:
+                        found_count += 1
+                        
+                        # 获取文件信息
+                        try:
+                            stat_info = os.stat(file_path)
+                            mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
+                            size_bytes = stat_info.st_size
+                            # 格式化大小
+                            if size_bytes < 1024:
+                                size_str = f"{size_bytes} B"
+                            elif size_bytes < 1024 * 1024:
+                                size_str = f"{size_bytes / 1024:.1f} KB"
+                            elif size_bytes < 1024 * 1024 * 1024:
+                                size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
+                            else:
+                                size_str = f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+                        except:
+                            mtime = "-"
+                            size_str = "-"
+                        
+                        # 获取文件名和扩展名
+                        name_without_ext, file_ext = os.path.splitext(filename)
+                        # 获取不带扩展名的完整路径
+                        path_without_ext = os.path.join(root, name_without_ext)
+                        if file_ext:
+                            file_type = file_ext[1:].upper()  # 去掉点并转大写
+                        else:
+                            file_type = "无"
+                        
+                        results_buffer.append({
+                            'path': file_path,
+                            'name': f"{match_type} {path_without_ext}",
+                            'full_path': f"{match_type} {file_path}",
+                            'file_type': file_type,
+                            'date': mtime,
+                            'size': size_str
+                        })
+                        
+                        # 批量更新UI（每20个结果更新一次）
+                        if len(results_buffer) >= buffer_size:
+                            # 将结果放入队列
+                            for item in results_buffer:
+                                self.result_queue.put({'type': 'result', **item})
+                            results_buffer.clear()
+        except Exception as e:
+            print(f"Search error: {e}")
+        
+        # 添加剩余的结果
+        if results_buffer:
+            for item in results_buffer:
+                self.result_queue.put({'type': 'result', **item})
+        
+        # 调试信息
+        print(f"[Search] 搜索完成，共扫描 {scanned_files} 个文件，找到 {found_count} 个结果")
+        
+        # 重置搜索状态（先重置，避免后续更新被跳过）
+        self.is_searching = False
+        
+        # 搜索完成，更新UI状态（通过队列）
+        final_status = f"搜索完成，共找到 {found_count} 个结果（扫描了 {scanned_files} 个文件）"
+        self.result_queue.put({'type': 'status', 'text': final_status})
+        self.result_queue.put({'type': 'button', 'button': 'search', 'enabled': True})
+        self.result_queue.put({'type': 'button', 'button': 'stop', 'enabled': False})
+        
+        print(f"[Search] UI更新已调度（使用队列）")
+    
+    def on_result_double_clicked(self, row, column):
+        """双击搜索结果，打开文件所在文件夹或文件夹本身"""
+        # 从第一列获取存储的完整路径
+        path_item = self.result_list.item(row, 0)
+        if path_item:
+            file_path = path_item.data(256)  # 获取存储的完整路径
+            
+            if os.path.exists(file_path):
+                # 如果是文件夹，直接打开文件夹；如果是文件，打开文件所在文件夹
+                if os.path.isdir(file_path):
+                    folder_path = file_path
+                else:
+                    folder_path = os.path.dirname(file_path)
+                # 不关闭搜索对话框，保持独立
+                if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+                    self.main_window.add_new_tab(folder_path)
+
 import sys
 import os
 import json
@@ -60,7 +480,7 @@ import string
 import time
 import socket
 import threading
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog)  # QDockWidget removed (unused)
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView)  # QDockWidget removed (unused)
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject  # QModelIndex removed (unused)
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent
@@ -1076,6 +1496,9 @@ class CustomTabBar(QTabBar):
         self.main_window = None
         self.hovered_tab = -1  # 当前鼠标悬停的标签页索引
         self.setMouseTracking(True)  # 启用鼠标追踪
+        self.setMovable(True)  # 启用标签页拖拽排序
+        # 连接标签移动信号
+        self.tabMoved.connect(self.on_tab_moved)
     
     def event(self, event):
         # 拦截所有事件，确保双击事件能被处理
@@ -1161,6 +1584,34 @@ class CustomTabBar(QTabBar):
         """关闭指定索引的标签页"""
         if self.main_window and hasattr(self.main_window, 'close_tab'):
             self.main_window.close_tab(index)
+    
+    def on_tab_moved(self, from_index, to_index):
+        """标签页移动后的处理，确保固定标签页始终在左侧"""
+        if not self.main_window:
+            return
+        
+        # 获取被移动的标签页
+        moved_tab = self.main_window.tab_widget.widget(to_index)
+        if not moved_tab:
+            return
+        
+        # 检查是否违反固定标签页规则
+        is_pinned = getattr(moved_tab, 'is_pinned', False)
+        
+        # 统计固定标签页的数量
+        pinned_count = 0
+        for i in range(self.count()):
+            tab = self.main_window.tab_widget.widget(i)
+            if tab and getattr(tab, 'is_pinned', False):
+                pinned_count += 1
+        
+        # 如果是固定标签页移动到非固定区域，或非固定标签页移动到固定区域，需要纠正
+        if is_pinned and to_index >= pinned_count:
+            # 固定标签页不能移动到非固定区域，移回固定区域末尾
+            self.moveTab(to_index, pinned_count - 1)
+        elif not is_pinned and to_index < pinned_count - 1:
+            # 非固定标签页不能移动到固定区域，移到非固定区域开头
+            self.moveTab(to_index, pinned_count)
 
 
 class MainWindow(QMainWindow):
@@ -1326,6 +1777,37 @@ class MainWindow(QMainWindow):
     def show_bookmark_dialog(self):
         dlg = BookmarkDialog(self.bookmark_manager, self)
         dlg.exec_()
+    
+    def show_search_dialog(self):
+        """显示搜索对话框（非模态）"""
+        current_tab = self.tab_widget.currentWidget()
+        if not current_tab or not hasattr(current_tab, 'current_path'):
+            QMessageBox.warning(self, "提示", "请先打开一个文件夹")
+            return
+        
+        search_path = current_tab.current_path
+        
+        # 不支持搜索特殊路径
+        if search_path.startswith('shell:'):
+            QMessageBox.warning(self, "提示", "不支持搜索特殊路径（shell:）")
+            return
+        
+        if not os.path.exists(search_path):
+            QMessageBox.warning(self, "提示", f"路径不存在: {search_path}")
+            return
+        
+        # 创建非模态对话框
+        dlg = SearchDialog(search_path, self)
+        # 保存对话框引用，防止被垃圾回收
+        if not hasattr(self, 'search_dialogs'):
+            self.search_dialogs = []
+        self.search_dialogs.append(dlg)
+        
+        # 对话框关闭时从列表中移除
+        dlg.finished.connect(lambda: self.search_dialogs.remove(dlg) if dlg in self.search_dialogs else None)
+        
+        # 非模态显示，不阻塞主窗口
+        dlg.show()
 
     def tab_context_menu(self, pos):
         tab_index = self.tab_widget.tabBar().tabAt(pos)
@@ -1608,6 +2090,14 @@ class MainWindow(QMainWindow):
         self.add_tab_button.setFixedWidth(35)
         self.add_tab_button.clicked.connect(self.add_new_tab)
         btn_layout.addWidget(self.add_tab_button)
+        
+        # 搜索按钮
+        self.search_button = QPushButton("🔍")
+        self.search_button.setToolTip("搜索当前文件夹")
+        self.search_button.setFixedHeight(35)
+        self.search_button.setFixedWidth(35)
+        self.search_button.clicked.connect(self.show_search_dialog)
+        btn_layout.addWidget(self.search_button)
         
         btn_layout.addStretch(1)
         self.tab_widget.setCornerWidget(btn_widget)
