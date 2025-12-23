@@ -58,9 +58,11 @@ import json
 import subprocess
 import string
 import time
+import socket
+import threading
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog)  # QDockWidget removed (unused)
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal  # QModelIndex removed (unused)
+from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject  # QModelIndex removed (unused)
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent
 # from PyQt5.QtGui import QIcon  # unused
 
@@ -1064,13 +1066,16 @@ class DragDropTabWidget(QTabWidget):
             event.ignore()
 
 
-# 自定义 TabBar 以支持双击空白区域打开新标签页
-from PyQt5.QtWidgets import QTabBar
-from PyQt5.QtCore import QEvent
+# 自定义 TabBar 以支持双击空白区域打开新标签页和悬停显示关闭按钮
+from PyQt5.QtWidgets import QTabBar, QToolButton
+from PyQt5.QtCore import QEvent, QPoint
+from PyQt5.QtGui import QIcon
 class CustomTabBar(QTabBar):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.main_window = None
+        self.hovered_tab = -1  # 当前鼠标悬停的标签页索引
+        self.setMouseTracking(True)  # 启用鼠标追踪
     
     def event(self, event):
         # 拦截所有事件，确保双击事件能被处理
@@ -1109,9 +1114,59 @@ class CustomTabBar(QTabBar):
         
         # 如果点击在标签页上，调用默认行为
         super().mouseDoubleClickEvent(event)
+    
+    def mouseMoveEvent(self, event):
+        """追踪鼠标位置，更新悬停的标签页"""
+        tab_index = self.tabAt(event.pos())
+        if tab_index != self.hovered_tab:
+            # 移除旧的关闭按钮
+            if self.hovered_tab >= 0:
+                self.setTabButton(self.hovered_tab, QTabBar.RightSide, None)
+            
+            # 添加新的关闭按钮
+            self.hovered_tab = tab_index
+            if self.hovered_tab >= 0:
+                close_btn = QToolButton(self)
+                close_btn.setText("×")
+                close_btn.setFixedSize(16, 16)
+                close_btn.setStyleSheet("""
+                    QToolButton {
+                        border: none;
+                        background: transparent;
+                        color: #666;
+                        font-size: 18px;
+                        font-weight: bold;
+                        padding: 0px;
+                        margin: 0px;
+                    }
+                    QToolButton:hover {
+                        background: #ff6b6b;
+                        color: white;
+                        border-radius: 8px;
+                    }
+                """)
+                close_btn.clicked.connect(lambda: self.close_tab_at_index(self.hovered_tab))
+                self.setTabButton(self.hovered_tab, QTabBar.RightSide, close_btn)
+        
+        super().mouseMoveEvent(event)
+    
+    def leaveEvent(self, event):
+        """鼠标离开标签栏时移除关闭按钮"""
+        if self.hovered_tab >= 0:
+            self.setTabButton(self.hovered_tab, QTabBar.RightSide, None)
+            self.hovered_tab = -1
+        super().leaveEvent(event)
+    
+    def close_tab_at_index(self, index):
+        """关闭指定索引的标签页"""
+        if self.main_window and hasattr(self.main_window, 'close_tab'):
+            self.main_window.close_tab(index)
 
 
 class MainWindow(QMainWindow):
+    # 定义信号用于从服务器线程通知主线程打开新标签
+    open_path_signal = pyqtSignal(str)
+    
     def ensure_default_icons_on_bookmark_bar(self):
         """确保四个常用书签（带图标）始终在最左侧且不会被覆盖。"""
         bm = self.bookmark_manager
@@ -1191,7 +1246,9 @@ class MainWindow(QMainWindow):
             self.forward_button.setEnabled(False)
 
 
-
+    @pyqtSlot()
+    @pyqtSlot(str)
+    @pyqtSlot(str, bool)
     def add_new_tab(self, path="", is_shell=False):
         # 默认新建标签页为“此电脑”
         if not path:
@@ -1204,6 +1261,11 @@ class MainWindow(QMainWindow):
         self.tab_widget.setCurrentIndex(tab_index)
         # 更新导航按钮状态（确保新标签页的按钮状态正确）
         self.update_navigation_buttons()
+        
+        # 激活窗口（当从其他实例接收到路径时）
+        self.activateWindow()
+        self.raise_()
+        
         return tab_index
 
 
@@ -1491,8 +1553,7 @@ class MainWindow(QMainWindow):
 
         # 创建标签页控件（支持拖放）
         self.tab_widget = DragDropTabWidget(self)
-        self.tab_widget.setTabsClosable(True)
-        self.tab_widget.tabCloseRequested.connect(self.close_tab)
+        self.tab_widget.setTabsClosable(False)  # 禁用默认关闭按钮，使用自定义悬停关闭按钮
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
 
         # 使用自定义 TabBar 支持双击空白区域打开新标签页
@@ -1577,6 +1638,68 @@ class MainWindow(QMainWindow):
         # 右键标签页支持固定/取消固定
         self.tab_widget.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
         self.tab_widget.tabBar().customContextMenuRequested.connect(self.tab_context_menu)
+        
+        # 连接信号
+        self.open_path_signal.connect(self.handle_open_path_from_instance)
+        
+        # 启动单实例通信服务器
+        self.start_instance_server()
+
+    def handle_open_path_from_instance(self, path):
+        """处理从其他实例接收到的路径（在主线程中）"""
+        print(f"[MainWindow] Opening path in new tab: {path}")
+        self.add_new_tab(path)
+        # 激活并置顶窗口
+        self.activateWindow()
+        self.raise_()
+        self.showNormal()  # 如果最小化则恢复
+    
+    def start_instance_server(self):
+        """启动本地服务器监听其他实例的请求"""
+        def server_thread():
+            try:
+                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind(('127.0.0.1', 58923))  # 使用固定端口
+                server.listen(5)
+                server.settimeout(1.0)  # 设置超时，使线程可以退出
+                self.server_socket = server
+                print("[Server] Instance server started on port 58923")
+                
+                while getattr(self, 'server_running', True):
+                    try:
+                        conn, addr = server.accept()
+                        data = conn.recv(4096).decode('utf-8')
+                        conn.close()
+                        
+                        if data:
+                            print(f"[Server] Received path: {data}")
+                            # 使用信号在主线程中打开新标签页
+                            self.open_path_signal.emit(data)
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        print(f"[Server] Connection error: {e}")
+                        continue
+            except Exception as e:
+                print(f"[Server] Failed to start server: {e}")
+        
+        self.server_running = True
+        server_thread_obj = threading.Thread(target=server_thread, daemon=True)
+        server_thread_obj.start()
+        # 等待服务器启动
+        time.sleep(0.2)
+
+    def closeEvent(self, event):
+        """窗口关闭时停止服务器"""
+        self.server_running = False
+        if hasattr(self, 'server_socket'):
+            try:
+                self.server_socket.close()
+            except:
+                pass
+        super().closeEvent(event)
+
 
     def on_dir_tree_clicked(self, index):
         # 目录树点击，右侧当前标签页跳转
@@ -2042,10 +2165,55 @@ class BookmarkManagerDialog(QDialog):
 
     # BookmarkManagerDialog不再包含标签页相关方法
 
+def try_send_to_existing_instance(path):
+    """尝试将路径发送给已运行的实例"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client.settimeout(2.0)  # 增加超时时间
+            client.connect(('127.0.0.1', 58923))
+            client.send(path.encode('utf-8'))
+            client.close()
+            print(f"[Client] Successfully sent path to existing instance: {path}")
+            return True
+        except Exception as e:
+            print(f"[Client] Attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(0.1)  # 短暂等待后重试
+            continue
+    print("[Client] No existing instance found, starting new instance")
+    return False
+
 def main():
+    # 支持命令行参数：打开指定路径
+    path_to_open = None
+    if len(sys.argv) > 1:
+        path = sys.argv[1]
+        # 处理可能的引号
+        path = path.strip('"').strip("'")
+        if os.path.exists(path):
+            # 如果是文件，打开其所在目录
+            if os.path.isfile(path):
+                path = os.path.dirname(path)
+            path_to_open = path
+            
+            # 尝试发送给已运行的实例
+            if try_send_to_existing_instance(path):
+                print(f"Sent path to existing instance: {path}")
+                sys.exit(0)  # 退出程序，不启动新实例
+    
+    # 启动新实例
     app = QApplication(sys.argv)
     app.setApplicationName("TabExplorer")
     window = MainWindow()
+    
+    # 如果有路径参数，在新窗口中打开
+    # 注意：MainWindow.__init__() 已经调用了 load_pinned_tabs()
+    if path_to_open:
+        # 无论是否有固定标签页，都添加目标路径作为新标签
+        window.add_new_tab(path_to_open)
+    
     window.show()
     sys.exit(app.exec_())
 
