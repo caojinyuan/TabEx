@@ -100,6 +100,7 @@ class BreadcrumbPathBar(QWidget):
         
         # 面包屑容器（显示模式时显示）
         self.breadcrumb_widget = QWidget(self)
+        self.breadcrumb_widget.setStyleSheet("QWidget { background: #e8f5e9; }")
         self.breadcrumb_layout = QHBoxLayout(self.breadcrumb_widget)
         self.breadcrumb_layout.setContentsMargins(0, 0, 0, 0)
         self.breadcrumb_layout.setSpacing(0)
@@ -111,7 +112,7 @@ class BreadcrumbPathBar(QWidget):
         # 设置整体样式
         self.setStyleSheet("""
             BreadcrumbPathBar {
-                background: white;
+                background: #e8f5e9;
                 border: 1px solid #ccc;
                 border-radius: 2px;
             }
@@ -148,23 +149,40 @@ class BreadcrumbPathBar(QWidget):
         if os.name == 'nt':
             # Windows路径
             path = self.current_path.replace('/', '\\')
+            
+            # 检查是否是网络路径（UNC路径）
+            is_unc = path.startswith('\\\\')
+            
             segments = path.split('\\')
             
             # 构建累积路径
             accumulated = ""
+            segment_index = 0
             for i, segment in enumerate(segments):
                 if not segment:
                     continue
                 
-                if i == 0 and ':' in segment:
+                if is_unc and segment_index == 0:
+                    # UNC路径的服务器名
+                    accumulated = '\\\\' + segment
+                    parts.append((segment, accumulated))
+                    segment_index += 1
+                elif is_unc and segment_index == 1:
+                    # UNC路径的共享名
+                    accumulated += '\\' + segment
+                    parts.append((segment, accumulated))
+                    segment_index += 1
+                elif i == 0 and ':' in segment:
                     # 盘符
                     accumulated = segment + '\\'
                     parts.append((segment, accumulated))
+                    segment_index += 1
                 else:
                     if accumulated and not accumulated.endswith('\\'):
                         accumulated += '\\'
                     accumulated += segment
                     parts.append((segment, accumulated))
+                    segment_index += 1
         else:
             # Unix路径
             segments = self.current_path.split('/')
@@ -243,13 +261,13 @@ class ClickableLabel(QLabel):
         self.path = path
         self.setStyleSheet("""
             QLabel {
-                color: #0066cc;
+                color: #003d7a;
                 font-size: 11pt;
                 padding: 2px 2px;
                 border-radius: 2px;
             }
             QLabel:hover {
-                background-color: #e5f3ff;
+                background-color: #cce5ff;
                 text-decoration: underline;
             }
         """)
@@ -360,12 +378,20 @@ class FileExplorerTab(QWidget):
             if not display and path.startswith('shell:'):
                 display = path  # 兜底显示原始shell:路径
             if not display:
-                display = path[-8:] if len(path) > 8 else path
-            title = ("📌" if getattr(self, 'is_pinned', False) else "") + display
+                display = path
+            # 统一对所有display做长度限制
+            is_pinned = getattr(self, 'is_pinned', False)
+            max_len = 12 if is_pinned else 16  # 固定标签页显示更短，为📌图标留空间
+            if len(display) > max_len:
+                display = display[-max_len:]
+            pin_prefix = "📌" if is_pinned else ""
+            title = pin_prefix + display
+            print(f"DEBUG update_tab_title: path={path}, is_pinned={is_pinned}, pin_prefix='{pin_prefix}', title='{title}'")
             if self.main_window and hasattr(self.main_window, 'tab_widget'):
                 idx = self.main_window.tab_widget.indexOf(self)
                 if idx != -1:
                     self.main_window.tab_widget.setTabText(idx, title)
+                    print(f"DEBUG: Set tab {idx} text to '{title}'")
 
     def start_path_sync_timer(self):
         from PyQt5.QtCore import QTimer
@@ -377,16 +403,30 @@ class FileExplorerTab(QWidget):
         # 通过QAxWidget的LocationURL属性获取当前路径
         try:
             url = self.explorer.property('LocationURL')
-            if url and str(url).startswith('file:///'):
-                from urllib.parse import unquote
-                local_path = unquote(str(url)[8:])
-                if os.name == 'nt' and local_path.startswith('/'):
-                    local_path = local_path[1:]
-                if local_path != self.current_path:
+            if url:
+                url_str = str(url)
+                local_path = None
+                
+                # 处理 file:/// 本地路径
+                if url_str.startswith('file:///'):
+                    from urllib.parse import unquote
+                    local_path = unquote(url_str[8:])
+                    if os.name == 'nt' and local_path.startswith('/'):
+                        local_path = local_path[1:]
+                # 处理 shell: 特殊路径
+                elif url_str.startswith('shell:') or '::' in url_str:
+                    # Shell特殊文件夹，通常以 shell: 或包含 CLSID (::)
+                    # 这些路径我们已经在 current_path 中维护，无需更新
+                    return
+                
+                if local_path and local_path != self.current_path:
                     self.current_path = local_path
                     if hasattr(self, 'path_bar'):
                         self.path_bar.set_path(local_path)
                     self.update_tab_title()
+                    # 只在非程序化导航时添加到历史记录
+                    if not self._navigating_programmatically and hasattr(self, '_add_to_history'):
+                        self._add_to_history(local_path)
                     # 同步左侧目录树
                     if self.main_window and hasattr(self.main_window, 'expand_dir_tree_to_path'):
                         self.main_window.expand_dir_tree_to_path(local_path)
@@ -460,13 +500,8 @@ class FileExplorerTab(QWidget):
         self.explorer.dynamicCall('OnNewWindow3(QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None)
 
 
-        # 在Explorer下方添加盘符列表（初始隐藏）
-        from PyQt5.QtWidgets import QListWidget, QLabel
-        self.drive_list = QListWidget()
-        self.drive_list.setVisible(False)
-        self.drive_list.itemDoubleClicked.connect(self.on_drive_double_clicked)
-        layout.addWidget(self.drive_list)
         # 兼容原有空白双击
+        from PyQt5.QtWidgets import QLabel
         self.blank = QLabel()
         # 保持空白区域为固定高度，避免其扩展占满右侧空间
         self.blank.setFixedHeight(10)
@@ -824,7 +859,7 @@ class FileExplorerTab(QWidget):
     # 移除 on_document_complete 和 eventFilter 相关内容
 
     def go_up(self, force=False):
-        # 返回上一级目录，盘符根目录时显示所有盘符列表
+        # 返回上一级目录，盘符根目录时导航到"此电脑"
         # 如果 force=True，则绕过鼠标位置检查（用于按钮或程序化调用）
         if not force:
             # 仅在明确来自空白区域或路径栏的触发时执行，避免误由文件双击触发
@@ -842,54 +877,40 @@ class FileExplorerTab(QWidget):
         if not self.current_path:
             return
         path = self.current_path
-        # 判断是否为盘符根目录
+        # 判断是否为盘符根目录，导航到"此电脑"
         if path.endswith(":\\") or path.endswith(":/"):
-            self.show_drive_list()
+            self.navigate_to('shell:MyComputerFolder', is_shell=True)
             return
         parent_path = os.path.dirname(path)
         if parent_path and os.path.exists(parent_path):
             self.navigate_to(parent_path)
 
-    def show_drive_list(self):
-        # 列出所有盘符到QListWidget
-        import string
-        self.drive_list.clear()
-        drives = []
-        for letter in string.ascii_uppercase:
-            drive = f"{letter}:\\"
-            if os.path.exists(drive):
-                drives.append(drive)
-        if not drives:
-            self.drive_list.setVisible(False)
-            QMessageBox.information(self, "无可用盘符", "未检测到任何磁盘驱动器。")
-            return
-        self.drive_list.addItems(drives)
-        self.drive_list.setVisible(True)
-
-    def on_drive_double_clicked(self, item):
-        drive = item.text()
-        self.drive_list.setVisible(False)
-        self.navigate_to(drive)
     def __init__(self, parent=None, path="", is_shell=False):
         super().__init__(parent)
         self.main_window = parent
         self.current_path = path if path else QDir.homePath()
+        # 浏览历史记录
+        self.history = []
+        self.history_index = -1
+        # 标志：是否正在程序化导航（用于防止sync时重复添加历史）
+        self._navigating_programmatically = False
         self.setup_ui()
         self.navigate_to(self.current_path, is_shell=is_shell)
         self.start_path_sync_timer()
 
     # 移除重复的setup_ui，保留带路径栏的实现
 
-    def navigate_to(self, path, is_shell=False):
+    def navigate_to(self, path, is_shell=False, add_to_history=True):
         # 支持本地路径和shell特殊路径
-        if hasattr(self, 'drive_list'):
-            self.drive_list.setVisible(False)
         if is_shell:
             self.explorer.dynamicCall("Navigate(const QString&)", path)
             self.current_path = path
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(path)
             self.update_tab_title()
+            # 添加到历史记录
+            if add_to_history:
+                self._add_to_history(path)
         elif os.path.exists(path):
             url = QDir.toNativeSeparators(path)
             self.explorer.dynamicCall("Navigate(const QString&)", url)
@@ -897,6 +918,62 @@ class FileExplorerTab(QWidget):
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(path)
             self.update_tab_title()
+            # 添加到历史记录
+            if add_to_history:
+                self._add_to_history(path)
+    
+    def _add_to_history(self, path):
+        """添加路径到历史记录"""
+        # 如果当前不在历史末尾，删除当前位置之后的所有历史
+        if self.history_index < len(self.history) - 1:
+            self.history = self.history[:self.history_index + 1]
+        # 添加新路径（避免重复添加相同路径）
+        if not self.history or self.history[-1] != path:
+            self.history.append(path)
+            self.history_index = len(self.history) - 1
+        # 更新主窗口按钮状态
+        if self.main_window and hasattr(self.main_window, 'update_navigation_buttons'):
+            self.main_window.update_navigation_buttons()
+    
+    def can_go_back(self):
+        """是否可以后退"""
+        return self.history_index > 0
+    
+    def can_go_forward(self):
+        """是否可以前进"""
+        return self.history_index < len(self.history) - 1
+    
+    def go_back(self):
+        """后退到上一个位置"""
+        if self.can_go_back():
+            self.history_index -= 1
+            path = self.history[self.history_index]
+            is_shell = path.startswith('shell:')
+            # 设置标志，防止sync时重复添加历史
+            self._navigating_programmatically = True
+            self.navigate_to(path, is_shell=is_shell, add_to_history=False)
+            # 延迟重置标志，确保sync不会在导航完成前被触发
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(1000, lambda: setattr(self, '_navigating_programmatically', False))
+            # 更新主窗口按钮状态
+            if self.main_window and hasattr(self.main_window, 'update_navigation_buttons'):
+                self.main_window.update_navigation_buttons()
+    
+    def go_forward(self):
+        """前进到下一个位置"""
+        if self.can_go_forward():
+            self.history_index += 1
+            path = self.history[self.history_index]
+            is_shell = path.startswith('shell:')
+            # 设置标志，防止sync时重复添加历史
+            self._navigating_programmatically = True
+            self.navigate_to(path, is_shell=is_shell, add_to_history=False)
+            # 延迟重置标志，确保sync不会在导航完成前被触发
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(1000, lambda: setattr(self, '_navigating_programmatically', False))
+            # 更新主窗口按钮状态
+            if self.main_window and hasattr(self.main_window, 'update_navigation_buttons'):
+                self.main_window.update_navigation_buttons()
 
 
 class DragDropTabWidget(QTabWidget):
@@ -911,13 +988,68 @@ class DragDropTabWidget(QTabWidget):
             event.acceptProposedAction()
         else:
             event.ignore()
+    
+    def mouseDoubleClickEvent(self, event):
+        """捕获 TabWidget 区域的双击事件"""
+        from PyQt5.QtCore import QPoint
+        # 获取 TabBar 的几何位置
+        tabbar = self.tabBar()
+        # 将事件位置转换为 TabBar 的坐标系
+        tabbar_pos = tabbar.mapFrom(self, event.pos())
+        
+        print(f"[DEBUG] TabWidget double click: pos={event.pos()}, tabbar_pos={tabbar_pos}")
+        print(f"[DEBUG] TabBar rect: {tabbar.rect()}")
+        
+        # 检查点击是否在 TabBar 的矩形范围内（使用 TabBar 自己的坐标系）
+        in_tabbar = tabbar.rect().contains(tabbar_pos)
+        print(f"[DEBUG] In TabBar: {in_tabbar}")
+        
+        if in_tabbar:
+            # 在 TabBar 内，检查是否点击在空白区域
+            clicked_tab = tabbar.tabAt(tabbar_pos)
+            print(f"[DEBUG] Clicked tab index: {clicked_tab}")
+            
+            if clicked_tab == -1:
+                # 空白区域，打开新标签页
+                if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+                    print(f"[DEBUG] Opening new tab from TabBar blank area...")
+                    self.main_window.add_new_tab()
+                    return
+        else:
+            # 不在 TabBar 内，检查是否在标签页头部区域（TabBar 右侧的空白）
+            # 获取 TabWidget 的 TabBar 所在的区域高度
+            if event.pos().y() < tabbar.height():
+                print(f"[DEBUG] Click is in tab header area but outside TabBar")
+                # 这是标签头和按钮之间的空白区域，打开新标签页
+                if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+                    print(f"[DEBUG] Opening new tab from header blank area...")
+                    self.main_window.add_new_tab()
+                    return
+        
+        super().mouseDoubleClickEvent(event)
 
     def dropEvent(self, event: QDropEvent):
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             for url in urls:
+                path = None
+                # 尝试获取本地文件路径
                 if url.isLocalFile():
                     path = url.toLocalFile()
+                else:
+                    # 尝试从 URL 字符串中提取路径（支持网络路径）
+                    url_str = url.toString()
+                    if url_str.startswith('file:///'):
+                        from urllib.parse import unquote
+                        path = unquote(url_str[8:])
+                        if os.name == 'nt' and path.startswith('/'):
+                            path = path[1:]
+                    elif url_str.startswith('file://'):
+                        from urllib.parse import unquote
+                        # 网络路径 file://server/share
+                        path = '\\\\' + unquote(url_str[7:]).replace('/', '\\')
+                
+                if path and os.path.exists(path):
                     if os.path.isdir(path):
                         # 如果是文件夹，打开新标签页
                         if self.main_window and hasattr(self.main_window, 'add_new_tab'):
@@ -930,6 +1062,53 @@ class DragDropTabWidget(QTabWidget):
             event.acceptProposedAction()
         else:
             event.ignore()
+
+
+# 自定义 TabBar 以支持双击空白区域打开新标签页
+from PyQt5.QtWidgets import QTabBar
+from PyQt5.QtCore import QEvent
+class CustomTabBar(QTabBar):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.main_window = None
+    
+    def event(self, event):
+        # 拦截所有事件，确保双击事件能被处理
+        if event.type() == QEvent.MouseButtonDblClick:
+            print(f"[DEBUG] TabBar event: MouseButtonDblClick")
+            self.mouseDoubleClickEvent(event)
+            return True
+        return super().event(event)
+    
+    def mouseDoubleClickEvent(self, event):
+        print(f"[DEBUG] TabBar double click event triggered")
+        # 获取点击位置
+        pos = event.pos()
+        # 判断是否点在空白区域（没有点在任何标签页上）
+        clicked_tab = self.tabAt(pos)
+        print(f"[DEBUG] Clicked tab: {clicked_tab}, pos: ({pos.x()}, {pos.y()}), count: {self.count()}")
+        
+        # 如果点击在空白区域，或点击在最后一个标签右侧的空白处
+        is_blank = clicked_tab == -1
+        if not is_blank and self.count() > 0:
+            # 检查是否点击在最后一个标签页的右侧
+            last_tab_rect = self.tabRect(self.count() - 1)
+            print(f"[DEBUG] Last tab right edge: {last_tab_rect.right()}")
+            if pos.x() > last_tab_rect.right():
+                is_blank = True
+        
+        print(f"[DEBUG] Is blank area: {is_blank}, has main_window: {self.main_window is not None}")
+        
+        if is_blank:
+            # 点击在空白区域，打开新标签页
+            if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+                print(f"[DEBUG] Opening new tab from TabBar...")
+                self.main_window.add_new_tab()
+                event.accept()
+                return
+        
+        # 如果点击在标签页上，调用默认行为
+        super().mouseDoubleClickEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -978,13 +1157,39 @@ class MainWindow(QMainWindow):
         pos = event.pos()
         # 判断是否点在tab右侧空白区（包括tabbar宽度范围内和超出tab的区域）
         if tabbar.tabAt(pos) == -1 or pos.x() > tabbar.tabRect(tabbar.count() - 1).right():
-            self.go_up_current_tab()
+            self.add_new_tab()
 
 
     def go_up_current_tab(self):
         current_tab = self.tab_widget.currentWidget()
         if hasattr(current_tab, 'go_up'):
             current_tab.go_up(force=True)
+    
+    def go_back_current_tab(self):
+        """后退当前标签页"""
+        current_tab = self.tab_widget.currentWidget()
+        if hasattr(current_tab, 'go_back'):
+            current_tab.go_back()
+    
+    def go_forward_current_tab(self):
+        """前进当前标签页"""
+        current_tab = self.tab_widget.currentWidget()
+        if hasattr(current_tab, 'go_forward'):
+            current_tab.go_forward()
+    
+    def update_navigation_buttons(self):
+        """更新前进后退按钮状态"""
+        current_tab = self.tab_widget.currentWidget()
+        if hasattr(current_tab, 'can_go_back'):
+            self.back_button.setEnabled(current_tab.can_go_back())
+        else:
+            self.back_button.setEnabled(False)
+        
+        if hasattr(current_tab, 'can_go_forward'):
+            self.forward_button.setEnabled(current_tab.can_go_forward())
+        else:
+            self.forward_button.setEnabled(False)
+
 
 
     def add_new_tab(self, path="", is_shell=False):
@@ -994,9 +1199,11 @@ class MainWindow(QMainWindow):
             is_shell = True
         tab = FileExplorerTab(self, path, is_shell=is_shell)
         tab.is_pinned = False
-        short = path[-8:] if len(path) > 8 else path
+        short = path[-16:] if len(path) > 16 else path
         tab_index = self.tab_widget.addTab(tab, short)
         self.tab_widget.setCurrentIndex(tab_index)
+        # 更新导航按钮状态（确保新标签页的按钮状态正确）
+        self.update_navigation_buttons()
         return tab_index
 
 
@@ -1023,12 +1230,17 @@ class MainWindow(QMainWindow):
                 self.setWindowTitle(f"TabExplorer - {tab.current_path}")
                 # 展开并选中左侧目录树到当前目录
                 self.expand_dir_tree_to_path(tab.current_path)
+            # 更新导航按钮状态
+            self.update_navigation_buttons()
 
     def expand_dir_tree_to_path(self, path):
         # 展开并选中左侧目录树到指定路径
         if not hasattr(self, 'dir_model') or not hasattr(self, 'dir_tree'):
             return
         if not path or not os.path.exists(path):
+            return
+        # 如果是网络路径，直接返回，不展开目录树
+        if path.startswith('\\\\'):
             return
         idx = self.dir_model.index(path)
         if idx.isValid():
@@ -1143,9 +1355,10 @@ class MainWindow(QMainWindow):
         self.tab_widget.clear()
         new_tabs = pinned + unpinned
         for tab in new_tabs:
-            short = tab.current_path[-8:] if len(tab.current_path) > 8 else tab.current_path
-            title = ("📌" if getattr(tab, 'is_pinned', False) else "") + short
-            self.tab_widget.addTab(tab, title)
+            # 先添加标签页（临时标题）
+            self.tab_widget.addTab(tab, "")
+            # 然后调用update_tab_title更新标题（会考虑shell路径映射和图标）
+            tab.update_tab_title()
         # 恢复原先的tab焦点
         if current_tab is not None:
             for i, tab in enumerate(new_tabs):
@@ -1172,8 +1385,9 @@ class MainWindow(QMainWindow):
                 for path in paths:
                     tab = FileExplorerTab(self, path)
                     tab.is_pinned = True
-                    short = path[-8:] if len(path) > 8 else path
-                    title = "📌" + short
+                    short = path[-12:] if len(path) > 12 else path
+                    pin_prefix = "📌"
+                    title = pin_prefix + short
                     self.tab_widget.addTab(tab, title)
                     has_pinned = True
             except Exception:
@@ -1263,7 +1477,12 @@ class MainWindow(QMainWindow):
         drives_parent = self.dir_model.index(root_path)
         for i in range(self.dir_model.rowCount(drives_parent)):
             idx = self.dir_model.index(i, 0, drives_parent)
-            self.dir_tree.expand(idx)
+            path = self.dir_model.filePath(idx)
+            # 隐藏网络驱动器（UNC路径以\\开头）
+            if path.startswith('\\\\'):
+                self.dir_tree.setRowHidden(i, drives_parent, True)
+            else:
+                self.dir_tree.expand(idx)
 
         # 右侧原有标签页区域
         right_widget = QWidget()
@@ -1276,43 +1495,75 @@ class MainWindow(QMainWindow):
         self.tab_widget.tabCloseRequested.connect(self.close_tab)
         self.tab_widget.currentChanged.connect(self.on_tab_changed)
 
+        # 使用自定义 TabBar 支持双击空白区域打开新标签页
+        custom_tabbar = CustomTabBar()
+        custom_tabbar.main_window = self
+        self.tab_widget.setTabBar(custom_tabbar)
+
         # 设置选中标签页背景色为淡黄色
         tabbar = self.tab_widget.tabBar()
+        tabbar.setAcceptDrops(True)
         tabbar.setStyleSheet("""
             QTabBar::tab {
                 border-right: 1px solid #d3d3d3;
                 padding-right: 12px;
                 padding-left: 12px;
                 min-height: 36px;
+                min-width: 120px;
                 font-size: 15px;
             }
             QTabBar::tab:selected {
                 background: #FFF9CC;
             }
         """)
-        # 绑定双击事件
-        tabbar.mouseDoubleClickEvent = self.tabbar_mouse_double_click
 
-        # 添加新标签页按钮和上一级按钮
+        # 添加导航和新标签页按钮
         btn_widget = QWidget()
         btn_layout = QHBoxLayout(btn_widget)
         btn_layout.setContentsMargins(0, 0, 0, 0)
-        self.up_button = QPushButton("⬆️")
-        self.up_button.setToolTip("上一级目录")
-        self.up_button.setFixedHeight(35)
-        self.up_button.setFixedWidth(35)
-        self.up_button.clicked.connect(self.go_up_current_tab)
-        btn_layout.addWidget(self.up_button)
+        
+        # 后退按钮
+        self.back_button = QPushButton("←")
+        self.back_button.setToolTip("后退")
+        self.back_button.setFixedHeight(35)
+        self.back_button.setFixedWidth(35)
+        self.back_button.clicked.connect(self.go_back_current_tab)
+        self.back_button.setEnabled(False)
+        btn_layout.addWidget(self.back_button)
+        
+        # 前进按钮
+        self.forward_button = QPushButton("→")
+        self.forward_button.setToolTip("前进")
+        self.forward_button.setFixedHeight(35)
+        self.forward_button.setFixedWidth(35)
+        self.forward_button.clicked.connect(self.go_forward_current_tab)
+        self.forward_button.setEnabled(False)
+        btn_layout.addWidget(self.forward_button)
+        
+        # 新建标签页按钮
         self.add_tab_button = QPushButton("➕")
         self.add_tab_button.setToolTip("新建标签页")
         self.add_tab_button.setFixedHeight(35)
         self.add_tab_button.setFixedWidth(35)
         self.add_tab_button.clicked.connect(self.add_new_tab)
         btn_layout.addWidget(self.add_tab_button)
+        
         btn_layout.addStretch(1)
         self.tab_widget.setCornerWidget(btn_widget)
-        # 双击角落（标签区与按钮之间的空白）等效返回上一级
-        btn_widget.mouseDoubleClickEvent = lambda e: self.go_up_current_tab()
+        
+        # 为 btn_widget 添加双击事件处理，双击空白区域打开新标签页
+        def btn_widget_double_click(event):
+            print(f"[DEBUG] btn_widget double click event triggered")
+            # 检查点击位置是否在按钮之外的空白区域
+            from PyQt5.QtWidgets import QApplication
+            child = btn_widget.childAt(event.pos())
+            print(f"[DEBUG] Clicked child widget: {child}")
+            if child is None:
+                # 点击在空白区域
+                print(f"[DEBUG] Opening new tab from btn_widget blank area")
+                self.add_new_tab()
+        
+        btn_widget.mouseDoubleClickEvent = btn_widget_double_click
 
         right_layout.addWidget(self.tab_widget)
         self.splitter.addWidget(right_widget)
@@ -1337,12 +1588,26 @@ class MainWindow(QMainWindow):
             current_tab.navigate_to(path)
 
     def open_bookmark_url(self, url):
-        # 支持 file:///、shell: 路径和本地绝对路径
+        # 支持 file:///、file://、shell: 路径和本地绝对路径
         from urllib.parse import unquote
-        if url.startswith('file:///'):
-            local_path = unquote(url[8:])
-            if os.name == 'nt' and local_path.startswith('/'):
-                local_path = local_path[1:]
+        if url.startswith('file:'):
+            # 处理各种file URL格式
+            if url.startswith('file://///'):
+                # UNC路径: file://///server/share/... -> \\server\share\...
+                local_path = '\\\\' + unquote(url[10:]).replace('/', '\\')
+            elif url.startswith('file:////'):
+                # UNC路径: file:////server/share/... -> \\server\share\...
+                local_path = '\\\\' + unquote(url[9:]).replace('/', '\\')
+            elif url.startswith('file:///'):
+                # 本地路径: file:///C:/... -> C:\...
+                local_path = unquote(url[8:])
+                if os.name == 'nt' and local_path.startswith('/'):
+                    local_path = local_path[1:]
+                local_path = local_path.replace('/', '\\')
+            else:
+                # file://server/share/... -> \\server\share\...
+                local_path = '\\\\' + unquote(url[7:]).replace('/', '\\')
+            
             # 检查是否是 shell: 路径
             if local_path.startswith('shell:'):
                 self.add_new_tab(local_path, is_shell=True)
