@@ -1,3 +1,349 @@
+﻿"""
+资源管理器监控模块
+监控新打开的 Windows Explorer 窗口，获取路径并在 TabExplorer 中打开
+"""
+
+import time
+import threading
+import win32gui
+import win32process
+import win32con
+from collections import defaultdict
+
+try:
+    import win32com.client
+    HAS_COM = True
+except:
+    HAS_COM = False
+
+
+class ExplorerMonitor:
+    def __init__(self, main_window):
+        self.main_window = main_window
+        self.monitoring = False
+        self.monitor_thread = None
+        self.known_windows = set()  # 已知的窗口句柄
+        self.window_paths = {}  # 窗口句柄 -> 路径映射
+        
+    def start(self):
+        """启动监控"""
+        if self.monitoring:
+            return
+        
+        # 在启动前记录所有已存在的Explorer窗口
+        def record_existing(hwnd, _):
+            try:
+                if win32gui.IsWindowVisible(hwnd):
+                    class_name = win32gui.GetClassName(hwnd)
+                    if class_name in ["CabinetWClass", "ExploreWClass"]:
+                        self.known_windows.add(hwnd)
+            except:
+                pass
+            return True
+        
+        win32gui.EnumWindows(record_existing, None)
+        print(f"[ExplorerMonitor] 启动时已记录 {len(self.known_windows)} 个现有Explorer窗口")
+        
+        self.monitoring = True
+        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.monitor_thread.start()
+        print("[ExplorerMonitor] 监控已启动")
+    
+    def stop(self):
+        """停止监控"""
+        self.monitoring = False
+        print("[ExplorerMonitor] 监控已停止")
+    
+    def _monitor_loop(self):
+        """监控循环"""
+        # 在线程中初始化COM
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except Exception as e:
+            print(f"[ExplorerMonitor] COM初始化失败: {e}")
+        
+        try:
+            while self.monitoring:
+                try:
+                    self._check_new_explorer_windows()
+                    time.sleep(0.2)  # 改为0.2秒，提高响应速度
+                except Exception as e:
+                    print(f"[ExplorerMonitor] 监控错误: {e}")
+                    time.sleep(1)
+        finally:
+            # 线程结束时清理COM
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except:
+                pass
+    
+    def _check_new_explorer_windows(self):
+        """检查新的资源管理器窗口"""
+        current_windows = set()
+        new_windows = []  # 新发现的窗口列表
+        
+        # 定期输出检查状态（每5秒）
+        if not hasattr(self, '_check_counter'):
+            self._check_counter = 0
+        self._check_counter += 1
+        if self._check_counter % 25 == 0:  # 0.2s * 25 = 5s
+            print(f"[ExplorerMonitor] 监控运行中... (已检查 {self._check_counter} 次)")
+        
+        def enum_callback(hwnd, _):
+            try:
+                # 检查窗口是否可见
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                
+                # 获取窗口类名
+                class_name = win32gui.GetClassName(hwnd)
+                
+                # Explorer 窗口的类名是 "CabinetWClass" 或 "ExploreWClass"
+                if class_name not in ["CabinetWClass", "ExploreWClass"]:
+                    return True
+                
+                # 获取窗口标题（新窗口可能标题为空，不过滤）
+                title = win32gui.GetWindowText(hwnd)
+                
+                # 记录当前窗口
+                current_windows.add(hwnd)
+                
+                # 检查是否是新窗口
+                if hwnd not in self.known_windows:
+                    print(f"[ExplorerMonitor] 发现新窗口: '{title}' (hwnd={hwnd}, class={class_name})")
+                    new_windows.append((hwnd, title))
+                
+            except Exception as e:
+                print(f"[ExplorerMonitor] 枚举窗口错误: {e}")
+            
+            return True
+        
+        # 枚举所有顶层窗口
+        win32gui.EnumWindows(enum_callback, None)
+        
+        # 更新已知窗口列表
+        self.known_windows = current_windows
+        
+        # 处理新窗口（在枚举完成后处理，避免在枚举过程中修改窗口）
+        for hwnd, title in new_windows:
+            self._handle_new_window(hwnd, title)
+    
+    def _handle_new_window(self, hwnd, title):
+        """处理新打开的资源管理器窗口 - 直接嵌入该窗口而不是创建新标签"""
+        try:
+            # 延迟并重试获取路径（Win+E 打开的窗口需要更长时间初始化）
+            path = None
+            max_retries = 5
+            
+            for retry in range(max_retries):
+                # 等待时间递增
+                wait_time = 0.1 + (retry * 0.1)  # 0.1, 0.2, 0.3, 0.4, 0.5
+                time.sleep(wait_time)
+                
+                print(f"[ExplorerMonitor] 尝试获取路径 (第{retry+1}次，等待{wait_time}秒)...")
+                path = self._get_explorer_path(hwnd)
+                
+                if path:
+                    break
+                    
+                if retry < max_retries - 1:
+                    print(f"[ExplorerMonitor] 路径为空，等待窗口初始化...")
+            
+            if path:
+                print(f"[ExplorerMonitor] 最终获取到路径: {path}")
+                
+                # 判断是否是 shell: 路径
+                is_shell = path.startswith('shell:') or '::' in path
+                
+                # 在主线程中直接嵌入该Explorer窗口到新标签页
+                from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+                QMetaObject.invokeMethod(
+                    self.main_window,
+                    "embed_existing_explorer",
+                    Qt.QueuedConnection,
+                    Q_ARG(int, hwnd),
+                    Q_ARG(str, path)
+                )
+                
+                # 不再关闭原窗口，因为我们要嵌入它
+                # self._close_explorer_window(hwnd)
+            else:
+                print(f"[ExplorerMonitor] 重试{max_retries}次后仍无法获取路径，窗口标题: {title}")
+                print(f"[ExplorerMonitor] 尝试根据标题猜测路径...")
+                
+                # 根据标题猜测路径
+                fallback_path = self._guess_path_from_title(title)
+                if fallback_path:
+                    print(f"[ExplorerMonitor] 使用备用路径: {fallback_path}")
+                    from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+                    QMetaObject.invokeMethod(
+                        self.main_window,
+                        "embed_existing_explorer",
+                        Qt.QueuedConnection,
+                        Q_ARG(int, hwnd),
+                        Q_ARG(str, fallback_path)
+                    )
+                
+        except Exception as e:
+            print(f"[ExplorerMonitor] 处理新窗口错误: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _guess_path_from_title(self, title):
+        """根据窗口标题猜测路径"""
+        title_map = {
+            '此电脑': 'shell:MyComputerFolder',
+            '快速访问': 'shell:MyComputerFolder',
+            '回收站': 'shell:RecycleBinFolder',
+            '桌面': 'shell:Desktop',
+            '网络': 'shell:NetworkPlacesFolder',
+            '下载': 'shell:Downloads',
+            '文档': 'shell:Personal',
+            '图片': 'shell:My Pictures',
+            '音乐': 'shell:My Music',
+            '视频': 'shell:My Video',
+        }
+        
+        for key, value in title_map.items():
+            if key in title:
+                return value
+        
+        return None
+    
+    def _get_explorer_path(self, hwnd):
+        """获取资源管理器窗口的路径"""
+        if not HAS_COM:
+            return None
+        
+        try:
+            # 使用 Shell.Application COM 对象获取所有窗口
+            shell = win32com.client.Dispatch("Shell.Application")
+            windows = shell.Windows()
+            
+            for window in windows:
+                try:
+                    # 获取窗口句柄
+                    window_hwnd = window.HWND
+                    
+                    if window_hwnd == hwnd:
+                        # 获取当前路径
+                        try:
+                            location = window.LocationURL
+                        except Exception as e:
+                            print(f"[ExplorerMonitor] 获取LocationURL失败: {e}")
+                            # 尝试使用 LocationName
+                            try:
+                                location_name = window.LocationName
+                                print(f"[ExplorerMonitor] LocationName: {location_name}")
+                                # 如果是特殊文件夹名称，返回 None 让调用者处理
+                                return None
+                            except:
+                                return None
+                        
+                        # 处理空 URL
+                        if not location or location.strip() == '':
+                            print(f"[ExplorerMonitor] URL为空，尝试获取Document...")
+                            try:
+                                # 尝试通过 Document 获取路径
+                                doc = window.Document
+                                if hasattr(doc, 'Folder'):
+                                    folder = doc.Folder
+                                    if hasattr(folder, 'Self'):
+                                        path_item = folder.Self
+                                        if hasattr(path_item, 'Path'):
+                                            doc_path = path_item.Path
+                                            print(f"[ExplorerMonitor] 通过Document获取路径: {doc_path}")
+                                            
+                                            # 转换CLSID为shell路径
+                                            if '::' in doc_path:
+                                                clsid_map = {
+                                                    '::{20D04FE0-3AEA-1069-A2D8-08002B30309D}': 'shell:MyComputerFolder',
+                                                    '::{645FF040-5081-101B-9F08-00AA002F954E}': 'shell:RecycleBinFolder',
+                                                    '::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}': 'shell:NetworkPlacesFolder',
+                                                }
+                                                for clsid, shell_path in clsid_map.items():
+                                                    if clsid in doc_path:
+                                                        print(f"[ExplorerMonitor] CLSID转换为: {shell_path}")
+                                                        return shell_path
+                                            
+                                            return doc_path
+                            except Exception as e:
+                                print(f"[ExplorerMonitor] 通过Document获取路径失败: {e}")
+                            return None
+                        
+                        print(f"[ExplorerMonitor] 原始URL: {location}")
+                        
+                        # 转换 file:/// URL 到本地路径
+                        if location.startswith('file:///'):
+                            from urllib.parse import unquote
+                            path = unquote(location[8:])  # 移除 'file:///'
+                            
+                            # Windows 路径处理
+                            if path.startswith('/'):
+                                path = path[1:]  # 移除开头的 /
+                            
+                            path = path.replace('/', '\\')
+                            print(f"[ExplorerMonitor] 转换后路径: {path}")
+                            return path
+                        
+                        # 处理特殊路径（如"快速访问"、"此电脑"等）
+                        elif '::' in location or location.startswith('shell:'):
+                            # CLSID 格式的特殊路径
+                            print(f"[ExplorerMonitor] 检测到特殊路径: {location}")
+                            
+                            # 尝试将常见的 CLSID 转换为 shell: 路径
+                            clsid_map = {
+                                '::{20D04FE0-3AEA-1069-A2D8-08002B30309D}': 'shell:MyComputerFolder',  # 此电脑
+                                '::{645FF040-5081-101B-9F08-00AA002F954E}': 'shell:RecycleBinFolder',  # 回收站
+                                '::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}': 'shell:NetworkPlacesFolder',  # 网络
+                            }
+                            
+                            for clsid, shell_path in clsid_map.items():
+                                if clsid in location:
+                                    print(f"[ExplorerMonitor] 转换为: {shell_path}")
+                                    return shell_path
+                            
+                            # 对于"快速访问"等，默认打开"此电脑"
+                            if 'home' in location.lower() or location == '':
+                                print(f"[ExplorerMonitor] 快速访问或空路径，使用此电脑")
+                                return 'shell:MyComputerFolder'
+                            
+                            return location
+                        
+                        # 其他情况尝试直接返回
+                        else:
+                            print(f"[ExplorerMonitor] 未知格式，直接返回: {location}")
+                            return location
+                
+                except Exception as e:
+                    print(f"[ExplorerMonitor] 处理窗口时出错: {e}")
+                    continue
+            
+            print(f"[ExplorerMonitor] 在所有窗口中未找到匹配的句柄: {hwnd}")
+            
+        except Exception as e:
+            print(f"[ExplorerMonitor] 获取路径错误: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return None
+    
+    def _close_explorer_window(self, hwnd):
+        """关闭资源管理器窗口"""
+        try:
+            # 发送关闭消息
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+            print(f"[ExplorerMonitor] 已关闭窗口 (hwnd={hwnd})")
+        except Exception as e:
+            print(f"[ExplorerMonitor] 关闭窗口错误: {e}")
+
+
+# ============================================================================
+# 书签管理对话框
+# ============================================================================
+
 from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton
 # 多层结构书签弹窗
 class BookmarkDialog(QDialog):
@@ -572,210 +918,6 @@ except Exception:
     HAS_PYWIN = False
 
 # 面包屑导航路径栏
-class BreadcrumbPathBar(QWidget):
-    """类似Windows资源管理器的面包屑路径栏，支持点击层级跳转"""
-    pathChanged = pyqtSignal(str)  # 当路径改变时发出信号
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.current_path = ""
-        self.edit_mode = False
-        self.init_ui()
-    
-    def init_ui(self):
-        self.layout = QHBoxLayout(self)
-        self.layout.setContentsMargins(3, 0, 3, 0)
-        self.layout.setSpacing(0)
-        
-        # 路径编辑框（编辑模式时显示）
-        self.path_edit = QLineEdit(self)
-        self.path_edit.setFixedHeight(30)
-        self.path_edit.setStyleSheet("QLineEdit { font-size: 12pt; padding: 3px; border: 1px solid #ccc; }")
-        self.path_edit.hide()
-        self.path_edit.returnPressed.connect(self.on_edit_finished)
-        self.path_edit.editingFinished.connect(self.exit_edit_mode)
-        
-        # 面包屑容器（显示模式时显示）
-        self.breadcrumb_widget = QWidget(self)
-        self.breadcrumb_widget.setStyleSheet("QWidget { background: #e8f5e9; }")
-        self.breadcrumb_layout = QHBoxLayout(self.breadcrumb_widget)
-        self.breadcrumb_layout.setContentsMargins(0, 0, 0, 0)
-        self.breadcrumb_layout.setSpacing(0)
-        self.breadcrumb_layout.addStretch(1)
-        
-        self.layout.addWidget(self.breadcrumb_widget)
-        self.layout.addWidget(self.path_edit)
-        
-        # 设置整体样式
-        self.setStyleSheet("""
-            BreadcrumbPathBar {
-                background: #e8f5e9;
-                border: 1px solid #ccc;
-                border-radius: 2px;
-            }
-        """)
-        self.setFixedHeight(30)
-    
-    def set_path(self, path):
-        """设置并显示路径"""
-        self.current_path = path
-        if not self.edit_mode:
-            self.update_breadcrumbs()
-    
-    def update_breadcrumbs(self):
-        """更新面包屑显示"""
-        # 清空现有的面包屑
-        while self.breadcrumb_layout.count() > 1:  # 保留最后的stretch
-            item = self.breadcrumb_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        
-        if not self.current_path:
-            return
-        
-        # 处理特殊路径
-        if self.current_path.startswith('shell:'):
-            # shell路径直接显示为一个标签
-            label = ClickableLabel(self.current_path, self.current_path)
-            label.clicked.connect(self.on_segment_clicked)
-            self.breadcrumb_layout.insertWidget(0, label)
-            return
-        
-        # 分割路径
-        parts = []
-        if os.name == 'nt':
-            # Windows路径
-            path = self.current_path.replace('/', '\\')
-            
-            # 检查是否是网络路径（UNC路径）
-            is_unc = path.startswith('\\\\')
-            
-            segments = path.split('\\')
-            
-            # 构建累积路径
-            accumulated = ""
-            segment_index = 0
-            for i, segment in enumerate(segments):
-                if not segment:
-                    continue
-                
-                if is_unc and segment_index == 0:
-                    # UNC路径的服务器名
-                    accumulated = '\\\\' + segment
-                    parts.append((segment, accumulated))
-                    segment_index += 1
-                elif is_unc and segment_index == 1:
-                    # UNC路径的共享名
-                    accumulated += '\\' + segment
-                    parts.append((segment, accumulated))
-                    segment_index += 1
-                elif i == 0 and ':' in segment:
-                    # 盘符
-                    accumulated = segment + '\\'
-                    parts.append((segment, accumulated))
-                    segment_index += 1
-                else:
-                    if accumulated and not accumulated.endswith('\\'):
-                        accumulated += '\\'
-                    accumulated += segment
-                    parts.append((segment, accumulated))
-                    segment_index += 1
-        else:
-            # Unix路径
-            segments = self.current_path.split('/')
-            accumulated = ""
-            for segment in segments:
-                if not segment:
-                    continue
-                accumulated += '/' + segment
-                parts.append((segment, accumulated))
-        
-        # 创建面包屑标签
-        for i, (name, full_path) in enumerate(parts):
-            # 创建可点击的标签
-            label = ClickableLabel(name, full_path)
-            label.clicked.connect(self.on_segment_clicked)
-            self.breadcrumb_layout.insertWidget(i * 2, label)
-            
-            # 添加分隔符（除了最后一个）
-            if i < len(parts) - 1:
-                separator = QLabel(">")
-                separator.setStyleSheet("QLabel { color: #888; font-size: 11pt; padding: 0 2px; }")
-                self.breadcrumb_layout.insertWidget(i * 2 + 1, separator)
-    
-    def on_segment_clicked(self, path):
-        """点击某个层级时触发"""
-        self.current_path = path
-        self.pathChanged.emit(path)
-        self.update_breadcrumbs()
-    
-    def enter_edit_mode(self):
-        """进入编辑模式"""
-        self.edit_mode = True
-        self.breadcrumb_widget.hide()
-        self.path_edit.setText(self.current_path)
-        self.path_edit.show()
-        self.path_edit.setFocus()
-        self.path_edit.selectAll()
-    
-    def exit_edit_mode(self):
-        """退出编辑模式"""
-        if self.edit_mode:
-            self.edit_mode = False
-            self.path_edit.hide()
-            self.breadcrumb_widget.show()
-            self.update_breadcrumbs()
-    
-    def on_edit_finished(self):
-        """编辑完成时触发"""
-        new_path = self.path_edit.text().strip()
-        if new_path and new_path != self.current_path:
-            self.current_path = new_path
-            self.pathChanged.emit(new_path)
-        self.exit_edit_mode()
-    
-    def mouseDoubleClickEvent(self, event: QMouseEvent):
-        """双击进入编辑模式"""
-        self.enter_edit_mode()
-        super().mouseDoubleClickEvent(event)
-    
-    def mousePressEvent(self, event: QMouseEvent):
-        """单击也可以进入编辑模式（点击空白处）"""
-        if event.button() == Qt.LeftButton:
-            # 检查是否点击在面包屑标签上
-            child = self.childAt(event.pos())
-            if child is None or child == self.breadcrumb_widget:
-                self.enter_edit_mode()
-        super().mousePressEvent(event)
-
-
-class ClickableLabel(QLabel):
-    """可点击的标签，用于面包屑导航"""
-    clicked = pyqtSignal(str)
-    
-    def __init__(self, text, path, parent=None):
-        super().__init__(text, parent)
-        self.path = path
-        self.setStyleSheet("""
-            QLabel {
-                color: #003d7a;
-                font-size: 11pt;
-                padding: 2px 2px;
-                border-radius: 2px;
-            }
-            QLabel:hover {
-                background-color: #cce5ff;
-                text-decoration: underline;
-            }
-        """)
-        self.setCursor(Qt.PointingHandCursor)
-    
-    def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.LeftButton:
-            self.clicked.emit(self.path)
-        super().mousePressEvent(event)
-
-
 class BookmarkManager:
     def __init__(self, config_file="bookmarks.json"):
         self.config_file = config_file
@@ -870,12 +1012,35 @@ class FileExplorerTab(QWidget):
                 'shell:Desktop': '桌面',
                 'shell:NetworkPlacesFolder': '网络',
             }
+            
+            # CLSID 路径映射（防止未转换的CLSID路径）
+            clsid_map = {
+                '::{20D04FE0-3AEA-1069-A2D8-08002B30309D}': '此电脑',
+                '::{645FF040-5081-101B-9F08-00AA002F954E}': '回收站',
+                '::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}': '网络',
+            }
+            
             path = self.current_path
+            display = None
+            
+            # 先检查 shell: 路径
             display = shell_map.get(path, None)
+            
+            # 检查 CLSID 路径
+            if not display and '::' in path:
+                for clsid, name in clsid_map.items():
+                    if clsid in path:
+                        display = name
+                        break
+            
+            # 检查是否是其他 shell: 路径
             if not display and path.startswith('shell:'):
                 display = path  # 兜底显示原始shell:路径
+            
+            # 最后使用路径本身
             if not display:
                 display = path
+                
             # 统一对所有display做长度限制
             is_pinned = getattr(self, 'is_pinned', False)
             max_len = 12 if is_pinned else 16  # 固定标签页显示更短，为📌图标留空间
@@ -889,6 +1054,20 @@ class FileExplorerTab(QWidget):
                 if idx != -1:
                     self.main_window.tab_widget.setTabText(idx, title)
                     print(f"DEBUG: Set tab {idx} text to '{title}'")
+    
+    def refresh_explorer(self):
+        """刷新Explorer视图以更新覆盖图标（如Git Tortoise图标）"""
+        try:
+            # 方法1: 发送F5键刷新
+            self.explorer.dynamicCall('Refresh()')
+        except:
+            try:
+                # 方法2: 重新导航到当前路径
+                if hasattr(self, 'current_path') and self.current_path:
+                    is_shell = self.current_path.startswith('shell:')
+                    self.navigate_to(self.current_path, is_shell=is_shell)
+            except Exception as e:
+                print(f"[refresh_explorer] 刷新失败: {e}")
 
     def start_path_sync_timer(self):
         from PyQt5.QtCore import QTimer
@@ -897,7 +1076,34 @@ class FileExplorerTab(QWidget):
         self._path_sync_timer.start(500)
 
     def sync_path_bar_with_explorer(self):
-        # 通过QAxWidget的LocationURL属性获取当前路径
+        """同步Explorer窗口的当前路径到current_path"""
+        # 如果是真实嵌入的Explorer窗口
+        if hasattr(self, 'explorer_hwnd'):
+            try:
+                import win32gui
+                
+                # 获取窗口标题，通常包含当前路径
+                title = win32gui.GetWindowText(self.explorer_hwnd)
+                
+                # Explorer窗口标题就是当前文件夹路径
+                if title and title != self.current_path:
+                    # 验证是否是有效路径
+                    import os
+                    if os.path.exists(title):
+                        print(f"[sync_path] 路径变化: {self.current_path} -> {title}")
+                        self.current_path = title
+                        self.update_tab_title()
+                        # 同步左侧目录树
+                        if self.main_window and hasattr(self.main_window, 'expand_dir_tree_to_path'):
+                            self.main_window.expand_dir_tree_to_path(title)
+            except Exception as e:
+                pass
+            return
+        
+        # 如果是QAxWidget的Shell.Explorer控件（降级方案）
+        if not hasattr(self, 'explorer'):
+            return
+        
         try:
             url = self.explorer.property('LocationURL')
             if url:
@@ -921,9 +1127,6 @@ class FileExplorerTab(QWidget):
                     if hasattr(self, 'path_bar'):
                         self.path_bar.set_path(local_path)
                     self.update_tab_title()
-                    # 只在非程序化导航时添加到历史记录
-                    if not self._navigating_programmatically and hasattr(self, '_add_to_history'):
-                        self._add_to_history(local_path)
                     # 同步左侧目录树
                     if self.main_window and hasattr(self.main_window, 'expand_dir_tree_to_path'):
                         self.main_window.expand_dir_tree_to_path(local_path)
@@ -934,84 +1137,179 @@ class FileExplorerTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # 面包屑路径栏
-        self.path_bar = BreadcrumbPathBar(self)
-        self.path_bar.pathChanged.connect(self.on_path_bar_changed)
-        layout.addWidget(self.path_bar)
-
-        # 嵌入Explorer控件
-        self.explorer = QAxWidget(self)
-        self.explorer.setControl("Shell.Explorer")
-        layout.addWidget(self.explorer)
-        # 绑定导航完成信号，自动更新路径栏
-        self.explorer.dynamicCall('NavigateComplete2(QVariant,QVariant)', None, None)  # 预绑定，防止信号未注册
-        self.explorer.dynamicCall('Navigate(const QString&)', QDir.toNativeSeparators(self.current_path))
-        self.explorer.dynamicCall('Visible', True)
-        self.explorer.dynamicCall('RegisterAsBrowser', True)
-        self.explorer.dynamicCall('RegisterAsDropTarget', True)
-        self.explorer.dynamicCall('TheaterMode', False)
-        self.explorer.dynamicCall('ToolBar', False)
-        self.explorer.dynamicCall('StatusBar', False)
-        self.explorer.dynamicCall('MenuBar', False)
-        self.explorer.dynamicCall('AddressBar', False)
-        self.explorer.dynamicCall('Resizable', True)
-        self.explorer.dynamicCall('FullScreen', False)
-        self.explorer.dynamicCall('Offline', False)
-        self.explorer.dynamicCall('Silent', True)
-        self.explorer.dynamicCall('NavigateComplete2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('NavigateError(QVariant,QVariant,QVariant,QVariant)', None, None, None, None)
-        self.explorer.dynamicCall('DocumentComplete(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('BeforeNavigate2(QVariant,QVariant,QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None, None, None)
-        self.explorer.dynamicCall('NewWindow2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('NewWindow3(QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None)
-        self.explorer.dynamicCall('OnQuit()', )
-        self.explorer.dynamicCall('OnVisible()', )
-        self.explorer.dynamicCall('OnToolBar()', )
-        self.explorer.dynamicCall('OnMenuBar()', )
-        self.explorer.dynamicCall('OnStatusBar()', )
-        self.explorer.dynamicCall('OnFullScreen()', )
-        self.explorer.dynamicCall('OnTheaterMode()', )
-        self.explorer.dynamicCall('OnAddressBar()', )
-        self.explorer.dynamicCall('OnResizable()', )
-        self.explorer.dynamicCall('OnOffline()', )
-        self.explorer.dynamicCall('OnSilent()', )
-        self.explorer.dynamicCall('OnRegisterAsBrowser()', )
-        self.explorer.dynamicCall('OnRegisterAsDropTarget()', )
-        self.explorer.dynamicCall('OnNavigateComplete2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnNavigateError(QVariant,QVariant,QVariant,QVariant)', None, None, None, None)
-        self.explorer.dynamicCall('OnDocumentComplete(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnBeforeNavigate2(QVariant,QVariant,QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None, None, None)
-        self.explorer.dynamicCall('OnNewWindow2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnNewWindow3(QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None)
-        self.explorer.dynamicCall('OnQuit()', )
-        # 连接信号
-        self.explorer.dynamicCall('NavigateComplete2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('DocumentComplete(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('BeforeNavigate2(QVariant,QVariant,QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None, None, None)
-        self.explorer.dynamicCall('NewWindow2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('NewWindow3(QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None)
-        self.explorer.dynamicCall('OnNavigateComplete2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnDocumentComplete(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnBeforeNavigate2(QVariant,QVariant,QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None, None, None)
-        self.explorer.dynamicCall('OnNewWindow2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnNewWindow3(QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None)
-
-
-        # 兼容原有空白双击
-        from PyQt5.QtWidgets import QLabel
-        self.blank = QLabel()
-        # 保持空白区域为固定高度，避免其扩展占满右侧空间
-        self.blank.setFixedHeight(10)
-        self.blank.setStyleSheet("background: transparent;")
-        self.blank.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-        self.blank.mouseDoubleClickEvent = self.blank_double_click
-        layout.addWidget(self.blank)
-
-        # 安装事件过滤器以捕获 Explorer 的鼠标按下与双击事件
+        # 嵌入真正的Windows资源管理器窗口（完整功能）
         try:
-            self.explorer.installEventFilter(self)
-        except Exception:
-            pass
+            self.embed_real_explorer()
+        except Exception as e:
+            print(f"[setup_ui] 嵌入真实Explorer失败: {e}")
+            # 降级到使用简单控件
+            self.use_simple_explorer()
+    
+    def embed_real_explorer(self):
+        """嵌入真正的Windows资源管理器窗口"""
+        import subprocess
+        import win32gui
+        import win32con
+        import win32process
+        from PyQt5.QtCore import QTimer
+        from PyQt5.QtWidgets import QWidget
+        import time
+        
+        # 创建容器widget
+        self.explorer_container = QWidget()
+        self.layout().addWidget(self.explorer_container)
+        
+        # 如果传入了已存在的Explorer窗口句柄，直接嵌入它
+        if hasattr(self, 'existing_explorer_hwnd') and self.existing_explorer_hwnd:
+            print(f"[embed_real_explorer] 嵌入已存在的Explorer窗口: {self.existing_explorer_hwnd}")
+            self._embed_window(self.existing_explorer_hwnd)
+            return
+        
+        # 否则，启动新的Explorer进程
+        # 记录启动前的所有Explorer窗口
+        existing_windows = set()
+        def record_existing(hwnd, extra):
+            if win32gui.IsWindowVisible(hwnd):
+                class_name = win32gui.GetClassName(hwnd)
+                if class_name in ['CabinetWClass', 'ExploreWClass']:
+                    existing_windows.add(hwnd)
+            return True
+        
+        win32gui.EnumWindows(record_existing, None)
+        
+        # 启动explorer进程
+        path = QDir.toNativeSeparators(self.current_path)
+        # 使用 /e 参数打开资源管理器（带左侧树），/root 设置根目录
+        cmd = f'explorer.exe /e,/root,"{path}"'
+        
+        print(f"[embed_real_explorer] 启动命令: {cmd}")
+        subprocess.Popen(cmd, shell=True)
+        
+        # 等待窗口创建并获取句柄
+        self.retry_count = 0
+        def find_and_embed():
+            try:
+                self.retry_count += 1
+                
+                # 查找新创建的Explorer窗口（不在existing_windows中的）
+                new_windows = []
+                
+                def callback(hwnd, extra):
+                    if win32gui.IsWindowVisible(hwnd) and hwnd not in existing_windows:
+                        class_name = win32gui.GetClassName(hwnd)
+                        if class_name in ['CabinetWClass', 'ExploreWClass']:
+                            new_windows.append(hwnd)
+                    return True
+                
+                win32gui.EnumWindows(callback, None)
+                
+                explorer_hwnd = new_windows[0] if new_windows else None
+                
+                if explorer_hwnd:
+                    print(f"[embed_real_explorer] 找到Explorer窗口: {explorer_hwnd}")
+                    self._embed_window(explorer_hwnd)
+                else:
+                    # 最多重试15次（3秒）
+                    if self.retry_count < 15:
+                        print(f"[embed_real_explorer] 未找到Explorer窗口，重试 {self.retry_count}/15...")
+                        QTimer.singleShot(200, find_and_embed)
+                    else:
+                        print(f"[embed_real_explorer] 超时未找到窗口，降级到简单控件")
+                        self.use_simple_explorer()
+                    
+            except Exception as e:
+                print(f"[embed_real_explorer] 嵌入失败: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 增加初始延迟到800ms，给Explorer更多启动时间
+        QTimer.singleShot(800, find_and_embed)
+    
+    def _embed_window(self, explorer_hwnd):
+        """嵌入Explorer窗口到容器中"""
+        import win32gui
+        import win32con
+        
+        # 将Explorer窗口设置为子窗口并嵌入
+        container_hwnd = int(self.explorer_container.winId())
+        
+        # 先隐藏Explorer窗口，避免嵌入过程中的闪烁和抖动
+        win32gui.ShowWindow(explorer_hwnd, win32con.SW_HIDE)
+        
+        # 移除Explorer窗口的边框和标题栏
+        style = win32gui.GetWindowLong(explorer_hwnd, win32con.GWL_STYLE)
+        style = style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME & ~win32con.WS_BORDER
+        win32gui.SetWindowLong(explorer_hwnd, win32con.GWL_STYLE, style)
+        
+        # 移除扩展样式中的边框
+        ex_style = win32gui.GetWindowLong(explorer_hwnd, win32con.GWL_EXSTYLE)
+        ex_style = ex_style & ~win32con.WS_EX_CLIENTEDGE & ~win32con.WS_EX_WINDOWEDGE
+        win32gui.SetWindowLong(explorer_hwnd, win32con.GWL_EXSTYLE, ex_style)
+        
+        # 设置为子窗口（WS_CHILD样式）
+        win32gui.SetParent(explorer_hwnd, container_hwnd)
+        
+        # 调整大小以充满容器，使用SetWindowPos确保位置正确
+        rect = self.explorer_container.rect()
+        win32gui.SetWindowPos(
+            explorer_hwnd,
+            0,  # HWND_TOP
+            0, 0,  # x, y 坐标
+            rect.width(), rect.height(),
+            win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED
+        )
+        
+        # 最后显示窗口
+        win32gui.ShowWindow(explorer_hwnd, win32con.SW_SHOW)
+        
+        # 强制刷新窗口以确保正确显示
+        win32gui.InvalidateRect(explorer_hwnd, None, True)
+        win32gui.UpdateWindow(explorer_hwnd)
+        
+        # 保存句柄以便后续使用
+        self.explorer_hwnd = explorer_hwnd
+        
+        # 监听容器大小变化
+        self.explorer_container.resizeEvent = self.on_container_resize
+        
+        print(f"[_embed_window] Explorer窗口已嵌入")
+    
+    def on_container_resize(self, event):
+        """容器大小改变时调整嵌入的Explorer窗口大小"""
+        if hasattr(self, 'explorer_hwnd'):
+            try:
+                import win32gui
+                import win32con
+                rect = self.explorer_container.rect()
+                # 强制设置窗口位置和大小，确保始终从(0,0)开始
+                win32gui.SetWindowPos(
+                    self.explorer_hwnd,
+                    win32con.HWND_TOP,
+                    0, 0,  # x, y - 确保从容器左上角开始
+                    rect.width(), rect.height(),
+                    win32con.SWP_SHOWWINDOW | win32con.SWP_FRAMECHANGED
+                )
+                # 强制刷新窗口
+                win32gui.InvalidateRect(self.explorer_hwnd, None, True)
+                win32gui.UpdateWindow(self.explorer_hwnd)
+            except Exception as e:
+                print(f"[on_container_resize] 调整窗口大小失败: {e}")
+    
+    def use_simple_explorer(self):
+        """降级方案：使用简单的Shell.Explorer控件"""
+        self.explorer = QAxWidget(self)
+        self.explorer.setControl("Shell.Explorer.2")
+        self.layout().addWidget(self.explorer)
+        self.explorer.dynamicCall('Navigate(const QString&)', QDir.toNativeSeparators(self.current_path))
+        print(f"[setup_ui] 使用简单Explorer控件")
+        self.explorer.dynamicCall('OnNavigateComplete2(QVariant,QVariant)', None, None)
+        self.explorer.dynamicCall('OnDocumentComplete(QVariant,QVariant)', None, None)
+        self.explorer.dynamicCall('OnBeforeNavigate2(QVariant,QVariant,QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None, None, None)
+        self.explorer.dynamicCall('OnNewWindow2(QVariant,QVariant)', None, None)
+        self.explorer.dynamicCall('OnNewWindow3(QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None)
+
+        # 注意：真实Explorer窗口的事件处理由Windows本身管理
+        # 我们不需要installEventFilter，因为不再使用QAxWidget
 
     def event(self, e):
         # 捕获QAxWidget的NavigateComplete2事件
@@ -1382,96 +1680,74 @@ class FileExplorerTab(QWidget):
         if parent_path and os.path.exists(parent_path):
             self.navigate_to(parent_path)
 
-    def __init__(self, parent=None, path="", is_shell=False):
+    def __init__(self, parent=None, path="", is_shell=False, existing_hwnd=None):
         super().__init__(parent)
         self.main_window = parent
         self.current_path = path if path else QDir.homePath()
-        # 浏览历史记录
-        self.history = []
-        self.history_index = -1
-        # 标志：是否正在程序化导航（用于防止sync时重复添加历史）
-        self._navigating_programmatically = False
+        # 如果传入了已存在的Explorer窗口句柄，保存它
+        self.existing_explorer_hwnd = existing_hwnd
         self.setup_ui()
-        self.navigate_to(self.current_path, is_shell=is_shell)
+        if not existing_hwnd:  # 只有新创建的标签页需要导航
+            self.navigate_to(self.current_path, is_shell=is_shell)
         self.start_path_sync_timer()
 
     # 移除重复的setup_ui，保留带路径栏的实现
 
-    def navigate_to(self, path, is_shell=False, add_to_history=True):
+    def navigate_to(self, path, is_shell=False):
         # 支持本地路径和shell特殊路径
-        if is_shell:
-            self.explorer.dynamicCall("Navigate(const QString&)", path)
-            self.current_path = path
-            if hasattr(self, 'path_bar'):
-                self.path_bar.set_path(path)
-            self.update_tab_title()
-            # 添加到历史记录
-            if add_to_history:
-                self._add_to_history(path)
-        elif os.path.exists(path):
-            url = QDir.toNativeSeparators(path)
-            self.explorer.dynamicCall("Navigate(const QString&)", url)
-            self.current_path = path
-            if hasattr(self, 'path_bar'):
-                self.path_bar.set_path(path)
-            self.update_tab_title()
-            # 添加到历史记录
-            if add_to_history:
-                self._add_to_history(path)
+        
+        # 自动检测 CLSID 路径并转换
+        if '::' in path and not is_shell:
+            clsid_map = {
+                '::{20D04FE0-3AEA-1069-A2D8-08002B30309D}': 'shell:MyComputerFolder',
+                '::{645FF040-5081-101B-9F08-00AA002F954E}': 'shell:RecycleBinFolder',
+                '::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}': 'shell:NetworkPlacesFolder',
+            }
+            for clsid, shell_path in clsid_map.items():
+                if clsid in path:
+                    print(f"[navigate_to] 检测到CLSID路径，转换为: {shell_path}")
+                    path = shell_path
+                    is_shell = True
+                    break
+        
+        # 如果使用真实Explorer窗口，需要通过COM导航
+        if hasattr(self, 'explorer_hwnd'):
+            try:
+                import win32com.client
+                shell = win32com.client.Dispatch("Shell.Application")
+                # 查找我们的Explorer窗口
+                for window in shell.Windows():
+                    try:
+                        if int(window.HWND) == self.explorer_hwnd:
+                            # 导航到新路径
+                            if is_shell or path.startswith('shell:'):
+                                window.Navigate(path)
+                            else:
+                                window.Navigate(QDir.toNativeSeparators(path))
+                            self.current_path = path
+                            self.update_tab_title()
+                            return
+                    except:
+                        continue
+            except Exception as e:
+                print(f"[navigate_to] COM导航失败: {e}")
+        
+        # 降级到使用QAxWidget
+        if hasattr(self, 'explorer') and self.explorer:
+            if is_shell or path.startswith('shell:'):
+                self.explorer.dynamicCall("Navigate(const QString&)", path)
+                self.current_path = path
+                if hasattr(self, 'path_bar'):
+                    self.path_bar.set_path(path)
+                self.update_tab_title()
+            elif os.path.exists(path):
+                url = QDir.toNativeSeparators(path)
+                self.explorer.dynamicCall("Navigate(const QString&)", url)
+                self.current_path = path
+                if hasattr(self, 'path_bar'):
+                    self.path_bar.set_path(path)
+                self.update_tab_title()
     
-    def _add_to_history(self, path):
-        """添加路径到历史记录"""
-        # 如果当前不在历史末尾，删除当前位置之后的所有历史
-        if self.history_index < len(self.history) - 1:
-            self.history = self.history[:self.history_index + 1]
-        # 添加新路径（避免重复添加相同路径）
-        if not self.history or self.history[-1] != path:
-            self.history.append(path)
-            self.history_index = len(self.history) - 1
-        # 更新主窗口按钮状态
-        if self.main_window and hasattr(self.main_window, 'update_navigation_buttons'):
-            self.main_window.update_navigation_buttons()
-    
-    def can_go_back(self):
-        """是否可以后退"""
-        return self.history_index > 0
-    
-    def can_go_forward(self):
-        """是否可以前进"""
-        return self.history_index < len(self.history) - 1
-    
-    def go_back(self):
-        """后退到上一个位置"""
-        if self.can_go_back():
-            self.history_index -= 1
-            path = self.history[self.history_index]
-            is_shell = path.startswith('shell:')
-            # 设置标志，防止sync时重复添加历史
-            self._navigating_programmatically = True
-            self.navigate_to(path, is_shell=is_shell, add_to_history=False)
-            # 延迟重置标志，确保sync不会在导航完成前被触发
-            from PyQt5.QtCore import QTimer
-            QTimer.singleShot(1000, lambda: setattr(self, '_navigating_programmatically', False))
-            # 更新主窗口按钮状态
-            if self.main_window and hasattr(self.main_window, 'update_navigation_buttons'):
-                self.main_window.update_navigation_buttons()
-    
-    def go_forward(self):
-        """前进到下一个位置"""
-        if self.can_go_forward():
-            self.history_index += 1
-            path = self.history[self.history_index]
-            is_shell = path.startswith('shell:')
-            # 设置标志，防止sync时重复添加历史
-            self._navigating_programmatically = True
-            self.navigate_to(path, is_shell=is_shell, add_to_history=False)
-            # 延迟重置标志，确保sync不会在导航完成前被触发
-            from PyQt5.QtCore import QTimer
-            QTimer.singleShot(1000, lambda: setattr(self, '_navigating_programmatically', False))
-            # 更新主窗口按钮状态
-            if self.main_window and hasattr(self.main_window, 'update_navigation_buttons'):
-                self.main_window.update_navigation_buttons()
-
 
 class DragDropTabWidget(QTabWidget):
     """支持拖放文件夹的自定义QTabWidget"""
@@ -1694,19 +1970,17 @@ class MainWindow(QMainWindow):
     open_path_signal = pyqtSignal(str)
     
     def ensure_default_icons_on_bookmark_bar(self):
-        """确保四个常用书签（带图标）始终在最左侧且不会被覆盖。"""
+        """确保五个常用书签（带图标）始终在最左侧且不会被覆盖。"""
         bm = self.bookmark_manager
         tree = bm.get_tree()
         bar = tree.get('bookmark_bar')
         if not bar or 'children' not in bar:
             return
-        # 获取“下载”文件夹路径（跨平台，优先Win用户目录）
         import time
         import os
         from PyQt5.QtCore import QStandardPaths
         downloads_path = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
         if not downloads_path or not os.path.exists(downloads_path):
-            # 兜底
             downloads_path = os.path.join(os.path.expanduser('~'), 'Downloads')
         icon_map = [
             ("🖥️", "此电脑", "shell:MyComputerFolder"),
@@ -1746,32 +2020,6 @@ class MainWindow(QMainWindow):
         if hasattr(current_tab, 'go_up'):
             current_tab.go_up(force=True)
     
-    def go_back_current_tab(self):
-        """后退当前标签页"""
-        current_tab = self.tab_widget.currentWidget()
-        if hasattr(current_tab, 'go_back'):
-            current_tab.go_back()
-    
-    def go_forward_current_tab(self):
-        """前进当前标签页"""
-        current_tab = self.tab_widget.currentWidget()
-        if hasattr(current_tab, 'go_forward'):
-            current_tab.go_forward()
-    
-    def update_navigation_buttons(self):
-        """更新前进后退按钮状态"""
-        current_tab = self.tab_widget.currentWidget()
-        if hasattr(current_tab, 'can_go_back'):
-            self.back_button.setEnabled(current_tab.can_go_back())
-        else:
-            self.back_button.setEnabled(False)
-        
-        if hasattr(current_tab, 'can_go_forward'):
-            self.forward_button.setEnabled(current_tab.can_go_forward())
-        else:
-            self.forward_button.setEnabled(False)
-
-
     @pyqtSlot()
     @pyqtSlot(str)
     @pyqtSlot(str, bool)
@@ -1785,10 +2033,27 @@ class MainWindow(QMainWindow):
         short = path[-16:] if len(path) > 16 else path
         tab_index = self.tab_widget.addTab(tab, short)
         self.tab_widget.setCurrentIndex(tab_index)
-        # 更新导航按钮状态（确保新标签页的按钮状态正确）
-        self.update_navigation_buttons()
         
         # 激活窗口（当从其他实例接收到路径时）
+        self.activateWindow()
+        self.raise_()
+        
+        return tab_index
+
+    @pyqtSlot(int, str)
+    def embed_existing_explorer(self, hwnd, path):
+        """嵌入已存在的Explorer窗口到新标签页"""
+        print(f"[MainWindow] 嵌入已存在Explorer窗口: hwnd={hwnd}, path={path}")
+        
+        # 创建新标签页，但使用特殊标记告诉它嵌入已存在的窗口
+        is_shell = path.startswith('shell:') or '::' in path
+        tab = FileExplorerTab(self, path, is_shell=is_shell, existing_hwnd=hwnd)
+        tab.is_pinned = False
+        short = path[-16:] if len(path) > 16 else path
+        tab_index = self.tab_widget.addTab(tab, short)
+        self.tab_widget.setCurrentIndex(tab_index)
+        
+        # 激活窗口
         self.activateWindow()
         self.raise_()
         
@@ -1818,31 +2083,127 @@ class MainWindow(QMainWindow):
                 self.setWindowTitle(f"TabExplorer - {tab.current_path}")
                 # 展开并选中左侧目录树到当前目录
                 self.expand_dir_tree_to_path(tab.current_path)
-            # 更新导航按钮状态
-            self.update_navigation_buttons()
+                # 刷新Explorer视图以更新覆盖图标
+                if hasattr(tab, 'refresh_explorer'):
+                    from PyQt5.QtCore import QTimer
+                    # 延迟刷新，确保视图已完全切换
+                    QTimer.singleShot(100, tab.refresh_explorer)
+                # 触发嵌入窗口的resize以适应容器大小
+                if hasattr(tab, 'explorer_container') and hasattr(tab, 'explorer_hwnd'):
+                    from PyQt5.QtCore import QTimer
+                    # 立即调整一次
+                    self._resize_embedded_explorer(tab)
+                    # 延迟再次调整，确保完全显示
+                    QTimer.singleShot(100, lambda: self._resize_embedded_explorer(tab))
+    
+    def _resize_embedded_explorer(self, tab):
+        """调整标签页中嵌入的Explorer窗口大小"""
+        try:
+            import win32gui
+            import win32con
+            if hasattr(tab, 'explorer_hwnd') and hasattr(tab, 'explorer_container'):
+                rect = tab.explorer_container.rect()
+                # 确保窗口可见
+                win32gui.ShowWindow(tab.explorer_hwnd, win32con.SW_SHOW)
+                # 使用SetWindowPos确保位置从(0,0)开始，并使用FRAMECHANGED强制重绘
+                win32gui.SetWindowPos(
+                    tab.explorer_hwnd,
+                    win32con.HWND_TOP,
+                    0, 0,
+                    rect.width(), rect.height(),
+                    win32con.SWP_SHOWWINDOW | win32con.SWP_FRAMECHANGED
+                )
+                # 强制刷新窗口内容
+                win32gui.InvalidateRect(tab.explorer_hwnd, None, True)
+                win32gui.UpdateWindow(tab.explorer_hwnd)
+        except Exception as e:
+            pass  # 静默处理错误
 
     def expand_dir_tree_to_path(self, path):
-        # 展开并选中左侧目录树到指定路径
-        if not hasattr(self, 'dir_model') or not hasattr(self, 'dir_tree'):
+        # 展开并选中左侧目录树到指定路径（自定义模型）
+        if not hasattr(self, 'custom_tree_model') or not hasattr(self, 'dir_tree'):
             return
         if not path or not os.path.exists(path):
             return
         # 如果是网络路径，直接返回，不展开目录树
         if path.startswith('\\\\'):
             return
-        idx = self.dir_model.index(path)
-        if idx.isValid():
-            # 递归收集所有父索引
-            parents = []
-            parent = idx.parent()
-            while parent.isValid():
-                parents.append(parent)
-                parent = parent.parent()
-            # 先从根到叶子依次展开
-            for p in reversed(parents):
-                self.dir_tree.expand(p)
-            self.dir_tree.setCurrentIndex(idx)
-            self.dir_tree.scrollTo(idx)
+        
+        # 规范化路径
+        path = os.path.normpath(path)
+        
+        # 获取路径的驱动器号
+        drive = os.path.splitdrive(path)[0]  # 如 "D:"
+        if not drive:
+            return
+        
+        # 在树中查找对应的驱动器节点
+        drive_item = None
+        for i in range(self.custom_tree_model.rowCount()):
+            item = self.custom_tree_model.item(i)
+            if hasattr(item, 'fs_path') and item.fs_path and item.fs_path.startswith(drive):
+                drive_item = item
+                break
+        
+        if not drive_item:
+            return
+        
+        # 展开驱动器节点
+        drive_index = self.custom_tree_model.indexFromItem(drive_item)
+        self.dir_tree.expand(drive_index)
+        
+        # 确保驱动器子目录已加载
+        if drive_item.rowCount() == 0 or drive_item.child(0).text() == "":
+            self.on_custom_tree_expanded(drive_index)
+        
+        # 分解路径为各级目录
+        rel_path = os.path.splitdrive(path)[1]  # 去掉驱动器号，如 "\project\test"
+        if rel_path.startswith('\\') or rel_path.startswith('/'):
+            rel_path = rel_path[1:]
+        
+        if not rel_path:  # 如果是驱动器根目录
+            self.dir_tree.setCurrentIndex(drive_index)
+            self.dir_tree.scrollTo(drive_index)
+            return
+        
+        # 逐级查找并展开路径
+        path_parts = rel_path.split(os.sep)
+        current_item = drive_item
+        
+        for part in path_parts:
+            if not part:
+                continue
+            
+            # 在当前节点的子节点中查找
+            found = False
+            for i in range(current_item.rowCount()):
+                child = current_item.child(i)
+                if child.text() == part:
+                    # 找到匹配的子节点
+                    child_index = self.custom_tree_model.indexFromItem(child)
+                    self.dir_tree.expand(child_index)
+                    
+                    # 确保子目录已加载
+                    if child.rowCount() == 0 or child.child(0).text() == "":
+                        self.on_custom_tree_expanded(child_index)
+                    
+                    current_item = child
+                    found = True
+                    break
+            
+            if not found:
+                # 如果找不到，可能是因为目录还未加载
+                break
+        
+        # 选中并滚动到最后找到的节点
+        final_index = self.custom_tree_model.indexFromItem(current_item)
+        self.dir_tree.setCurrentIndex(final_index)
+        self.dir_tree.scrollTo(final_index)
+    
+
+    
+
+    
     def create_toolbar(self):
         toolbar = QToolBar()
         self.addToolBar(Qt.TopToolBarArea, toolbar)
@@ -1985,6 +2346,28 @@ class MainWindow(QMainWindow):
                     self.tab_widget.setCurrentIndex(i)
                     break
 
+    def load_config(self):
+        """加载配置文件"""
+        config_file = "config.json"
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"[Config] 加载配置失败: {e}")
+                return {}
+        return {}
+    
+    def save_config(self, config):
+        """保存配置文件"""
+        config_file = "config.json"
+        try:
+            with open(config_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            print(f"[Config] 配置已保存")
+        except Exception as e:
+            print(f"[Config] 保存配置失败: {e}")
+    
     def save_pinned_tabs(self):
         pinned_paths = []
         for i in range(self.tab_widget.count()):
@@ -1992,15 +2375,19 @@ class MainWindow(QMainWindow):
             if hasattr(tab, 'is_pinned') and tab.is_pinned:
                 if hasattr(tab, 'current_path'):
                     pinned_paths.append(tab.current_path)
-        with open("pinned_tabs.json", "w", encoding="utf-8") as f:
-            json.dump(pinned_paths, f, ensure_ascii=False, indent=2)
+        
+        # 保存到统一配置文件
+        config = self.load_config()
+        config['pinned_tabs'] = pinned_paths
+        self.save_config(config)
 
     def load_pinned_tabs(self):
         has_pinned = False
-        if os.path.exists("pinned_tabs.json"):
+        config = self.load_config()
+        paths = config.get('pinned_tabs', [])
+        if paths:
             try:
-                with open("pinned_tabs.json", "r", encoding="utf-8") as f:
-                    paths = json.load(f)
+                pass  # paths已经从config获取
                 for path in paths:
                     tab = FileExplorerTab(self, path)
                     tab.is_pinned = True
@@ -2019,6 +2406,10 @@ class MainWindow(QMainWindow):
         # 检查并自动添加常用书签
         self.ensure_default_bookmarks()
         self.init_ui()
+        
+        # 初始化资源管理器监控（默认不启动）
+        self.explorer_monitor = None
+        self._init_explorer_monitor()
 
     def ensure_default_bookmarks(self):
         bm = self.bookmark_manager
@@ -2075,33 +2466,18 @@ class MainWindow(QMainWindow):
         self.splitter = QSplitter()
         self.splitter.setOrientation(Qt.Horizontal)
 
-        # 左侧目录树
-        self.dir_model = QFileSystemModel()
-        # 设置根为计算机根目录（显示所有盘符）
-        root_path = QDir.rootPath()  # 通常为C:/
-        self.dir_model.setRootPath(root_path)
+        # 隐藏左侧目录树，因为右侧Explorer会显示自己的导航窗格
+        # 如果需要恢复，取消以下注释：
+        """
+        # 左侧目录树 - 使用自定义模型显示固定书签和盘符
         self.dir_tree = QTreeView()
-        self.dir_tree.setModel(self.dir_model)
-        # 不设置setRootIndex，或者设置为index("")，这样能显示所有盘符
-        # self.dir_tree.setRootIndex(self.dir_model.index(""))
         self.dir_tree.setHeaderHidden(True)
-        self.dir_tree.setColumnHidden(1, True)
-        self.dir_tree.setColumnHidden(2, True)
-        self.dir_tree.setColumnHidden(3, True)
         self.dir_tree.setMinimumWidth(200)
         self.dir_tree.setMaximumWidth(350)
-        self.dir_tree.clicked.connect(self.on_dir_tree_clicked)
+        self.dir_tree.clicked.connect(self.on_custom_tree_clicked)
+        self.populate_custom_dir_tree()
         self.splitter.addWidget(self.dir_tree)
-        # 自动展开所有驱动器根节点（即“我的电脑”下所有盘符）
-        drives_parent = self.dir_model.index(root_path)
-        for i in range(self.dir_model.rowCount(drives_parent)):
-            idx = self.dir_model.index(i, 0, drives_parent)
-            path = self.dir_model.filePath(idx)
-            # 隐藏网络驱动器（UNC路径以\\开头）
-            if path.startswith('\\\\'):
-                self.dir_tree.setRowHidden(i, drives_parent, True)
-            else:
-                self.dir_tree.expand(idx)
+        """
 
         # 右侧原有标签页区域
         right_widget = QWidget()
@@ -2139,24 +2515,6 @@ class MainWindow(QMainWindow):
         btn_widget = QWidget()
         btn_layout = QHBoxLayout(btn_widget)
         btn_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # 后退按钮
-        self.back_button = QPushButton("←")
-        self.back_button.setToolTip("后退")
-        self.back_button.setFixedHeight(35)
-        self.back_button.setFixedWidth(35)
-        self.back_button.clicked.connect(self.go_back_current_tab)
-        self.back_button.setEnabled(False)
-        btn_layout.addWidget(self.back_button)
-        
-        # 前进按钮
-        self.forward_button = QPushButton("→")
-        self.forward_button.setToolTip("前进")
-        self.forward_button.setFixedHeight(35)
-        self.forward_button.setFixedWidth(35)
-        self.forward_button.clicked.connect(self.go_forward_current_tab)
-        self.forward_button.setEnabled(False)
-        btn_layout.addWidget(self.forward_button)
         
         # 新建标签页按钮
         self.add_tab_button = QPushButton("➕")
@@ -2207,8 +2565,21 @@ class MainWindow(QMainWindow):
         # 连接信号
         self.open_path_signal.connect(self.handle_open_path_from_instance)
         
+        # 添加F5快捷键刷新当前Explorer视图
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui import QKeySequence
+        refresh_shortcut = QShortcut(QKeySequence("F5"), self)
+        refresh_shortcut.activated.connect(self.refresh_current_tab)
+        
         # 启动单实例通信服务器
         self.start_instance_server()
+    
+    def refresh_current_tab(self):
+        """刷新当前标签页的Explorer视图"""
+        current_tab = self.tab_widget.currentWidget()
+        if current_tab and hasattr(current_tab, 'refresh_explorer'):
+            current_tab.refresh_explorer()
+            print("[MainWindow] 已刷新当前Explorer视图")
 
     def handle_open_path_from_instance(self, path):
         """处理从其他实例接收到的路径（在主线程中）"""
@@ -2256,24 +2627,47 @@ class MainWindow(QMainWindow):
         time.sleep(0.2)
 
     def closeEvent(self, event):
-        """窗口关闭时停止服务器"""
+        """窗口关闭时停止服务器和监控"""
         self.server_running = False
         if hasattr(self, 'server_socket'):
             try:
                 self.server_socket.close()
             except:
                 pass
+        
+        # 停止资源管理器监控
+        if self.explorer_monitor:
+            self.explorer_monitor.stop()
+        
         super().closeEvent(event)
 
+    def resizeEvent(self, event):
+        """窗口大小改变时，调整所有嵌入的Explorer窗口大小"""
+        super().resizeEvent(event)
+        # 遍历所有标签页，调整嵌入窗口大小
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if hasattr(tab, 'explorer_hwnd') and hasattr(tab, 'explorer_container'):
+                try:
+                    import win32gui
+                    import win32con
+                    rect = tab.explorer_container.rect()
+                    # 使用SetWindowPos确保位置和大小都正确
+                    win32gui.SetWindowPos(
+                        tab.explorer_hwnd,
+                        win32con.HWND_TOP,
+                        0, 0,
+                        rect.width(), rect.height(),
+                        win32con.SWP_SHOWWINDOW | win32con.SWP_FRAMECHANGED
+                    )
+                    # 强制刷新
+                    win32gui.InvalidateRect(tab.explorer_hwnd, None, True)
+                    win32gui.UpdateWindow(tab.explorer_hwnd)
+                except:
+                    pass
 
-    def on_dir_tree_clicked(self, index):
-        # 目录树点击，右侧当前标签页跳转
-        if not index.isValid():
-            return
-        path = self.dir_model.filePath(index)
-        current_tab = self.tab_widget.currentWidget()
-        if hasattr(current_tab, 'navigate_to'):
-            current_tab.navigate_to(path)
+
+
 
     def open_bookmark_url(self, url):
         # 支持 file:///、file://、shell: 路径和本地绝对路径
@@ -2324,31 +2718,21 @@ class MainWindow(QMainWindow):
                 for child in node.get('children', []):
                     add_menu_items(menu, child)
             elif node.get('type') == 'url':
-                # 判断是否为四个常用项目
-                special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
-                name = node.get('name', '')
-                is_special = any(name.startswith(icon) for icon in special_icons)
-                if is_special:
-                    action = parent_menu.addAction(name)
-                else:
-                    action = parent_menu.addAction(f"📑 {name}")
+                action = parent_menu.addAction(f"📑 {node.get('name', '')}")
                 url = node.get('url', '')
                 action.triggered.connect(lambda checked, u=url: self.open_bookmark_url(u))
-        # 直接在菜单栏顶层添加
+        # 直接在菜单栏顶层添加所有书签（前5个是默认书签，已有图标）
         menubar = self.menuBar()
-        # 先添加所有书签和文件夹
-        for child in bookmark_bar['children']:
+        # 添加所有书签和文件夹
+        for idx, child in enumerate(bookmark_bar['children']):
             if child.get('type') == 'folder':
                 add_menu_items(menubar, child)
             elif child.get('type') == 'url':
-                # 判断是否为四个常用项目
-                special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
-                name = child.get('name', '')
-                is_special = any(name.startswith(icon) for icon in special_icons)
-                if is_special:
-                    action = menubar.addAction(name)
+                # 前5个默认书签已有emoji图标，不需要添加📑前缀
+                if idx < 5:
+                    action = menubar.addAction(child.get('name', ''))
                 else:
-                    action = menubar.addAction(f"📑 {name}")
+                    action = menubar.addAction(f"📑 {child.get('name', '')}")
                 url = child.get('url', '')
                 action.triggered.connect(lambda checked, u=url: self.open_bookmark_url(u))
         # 添加“书签管理”按钮到菜单栏最右侧（兼容所有系统样式）
@@ -2360,10 +2744,116 @@ class MainWindow(QMainWindow):
         manage_action = QAction("书签管理", self)
         manage_action.triggered.connect(self.show_bookmark_manager_dialog)
         menubar.addAction(manage_action)
+        
+        # 添加"设置"菜单
+        settings_action = QAction("⚙️ 设置", self)
+        settings_action.triggered.connect(self.show_settings_dialog)
+        menubar.addAction(settings_action)
 
     def show_bookmark_manager_dialog(self):
         dlg = BookmarkManagerDialog(self.bookmark_manager, self)
         dlg.exec_()
+    
+    def show_settings_dialog(self):
+        """显示设置对话框"""
+        dlg = SettingsDialog(self)
+        dlg.exec_()
+    
+    def _init_explorer_monitor(self):
+        """初始化资源管理器监控"""
+        try:
+            self.explorer_monitor = ExplorerMonitor(self)
+            # 根据配置决定是否启动监控
+            config = self.load_config()
+            if config.get('enable_explorer_monitor', True):
+                self.explorer_monitor.start()
+                print("[MainWindow] 资源管理器监控模块已加载并自动启动")
+            else:
+                print("[MainWindow] 资源管理器监控模块已加载但未启动（配置已禁用）")
+        except ImportError as e:
+            print(f"[MainWindow] 无法加载监控模块: {e}")
+            print("[MainWindow] 请确保已安装: pip install pywin32 psutil")
+            self.explorer_monitor = None
+        except Exception as e:
+            print(f"[MainWindow] 监控模块初始化错误: {e}")
+            self.explorer_monitor = None
+
+# 设置对话框
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.resize(500, 300)
+        self.main_window = parent
+        
+        layout = QVBoxLayout(self)
+        
+        # 接管资源管理器选项
+        from PyQt5.QtWidgets import QCheckBox, QLabel, QGroupBox
+        monitor_group = QGroupBox("资源管理器监控")
+        monitor_layout = QVBoxLayout()
+        
+        self.takeover_checkbox = QCheckBox("⚡ 接管资源管理器（Win+E等）")
+        self.takeover_checkbox.setToolTip(
+            "开启后，使用Win+E或双击文件夹等方式打开的资源管理器窗口\n"
+            "会自动在TabExplorer中打开新标签页。"
+        )
+        
+        # 从配置文件加载设置
+        config = self.main_window.load_config()
+        self.takeover_checkbox.setChecked(config.get('enable_explorer_monitor', True))
+        
+        monitor_layout.addWidget(self.takeover_checkbox)
+        
+        info_label = QLabel(
+            "注意：此功能需要安装依赖包：\n"
+            "pip install pywin32 psutil"
+        )
+        info_label.setStyleSheet("color: gray; font-size: 10px;")
+        monitor_layout.addWidget(info_label)
+        
+        monitor_group.setLayout(monitor_layout)
+        layout.addWidget(monitor_group)
+        
+        layout.addStretch()
+        
+        # 按钮
+        button_layout = QHBoxLayout()
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self.save_settings)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        
+        button_layout.addStretch()
+        button_layout.addWidget(save_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+    
+    def save_settings(self):
+        """保存设置"""
+        config = self.main_window.load_config()
+        
+        # 更新设置
+        old_monitor_state = config.get('enable_explorer_monitor', True)
+        new_monitor_state = self.takeover_checkbox.isChecked()
+        config['enable_explorer_monitor'] = new_monitor_state
+        
+        # 保存配置
+        self.main_window.save_config(config)
+        
+        # 如果监控状态改变，更新监控
+        if old_monitor_state != new_monitor_state:
+            if new_monitor_state:
+                if self.main_window.explorer_monitor:
+                    self.main_window.explorer_monitor.start()
+                    QMessageBox.information(self, "已启用", "资源管理器监控已启用")
+            else:
+                if self.main_window.explorer_monitor:
+                    self.main_window.explorer_monitor.stop()
+                    QMessageBox.information(self, "已禁用", "资源管理器监控已禁用")
+        
+        self.accept()
+
 
 # 书签管理对话框（初步框架，后续可扩展重命名/新建/删除等功能）
 from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton, QHBoxLayout, QInputDialog, QMessageBox
