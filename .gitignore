@@ -6,6 +6,7 @@ __pycache__/
 # build files
 create_icon.py
 create_icon_simple.py
+TabExplorer.exe
 
 # Configuration
 *.json

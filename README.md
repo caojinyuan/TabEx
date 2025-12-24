@@ -1,7 +1,15 @@
 # TabEx
 Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 
-特色功能
+## 📥 下载
+
+**最新版本**: 从 [Releases](../../releases/latest) 页面下载 `TabExplorer.exe`
+
+无需安装Python环境，下载即用！
+
+---
+
+## ✨ 特色功能
 ✅ 多标签页浏览（每个标签页独立历史记录）
 ✅ 前进/后退导航（支持浏览历史记录）
 ✅ 标签页固定（带 📌 图标，开机自动恢复）
@@ -35,6 +43,8 @@ Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 
 我本地环境：
 python 3.9.6
+
+
 
 
 
