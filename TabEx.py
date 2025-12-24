@@ -135,10 +135,21 @@ class SearchDialog(QDialog):
         type_options.addWidget(self.search_filename_cb)
         
         self.search_content_cb = QCheckBox("搜索文件内容")
+        self.search_content_cb.setChecked(True)  # 默认也选中
         type_options.addWidget(self.search_content_cb)
         
         type_options.addStretch(1)
         layout.addLayout(type_options)
+        
+        # 文件类型过滤
+        file_type_layout = QHBoxLayout()
+        file_type_layout.addWidget(QLabel("文件类型:"))
+        self.file_type_input = QLineEdit()
+        self.file_type_input.setPlaceholderText("例如: *.c,*.h,*.xml (留空表示搜索所有类型)")
+        self.file_type_input.setText("*.c,*.h,*.xdm,*.arxml,*.xml")  # 默认值
+        self.file_type_input.setStyleSheet("QLineEdit { padding: 5px; }")
+        file_type_layout.addWidget(self.file_type_input)
+        layout.addLayout(file_type_layout)
         
         # 状态标签
         self.status_label = QLabel("就绪")
@@ -263,11 +274,14 @@ class SearchDialog(QDialog):
         self.stop_btn.setEnabled(True)
         self.status_label.setText("搜索中...")
         
+        # 获取文件类型过滤
+        file_types = self.file_type_input.text().strip()
+        
         # 在后台线程执行搜索
         import threading
         self.search_thread = threading.Thread(
             target=self.do_search,
-            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked())
+            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked(), file_types)
         )
         self.search_thread.daemon = True
         self.search_thread.start()
@@ -278,16 +292,40 @@ class SearchDialog(QDialog):
         self.stop_btn.setEnabled(False)
         self.status_label.setText("已停止")
     
-    def do_search(self, keyword, search_filename, search_content):
+    def do_search(self, keyword, search_filename, search_content, file_types=""):
         found_count = 0
         keyword_lower = keyword.lower()
         results_buffer = []  # 结果缓冲区
         buffer_size = 20  # 每20个结果批量更新一次
         
+        # 解析文件类型过滤（支持*.ext格式，逗号分隔）
+        file_extensions = []
+        if file_types:
+            for ft in file_types.split(','):
+                ft = ft.strip()
+                if ft.startswith('*.'):
+                    file_extensions.append(ft[2:].lower())  # 去掉*.，只保留扩展名
+                elif ft.startswith('.'):
+                    file_extensions.append(ft[1:].lower())  # 去掉.，只保留扩展名
+                elif ft:
+                    file_extensions.append(ft.lower())  # 直接使用输入的扩展名
+        
         # 调试信息：输出搜索路径
         print(f"[Search] 开始搜索路径: {self.search_path}")
         print(f"[Search] 搜索关键词: {keyword}")
         print(f"[Search] 搜索文件名: {search_filename}, 搜索内容: {search_content}")
+        print(f"[Search] 文件类型过滤: {file_extensions if file_extensions else '所有类型'}")
+        
+        def matches_file_type(filename):
+            """检查文件是否匹配文件类型过滤"""
+            if not file_extensions:  # 如果没有设置过滤，匹配所有文件
+                return True
+            # 获取文件扩展名（不含点）
+            _, ext = os.path.splitext(filename)
+            if ext:
+                ext = ext[1:].lower()  # 去掉点号并转为小写
+                return ext in file_extensions
+            return False
         
         try:
             scanned_files = 0
@@ -345,47 +383,84 @@ class SearchDialog(QDialog):
                         break
                         break
                     
+                    # 检查文件类型过滤
+                    if not matches_file_type(filename):
+                        # 调试：显示被过滤的文件（仅对特定文件名）
+                        if 'TstMgr' in filename or scanned_files < 5:
+                            print(f"[Search] 文件被类型过滤跳过: {filename}")
+                        continue  # 跳过不匹配的文件类型
+                    
                     scanned_files += 1
                     file_path = os.path.join(root, filename)
                     matched = False
                     match_type = ""
+                    
+                    # 调试：显示正在搜索的特定文件
+                    if 'TstMgr_RtnSound.c' in filename:
+                        print(f"[Search] 正在搜索文件: {file_path}")
+                        print(f"[Search] 搜索文件名: {search_filename}, 搜索内容: {search_content}")
                     
                     # 搜索文件名
                     if search_filename and keyword_lower in filename.lower():
                         matched = True
                         match_type = "📄"
                     
-                    # 搜索文件内容
+                    # 搜索文件内容（不管文件名是否匹配，只要勾选了搜索内容就搜索）
                     if search_content and not matched:
+                        # 调试信息
+                        if 'TstMgr_RtnSound.c' in filename:
+                            print(f"[Search] 开始搜索文件内容: {file_path}")
+                        
                         try:
                             # 分块读取大文件，每次读取100MB
                             chunk_size = 100 * 1024 * 1024  # 100MB
                             file_size = os.path.getsize(file_path)
                             
-                            # 尝试以文本方式读取文件内容
-                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                if file_size <= chunk_size:
-                                    # 小文件直接全部读取
-                                    content = f.read()
-                                    if keyword_lower in content.lower():
-                                        matched = True
-                                        match_type = "📄"
-                                else:
-                                    # 大文件分块读取
-                                    overlap = len(keyword) * 2  # 重叠区域，防止关键词被分割
-                                    while True:
-                                        chunk = f.read(chunk_size)
-                                        if not chunk:
-                                            break
-                                        if keyword_lower in chunk.lower():
-                                            matched = True
-                                            match_type = "📄"
-                                            break
-                                        # 回退overlap字节，避免关键词跨块
-                                        if len(chunk) == chunk_size:
-                                            f.seek(f.tell() - overlap)
-                        except Exception:
-                            # 如果无法以文本方式读取，跳过该文件
+                            # 尝试多种编码方式读取文件内容
+                            encodings = ['utf-8', 'gbk', 'gb2312', 'latin-1']
+                            content_matched = False
+                            
+                            for encoding in encodings:
+                                try:
+                                    with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
+                                        if file_size <= chunk_size:
+                                            # 小文件直接全部读取
+                                            content = f.read()
+                                            if keyword_lower in content.lower():
+                                                matched = True
+                                                match_type = "📄"
+                                                content_matched = True
+                                                # 调试信息
+                                                if 'TstMgr_RtnSound.c' in filename:
+                                                    print(f"[Search] ✓ 在文件内容中找到关键词 (编码: {encoding})")
+                                                break
+                                        else:
+                                            # 大文件分块读取
+                                            overlap = len(keyword) * 2  # 重叠区域，防止关键词被分割
+                                            while True:
+                                                chunk = f.read(chunk_size)
+                                                if not chunk:
+                                                    break
+                                                if keyword_lower in chunk.lower():
+                                                    matched = True
+                                                    match_type = "📄"
+                                                    content_matched = True
+                                                    break
+                                                # 回退overlap字节，避免关键词跨块
+                                                if len(chunk) == chunk_size:
+                                                    f.seek(f.tell() - overlap)
+                                            if content_matched:
+                                                break
+                                except UnicodeDecodeError:
+                                    # 尝试下一个编码
+                                    continue
+                                except Exception as e:
+                                    # 其他错误，记录日志并尝试下一个编码
+                                    print(f"[Search] 读取文件失败 {file_path} (编码 {encoding}): {e}")
+                                    continue
+                        except Exception as e:
+                            # 如果无法以文本方式读取，记录日志并跳过该文件
+                            print(f"[Search] 无法读取文件 {file_path}: {e}")
                             pass
                     
                     if matched:
