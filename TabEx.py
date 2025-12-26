@@ -24,6 +24,9 @@ class ExplorerMonitor:
         self.monitor_thread = None
         self.known_windows = set()  # 已知的窗口句柄
         self.window_paths = {}  # 窗口句柄 -> 路径映射
+        self.embedded_windows = set()  # 已嵌入的窗口句柄
+        self.processing_windows = set()  # 正在处理中的窗口句柄
+        self.lock = threading.Lock()  # 用于保护共享数据
         
     def start(self):
         """启动监控"""
@@ -126,6 +129,13 @@ class ExplorerMonitor:
         # 更新已知窗口列表
         self.known_windows = current_windows
         
+        # 清理已关闭的窗口
+        with self.lock:
+            # 从embedded_windows中移除已不存在的窗口
+            self.embedded_windows &= current_windows
+            # 从processing_windows中移除已不存在的窗口（可能超时或被关闭）
+            self.processing_windows &= current_windows
+        
         # 处理新窗口（在枚举完成后处理，避免在枚举过程中修改窗口）
         for hwnd, title in new_windows:
             self._handle_new_window(hwnd, title)
@@ -133,6 +143,14 @@ class ExplorerMonitor:
     def _handle_new_window(self, hwnd, title):
         """处理新打开的资源管理器窗口 - 直接嵌入该窗口而不是创建新标签"""
         try:
+            # 检查窗口是否已经被嵌入或正在处理
+            with self.lock:
+                if hwnd in self.embedded_windows or hwnd in self.processing_windows:
+                    print(f"[ExplorerMonitor] 窗口 {hwnd} 已被处理，跳过")
+                    return
+                # 标记为正在处理
+                self.processing_windows.add(hwnd)
+            
             # 延迟并重试获取路径（Win+E 打开的窗口需要更长时间初始化）
             path = None
             max_retries = 5
@@ -153,6 +171,11 @@ class ExplorerMonitor:
             
             if path:
                 print(f"[ExplorerMonitor] 最终获取到路径: {path}")
+                
+                # 标记为已嵌入（在实际嵌入前标记，避免重复处理）
+                with self.lock:
+                    self.embedded_windows.add(hwnd)
+                    self.processing_windows.discard(hwnd)
                 
                 # 判断是否是 shell: 路径
                 is_shell = path.startswith('shell:') or '::' in path
@@ -177,6 +200,12 @@ class ExplorerMonitor:
                 fallback_path = self._guess_path_from_title(title)
                 if fallback_path:
                     print(f"[ExplorerMonitor] 使用备用路径: {fallback_path}")
+                    
+                    # 标记为已嵌入
+                    with self.lock:
+                        self.embedded_windows.add(hwnd)
+                        self.processing_windows.discard(hwnd)
+                    
                     from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
                     QMetaObject.invokeMethod(
                         self.main_window,
@@ -185,11 +214,18 @@ class ExplorerMonitor:
                         Q_ARG(int, hwnd),
                         Q_ARG(str, fallback_path)
                     )
+                else:
+                    # 没有找到路径，从处理中移除
+                    with self.lock:
+                        self.processing_windows.discard(hwnd)
                 
         except Exception as e:
             print(f"[ExplorerMonitor] 处理新窗口错误: {e}")
             import traceback
             traceback.print_exc()
+            # 出错时也要从处理中移除
+            with self.lock:
+                self.processing_windows.discard(hwnd)
     
     def _guess_path_from_title(self, title):
         """根据窗口标题猜测路径"""
@@ -216,6 +252,11 @@ class ExplorerMonitor:
         """获取资源管理器窗口的路径"""
         if not HAS_COM:
             return None
+        
+        # 检查窗口是否已被嵌入
+        with self.lock:
+            if hwnd in self.embedded_windows:
+                return None
         
         try:
             # 使用 Shell.Application COM 对象获取所有窗口
@@ -1005,6 +1046,9 @@ class BookmarkManager:
 
 
 class FileExplorerTab(QWidget):
+    # 类级别的嵌入锁，防止并发嵌入导致卡死
+    _embed_lock = threading.Lock()
+    
     def update_tab_title(self):
         if hasattr(self, 'current_path'):
             # shell: 路径中文映射
@@ -1157,13 +1201,29 @@ class FileExplorerTab(QWidget):
         from PyQt5.QtWidgets import QWidget
         import time
         
-        # 创建容器widget
-        self.explorer_container = QWidget()
-        self.layout().addWidget(self.explorer_container)
+        # 使用锁防止并发嵌入
+        if not FileExplorerTab._embed_lock.acquire(blocking=False):
+            print(f"[embed_real_explorer] 另一个嵌入操作正在进行，延迟200ms后重试...")
+            QTimer.singleShot(200, self.embed_real_explorer)
+            return
+        
+        try:
+            # 创建容器widget
+            self.explorer_container = QWidget()
+            self.layout().addWidget(self.explorer_container)
+            self._do_embed_real_explorer()
+        finally:
+            FileExplorerTab._embed_lock.release()
+    
+    def _do_embed_real_explorer(self):
+        """实际执行嵌入操作（内部方法）"""
+        import subprocess
+        import win32gui
+        from PyQt5.QtCore import QTimer
         
         # 如果传入了已存在的Explorer窗口句柄，直接嵌入它
         if hasattr(self, 'existing_explorer_hwnd') and self.existing_explorer_hwnd:
-            print(f"[embed_real_explorer] 嵌入已存在的Explorer窗口: {self.existing_explorer_hwnd}")
+            print(f"[_do_embed_real_explorer] 嵌入已存在的Explorer窗口: {self.existing_explorer_hwnd}")
             self._embed_window(self.existing_explorer_hwnd)
             return
         
@@ -1180,11 +1240,12 @@ class FileExplorerTab(QWidget):
         win32gui.EnumWindows(record_existing, None)
         
         # 启动explorer进程
+        from PyQt5.QtCore import QDir
         path = QDir.toNativeSeparators(self.current_path)
         # 使用 /e 参数打开资源管理器（带左侧树），/root 设置根目录
         cmd = f'explorer.exe /e,/root,"{path}"'
         
-        print(f"[embed_real_explorer] 启动命令: {cmd}")
+        print(f"[_do_embed_real_explorer] 启动命令: {cmd}")
         subprocess.Popen(cmd, shell=True)
         
         # 等待窗口创建并获取句柄
@@ -1208,19 +1269,19 @@ class FileExplorerTab(QWidget):
                 explorer_hwnd = new_windows[0] if new_windows else None
                 
                 if explorer_hwnd:
-                    print(f"[embed_real_explorer] 找到Explorer窗口: {explorer_hwnd}")
+                    print(f"[_do_embed_real_explorer] 找到Explorer窗口: {explorer_hwnd}")
                     self._embed_window(explorer_hwnd)
                 else:
                     # 最多重试15次（3秒）
                     if self.retry_count < 15:
-                        print(f"[embed_real_explorer] 未找到Explorer窗口，重试 {self.retry_count}/15...")
+                        print(f"[_do_embed_real_explorer] 未找到Explorer窗口，重试 {self.retry_count}/15...")
                         QTimer.singleShot(200, find_and_embed)
                     else:
-                        print(f"[embed_real_explorer] 超时未找到窗口，降级到简单控件")
+                        print(f"[_do_embed_real_explorer] 超时未找到窗口，降级到简单控件")
                         self.use_simple_explorer()
                     
             except Exception as e:
-                print(f"[embed_real_explorer] 嵌入失败: {e}")
+                print(f"[_do_embed_real_explorer] 嵌入失败: {e}")
                 import traceback
                 traceback.print_exc()
         
@@ -2202,10 +2263,6 @@ class MainWindow(QMainWindow):
         tab_index = self.tab_widget.addTab(tab, short)
         self.tab_widget.setCurrentIndex(tab_index)
         
-        # 激活窗口（当从其他实例接收到路径时）
-        self.activateWindow()
-        self.raise_()
-        
         return tab_index
 
     @pyqtSlot(int, str)
@@ -2220,10 +2277,6 @@ class MainWindow(QMainWindow):
         short = path[-16:] if len(path) > 16 else path
         tab_index = self.tab_widget.addTab(tab, short)
         self.tab_widget.setCurrentIndex(tab_index)
-        
-        # 激活窗口
-        self.activateWindow()
-        self.raise_()
         
         return tab_index
 
