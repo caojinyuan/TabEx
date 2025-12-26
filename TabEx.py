@@ -351,6 +351,8 @@ class BookmarkDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("书签")
         self.resize(500, 600)
+        # 移除问号按钮
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
         self.bookmark_manager = bookmark_manager
         layout = QVBoxLayout(self)
         self.tree = QTreeWidget()
@@ -903,8 +905,8 @@ import socket
 import threading
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView)  # QDockWidget removed (unused)
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject  # QModelIndex removed (unused)
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent
+from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QPoint  # QModelIndex removed (unused)
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QPalette, QColor
 # from PyQt5.QtGui import QIcon  # unused
 
 
@@ -1965,6 +1967,172 @@ class CustomTabBar(QTabBar):
             self.moveTab(to_index, pinned_count)
 
 
+# 自定义标题栏
+class CustomTitleBar(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.setFixedHeight(35)
+        self.drag_position = None
+        self.is_maximized = False
+        
+        # 设置背景色
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        palette.setColor(QPalette.Window, QColor(240, 240, 240))
+        self.setPalette(palette)
+        
+        # 创建布局
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # 窗口标题
+        self.title_label = QLabel("TabExplorer")
+        self.title_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        layout.addWidget(self.title_label)
+        
+        layout.addStretch(1)
+        
+        # 自定义功能按钮区域（在最小化按钮之前）
+        self.custom_buttons_layout = QHBoxLayout()
+        self.custom_buttons_layout.setSpacing(5)
+        
+        # 书签管理按钮
+        btn_bookmark = QPushButton("🔖")
+        btn_bookmark.setToolTip("书签管理")
+        btn_bookmark.setFixedSize(35, 30)
+        btn_bookmark.setStyleSheet("""
+            QPushButton {
+                border: none;
+                background-color: transparent;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 0, 0, 0.1);
+            }
+        """)
+        btn_bookmark.clicked.connect(self.on_bookmark_clicked)
+        self.custom_buttons_layout.addWidget(btn_bookmark)
+        
+        # 设置按钮
+        btn_settings = QPushButton("⚙️")
+        btn_settings.setToolTip("设置")
+        btn_settings.setFixedSize(35, 30)
+        btn_settings.setStyleSheet("""
+            QPushButton {
+                border: none;
+                background-color: transparent;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 0, 0, 0.1);
+            }
+        """)
+        btn_settings.clicked.connect(self.on_settings_clicked)
+        self.custom_buttons_layout.addWidget(btn_settings)
+        
+        layout.addLayout(self.custom_buttons_layout)
+        
+        # 窗口控制按钮
+        # 最小化按钮
+        self.btn_minimize = QPushButton("—")
+        self.btn_minimize.setFixedSize(45, 30)
+        self.btn_minimize.setStyleSheet("""
+            QPushButton {
+                border: none;
+                background-color: transparent;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 0, 0, 0.1);
+            }
+        """)
+        self.btn_minimize.clicked.connect(self.minimize_window)
+        layout.addWidget(self.btn_minimize)
+        
+        # 最大化/还原按钮
+        self.btn_maximize = QPushButton("□")
+        self.btn_maximize.setFixedSize(45, 30)
+        self.btn_maximize.setStyleSheet("""
+            QPushButton {
+                border: none;
+                background-color: transparent;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 0, 0, 0.1);
+            }
+        """)
+        self.btn_maximize.clicked.connect(self.maximize_window)
+        layout.addWidget(self.btn_maximize)
+        
+        # 关闭按钮
+        self.btn_close = QPushButton("✕")
+        self.btn_close.setFixedSize(45, 30)
+        self.btn_close.setStyleSheet("""
+            QPushButton {
+                border: none;
+                background-color: transparent;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: #E81123;
+                color: white;
+            }
+        """)
+        self.btn_close.clicked.connect(self.close_window)
+        layout.addWidget(self.btn_close)
+    
+    def on_bookmark_clicked(self):
+        """书签管理按钮点击事件"""
+        main_window = self.parent
+        main_window.show_bookmark_manager_dialog()
+    
+    def on_settings_clicked(self):
+        """设置按钮点击事件"""
+        main_window = self.parent
+        main_window.show_settings_dialog()
+    
+    def minimize_window(self):
+        self.parent.showMinimized()
+    
+    def maximize_window(self):
+        if self.is_maximized:
+            self.parent.showNormal()
+            self.btn_maximize.setText("□")
+            self.is_maximized = False
+        else:
+            self.parent.showMaximized()
+            self.btn_maximize.setText("❐")
+            self.is_maximized = True
+    
+    def close_window(self):
+        self.parent.close()
+    
+    def update_title(self, title):
+        self.title_label.setText(title)
+    
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.drag_position = event.globalPos() - self.parent.frameGeometry().topLeft()
+            event.accept()
+    
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton and self.drag_position is not None:
+            if self.is_maximized:
+                # 如果是最大化状态，拖动时先还原
+                self.maximize_window()
+                # 重新计算拖动位置
+                self.drag_position = QPoint(int(self.parent.width() / 2), 10)
+            self.parent.move(event.globalPos() - self.drag_position)
+            event.accept()
+    
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.maximize_window()
+
+
 class MainWindow(QMainWindow):
     # 定义信号用于从服务器线程通知主线程打开新标签
     open_path_signal = pyqtSignal(str)
@@ -2205,9 +2373,10 @@ class MainWindow(QMainWindow):
 
     
     def create_toolbar(self):
-        toolbar = QToolBar()
-        self.addToolBar(Qt.TopToolBarArea, toolbar)
-        # 工具栏保留，可在此添加其它功能按钮
+        # 工具栏已不再需要，因为使用了自定义标题栏和书签栏
+        # 如果将来需要添加工具栏功能，可以取消注释以下代码
+        # toolbar = QToolBar()
+        # self.addToolBar(Qt.TopToolBarArea, toolbar)
         pass
 
     def show_bookmark_dialog(self):
@@ -2454,10 +2623,36 @@ class MainWindow(QMainWindow):
         from PyQt5.QtWidgets import QSplitter, QTreeView, QFileSystemModel
         self.setWindowTitle("TabExplorer")
         self.setGeometry(100, 100, 1200, 800)
+        
+        # 隐藏默认标题栏，使用自定义标题栏
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        
+        # 创建主容器widget，包含自定义标题栏和原有内容
+        main_container = QWidget()
+        container_layout = QVBoxLayout(main_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        
+        # 添加自定义标题栏
+        self.title_bar = CustomTitleBar(self)
+        container_layout.addWidget(self.title_bar)
 
-        # 直接将“收藏夹”里的书签全部列在菜单栏顶层
-        self.menuBar().clear()
-        self.populate_bookmark_bar_menu()
+        # 创建书签栏widget（放在标签页上面）
+        self.bookmark_bar_widget = QWidget()
+        bookmark_bar_layout = QHBoxLayout(self.bookmark_bar_widget)
+        bookmark_bar_layout.setContentsMargins(5, 2, 5, 2)
+        bookmark_bar_layout.setSpacing(2)
+        self.bookmark_bar_widget.setStyleSheet("""
+            QWidget {
+                background-color: #f5f5f5;
+                border-bottom: 1px solid #d3d3d3;
+            }
+        """)
+        self.bookmark_bar_widget.setFixedHeight(32)
+        container_layout.addWidget(self.bookmark_bar_widget)
+        
+        # 填充书签栏
+        self.populate_bookmark_bar()
 
         # 创建工具栏
         self.create_toolbar()
@@ -2551,7 +2746,17 @@ class MainWindow(QMainWindow):
 
         right_layout.addWidget(self.tab_widget)
         self.splitter.addWidget(right_widget)
-        self.setCentralWidget(self.splitter)
+        
+        # 应用自定义标题栏（在设置central widget之前）
+        if hasattr(self, 'title_bar'):
+            # 如果已创建自定义标题栏，将splitter添加到容器布局
+            container_layout.addWidget(self.splitter)
+            self.setCentralWidget(main_container)
+            # 给窗口添加边框
+            self.setStyleSheet("QMainWindow { border: 1px solid #999; }")
+        else:
+            # 否则使用原有方式
+            self.setCentralWidget(self.splitter)
 
         # 加载固定标签页
         has_pinned = self.load_pinned_tabs()
@@ -2573,6 +2778,12 @@ class MainWindow(QMainWindow):
         
         # 启动单实例通信服务器
         self.start_instance_server()
+    
+    def setWindowTitle(self, title):
+        """重写setWindowTitle以同步更新自定义标题栏"""
+        super().setWindowTitle(title)
+        if hasattr(self, 'title_bar'):
+            self.title_bar.update_title(title)
     
     def refresh_current_tab(self):
         """刷新当前标签页的Explorer视图"""
@@ -2750,13 +2961,114 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self.show_settings_dialog)
         menubar.addAction(settings_action)
 
+    def populate_bookmark_bar(self):
+        """填充书签栏widget"""
+        self.ensure_default_icons_on_bookmark_bar()
+        
+        # 清空现有书签栏
+        if hasattr(self, 'bookmark_bar_widget'):
+            layout = self.bookmark_bar_widget.layout()
+            if layout:
+                while layout.count():
+                    item = layout.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+        
+        bm = self.bookmark_manager
+        tree = bm.get_tree()
+        bookmark_bar = tree.get('bookmark_bar')
+        if not bookmark_bar or 'children' not in bookmark_bar:
+            return
+        
+        layout = self.bookmark_bar_widget.layout()
+        
+        # 定义默认书签的URL，用于判断是否添加图标
+        default_bookmark_urls = {
+            "shell:MyComputerFolder",
+            "shell:Desktop",
+            "shell:RecycleBinFolder",
+            "shell:Startup",
+        }
+        from PyQt5.QtCore import QStandardPaths
+        downloads_path = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
+        if downloads_path and os.path.exists(downloads_path):
+            default_bookmark_urls.add(downloads_path)
+        else:
+            default_bookmark_urls.add(os.path.join(os.path.expanduser('~'), 'Downloads'))
+        
+        def add_bookmark_button(node, is_default=False):
+            if node.get('type') == 'url':
+                name = node.get('name', '')
+                url = node.get('url', '')
+                # 如果不是默认书签（默认书签名称中已包含emoji），则添加📑图标
+                if url not in default_bookmark_urls:
+                    display_name = f"📑 {name}"
+                else:
+                    display_name = name
+                btn = QPushButton(display_name)
+                btn.setStyleSheet("""
+                    QPushButton {
+                        border: none;
+                        background-color: transparent;
+                        padding: 5px 10px;
+                        text-align: left;
+                        font-size: 13px;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(0, 0, 0, 0.1);
+                    }
+                """)
+                btn.clicked.connect(lambda checked, u=url: self.open_bookmark_url(u))
+                layout.addWidget(btn)
+            elif node.get('type') == 'folder':
+                name = node.get('name', '')
+                menu = QMenu(self)
+                
+                def add_menu_items(parent_menu, folder_node):
+                    for child in folder_node.get('children', []):
+                        if child.get('type') == 'folder':
+                            submenu = parent_menu.addMenu(f"📁 {child.get('name', '')}")
+                            add_menu_items(submenu, child)
+                        elif child.get('type') == 'url':
+                            action = parent_menu.addAction(f"📑 {child.get('name', '')}")
+                            url = child.get('url', '')
+                            action.triggered.connect(lambda checked, u=url: self.open_bookmark_url(u))
+                
+                add_menu_items(menu, node)
+                
+                btn = QPushButton(f"📁 {name}")
+                btn.setStyleSheet("""
+                    QPushButton {
+                        border: none;
+                        background-color: transparent;
+                        padding: 5px 10px;
+                        text-align: left;
+                        font-size: 13px;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(0, 0, 0, 0.1);
+                    }
+                """)
+                btn.setMenu(menu)
+                layout.addWidget(btn)
+        
+        # 添加所有书签
+        for idx, child in enumerate(bookmark_bar['children']):
+            add_bookmark_button(child, is_default=(idx < 5))
+        
+        layout.addStretch(1)
+
     def show_bookmark_manager_dialog(self):
         dlg = BookmarkManagerDialog(self.bookmark_manager, self)
+        # 确保移除问号按钮
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         dlg.exec_()
     
     def show_settings_dialog(self):
         """显示设置对话框"""
         dlg = SettingsDialog(self)
+        # 确保移除问号按钮
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         dlg.exec_()
     
     def _init_explorer_monitor(self):
@@ -2784,6 +3096,8 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.resize(500, 300)
+        # 移除问号按钮 - 使用setWindowFlag方法
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
         self.main_window = parent
         
         layout = QVBoxLayout(self)
@@ -2862,6 +3176,8 @@ class BookmarkManagerDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("书签管理")
         self.resize(600, 500)
+        # 移除问号按钮 - 使用setWindowFlag方法
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
         self.bookmark_manager = bookmark_manager
         layout = QVBoxLayout(self)
         self.tree = QTreeWidget()
@@ -3122,6 +3438,22 @@ class BookmarkManagerDialog(QDialog):
         bookmark_bar = tree.get('bookmark_bar')
         if not bookmark_bar or 'children' not in bookmark_bar:
             return
+        
+        # 定义默认书签的URL，这些不显示在管理界面中
+        default_bookmark_urls = {
+            "shell:MyComputerFolder",
+            "shell:Desktop",
+            "shell:RecycleBinFolder",
+            "shell:Startup",
+        }
+        # 下载路径需要动态获取
+        from PyQt5.QtCore import QStandardPaths
+        downloads_path = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
+        if downloads_path and os.path.exists(downloads_path):
+            default_bookmark_urls.add(downloads_path)
+        else:
+            default_bookmark_urls.add(os.path.join(os.path.expanduser('~'), 'Downloads'))
+        
         def add_node(parent_item, node):
             if node.get('type') == 'folder':
                 item = QTreeWidgetItem([f"📁 {node.get('name', '')}", '文件夹', ''])
@@ -3133,7 +3465,11 @@ class BookmarkManagerDialog(QDialog):
                 for child in node.get('children', []):
                     add_node(item, child)
             elif node.get('type') == 'url':
-                item = QTreeWidgetItem([f"📑 {node.get('name', '')}", '书签', node.get('url', '')])
+                # 跳过默认书签
+                url = node.get('url', '')
+                if url in default_bookmark_urls:
+                    return
+                item = QTreeWidgetItem([f"📑 {node.get('name', '')}", '书签', url])
                 item.setData(0, 1, node.get('id'))
                 if parent_item:
                     parent_item.addChild(item)
