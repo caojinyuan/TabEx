@@ -23,16 +23,20 @@ Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 ✅ 双击空白区域智能操作（标签栏空白→新建标签页，文件区空白→返回上级）
 ✅ **单实例模式**（右键菜单打开文件夹时在已有窗口中打开新标签页，避免启动多个进程）
 ✅ **强大的搜索功能**（支持文件名、文件内容、文件夹名搜索）
+✅ **🆕 自动监听新Explorer窗口**（类似Clover，新打开的Windows资源管理器窗口会自动嵌入到TabExplorer的标签页中）
 
-注册为右键菜单：
-运行 `3_register_as_default.bat` 注册到资源管理器右键菜单（需管理员权限）
-支持：
-- 右键文件夹 → "open with TabExplorer"
-- 右键文件 → "open with TabExplorer"（打开文件所在文件夹）
-- 文件夹空白处右键 → "open TabExplorer here"
-- 右键驱动器 → "open with TabExplorer"
+---
 
-卸载右键菜单：运行 `4_unregister.bat`
+## 🆕 最近更新（2025-12）
+- **自定义标题栏**：将“📑 书签管理”“⚙️ 设置”与最小化/最大化/关闭按钮放在同一行的顶部标题栏，支持拖动与双击最大化。
+- **书签栏位置与高度**：书签栏固定在标题栏下方，统一高度为 28px，移除重复入口（不再在书签栏显示“书签管理/设置”）。
+- **弹框优化**：设置、书签管理弹框采用模态对话框并移除右上角问号按钮；设置弹框更大更舒适。
+- **蓝色圆角外边框**：窗口采用蓝色可见外边框（白色内容容器嵌套），更易与其他应用区分。
+- **无边框拖拽缩放**：支持从窗口边缘/角落拖拽调整大小；鼠标在边缘时自动显示对应的调整大小光标；在内容区保持正常箭头光标。
+- **图标支持**：运行时为应用与任务栏添加蓝白主题图标（TE字样）。若需自定义 `.ico`，可在打包时替换。
+
+---
+
 
 运行环境：
 首次运行前需要双击 0_install_requirements.bat ， 安装必要软件。
@@ -41,10 +45,57 @@ Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 开机自启动方式：
 将 1_TabEx.bat 的快捷方式放到 shell:startup 目录
 
+### 🛠️ 从源码运行
+
+在已安装依赖的情况下，可直接运行：
+
+```powershell
+d:
+cd d:\test\TabEx_github
+python TabEx.py
+```
+
+---
+
+## 🧱 打包为 EXE
+
+- 推荐使用仓库内脚本 [2_build_exe.bat](2_build_exe.bat)。
+- 如需指定自定义图标（`.ico`），可在打包命令中加入 `--icon your_icon.ico`：
+
+```powershell
+pyinstaller --noconfirm --onefile --windowed --icon your_icon.ico TabEx.py -n TabExplorer
+```
+
+提示：运行时已内置蓝白主题的应用图标；打包为 EXE 时可替换为品牌化的 `.ico` 文件。
+
+## 🔥 新功能：自动监听Explorer窗口
+
+**功能说明**：
+类似于Clover的核心功能，TabExplorer现在可以自动监听系统中新打开的Windows资源管理器窗口，并将其自动嵌入到TabExplorer的标签页中。
+
+**如何使用**：
+1. 启动TabExplorer
+2. 在菜单栏点击 `⚙️ 设置` → 确保 `监听新Explorer窗口` 选项已勾选（默认启用）
+3. 打开任意新的Windows资源管理器窗口（比如通过Win+E快捷键，或双击文件夹）
+4. 新打开的资源管理器窗口会被自动关闭，并在TabExplorer中打开一个新的标签页指向该路径
+
+**配置选项**：
+- 可以在 `config.json` 中设置 `"enable_explorer_monitor": false` 来禁用此功能
+- 也可以通过菜单栏的设置选项动态启用/禁用
+
+**工作原理**：
+- 后台监听线程定期检测新打开的Explorer窗口（CabinetWClass类）
+- 通过COM接口获取新窗口的当前路径
+- 在TabExplorer中创建新标签页并导航到该路径
+- 自动关闭原Explorer窗口，实现无缝体验
+
+**使用提示**：
+1. 功能在启动后2秒自动开启（确保窗口完全初始化）
+2. 可以通过控制台查看详细的监听日志
+3. 如遇问题，可在设置中临时禁用再重新启用
+
 我本地环境：
 python 3.9.6
-
-
 
 
 

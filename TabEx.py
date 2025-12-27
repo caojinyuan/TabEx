@@ -1,4 +1,4 @@
-from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton
+﻿from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton
 # 多层结构书签弹窗
 class BookmarkDialog(QDialog):
     def __init__(self, bookmark_manager, parent=None):
@@ -555,10 +555,11 @@ import string
 import time
 import socket
 import threading
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView)  # QDockWidget removed (unused)
+import queue
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy)  # QDockWidget removed (unused)
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject  # QModelIndex removed (unused)
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent
+from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize  # QModelIndex removed (unused)
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor
 # from PyQt5.QtGui import QIcon  # unused
 
 
@@ -570,6 +571,32 @@ try:
     HAS_PYWIN = True
 except Exception:
     HAS_PYWIN = False
+
+# Windows API for monitoring new Explorer windows
+if HAS_PYWIN:
+    try:
+        import ctypes.wintypes as wintypes
+        user32 = ctypes.windll.user32
+        ole32 = ctypes.windll.ole32
+        
+        # Constants for SetWinEventHook
+        EVENT_OBJECT_CREATE = 0x8000
+        EVENT_SYSTEM_FOREGROUND = 0x0003
+        WINEVENT_OUTOFCONTEXT = 0x0000
+        
+        # Define callback type
+        WinEventProcType = ctypes.WINFUNCTYPE(
+            None,
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.HWND,
+            wintypes.LONG,
+            wintypes.LONG,
+            wintypes.DWORD,
+            wintypes.DWORD
+        )
+    except Exception as e:
+        print(f"Failed to setup Windows API monitoring: {e}")
 
 # 面包屑导航路径栏
 class BreadcrumbPathBar(QWidget):
@@ -1843,12 +1870,462 @@ class MainWindow(QMainWindow):
                 self.dir_tree.expand(p)
             self.dir_tree.setCurrentIndex(idx)
             self.dir_tree.scrollTo(idx)
-    def create_toolbar(self):
-        toolbar = QToolBar()
-        self.addToolBar(Qt.TopToolBarArea, toolbar)
-        # 工具栏保留，可在此添加其它功能按钮
-        pass
+    def create_custom_titlebar(self, main_layout):
+        """创建自定义标题栏，包含窗口控制按钮和功能按钮"""
+        titlebar = QWidget()
+        titlebar.setFixedHeight(32)
+        titlebar.setStyleSheet("background-color: #f0f0f0; border-bottom: 1px solid #ccc;")
+        titlebar_layout = QHBoxLayout(titlebar)
+        titlebar_layout.setContentsMargins(10, 0, 0, 0)
+        titlebar_layout.setSpacing(0)
+        
+        # 窗口标题
+        title_label = QLabel("TabExplorer")
+        title_label.setStyleSheet("font-weight: bold; font-size: 11pt; color: #333;")
+        titlebar_layout.addWidget(title_label)
+        
+        # 用于拖动窗口
+        self.titlebar_widget = titlebar
+        self.drag_position = None
+        
+        titlebar_layout.addStretch()
+        
+        # 书签管理按钮
+        bookmark_btn = QPushButton("📑")
+        bookmark_btn.setToolTip("书签管理")
+        bookmark_btn.setFixedSize(40, 32)
+        bookmark_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                font-size: 14pt;
+            }
+            QPushButton:hover {
+                background: rgba(0, 0, 0, 0.1);
+            }
+            QPushButton:pressed {
+                background: rgba(0, 0, 0, 0.2);
+            }
+        """)
+        bookmark_btn.clicked.connect(self.show_bookmark_manager_dialog)
+        titlebar_layout.addWidget(bookmark_btn)
+        
+        # 设置按钮
+        settings_btn = QPushButton("⚙️")
+        settings_btn.setToolTip("设置")
+        settings_btn.setFixedSize(40, 32)
+        settings_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                font-size: 14pt;
+            }
+            QPushButton:hover {
+                background: rgba(0, 0, 0, 0.1);
+            }
+            QPushButton:pressed {
+                background: rgba(0, 0, 0, 0.2);
+            }
+        """)
+        settings_btn.clicked.connect(self.show_settings_menu)
+        titlebar_layout.addWidget(settings_btn)
+        
+        # 最小化按钮
+        min_btn = QPushButton("—")
+        min_btn.setFixedSize(45, 32)
+        min_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                font-size: 16pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: rgba(0, 0, 0, 0.1);
+            }
+        """)
+        min_btn.clicked.connect(self.showMinimized)
+        titlebar_layout.addWidget(min_btn)
+        
+        # 最大化/还原按钮
+        self.max_btn = QPushButton("□")
+        self.max_btn.setFixedSize(45, 32)
+        self.max_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                font-size: 16pt;
+            }
+            QPushButton:hover {
+                background: rgba(0, 0, 0, 0.1);
+            }
+        """)
+        self.max_btn.clicked.connect(self.toggle_maximize)
+        titlebar_layout.addWidget(self.max_btn)
+        
+        # 关闭按钮
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(45, 32)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                font-size: 16pt;
+            }
+            QPushButton:hover {
+                background: #e81123;
+                color: white;
+            }
+        """)
+        close_btn.clicked.connect(self.close)
+        titlebar_layout.addWidget(close_btn)
+        
+        main_layout.addWidget(titlebar)
+    
+    def toggle_maximize(self):
+        """切换最大化/还原窗口"""
+        if self.isMaximized():
+            self.showNormal()
+            self.max_btn.setText("□")
+        else:
+            self.showMaximized()
+            self.max_btn.setText("❐")
+    
+    def mousePressEvent(self, event):
+        """鼠标按下事件 - 用于拖动窗口"""
+        if event.button() == Qt.LeftButton and hasattr(self, 'titlebar_widget'):
+            # 检查点击位置是否在标题栏内
+            titlebar_rect = self.titlebar_widget.geometry()
+            if titlebar_rect.contains(event.pos()):
+                self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
+                event.accept()
+        super().mousePressEvent(event)
+    
+    def mouseMoveEvent(self, event):
+        """鼠标移动事件 - 拖动窗口"""
+        if event.buttons() == Qt.LeftButton and self.drag_position is not None:
+            if not self.isMaximized():
+                self.move(event.globalPos() - self.drag_position)
+                event.accept()
+        super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        """鼠标释放事件"""
+        self.drag_position = None
+        super().mouseReleaseEvent(event)
+    
+    def create_custom_titlebar(self, main_layout):
+        """创建自定义标题栏，包含窗口控制按钮和功能按钮"""
+        titlebar = QWidget()
+        titlebar.setFixedHeight(32)
+        titlebar.setStyleSheet("background-color: #f0f0f0; border-bottom: 1px solid #ccc;")
+        titlebar_layout = QHBoxLayout(titlebar)
+        titlebar_layout.setContentsMargins(10, 0, 0, 0)
+        titlebar_layout.setSpacing(0)
+        
+        # 窗口标题
+        title_label = QLabel("TabExplorer")
+        title_label.setStyleSheet("font-weight: bold; font-size: 11pt; color: #333;")
+        titlebar_layout.addWidget(title_label)
+        
+        # 用于拖动窗口
+        self.titlebar_widget = titlebar
+        self.drag_position = None
+        
+        titlebar_layout.addStretch()
+        
+        # 书签管理按钮
+        bookmark_btn = QPushButton("📑")
+        bookmark_btn.setToolTip("书签管理")
+        bookmark_btn.setFixedSize(40, 32)
+        bookmark_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                font-size: 14pt;
+            }
+            QPushButton:hover {
+                background: rgba(0, 0, 0, 0.1);
+            }
+            QPushButton:pressed {
+                background: rgba(0, 0, 0, 0.2);
+            }
+        """)
+        bookmark_btn.clicked.connect(self.show_bookmark_manager_dialog)
+        titlebar_layout.addWidget(bookmark_btn)
+        
+        # 设置按钮
+        settings_btn = QPushButton("⚙️")
+        settings_btn.setToolTip("设置")
+        settings_btn.setFixedSize(40, 32)
+        settings_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                font-size: 14pt;
+            }
+            QPushButton:hover {
+                background: rgba(0, 0, 0, 0.1);
+            }
+            QPushButton:pressed {
+                background: rgba(0, 0, 0, 0.2);
+            }
+        """)
+        settings_btn.clicked.connect(self.show_settings_menu)
+        titlebar_layout.addWidget(settings_btn)
+        
+        # 最小化按钮
+        min_btn = QPushButton("—")
+        min_btn.setFixedSize(45, 32)
+        min_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                font-size: 16pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: rgba(0, 0, 0, 0.1);
+            }
+        """)
+        min_btn.clicked.connect(self.showMinimized)
+        titlebar_layout.addWidget(min_btn)
+        
+        # 最大化/还原按钮
+        self.max_btn = QPushButton("☐")
+        self.max_btn.setFixedSize(45, 32)
+        self.max_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                font-size: 16pt;
+            }
+            QPushButton:hover {
+                background: rgba(0, 0, 0, 0.1);
+            }
+        """)
+        self.max_btn.clicked.connect(self.toggle_maximize)
+        titlebar_layout.addWidget(self.max_btn)
+        
+        # 关闭按钮
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(45, 32)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                font-size: 16pt;
+            }
+            QPushButton:hover {
+                background: #e81123;
+                color: white;
+            }
+        """)
+        close_btn.clicked.connect(self.close)
+        titlebar_layout.addWidget(close_btn)
+        
+        main_layout.addWidget(titlebar)
+    
+    def toggle_maximize(self):
+        """切换最大化/还原窗口"""
+        if self.isMaximized():
+            self.showNormal()
+            self.max_btn.setText("☐")
+        else:
+            self.showMaximized()
+            self.max_btn.setText("❐")
+    
+    def mousePressEvent(self, event):
+        """鼠标按下事件 - 用于拖动窗口或调整大小"""
+        if event.button() == Qt.LeftButton:
+            # 检测是否在边缘（调整大小）
+            edge = self.detect_edge(event.pos())
+            if edge and not self.isMaximized():
+                self.resizing = True
+                self.resize_direction = edge
+                self.resize_start_pos = event.globalPos()
+                self.resize_start_geometry = self.geometry()
+                event.accept()
+                return
+            
+            # 检查点击位置是否在标题栏内（拖动窗口）
+            if hasattr(self, 'titlebar_widget'):
+                titlebar_rect = self.titlebar_widget.geometry()
+                if titlebar_rect.contains(event.pos()):
+                    self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
+                    event.accept()
+        super().mousePressEvent(event)
+    
+    def mouseMoveEvent(self, event):
+        """鼠标移动事件 - 拖动窗口或调整大小"""
+        if event.buttons() == Qt.LeftButton:
+            # 调整窗口大小
+            if self.resizing and self.resize_direction:
+                self.resize_window(event.globalPos())
+                # 调整大小时保持调整大小的光标
+                self.update_cursor(self.resize_direction)
+                event.accept()
+                return
+            
+            # 拖动窗口
+            if self.drag_position is not None and not self.isMaximized():
+                self.move(event.globalPos() - self.drag_position)
+                event.accept()
+                return
+        else:
+            # 只有在没有按键按下时才更新光标（仅在未最大化时）
+            if not self.isMaximized():
+                edge = self.detect_edge(event.pos())
+                if edge:
+                    # 在边缘，显示调整大小光标
+                    self.update_cursor(edge)
+                    event.accept()
+                    return
+                else:
+                    # 不在边缘，恢复默认光标（通过QApplication恢复）
+                    self.update_cursor(None)
+        
+        super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        """鼠标释放事件"""
+        self.drag_position = None
+        self.resizing = False
+        self.resize_direction = None
+        # 释放后恢复默认光标，避免停留在调整大小形状
+        try:
+            self.update_cursor(None)
+        except Exception:
+            pass
+        super().mouseReleaseEvent(event)
+    
+    def leaveEvent(self, event):
+        """鼠标离开窗口时恢复覆盖的光标"""
+        from PyQt5.QtWidgets import QApplication
+        if getattr(self, 'cursor_overridden', False):
+            QApplication.restoreOverrideCursor()
+            self.cursor_overridden = False
+        super().leaveEvent(event)
+    
+    def detect_edge(self, pos):
+        """检测鼠标是否在窗口边缘，返回边缘方向"""
+        rect = self.rect()
+        margin = self.resize_margin
+        
+        left = pos.x() <= margin
+        right = pos.x() >= rect.width() - margin
+        top = pos.y() <= margin
+        bottom = pos.y() >= rect.height() - margin
+        
+        if top and left:
+            return 'top-left'
+        elif top and right:
+            return 'top-right'
+        elif bottom and left:
+            return 'bottom-left'
+        elif bottom and right:
+            return 'bottom-right'
+        elif top:
+            return 'top'
+        elif bottom:
+            return 'bottom'
+        elif left:
+            return 'left'
+        elif right:
+            return 'right'
+        return None
+    
+    def update_cursor(self, edge):
+        """根据边缘位置更新鼠标光标（使用QApplication覆盖，避免子控件干扰）"""
+        from PyQt5.QtGui import QCursor
+        from PyQt5.QtWidgets import QApplication
 
+        def apply(shape):
+            if not self.cursor_overridden:
+                QApplication.setOverrideCursor(QCursor(shape))
+                self.cursor_overridden = True
+            else:
+                # 已覆盖则变更形状
+                QApplication.changeOverrideCursor(QCursor(shape))
+
+        def clear():
+            if self.cursor_overridden:
+                QApplication.restoreOverrideCursor()
+                self.cursor_overridden = False
+
+        if edge == 'top-left' or edge == 'bottom-right':
+            apply(Qt.SizeFDiagCursor)
+        elif edge == 'top-right' or edge == 'bottom-left':
+            apply(Qt.SizeBDiagCursor)
+        elif edge == 'top' or edge == 'bottom':
+            apply(Qt.SizeVerCursor)
+        elif edge == 'left' or edge == 'right':
+            apply(Qt.SizeHorCursor)
+        else:
+            clear()
+    
+    def resize_window(self, global_pos):
+        """根据鼠标位置调整窗口大小"""
+        delta = global_pos - self.resize_start_pos
+        old_geo = self.resize_start_geometry
+        
+        # 计算新的位置和大小
+        new_x = old_geo.x()
+        new_y = old_geo.y()
+        new_width = old_geo.width()
+        new_height = old_geo.height()
+        
+        # 根据拖动方向调整窗口位置和大小
+        if 'left' in self.resize_direction:
+            new_x = old_geo.x() + delta.x()
+            new_width = old_geo.width() - delta.x()
+        
+        if 'right' in self.resize_direction:
+            new_width = old_geo.width() + delta.x()
+        
+        if 'top' in self.resize_direction:
+            new_y = old_geo.y() + delta.y()
+            new_height = old_geo.height() - delta.y()
+        
+        if 'bottom' in self.resize_direction:
+            new_height = old_geo.height() + delta.y()
+        
+        # 应用最小尺寸限制
+        if new_width < self.minimumWidth():
+            if 'left' in self.resize_direction:
+                new_x = old_geo.x() + old_geo.width() - self.minimumWidth()
+            new_width = self.minimumWidth()
+        
+        if new_height < self.minimumHeight():
+            if 'top' in self.resize_direction:
+                new_y = old_geo.y() + old_geo.height() - self.minimumHeight()
+            new_height = self.minimumHeight()
+        
+        # 一次性设置新的几何形状
+        self.setGeometry(new_x, new_y, new_width, new_height)
+    
+    def mouseDoubleClickEvent(self, event):
+        """鼠标双击事件 - 双击标题栏切换最大化/还原"""
+        if event.button() == Qt.LeftButton and hasattr(self, 'titlebar_widget'):
+            # 检查双击位置是否在标题栏范围内
+            titlebar_pos = self.titlebar_widget.mapFrom(self, event.pos())
+            if self.titlebar_widget.rect().contains(titlebar_pos):
+                # 排除按钮区域（避免双击按钮触发最大化）
+                clicked_widget = self.titlebar_widget.childAt(titlebar_pos)
+                if clicked_widget is None or isinstance(clicked_widget, QLabel):
+                    self.toggle_maximize()
+                    event.accept()
+                    return
+        super().mouseDoubleClickEvent(event)
+    
+    def show_settings_menu(self):
+        """显示设置对话框"""
+        dlg = SettingsDialog(self.config, self)
+        if dlg.exec_():
+            checked = dlg.monitor_cb.isChecked()
+            if checked != self.config.get("enable_explorer_monitor", True):
+                self.toggle_explorer_monitor(checked)
+        
     def show_bookmark_dialog(self):
         dlg = BookmarkDialog(self.bookmark_manager, self)
         dlg.exec_()
@@ -1986,39 +2463,103 @@ class MainWindow(QMainWindow):
                     break
 
     def save_pinned_tabs(self):
+        """保存固定标签页到config.json"""
         pinned_paths = []
         for i in range(self.tab_widget.count()):
             tab = self.tab_widget.widget(i)
             if hasattr(tab, 'is_pinned') and tab.is_pinned:
                 if hasattr(tab, 'current_path'):
                     pinned_paths.append(tab.current_path)
-        with open("pinned_tabs.json", "w", encoding="utf-8") as f:
-            json.dump(pinned_paths, f, ensure_ascii=False, indent=2)
+        
+        # 更新config并保存
+        self.config["pinned_tabs"] = pinned_paths
+        self.save_config()
+        
+        print(f"[Config] Saved {len(pinned_paths)} pinned tabs to config.json")
 
     def load_pinned_tabs(self):
+        """从config.json加载固定标签页"""
         has_pinned = False
-        if os.path.exists("pinned_tabs.json"):
-            try:
-                with open("pinned_tabs.json", "r", encoding="utf-8") as f:
-                    paths = json.load(f)
-                for path in paths:
-                    tab = FileExplorerTab(self, path)
-                    tab.is_pinned = True
-                    short = path[-12:] if len(path) > 12 else path
-                    pin_prefix = "📌"
-                    title = pin_prefix + short
-                    self.tab_widget.addTab(tab, title)
-                    has_pinned = True
-            except Exception:
-                pass
+        
+        # 从config.json读取
+        pinned_paths = self.config.get("pinned_tabs", [])
+        
+        if pinned_paths:
+            print(f"[Config] Loading {len(pinned_paths)} pinned tabs from config.json")
+            for path in pinned_paths:
+                if os.path.exists(path) or path.startswith('shell:'):
+                    try:
+                        is_shell = path.startswith('shell:')
+                        tab = FileExplorerTab(self, path, is_shell=is_shell)
+                        tab.is_pinned = True
+                        short = path[-12:] if len(path) > 12 else path
+                        pin_prefix = "📌"
+                        title = pin_prefix + short
+                        self.tab_widget.addTab(tab, title)
+                        has_pinned = True
+                        print(f"[Config] ✓ Loaded pinned tab: {path}")
+                    except Exception as e:
+                        print(f"[Config] ✗ Failed to load pinned tab {path}: {e}")
+                else:
+                    print(f"[Config] ⚠ Skipping non-existent path: {path}")
+        else:
+            print("[Config] No pinned tabs found in config.json")
+        
         return has_pinned
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        
+        # 加载配置
+        self.config = self.load_config()
+        
         self.bookmark_manager = BookmarkManager()
         # 检查并自动添加常用书签
         self.ensure_default_bookmarks()
+        
+        # 窗口调整大小相关变量
+        self.resizing = False
+        self.resize_direction = None
+        self.resize_margin = 10  # 边缘检测范围（像素），增加到10像素更容易触发
+        self.cursor_overridden = False  # 通过QApplication是否已覆盖光标
+        
         self.init_ui()
+
+        # 使用应用图标作为窗口图标
+        try:
+            from PyQt5.QtWidgets import QApplication
+            self.setWindowIcon(QApplication.windowIcon())
+        except Exception:
+            pass
+    
+    def load_config(self):
+        """加载配置文件"""
+        default_config = {
+            "enable_explorer_monitor": True,  # 默认启用Explorer监听
+            "pinned_tabs": []  # 默认没有固定标签页
+        }
+        
+        try:
+            if os.path.exists("config.json"):
+                with open("config.json", "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                    # 合并默认配置
+                    for key, value in default_config.items():
+                        if key not in config:
+                            config[key] = value
+                    return config
+        except Exception as e:
+            print(f"Failed to load config: {e}")
+        
+        return default_config
+    
+    def save_config(self):
+        """保存配置文件"""
+        try:
+            with open("config.json", "w", encoding="utf-8") as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Failed to save config: {e}")
 
     def ensure_default_bookmarks(self):
         bm = self.bookmark_manager
@@ -2061,15 +2602,65 @@ class MainWindow(QMainWindow):
 
     def init_ui(self):
         from PyQt5.QtWidgets import QSplitter, QTreeView, QFileSystemModel
-        self.setWindowTitle("TabExplorer")
         self.setGeometry(100, 100, 1200, 800)
+        
+        # 设置窗口最小尺寸，允许窗口缩小到很小
+        self.setMinimumSize(400, 300)
+        
+        # 启用鼠标追踪，以便在边缘时显示调整大小光标
+        self.setMouseTracking(True)
+        
+        # 隐藏默认标题栏
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        
+        # 创建主容器，蓝色背景作为边框
+        main_container = QWidget()
+        main_container.setStyleSheet("background: #2196F3;")
+        main_container.setAttribute(Qt.WA_TransparentForMouseEvents)  # 让鼠标事件穿透到主窗口
+        container_layout = QVBoxLayout(main_container)
+        container_layout.setContentsMargins(4, 4, 4, 4)
+        container_layout.setSpacing(0)
+        
+        # 创建内容容器，白色背景
+        content_widget = QWidget()
+        content_widget.setStyleSheet("background: white;")
+        main_layout = QVBoxLayout(content_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # 将内容容器添加到主容器
+        container_layout.addWidget(content_widget)
+        
+        # 创建自定义标题栏
+        self.create_custom_titlebar(main_layout)
 
-        # 直接将“收藏夹”里的书签全部列在菜单栏顶层
-        self.menuBar().clear()
+        # 书签栏（菜单栏）
+        menu_bar = self.menuBar()
+        menu_bar.clear()
+        menu_bar.setFixedHeight(28)  # 设置菜单栏高度
+        # 设置菜单栏的大小策略，允许它被压缩
+        menu_bar.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        menu_bar.setStyleSheet("""
+            QMenuBar {
+                background-color: #f5f5f5;
+                border-bottom: 1px solid #ddd;
+                padding: 2px;
+            }
+            QMenuBar::item {
+                padding: 4px 8px;
+                background: transparent;
+                min-width: 0px;
+            }
+            QMenuBar::item:selected {
+                background: #e0e0e0;
+            }
+            QMenuBar::item:pressed {
+                background: #d0d0d0;
+            }
+        """)
         self.populate_bookmark_bar_menu()
-
-        # 创建工具栏
-        self.create_toolbar()
+        # 将菜单栏添加到主布局
+        main_layout.addWidget(menu_bar)
 
         # 主分割器，左树右标签
         self.splitter = QSplitter()
@@ -2193,7 +2784,12 @@ class MainWindow(QMainWindow):
 
         right_layout.addWidget(self.tab_widget)
         self.splitter.addWidget(right_widget)
-        self.setCentralWidget(self.splitter)
+        
+        # 将分割器添加到主容器
+        main_layout.addWidget(self.splitter)
+        
+        # 设置主容器为中心部件
+        self.setCentralWidget(main_container)
 
         # 加载固定标签页
         has_pinned = self.load_pinned_tabs()
@@ -2209,6 +2805,9 @@ class MainWindow(QMainWindow):
         
         # 启动单实例通信服务器
         self.start_instance_server()
+        
+        # 启动Explorer窗口监听
+        self.start_explorer_monitor()
 
     def handle_open_path_from_instance(self, path):
         """处理从其他实例接收到的路径（在主线程中）"""
@@ -2254,15 +2853,243 @@ class MainWindow(QMainWindow):
         server_thread_obj.start()
         # 等待服务器启动
         time.sleep(0.2)
+    
+    def start_explorer_monitor(self):
+        """启动Explorer窗口监听"""
+        # 检查配置是否启用
+        if not self.config.get("enable_explorer_monitor", True):
+            print("[Explorer Monitor] Monitoring disabled in config")
+            return
+        
+        if not HAS_PYWIN:
+            print("[Explorer Monitor] Windows API not available, monitoring disabled")
+            return
+        
+        print("[Explorer Monitor] Will start monitoring in 2 seconds...")
+        self.explorer_monitoring = False
+        self.known_explorer_windows = set()  # 记录已知的Explorer窗口
+        
+        # 延迟启动监听，确保主窗口完全初始化
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(2000, self._start_monitor_thread)
+    
+    def _start_monitor_thread(self):
+        """实际启动监听线程（延迟调用）"""
+        try:
+            self.monitor_our_window = int(self.winId())  # 记录我们自己的窗口句柄
+            self.explorer_monitoring = True
+            print("[Explorer Monitor] Starting Explorer window monitoring...")
+            
+            # 启动监听线程
+            monitor_thread = threading.Thread(target=self._explorer_monitor_loop, daemon=True)
+            monitor_thread.start()
+        except Exception as e:
+            print(f"[Explorer Monitor] Failed to start: {e}")
+    
+    def stop_explorer_monitor(self):
+        """停止Explorer窗口监听"""
+        self.explorer_monitoring = False
+        print("[Explorer Monitor] Stopped")
+    
+    def _explorer_monitor_loop(self):
+        """Explorer窗口监听循环（在后台线程运行）"""
+        try:
+            # 首先记录所有已存在的Explorer窗口
+            def enum_windows_callback(hwnd, _):
+                try:
+                    class_name = win32gui.GetClassName(hwnd)
+                    if class_name == "CabinetWClass":
+                        if win32gui.IsWindowVisible(hwnd):
+                            self.known_explorer_windows.add(hwnd)
+                except:
+                    pass
+                return True
+            
+            win32gui.EnumWindows(enum_windows_callback, None)
+            print(f"[Explorer Monitor] Found {len(self.known_explorer_windows)} existing Explorer windows")
+            
+            # 定期检查新的Explorer窗口
+            while self.explorer_monitoring:
+                time.sleep(0.5)  # 每500ms检查一次
+                
+                current_explorer_windows = set()
+                
+                def check_windows_callback(hwnd, _):
+                    try:
+                        class_name = win32gui.GetClassName(hwnd)
+                        if class_name == "CabinetWClass":
+                            if win32gui.IsWindowVisible(hwnd):
+                                current_explorer_windows.add(hwnd)
+                    except:
+                        pass
+                    return True
+                
+                win32gui.EnumWindows(check_windows_callback, None)
+                
+                # 找出新增的窗口
+                new_windows = current_explorer_windows - self.known_explorer_windows
+                
+                for hwnd in new_windows:
+                    # 检查是否是我们自己的窗口（避免误捕获嵌入的Explorer控件）
+                    try:
+                        # 获取窗口标题，避免捕获我们自己的主窗口
+                        title = win32gui.GetWindowText(hwnd)
+                        if "TabExplorer" in title or "TabEx" in title:
+                            print(f"[Explorer Monitor] Skipping our own window: {title}")
+                            continue
+                        
+                        # 获取窗口的父窗口，如果父窗口是我们的应用，则跳过
+                        try:
+                            parent = win32gui.GetParent(hwnd)
+                            if parent == self.monitor_our_window:
+                                print(f"[Explorer Monitor] Skipping child window")
+                                continue
+                        except:
+                            pass
+                        
+                        print(f"[Explorer Monitor] New Explorer window detected: {hwnd} - {title}")
+                        
+                        # 尝试获取Explorer窗口的当前路径
+                        path = self._get_explorer_path(hwnd)
+                        
+                        if path:
+                            print(f"[Explorer Monitor] ✓ Successfully got path: {path}")
+                            
+                            # 在主线程中打开新标签页
+                            print(f"[Explorer Monitor] Emitting signal to open new tab...")
+                            self.open_path_signal.emit(path)
+                            
+                            # 等待一小段时间让标签页创建
+                            time.sleep(0.5)
+                            
+                            # 关闭原Explorer窗口
+                            try:
+                                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                                print(f"[Explorer Monitor] ✓ Closed original Explorer window (hwnd={hwnd})")
+                            except Exception as e:
+                                print(f"[Explorer Monitor] ✗ Failed to close window: {e}")
+                        else:
+                            print(f"[Explorer Monitor] ✗ Could not get path from window {hwnd} - {title}")
+                    
+                    except Exception as e:
+                        print(f"[Explorer Monitor] Error processing window {hwnd}: {e}")
+                
+                # 更新已知窗口列表
+                self.known_explorer_windows = current_explorer_windows
+                
+        except Exception as e:
+            print(f"[Explorer Monitor] Monitor loop error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _get_explorer_path(self, hwnd):
+        """通过COM接口获取Explorer窗口的当前路径"""
+        try:
+            # 使用Shell.Application COM对象
+            import win32com.client
+            
+            # 多次尝试获取路径（有时窗口刚打开时COM对象还没准备好）
+            for attempt in range(3):
+                try:
+                    shell = win32com.client.Dispatch("Shell.Application")
+                    
+                    # 遍历所有打开的Explorer窗口
+                    for window in shell.Windows():
+                        try:
+                            # 获取窗口句柄
+                            window_hwnd = window.HWND
+                            
+                            if window_hwnd == hwnd:
+                                # 获取当前路径
+                                location = window.LocationURL
+                                
+                                print(f"[Explorer Monitor] LocationURL: {location}")
+                                
+                                if location:
+                                    # 转换file:///格式的URL为本地路径
+                                    if location.startswith('file:///'):
+                                        from urllib.parse import unquote
+                                        path = unquote(location[8:])  # 移除 'file:///'
+                                        # Windows路径处理
+                                        if path.startswith('/'):
+                                            path = path[1:]
+                                        path = path.replace('/', '\\')
+                                        return path
+                                    elif '::' in location:
+                                        # CLSID 格式的特殊路径（如"此电脑"）
+                                        # 例如：::{20D04FE0-3AEA-1069-A2D8-08002B30309D}
+                                        print(f"[Explorer Monitor] Special shell path detected: {location}")
+                                        
+                                        # 常见的 CLSID 映射
+                                        clsid_map = {
+                                            '{20D04FE0-3AEA-1069-A2D8-08002B30309D}': 'shell:MyComputerFolder',  # 此电脑
+                                            '{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}': 'shell:NetworkPlacesFolder',  # 网络
+                                            '{031E4825-7B94-4DC3-B131-E946B44C8DD5}': 'shell:Libraries',  # 库
+                                        }
+                                        
+                                        for clsid, shell_path in clsid_map.items():
+                                            if clsid in location:
+                                                return shell_path
+                                        
+                                        # 如果是未知的特殊路径，返回默认位置
+                                        print(f"[Explorer Monitor] Unknown CLSID, using default home path")
+                                        return QDir.homePath()
+                                    else:
+                                        # 其他格式的路径
+                                        return location
+                                else:
+                                    print(f"[Explorer Monitor] LocationURL is empty, trying alternative methods...")
+                                    
+                                    # 尝试获取 LocationName
+                                    try:
+                                        location_name = window.LocationName
+                                        print(f"[Explorer Monitor] LocationName: {location_name}")
+                                        
+                                        # 根据位置名称推断路径
+                                        if location_name in ['此电脑', 'This PC', 'My Computer']:
+                                            return 'shell:MyComputerFolder'
+                                        elif location_name in ['网络', 'Network']:
+                                            return 'shell:NetworkPlacesFolder'
+                                        elif location_name in ['回收站', 'Recycle Bin']:
+                                            return 'shell:RecycleBinFolder'
+                                    except:
+                                        pass
+                                    
+                                    # 如果都失败了，返回用户主目录
+                                    return QDir.homePath()
+                        except Exception as e:
+                            print(f"[Explorer Monitor] Error accessing window properties: {e}")
+                            continue
+                    
+                    # 如果第一次没找到，等待一下再试
+                    if attempt < 2:
+                        time.sleep(0.2)
+                        
+                except Exception as e:
+                    print(f"[Explorer Monitor] Attempt {attempt + 1} failed: {e}")
+                    if attempt < 2:
+                        time.sleep(0.2)
+            
+            return None
+            
+        except Exception as e:
+            print(f"[Explorer Monitor] Error getting path: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def closeEvent(self, event):
-        """窗口关闭时停止服务器"""
+        """窗口关闭时停止服务器和监听"""
         self.server_running = False
         if hasattr(self, 'server_socket'):
             try:
                 self.server_socket.close()
             except:
                 pass
+        
+        # 停止Explorer监听
+        self.stop_explorer_monitor()
+        
         super().closeEvent(event)
 
 
@@ -2351,58 +3178,71 @@ class MainWindow(QMainWindow):
                     action = menubar.addAction(f"📑 {name}")
                 url = child.get('url', '')
                 action.triggered.connect(lambda checked, u=url: self.open_bookmark_url(u))
-        # 添加“书签管理”按钮到菜单栏最右侧（兼容所有系统样式）
-        # 方案：添加一个空菜单右对齐，再添加“书签管理”action
-        menubar.addSeparator()
-        actions = menubar.actions()
-        if actions:
-            menubar.insertSeparator(actions[-1])
-        manage_action = QAction("书签管理", self)
-        manage_action.triggered.connect(self.show_bookmark_manager_dialog)
-        menubar.addAction(manage_action)
+        # 仅显示书签内容，不在菜单栏添加“设置”或“书签管理”入口
+    
+    def toggle_explorer_monitor(self, checked):
+        """切换Explorer监听功能"""
+        self.config["enable_explorer_monitor"] = checked
+        self.save_config()
+        
+        if checked:
+            print("[Settings] Enabling Explorer monitoring")
+            self.start_explorer_monitor()
+        else:
+            print("[Settings] Disabling Explorer monitoring")
+            self.stop_explorer_monitor()
+        
+        QMessageBox.information(
+            self, 
+            "设置已更新", 
+            f"Explorer窗口监听已{'启用' if checked else '禁用'}\n{'新打开的文件管理器窗口将自动嵌入到标签页中' if checked else '新打开的文件管理器窗口将独立显示'}"
+        )
 
     def show_bookmark_manager_dialog(self):
         dlg = BookmarkManagerDialog(self.bookmark_manager, self)
         dlg.exec_()
 
+class SettingsDialog(QDialog):
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.resize(500, 300)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+        
+        # 添加标题说明
+        from PyQt5.QtWidgets import QDialogButtonBox, QLabel
+        title_label = QLabel("应用设置")
+        title_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #333;")
+        layout.addWidget(title_label)
+        
+        # 添加分隔线
+        from PyQt5.QtWidgets import QFrame
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(line)
+        
+        # 选项区域
+        self.monitor_cb = QCheckBox("监听新Explorer窗口", self)
+        self.monitor_cb.setChecked(config.get("enable_explorer_monitor", True))
+        self.monitor_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        layout.addWidget(self.monitor_cb)
+        
+        # 添加弹性空间，将按钮推到底部
+        layout.addStretch(1)
+        
+        # 按钮区域
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
 # 书签管理对话框（初步框架，后续可扩展重命名/新建/删除等功能）
 from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton, QHBoxLayout, QInputDialog, QMessageBox
 class BookmarkManagerDialog(QDialog):
-    def __init__(self, bookmark_manager, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("书签管理")
-        self.resize(600, 500)
-        self.bookmark_manager = bookmark_manager
-        layout = QVBoxLayout(self)
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["名称", "类型", "路径"])
-        self.tree.setColumnWidth(0, 250)  # 第一列宽一些
-        layout.addWidget(self.tree)
-        self.populate_tree()
-
-        btn_layout = QHBoxLayout()
-        # self.rename_btn = QPushButton("重命名")  # 已移除重命名按钮
-        # self.rename_btn.clicked.connect(self.rename_item)
-        # btn_layout.addWidget(self.rename_btn)
-        self.edit_btn = QPushButton("编辑")
-        self.edit_btn.clicked.connect(self.edit_item)
-        btn_layout.addWidget(self.edit_btn)
-        self.delete_btn = QPushButton("删除")
-        self.delete_btn.clicked.connect(self.delete_item)
-        btn_layout.addWidget(self.delete_btn)
-        self.new_folder_btn = QPushButton("新建文件夹")
-        self.new_folder_btn.clicked.connect(self.create_folder)
-        btn_layout.addWidget(self.new_folder_btn)
-        self.up_btn = QPushButton("上移")
-        self.up_btn.clicked.connect(self.move_item_up)
-        btn_layout.addWidget(self.up_btn)
-        self.down_btn = QPushButton("下移")
-        self.down_btn.clicked.connect(self.move_item_down)
-        btn_layout.addWidget(self.down_btn)
-        close_btn = QPushButton("关闭")
-        close_btn.clicked.connect(self.accept)
-        btn_layout.addWidget(close_btn)
-        layout.addLayout(btn_layout)
 
     def move_item_up(self):
         item = self.tree.currentItem()
@@ -2516,6 +3356,7 @@ class BookmarkManagerDialog(QDialog):
     def __init__(self, bookmark_manager, parent=None):
         super().__init__(parent)
         self.setWindowTitle("书签管理")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.resize(600, 500)
         self.bookmark_manager = bookmark_manager
         layout = QVBoxLayout(self)
@@ -2771,6 +3612,36 @@ def main():
     # 启动新实例
     app = QApplication(sys.argv)
     app.setApplicationName("TabExplorer")
+    # 创建并设置应用图标（用于任务栏与窗口）
+    try:
+        from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QIcon
+        # 生成简单的蓝白主题图标，呼应应用配色
+        pix = QPixmap(256, 256)
+        pix.fill(Qt.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+        blue = QColor("#2196F3")
+        white = QColor("white")
+        # 外层蓝色圆角背景
+        painter.setBrush(blue)
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(0, 0, 256, 256, 40, 40)
+        # 内层白色圆角容器，形成蓝色边框效果
+        margin = 28
+        painter.setBrush(white)
+        painter.drawRoundedRect(margin, margin, 256 - 2*margin, 256 - 2*margin, 24, 24)
+        # 中央绘制 "TE" 字样（TabExplorer缩写）
+        painter.setPen(blue)
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(96)
+        painter.setFont(font)
+        painter.drawText(pix.rect(), Qt.AlignCenter, "TE")
+        painter.end()
+        icon = QIcon(pix)
+        app.setWindowIcon(icon)
+    except Exception as e:
+        print(f"[Icon] Failed to create app icon: {e}")
     window = MainWindow()
     
     # 如果有路径参数，在新窗口中打开
@@ -2784,3 +3655,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
