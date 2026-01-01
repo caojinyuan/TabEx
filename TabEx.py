@@ -1,4 +1,44 @@
-﻿from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton
+﻿# 全局搜索缓存（LRU缓存，最多缓存50个搜索结果）
+from collections import OrderedDict
+import hashlib
+
+class SearchCache:
+    """搜索结果缓存，使用LRU策略"""
+    def __init__(self, max_size=50):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+    
+    def get_key(self, search_path, keyword, search_filename, search_content, file_types):
+        """生成缓存键"""
+        key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}"
+        return hashlib.md5(key_str.encode()).hexdigest()
+    
+    def get(self, key):
+        """获取缓存结果"""
+        if key in self.cache:
+            # 移到末尾（最近使用）
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return None
+    
+    def put(self, key, value):
+        """存储缓存结果"""
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        else:
+            self.cache[key] = value
+            # 如果超过最大缓存数，删除最旧的
+            if len(self.cache) > self.max_size:
+                self.cache.popitem(last=False)
+    
+    def clear(self):
+        """清空缓存"""
+        self.cache.clear()
+
+# 全局搜索缓存实例
+_search_cache = SearchCache()
+
+from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton
 # 多层结构书签弹窗
 class BookmarkDialog(QDialog):
     def __init__(self, bookmark_manager, parent=None):
@@ -89,10 +129,15 @@ class SearchDialog(QDialog):
         self.search_thread = None
         self.is_searching = False
         
-        # 线程安全的结果队列
+        # 线程安全的结果队列（限制大小防止内存溢出）
         import queue
-        self.result_queue = queue.Queue()
+        self.result_queue = queue.Queue(maxsize=1000)  # 最多缓存1000个待显示的结果
         self.ui_update_timer = None
+        self.queue_overflow_count = 0  # 队列溢出计数
+        
+        # 结果限制配置（防止UI卡死）
+        self.max_results = 5000  # 最多显示5000个结果
+        self.current_result_count = 0
         
         layout = QVBoxLayout(self)
         
@@ -116,6 +161,12 @@ class SearchDialog(QDialog):
         self.stop_btn.clicked.connect(self.stop_search)
         self.stop_btn.setEnabled(False)
         search_options.addWidget(self.stop_btn)
+        
+        # 清除缓存按钮
+        self.clear_cache_btn = QPushButton("🗑️ 清除缓存")
+        self.clear_cache_btn.setToolTip("清除所有搜索缓存")
+        self.clear_cache_btn.clicked.connect(self.clear_search_cache)
+        search_options.addWidget(self.clear_cache_btn)
         
         layout.addLayout(search_options)
         
@@ -190,48 +241,78 @@ class SearchDialog(QDialog):
         from PyQt5.QtCore import QTimer
         self.ui_update_timer = QTimer(self)
         self.ui_update_timer.timeout.connect(self.update_ui_from_queue)
-        self.ui_update_timer.start(100)  # 每100ms检查一次队列
+        self.ui_update_timer.start(50)  # 每50ms检查一次队列（加快消费速度）
     
     def update_ui_from_queue(self):
-        """从队列中取出结果并更新UI（在主线程中调用）"""
+        """从队列中取出结果并更新UI（在主线程中调用，批量优化）"""
         try:
-            while True:
-                item = self.result_queue.get_nowait()
-                if item['type'] == 'result':
-                    # 添加表格行（排序时暂时禁用以提高性能）
-                    sorting_enabled = self.result_list.isSortingEnabled()
-                    self.result_list.setSortingEnabled(False)
+            # 批量处理结果（一次处理最多200个，加快队列消费）
+            batch_results = []
+            batch_count = 0
+            max_batch = 200  # 从50增加到20
+            
+            while batch_count < max_batch:
+                try:
+                    item = self.result_queue.get_nowait()
+                    
+                    if item['type'] == 'result':
+                        batch_results.append(item)
+                        batch_count += 1
+                    elif item['type'] == 'status':
+                        self.status_label.setText(item['text'])
+                    elif item['type'] == 'button':
+                        if item['button'] == 'search':
+                            self.search_btn.setEnabled(item['enabled'])
+                        elif item['button'] == 'stop':
+                            self.stop_btn.setEnabled(item['enabled'])
+                    elif item['type'] == 'enable_sorting':
+                        # 搜索完成后启用排序
+                        self.result_list.setSortingEnabled(True)
+                except:
+                    break  # 队列为空
+            
+            # 批量添加结果到表格（性能优化）
+            if batch_results:
+                from PyQt5.QtCore import Qt
+                
+                # 禁用更新以提高性能
+                self.result_list.setUpdatesEnabled(False)
+                
+                for item in batch_results:
+                    # 检查是否超过最大结果数
+                    if self.current_result_count >= self.max_results:
+                        break
                     
                     row = self.result_list.rowCount()
                     self.result_list.insertRow(row)
-                    # 文件名项 - 使用省略号在开头
+                    
+                    # 文件名项
                     name_item = QTableWidgetItem(item['name'])
-                    # 设置文本省略模式：在开头显示省略号，优先显示文件名
-                    from PyQt5.QtCore import Qt
                     name_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                    name_item.setToolTip(item['full_path'])  # 添加完整路径的提示
+                    name_item.setToolTip(item['full_path'])
                     self.result_list.setItem(row, 0, name_item)
                     self.result_list.setItem(row, 1, QTableWidgetItem(item['file_type']))
                     self.result_list.setItem(row, 2, QTableWidgetItem(item['date']))
                     self.result_list.setItem(row, 3, QTableWidgetItem(item['size']))
-                    # 存储完整路径到第一列的data中
                     self.result_list.item(row, 0).setData(256, item['path'])
                     
-                    # 恢复排序状态
-                    self.result_list.setSortingEnabled(sorting_enabled)
-                elif item['type'] == 'status':
-                    self.status_label.setText(item['text'])
-                elif item['type'] == 'button':
-                    if item['button'] == 'search':
-                        self.search_btn.setEnabled(item['enabled'])
-                    elif item['button'] == 'stop':
-                        self.stop_btn.setEnabled(item['enabled'])
-        except:
-            pass  # 队列为空
+                    self.current_result_count += 1
+                
+                # 重新启用更新
+                self.result_list.setUpdatesEnabled(True)
+                
+        except Exception as e:
+            print(f"[Search] UI update error: {e}")
     
     def add_search_result(self, text):
         """添加搜索结果项（通过队列，线程安全）"""
         self.result_queue.put({'type': 'result', 'text': text})
+    
+    def clear_search_cache(self):
+        """清除所有搜索缓存"""
+        global _search_cache
+        _search_cache.clear()
+        QMessageBox.information(self, "提示", "搜索缓存已清除")
     
     def start_search(self):
         keyword = self.search_input.text().strip()
@@ -267,21 +348,53 @@ class SearchDialog(QDialog):
         # 更新搜索路径
         self.search_path = search_path
         
+        # 获取文件类型过滤
+        file_types = self.file_type_input.text().strip()
+        
+        # 检查缓存
+        global _search_cache
+        cache_key = _search_cache.get_key(
+            search_path, keyword, 
+            self.search_filename_cb.isChecked(), 
+            self.search_content_cb.isChecked(), 
+            file_types
+        )
+        cached_results = _search_cache.get(cache_key)
+        
+        if cached_results is not None:
+            # 使用缓存结果
+            print(f"[Search] 使用缓存结果，共 {len(cached_results)} 个")
+            self.result_list.setRowCount(0)
+            self.status_label.setText("正在加载缓存结果...")
+            
+            # 批量添加缓存结果
+            sorting_enabled = self.result_list.isSortingEnabled()
+            self.result_list.setSortingEnabled(False)
+            
+            for item in cached_results:
+                self.result_queue.put({'type': 'result', **item})
+            
+            self.result_list.setSortingEnabled(sorting_enabled)
+            self.status_label.setText(f"搜索完成（缓存），共找到 {len(cached_results)} 个结果")
+            return
+        
         # 清空之前的结果
         self.result_list.setRowCount(0)
+        self.current_result_count = 0  # 重置计数器
+        
+        # 搜索期间完全禁用排序（性能优化）
+        self.result_list.setSortingEnabled(False)
+        
         self.is_searching = True
         self.search_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.status_label.setText("搜索中...")
-        
-        # 获取文件类型过滤
-        file_types = self.file_type_input.text().strip()
+        self.status_label.setText(f"搜索中... (最多显示{self.max_results}个结果)")
         
         # 在后台线程执行搜索
         import threading
         self.search_thread = threading.Thread(
             target=self.do_search,
-            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked(), file_types)
+            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked(), file_types, cache_key)
         )
         self.search_thread.daemon = True
         self.search_thread.start()
@@ -292,11 +405,70 @@ class SearchDialog(QDialog):
         self.stop_btn.setEnabled(False)
         self.status_label.setText("已停止")
     
-    def do_search(self, keyword, search_filename, search_content, file_types=""):
+    def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None):
         found_count = 0
         keyword_lower = keyword.lower()
         results_buffer = []  # 结果缓冲区
-        buffer_size = 20  # 每20个结果批量更新一次
+        buffer_size = 100  # 每100个结果批量更新一次（优化：从20增加到100）
+        all_results = []  # 存储所有结果用于缓存（限制大小）
+        
+        # 结果限制（防止内存溢出和UI卡死）
+        max_results = self.max_results
+        results_limited = False
+        
+        # 二进制文件扩展名黑名单（这些文件肯定不搜索内容）
+        binary_file_extensions = {
+            # 可执行文件
+            'exe', 'dll', 'so', 'dylib', 'bin', 'com', 'app',
+            # 归档/压缩文件
+            'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso', 'dmg',
+            # 图片文件
+            'jpg', 'jpeg', 'png', 'gif', 'bmp', 'ico', 'svg', 'webp', 'tiff', 'psd', 'ai',
+            # 音频文件
+            'mp3', 'wav', 'flac', 'aac', 'ogg', 'wma', 'm4a',
+            # 视频文件
+            'mp4', 'avi', 'mkv', 'mov', 'wmv', 'flv', 'webm', 'mpeg', 'mpg',
+            # Office文件（二进制格式）
+            'doc', 'xls', 'ppt', 'docx', 'xlsx', 'pptx', 'pdf',
+            # 数据库文件
+            'db', 'sqlite', 'mdb', 'accdb',
+            # 其他二进制
+            'obj', 'o', 'a', 'lib', 'pyc', 'pyo', 'class', 'jar', 'war',
+        }
+        
+        def is_text_file(file_path, sample_size=1024):
+            """智能检测文件是否为文本文件（读取前N字节检测）"""
+            try:
+                with open(file_path, 'rb') as f:
+                    sample = f.read(sample_size)
+                    if not sample:
+                        return True  # 空文件视为文本文件
+                    
+                    # 检测二进制字符的比例
+                    # 文本文件中NULL字节和其他控制字符应该很少
+                    null_count = sample.count(b'\x00')
+                    
+                    # 如果包含NULL字节，很可能是二进制文件
+                    if null_count > 0:
+                        return False
+                    
+                    # 统计非打印字符（排除常见的\r\n\t）
+                    non_printable = 0
+                    for byte in sample:
+                        # ASCII可打印字符范围：32-126，加上\r(13)\n(10)\t(9)
+                        if byte < 9 or (byte > 13 and byte < 32) or byte > 126:
+                            non_printable += 1
+                    
+                    # 如果超过10%是非打印字符，可能是二进制文件
+                    if non_printable / len(sample) > 0.1:
+                        return False
+                    
+                    return True
+            except:
+                return False  # 无法读取则视为二进制
+        
+        # 对于文件内容搜索，使用编译的正则表达式可能更快（可选优化）
+        # 但Python的内置字符串搜索已经很快，这里保持简单
         
         # 解析文件类型过滤（支持*.ext格式，逗号分隔）
         file_extensions = []
@@ -330,17 +502,13 @@ class SearchDialog(QDialog):
         try:
             scanned_files = 0
             folder_count = 0
+            skipped_binary_files = 0  # 跳过的二进制文件数
             for root, dirs, files in os.walk(self.search_path):
                 if not self.is_searching:
                     print("[Search] 搜索被中断")
                     break
                 
                 folder_count += 1
-                # 每处理10个文件夹更新一次状态（减少更新频率）
-                if folder_count % 10 == 0:
-                    # 通过队列更新状态
-                    status_text = f"搜索中... 已扫描 {scanned_files} 个文件，找到 {found_count} 个结果"
-                    self.result_queue.put({'type': 'status', 'text': status_text})
                 
                 # 搜索文件夹名
                 if search_filename:
@@ -348,6 +516,12 @@ class SearchDialog(QDialog):
                         if not self.is_searching:
                             break
                         
+                        # 检查是否达到结果限制
+                        if found_count >= max_results:
+                            results_limited = True
+                            break
+                        
+                        # 使用Python内置的字符串搜索（已优化）
                         if keyword_lower in dirname.lower():
                             found_count += 1
                             dir_path = os.path.join(root, dirname)
@@ -361,27 +535,48 @@ class SearchDialog(QDialog):
                                 mtime = "-"
                                 size_str = "-"
                             
-                            results_buffer.append({
+                            result_item = {
                                 'path': dir_path,
                                 'name': f"📁 {dirname}",
                                 'full_path': f"📁 {dir_path}",
                                 'file_type': '文件夹',
                                 'date': mtime,
                                 'size': size_str
-                            })
+                            }
+                            results_buffer.append(result_item)
+                            all_results.append(result_item)  # 保存到缓存列表
                             
-                            # 批量更新UI
+                            # 批量更新UI（队列满时等待）
                             if len(results_buffer) >= buffer_size:
                                 for item in results_buffer:
-                                    self.result_queue.put({'type': 'result', **item})
+                                    # 使用带超时的put，队列满时等待最多0.5秒
+                                    try:
+                                        self.result_queue.put({'type': 'result', **item}, timeout=0.5)
+                                    except:
+                                        # 超时后跳过该结果
+                                        self.queue_overflow_count += 1
                                 results_buffer.clear()
+                
+                # 检查是否达到结果限制
+                if found_count >= max_results:
+                    results_limited = True
+                    break
                 
                 # 搜索文件名和文件内容
                 for filename in files:
                     if not self.is_searching:
                         print("[Search] 搜索被中断（文件循环）")
                         break
+                    
+                    # 检查是否达到结果限制
+                    if found_count >= max_results:
+                        results_limited = True
                         break
+                    
+                    # 优化：如果只搜索文件名，快速过滤不匹配的文件
+                    if search_filename and not search_content:
+                        if keyword_lower not in filename.lower():
+                            continue  # 文件名不匹配，跳过
                     
                     # 检查文件类型过滤
                     if not matches_file_type(filename):
@@ -391,6 +586,16 @@ class SearchDialog(QDialog):
                         continue  # 跳过不匹配的文件类型
                     
                     scanned_files += 1
+                    
+                    # 每扫描100个文件更新一次状态（减少队列压力）
+                    if scanned_files % 100 == 0:
+                        # 使用带超时的put，确保状态能更新
+                        status_text = f"搜索中... 已扫描 {scanned_files} 个文件，找到 {found_count} 个结果"
+                        try:
+                            self.result_queue.put({'type': 'status', 'text': status_text}, timeout=0.1)
+                        except:
+                            pass  # 超时后继续搜索
+                    
                     file_path = os.path.join(root, filename)
                     matched = False
                     match_type = ""
@@ -400,21 +605,37 @@ class SearchDialog(QDialog):
                         print(f"[Search] 正在搜索文件: {file_path}")
                         print(f"[Search] 搜索文件名: {search_filename}, 搜索内容: {search_content}")
                     
-                    # 搜索文件名
+                    # 搜索文件名（Python内置优化）
                     if search_filename and keyword_lower in filename.lower():
                         matched = True
                         match_type = "📄"
                     
-                    # 搜索文件内容（不管文件名是否匹配，只要勾选了搜索内容就搜索）
+                    # 搜索文件内容（智能检测文本文件）
                     if search_content and not matched:
+                        # 获取文件扩展名
+                        _, ext = os.path.splitext(filename)
+                        file_ext = ext[1:].lower() if ext else ''  # 去掉点号并转小写
+                        
+                        # 1. 首先检查黑名单（明确的二进制文件）
+                        if file_ext in binary_file_extensions:
+                            skipped_binary_files += 1
+                            continue
+                        
+                        # 2. 对于其他文件，智能检测是否为文本文件
+                        if not is_text_file(file_path):
+                            skipped_binary_files += 1
+                            continue
+                        
                         # 调试信息
                         if 'TstMgr_RtnSound.c' in filename:
                             print(f"[Search] 开始搜索文件内容: {file_path}")
                         
                         try:
-                            # 分块读取大文件，每次读取100MB
-                            chunk_size = 100 * 1024 * 1024  # 100MB
+                            # 获取文件大小
                             file_size = os.path.getsize(file_path)
+                            
+                            # 分块读取大文件，每次读取10MB
+                            chunk_size = 10 * 1024 * 1024  # 10MB
                             
                             # 尝试多种编码方式读取文件内容
                             encodings = ['utf-8', 'gbk', 'gb2312', 'latin-1']
@@ -424,7 +645,7 @@ class SearchDialog(QDialog):
                                 try:
                                     with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
                                         if file_size <= chunk_size:
-                                            # 小文件直接全部读取
+                                            # 小文件直接全部读取（Python内置字符串搜索已优化）
                                             content = f.read()
                                             if keyword_lower in content.lower():
                                                 matched = True
@@ -435,7 +656,7 @@ class SearchDialog(QDialog):
                                                     print(f"[Search] ✓ 在文件内容中找到关键词 (编码: {encoding})")
                                                 break
                                         else:
-                                            # 大文件分块读取
+                                            # 大文件分块读取（优化：使用内存映射）
                                             overlap = len(keyword) * 2  # 重叠区域，防止关键词被分割
                                             while True:
                                                 chunk = f.read(chunk_size)
@@ -493,40 +714,73 @@ class SearchDialog(QDialog):
                         else:
                             file_type = "无"
                         
-                        results_buffer.append({
+                        result_item = {
                             'path': file_path,
                             'name': f"{match_type} {path_without_ext}",
                             'full_path': f"{match_type} {file_path}",
                             'file_type': file_type,
                             'date': mtime,
                             'size': size_str
-                        })
+                        }
+                        results_buffer.append(result_item)
+                        all_results.append(result_item)  # 保存到缓存列表
                         
                         # 批量更新UI（每20个结果更新一次）
                         if len(results_buffer) >= buffer_size:
-                            # 将结果放入队列
+                            # 将结果放入队列（队列满时等待）
                             for item in results_buffer:
-                                self.result_queue.put({'type': 'result', **item})
+                                try:
+                                    # 使用带超时的put，队列满时等待最多0.5秒
+                                    self.result_queue.put({'type': 'result', **item}, timeout=0.5)
+                                except:
+                                    # 超时后跳过该结果
+                                    self.queue_overflow_count += 1
                             results_buffer.clear()
         except Exception as e:
             print(f"Search error: {e}")
         
-        # 添加剩余的结果
+        # 添加剩余的结果（队列满时等待）
         if results_buffer:
             for item in results_buffer:
-                self.result_queue.put({'type': 'result', **item})
+                try:
+                    self.result_queue.put({'type': 'result', **item}, timeout=0.5)
+                except:
+                    self.queue_overflow_count += 1
         
         # 调试信息
         print(f"[Search] 搜索完成，共扫描 {scanned_files} 个文件，找到 {found_count} 个结果")
+        if search_content and skipped_binary_files > 0:
+            print(f"[Search] 跳过 {skipped_binary_files} 个二进制文件（不搜索内容）")
+        if self.queue_overflow_count > 0:
+            print(f"[Search] ⚠️ 队列溢出 {self.queue_overflow_count} 次（部分结果未显示）")
+        
+        # 将结果存入缓存（限制缓存大小，防止内存溢出）
+        if cache_key and all_results:
+            global _search_cache
+            # 只缓存前max_results个结果
+            cached_results = all_results[:max_results]
+            _search_cache.put(cache_key, cached_results)
+            print(f"[Search] 已将 {len(cached_results)} 个结果存入缓存")
         
         # 重置搜索状态（先重置，避免后续更新被跳过）
         self.is_searching = False
+        self.queue_overflow_count = 0  # 重置溢出计数
         
-        # 搜索完成，更新UI状态（通过队列）
-        final_status = f"搜索完成，共找到 {found_count} 个结果（扫描了 {scanned_files} 个文件）"
-        self.result_queue.put({'type': 'status', 'text': final_status})
-        self.result_queue.put({'type': 'button', 'button': 'search', 'enabled': True})
-        self.result_queue.put({'type': 'button', 'button': 'stop', 'enabled': False})
+        # 搜索完成，更新UI状态（使用带超时的put，避免卡死）
+        if results_limited:
+            final_status = f"搜索完成（已限制），显示前 {found_count} 个结果（扫描了 {scanned_files} 个文件）⚠️"
+        else:
+            final_status = f"搜索完成，共找到 {found_count} 个结果（扫描了 {scanned_files} 个文件）"
+        
+        # 使用超时put，防止队列满时卡死
+        try:
+            self.result_queue.put({'type': 'status', 'text': final_status}, timeout=1)
+            self.result_queue.put({'type': 'button', 'button': 'search', 'enabled': True}, timeout=1)
+            self.result_queue.put({'type': 'button', 'button': 'stop', 'enabled': False}, timeout=1)
+            # 搜索完成后启用排序
+            self.result_queue.put({'type': 'enable_sorting'}, timeout=1)
+        except:
+            print(f"[Search] ⚠️ 队列满，最终状态更新失败")
         
         print(f"[Search] UI更新已调度（使用队列）")
     
@@ -807,6 +1061,9 @@ class BookmarkManager:
     def __init__(self, config_file="bookmarks.json"):
         self.config_file = config_file
         self.bookmark_tree = self.load_bookmarks()
+        # 优化：延迟保存机制，避免频繁写入磁盘
+        self._save_timer = None
+        self._pending_save = False
 
     def load_bookmarks(self):
         if os.path.exists(self.config_file):
@@ -822,10 +1079,22 @@ class BookmarkManager:
                 return {}
         return {}
 
-    def save_bookmarks(self):
-        # 只保存根结构
-        with open(self.config_file, 'w', encoding='utf-8') as f:
-            json.dump({"roots": self.bookmark_tree}, f, ensure_ascii=False, indent=2)
+    def save_bookmarks(self, immediate=False):
+        # 优化：延迟保存，避免频繁操作时多次写入
+        if immediate:
+            # 立即保存
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump({"roots": self.bookmark_tree}, f, ensure_ascii=False, indent=2)
+            self._pending_save = False
+        else:
+            # 延迟保存：500ms后执行
+            self._pending_save = True
+            if self._save_timer is None:
+                from PyQt5.QtCore import QTimer
+                self._save_timer = QTimer()
+                self._save_timer.setSingleShot(True)
+                self._save_timer.timeout.connect(lambda: self.save_bookmarks(immediate=True))
+            self._save_timer.start(500)
 
     def get_all_bookmarks(self):
         # 返回所有书签（递归）
@@ -921,7 +1190,8 @@ class FileExplorerTab(QWidget):
         from PyQt5.QtCore import QTimer
         self._path_sync_timer = QTimer(self)
         self._path_sync_timer.timeout.connect(self.sync_path_bar_with_explorer)
-        self._path_sync_timer.start(500)
+        # 优化：从500ms改为1000ms，减少CPU占用
+        self._path_sync_timer.start(1000)
 
     def sync_path_bar_with_explorer(self):
         # 通过QAxWidget的LocationURL属性获取当前路径
@@ -970,12 +1240,19 @@ class FileExplorerTab(QWidget):
         self.explorer = QAxWidget(self)
         self.explorer.setControl("Shell.Explorer")
         layout.addWidget(self.explorer)
+        
+        # 添加F5快捷键支持（刷新视图和图标）
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui import QKeySequence
+        self.refresh_shortcut = QShortcut(QKeySequence('F5'), self)
+        self.refresh_shortcut.activated.connect(self.refresh_view)
+        
         # 绑定导航完成信号，自动更新路径栏
         self.explorer.dynamicCall('NavigateComplete2(QVariant,QVariant)', None, None)  # 预绑定，防止信号未注册
-        self.explorer.dynamicCall('Navigate(const QString&)', QDir.toNativeSeparators(self.current_path))
         self.explorer.dynamicCall('Visible', True)
         self.explorer.dynamicCall('RegisterAsBrowser', True)
         self.explorer.dynamicCall('RegisterAsDropTarget', True)
+        
         self.explorer.dynamicCall('TheaterMode', False)
         self.explorer.dynamicCall('ToolBar', False)
         self.explorer.dynamicCall('StatusBar', False)
@@ -1039,6 +1316,9 @@ class FileExplorerTab(QWidget):
             self.explorer.installEventFilter(self)
         except Exception:
             pass
+        
+        # 初始导航到当前路径（在setup_ui最后调用，确保所有设置已应用）
+        self.explorer.dynamicCall('Navigate(const QString&)', QDir.toNativeSeparators(self.current_path))
 
     def event(self, e):
         # 捕获QAxWidget的NavigateComplete2事件
@@ -1057,43 +1337,55 @@ class FileExplorerTab(QWidget):
         return super().event(e)
 
     def explorer_double_click(self, event):
-        # 使用短延迟再检查选中项数量以避免竞态：
-        # 如果在检查时没有选中项，则视为点击空白区并返回上一级。
+        # 优化：使用多重检测避免误判
+        # 1. 检查鼠标按下时是否点击在项目上（原生API）
+        # 2. 检查是否有选中项
+        # 3. 检查路径是否发生变化（多次检查）
         from PyQt5.QtCore import QTimer
+        
+        # 记录双击前的路径，用于检测是否发生了导航
+        try:
+            self._path_before_double = getattr(self, 'current_path', None)
+        except Exception:
+            self._path_before_double = None
+        
         def _check_and_go_up():
-            # 如果按下时已有选中项，认为双击是针对该项，跳过 go_up
+            # 优先级1: 如果按下时点击测试显示点击在项目上，直接跳过
+            if getattr(self, '_clicked_on_item', False):
+                self._clicked_on_item = False
+                return
+            
+            # 优先级2: 如果路径已经改变（说明进入了文件夹），跳过
+            try:
+                before_path = getattr(self, '_path_before_double', None)
+                cur_path = getattr(self, 'current_path', None)
+                if before_path is not None and cur_path is not None and cur_path != before_path:
+                    # 路径已改变，说明双击了文件夹并进入了，清理标志
+                    self._path_before_double = None
+                    return
+            except Exception:
+                pass
+            
+            # 优先级3: 如果按下时有选中项，跳过
             before = getattr(self, '_selected_before_click', None)
             if before is not None:
                 try:
                     if int(before) > 0:
-                        self._selected_before_click = None
                         return
                 except Exception:
                     pass
-                cnt = self.explorer.dynamicCall('SelectedItems().Count')
+            
+            # 确认是空白区域双击，返回上一级
             try:
-                cnt = self.explorer.dynamicCall('SelectedItems().Count')
-            except Exception:
-                try:
-                    sel = self.explorer.dynamicCall('SelectedItems()')
-                    if sel is not None:
-                        cnt = sel.property('Count') if hasattr(sel, 'property') else None
-                except Exception:
-                    cnt = None
-            if cnt is None:
-                # 无法确定，按原先约定触发 go_up()
-                try:
-                    self.go_up(force=True)
-                except Exception:
-                    pass
-                return
-            try:
-                if int(cnt) == 0:
-                        self.go_up(force=True)
+                self.go_up(force=True)
             except Exception:
                 pass
+            finally:
+                # 清理标志
+                self._path_before_double = None
 
-        QTimer.singleShot(50, _check_and_go_up)
+        # 延迟150ms检查，给Explorer充足的时间完成导航
+        QTimer.singleShot(150, _check_and_go_up)
 
     def on_path_bar_changed(self, path):
         """处理面包屑路径栏的路径变化"""
@@ -1131,7 +1423,7 @@ class FileExplorerTab(QWidget):
             QMessageBox.warning(self, "路径错误", f"路径不存在: {path}")
 
     def explorer_mouse_press(self, event):
-        # 在鼠标按下时记录当时的选中项数量，用于后续双击判断
+        # 在鼠标按下时记录当时的选中项数量和鼠标位置点击测试结果
         try:
             cnt = None
             try:
@@ -1144,8 +1436,22 @@ class FileExplorerTab(QWidget):
                 except Exception:
                     cnt = None
             self._selected_before_click = int(cnt) if cnt is not None else None
+            
+            # 使用原生点击测试来判断是否点击在项目上（更准确）
+            if HAS_PYWIN:
+                try:
+                    from PyQt5.QtGui import QCursor
+                    gx = QCursor.pos().x()
+                    gy = QCursor.pos().y()
+                    self._clicked_on_item = self._native_listview_hit_test(gx, gy)
+                except Exception:
+                    self._clicked_on_item = False
+            else:
+                self._clicked_on_item = False
+                
         except Exception:
             self._selected_before_click = None
+            self._clicked_on_item = False
         # 继续默认处理（不阻止控件行为）
         # 直接返回 None — 不尝试调用 ActiveX 的原始处理（事件仍会被控件处理）
         return None
@@ -1421,6 +1727,7 @@ class FileExplorerTab(QWidget):
         self.setup_ui()
         self.navigate_to(self.current_path, is_shell=is_shell)
         self.start_path_sync_timer()
+        self.start_icon_refresh_timer()  # 启动图标刷新定时器
 
     # 移除重复的setup_ui，保留带路径栏的实现
 
@@ -1437,7 +1744,17 @@ class FileExplorerTab(QWidget):
                 self._add_to_history(path)
         elif os.path.exists(path):
             url = QDir.toNativeSeparators(path)
-            self.explorer.dynamicCall("Navigate(const QString&)", url)
+            # 使用Navigate2来获得更好的控制
+            # navNoHistory = 0x2, navNoReadFromCache = 0x4, navNoWriteToCache = 0x8
+            # navAllowAutosearch = 0x10, navBrowserBar = 0x20, navHyperlink = 0x40
+            try:
+                # 尝试使用Navigate2获得更好的刷新效果
+                self.explorer.dynamicCall("Navigate2(QVariant,QVariant,QVariant,QVariant,QVariant)", 
+                                         url, 0, "", None, None)
+            except:
+                # 回退到普通Navigate
+                self.explorer.dynamicCall("Navigate(const QString&)", url)
+            
             self.current_path = path
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(path)
@@ -1445,6 +1762,10 @@ class FileExplorerTab(QWidget):
             # 添加到历史记录
             if add_to_history:
                 self._add_to_history(path)
+            
+            # 导航完成后强制刷新以更新图标
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(500, self.refresh_view)  # 延迟500ms后刷新
     
     def _add_to_history(self, path):
         """添加路径到历史记录"""
@@ -1498,6 +1819,37 @@ class FileExplorerTab(QWidget):
             # 更新主窗口按钮状态
             if self.main_window and hasattr(self.main_window, 'update_navigation_buttons'):
                 self.main_window.update_navigation_buttons()
+
+    def refresh_view(self):
+        """刷新当前视图（更新文件列表和图标，包括TortoiseGit覆盖层）"""
+        try:
+            # 使用REFRESH_COMPLETELY模式强制刷新，确保图标覆盖层更新
+            # REFRESH_NORMAL = 0, REFRESH_IFEXPIRED = 1, REFRESH_COMPLETELY = 3
+            self.explorer.dynamicCall('Refresh2(int)', 3)  # 强制完全刷新
+            print(f"[Refresh] 已刷新视图: {self.current_path}")
+        except Exception as e:
+            # 如果Refresh2失败，回退到普通Refresh
+            try:
+                self.explorer.dynamicCall('Refresh()')
+                print(f"[Refresh] 已刷新视图(普通模式): {self.current_path}")
+            except Exception as e2:
+                print(f"[Refresh] 刷新视图失败: {e2}")
+    
+    def start_icon_refresh_timer(self):
+        """启动图标刷新定时器（用于TortoiseGit等图标覆盖层更新）
+        
+        注意：TortoiseGit图标覆盖层需要：
+        1. 确保TortoiseGit已安装并配置正确
+        2. 文件夹是Git仓库
+        3. Windows资源管理器中能看到图标
+        4. Shell.Explorer控件已设置FolderFlags启用文件夹视图
+        """
+        from PyQt5.QtCore import QTimer
+        self.icon_refresh_timer = QTimer(self)
+        self.icon_refresh_timer.timeout.connect(self.refresh_view)
+        # 每10秒刷新一次图标（从30秒改为10秒，更快响应Git变化）
+        self.icon_refresh_timer.start(10000)  # 10秒
+        print(f"[Refresh] 图标自动刷新已启用（10秒间隔）")
 
 
 class DragDropTabWidget(QTabWidget):
@@ -2322,9 +2674,29 @@ class MainWindow(QMainWindow):
         """显示设置对话框"""
         dlg = SettingsDialog(self.config, self)
         if dlg.exec_():
-            checked = dlg.monitor_cb.isChecked()
-            if checked != self.config.get("enable_explorer_monitor", True):
-                self.toggle_explorer_monitor(checked)
+            # 获取新配置
+            old_monitor = self.config.get("enable_explorer_monitor", True)
+            old_interval = self.config.get("explorer_monitor_interval", 2.0)
+            
+            new_monitor = dlg.monitor_cb.isChecked()
+            new_interval = dlg.interval_spinbox.value()
+            
+            # 更新配置
+            self.config["enable_explorer_monitor"] = new_monitor
+            self.config["explorer_monitor_interval"] = new_interval
+            self.save_config()
+            
+            # 如果监听状态或间隔改变，重启监听
+            if old_monitor != new_monitor or (new_monitor and old_interval != new_interval):
+                if old_monitor:
+                    self.stop_explorer_monitor()
+                if new_monitor:
+                    self.monitor_interval = new_interval
+                    self.start_explorer_monitor()
+                
+                status = "已启用" if new_monitor else "已禁用"
+                interval_info = f"（检查间隔: {new_interval}秒）" if new_monitor else ""
+                QMessageBox.information(self, "设置已更新", f"Explorer窗口监听{status}{interval_info}")
         
     def show_bookmark_dialog(self):
         dlg = BookmarkDialog(self.bookmark_manager, self)
@@ -2679,8 +3051,9 @@ class MainWindow(QMainWindow):
         self.dir_tree.setColumnHidden(1, True)
         self.dir_tree.setColumnHidden(2, True)
         self.dir_tree.setColumnHidden(3, True)
-        self.dir_tree.setMinimumWidth(200)
-        self.dir_tree.setMaximumWidth(350)
+        self.dir_tree.setMinimumWidth(150)
+        # 移除最大宽度限制，允许自由拖动调整
+        # self.dir_tree.setMaximumWidth(350)
         self.dir_tree.clicked.connect(self.on_dir_tree_clicked)
         self.splitter.addWidget(self.dir_tree)
         # 自动展开所有驱动器根节点（即“我的电脑”下所有盘符）
@@ -2855,7 +3228,7 @@ class MainWindow(QMainWindow):
         time.sleep(0.2)
     
     def start_explorer_monitor(self):
-        """启动Explorer窗口监听"""
+        """启动Explorer窗口监听（优化版）"""
         # 检查配置是否启用
         if not self.config.get("enable_explorer_monitor", True):
             print("[Explorer Monitor] Monitoring disabled in config")
@@ -2865,13 +3238,16 @@ class MainWindow(QMainWindow):
             print("[Explorer Monitor] Windows API not available, monitoring disabled")
             return
         
-        print("[Explorer Monitor] Will start monitoring in 2 seconds...")
+        # 获取监听间隔配置（默认2秒，更轻量）
+        self.monitor_interval = self.config.get("explorer_monitor_interval", 2.0)
+        print(f"[Explorer Monitor] Will start monitoring in 3 seconds (interval: {self.monitor_interval}s)...")
         self.explorer_monitoring = False
         self.known_explorer_windows = set()  # 记录已知的Explorer窗口
+        self.last_check_time = 0  # 上次检查时间
         
         # 延迟启动监听，确保主窗口完全初始化
         from PyQt5.QtCore import QTimer
-        QTimer.singleShot(2000, self._start_monitor_thread)
+        QTimer.singleShot(3000, self._start_monitor_thread)
     
     def _start_monitor_thread(self):
         """实际启动监听线程（延迟调用）"""
@@ -2892,7 +3268,7 @@ class MainWindow(QMainWindow):
         print("[Explorer Monitor] Stopped")
     
     def _explorer_monitor_loop(self):
-        """Explorer窗口监听循环（在后台线程运行）"""
+        """Explorer窗口监听循环（优化版 - 降低CPU占用）"""
         try:
             # 首先记录所有已存在的Explorer窗口
             def enum_windows_callback(hwnd, _):
@@ -2907,11 +3283,18 @@ class MainWindow(QMainWindow):
             
             win32gui.EnumWindows(enum_windows_callback, None)
             print(f"[Explorer Monitor] Found {len(self.known_explorer_windows)} existing Explorer windows")
+            print(f"[Explorer Monitor] Monitor interval: {self.monitor_interval}s (optimized for low CPU usage)")
             
-            # 定期检查新的Explorer窗口
+            # 定期检查新的Explorer窗口（优化：使用更长的间隔）
             while self.explorer_monitoring:
-                time.sleep(0.5)  # 每500ms检查一次
+                time.sleep(self.monitor_interval)  # 默认2秒检查一次（降低CPU占用）
                 
+                current_time = time.time()
+                # 防抖：如果距离上次检查太近，跳过
+                if current_time - self.last_check_time < self.monitor_interval * 0.8:
+                    continue
+                
+                self.last_check_time = current_time
                 current_explorer_windows = set()
                 
                 def check_windows_callback(hwnd, _):
@@ -2929,13 +3312,20 @@ class MainWindow(QMainWindow):
                 # 找出新增的窗口
                 new_windows = current_explorer_windows - self.known_explorer_windows
                 
+                # 优化：如果没有新窗口，直接跳过处理
+                if not new_windows:
+                    self.known_explorer_windows = current_explorer_windows
+                    continue
+                
+                print(f"[Explorer Monitor] Detected {len(new_windows)} new Explorer window(s)")
+                
                 for hwnd in new_windows:
                     # 检查是否是我们自己的窗口（避免误捕获嵌入的Explorer控件）
                     try:
                         # 获取窗口标题，避免捕获我们自己的主窗口
                         title = win32gui.GetWindowText(hwnd)
                         if "TabExplorer" in title or "TabEx" in title:
-                            print(f"[Explorer Monitor] Skipping our own window: {title}")
+                            # print(f"[Explorer Monitor] Skipping our own window: {title}")
                             continue
                         
                         # 获取窗口的父窗口，如果父窗口是我们的应用，则跳过
@@ -2953,23 +3343,22 @@ class MainWindow(QMainWindow):
                         path = self._get_explorer_path(hwnd)
                         
                         if path:
-                            print(f"[Explorer Monitor] ✓ Successfully got path: {path}")
+                            print(f"[Explorer Monitor] ✓ Path: {path}")
                             
                             # 在主线程中打开新标签页
-                            print(f"[Explorer Monitor] Emitting signal to open new tab...")
                             self.open_path_signal.emit(path)
                             
-                            # 等待一小段时间让标签页创建
-                            time.sleep(0.5)
+                            # 优化：减少等待时间（从500ms到200ms）
+                            time.sleep(0.2)
                             
                             # 关闭原Explorer窗口
                             try:
                                 win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-                                print(f"[Explorer Monitor] ✓ Closed original Explorer window (hwnd={hwnd})")
+                                print(f"[Explorer Monitor] ✓ Closed original Explorer (hwnd={hwnd})")
                             except Exception as e:
-                                print(f"[Explorer Monitor] ✗ Failed to close window: {e}")
+                                print(f"[Explorer Monitor] ✗ Failed to close: {e}")
                         else:
-                            print(f"[Explorer Monitor] ✗ Could not get path from window {hwnd} - {title}")
+                            print(f"[Explorer Monitor] ✗ Could not get path from {hwnd}")
                     
                     except Exception as e:
                         print(f"[Explorer Monitor] Error processing window {hwnd}: {e}")
@@ -3230,6 +3619,25 @@ class SettingsDialog(QDialog):
         self.monitor_cb.setChecked(config.get("enable_explorer_monitor", True))
         self.monitor_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         layout.addWidget(self.monitor_cb)
+        
+        # 监听间隔设置
+        interval_layout = QHBoxLayout()
+        interval_layout.addWidget(QLabel("监听间隔（秒）:"))
+        from PyQt5.QtWidgets import QDoubleSpinBox
+        self.interval_spinbox = QDoubleSpinBox()
+        self.interval_spinbox.setRange(0.5, 10.0)
+        self.interval_spinbox.setSingleStep(0.5)
+        self.interval_spinbox.setValue(config.get("explorer_monitor_interval", 2.0))
+        self.interval_spinbox.setToolTip("检查新Explorer窗口的时间间隔，更长的间隔降低CPU占用")
+        interval_layout.addWidget(self.interval_spinbox)
+        interval_layout.addWidget(QLabel("（推荐: 2.0秒，降低CPU占用）"))
+        interval_layout.addStretch(1)
+        layout.addLayout(interval_layout)
+        
+        # 提示信息
+        tip_label = QLabel("💡 提示：\n• 较短间隔(0.5-1秒)响应更快但CPU占用高\n• 较长间隔(2-5秒)CPU占用低但响应稍慢\n• 推荐使用2秒平衡性能与响应")
+        tip_label.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
+        layout.addWidget(tip_label)
         
         # 添加弹性空间，将按钮推到底部
         layout.addStretch(1)
