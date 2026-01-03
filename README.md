@@ -24,7 +24,7 @@ Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 ✅ **单实例模式**（右键菜单打开文件夹时在已有窗口中打开新标签页，避免启动多个进程）
 ✅ **强大的搜索功能**（支持文件名、文件内容、文件夹名搜索，智能二进制文件过滤，LRU缓存优化）
 ✅ **🆕 自动监听新Explorer窗口**（类似Clover，新打开的Windows资源管理器窗口会自动嵌入到TabExplorer的标签页中）
-✅ **🆕 智能性能优化**（搜索缓存、批量UI更新、自动图标刷新）
+✅ **🆕 智能性能优化**（搜索缓存、批量UI更新、智能双击处理）
 
 ---
 
@@ -48,11 +48,9 @@ Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 - **状态实时更新**：每100个文件更新一次进度，搜索过程可视化
 
 ### 性能与稳定性优化
-- **Explorer监听优化**：监听频率从500ms降至2000ms，可在设置中自定义
-- **自动图标刷新**：每10秒自动刷新文件浏览器图标（TortoiseGit等覆盖层）
-- **F5快捷键刷新**：手动刷新当前视图，立即更新Git状态图标
-- **导航优化**：使用Navigate2和强制刷新，确保图标正确显示
-- **双击文件夹修复**：添加150ms延迟，解决双击进入文件夹又返回的问题
+- **Explorer监听优化**：监听频率从500ms降至2000ms，可在设置中自定义，支持多种窗口类型（CabinetWClass、ExploreWClass）
+- **智能双击处理**：使用双击ID机制和多重检查，准确区分文件夹双击和空白双击，防止误操作
+- **导航优化**：使用Navigate2确保平滑导航
 - **路径同步优化**：从500ms改为1000ms，减少资源占用
 - **延迟保存书签**：避免频繁I/O操作
 
@@ -88,8 +86,9 @@ Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 - 也可以通过菜单栏的设置选项动态启用/禁用
 
 **工作原理**：
-- 后台监听线程定期检测新打开的Explorer窗口（CabinetWClass类）
+- 后台监听线程定期检测新打开的Explorer窗口（支持CabinetWClass和ExploreWClass窗口类）
 - 通过COM接口获取新窗口的当前路径
+- 智能识别窗口类型，避免误捕获软件自身窗口
 - 在TabExplorer中创建新标签页并导航到该路径
 - 自动关闭原Explorer窗口，实现无缝体验
 
@@ -113,46 +112,11 @@ Add Chrome-like tab functionality to explorer, replacing Clover and ExTab.
 1. 搜索大量文件时，建议使用文件类型过滤
 2. 只搜索文件名比搜索内容快得多
 3. 搜索结果会被缓存，重复搜索秒开
-4. 按F5可以清空缓存重新搜索
-
-### 文件浏览器图标刷新
-
-**功能说明**：
-自动刷新文件浏览器中的图标覆盖层（如TortoiseGit状态图标）
-
-**刷新机制**：
-- **自动刷新**：每10秒自动刷新一次
-- **手动刷新**：按F5键立即刷新
-- **导航刷新**：切换文件夹时自动刷新
-- **强制刷新**：使用Refresh2完全刷新模式
-
-**注意事项**：
-- 左侧目录树会实时显示Git状态图标
-- 右侧文件浏览器由于Shell.Explorer限制，图标刷新可能不如左侧实时
-- 建议在Git操作后按F5手动刷新
-**如何使用**：
-1. 启动TabExplorer
-2. 在菜单栏点击 `⚙️ 设置` → 确保 `监听新Explorer窗口` 选项已勾选（默认启用）
-3. 打开任意新的Windows资源管理器窗口（比如通过Win+E快捷键，或双击文件夹）
-4. 新打开的资源管理器窗口会被自动关闭，并在TabExplorer中打开一个新的标签页指向该路径
-
-**配置选项**：
-- 可以在 `config.json` 中设置 `"enable_explorer_monitor": false` 来禁用此功能
-- 也可以通过菜单栏的设置选项动态启用/禁用
-
-**工作原理**：
-- 后台监听线程定期检测新打开的Explorer窗口（CabinetWClass类）
-- 通过COM接口获取新窗口的当前路径
-- 在TabExplorer中创建新标签页并导航到该路径
-- 自动关闭原Explorer窗口，实现无缝体验
-
-**使用提示**：
-1. 功能在启动后2秒自动开启（确保窗口完全初始化）
-2. 可以通过控制台查看详细的监听日志
-3. 如遇问题，可在设置中临时禁用再重新启用
+4. 缓存会在应用重启时自动清空
 
 我本地环境：
 python 3.9.6
+
 
 
 

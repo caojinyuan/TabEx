@@ -1241,12 +1241,6 @@ class FileExplorerTab(QWidget):
         self.explorer.setControl("Shell.Explorer")
         layout.addWidget(self.explorer)
         
-        # 添加F5快捷键支持（刷新视图和图标）
-        from PyQt5.QtWidgets import QShortcut
-        from PyQt5.QtGui import QKeySequence
-        self.refresh_shortcut = QShortcut(QKeySequence('F5'), self)
-        self.refresh_shortcut.activated.connect(self.refresh_view)
-        
         # 绑定导航完成信号，自动更新路径栏
         self.explorer.dynamicCall('NavigateComplete2(QVariant,QVariant)', None, None)  # 预绑定，防止信号未注册
         self.explorer.dynamicCall('Visible', True)
@@ -1547,92 +1541,60 @@ class FileExplorerTab(QWidget):
                     except Exception:
                         self._selected_before_click = None
                 elif event.type() == QEvent.MouseButtonDblClick:
+                    # 取消所有之前待处理的双击检查，避免多次操作时的累积效应
+                    try:
+                        for timer in getattr(self, '_pending_double_click_timers', []):
+                            try:
+                                timer.stop()
+                            except Exception:
+                                pass
+                        self._pending_double_click_timers = []
+                    except Exception:
+                        self._pending_double_click_timers = []
+                    
+                    # 为这次双击生成唯一ID
+                    self._double_click_id = getattr(self, '_double_click_id', 0) + 1
+                    current_click_id = self._double_click_id
+                    
                     # 延迟检查，避免与控件自身处理产生竞态
                     # 记录双击发生前的路径，以便判断双击是否触发了导航
-                    try:
-                        self._path_before_double = getattr(self, 'current_path', None)
-                    except Exception:
-                        self._path_before_double = None
-
-                    def _check_and_go_up():
-                        # 如果双击期间发生了导航（进入文件夹或打开文件），则跳过 go_up
-                        try:
-                            before_path = getattr(self, '_path_before_double', None)
-                            cur_path = getattr(self, 'current_path', None)
-                            if before_path is not None and cur_path is not None and cur_path != before_path:
-                                # 导航已发生，跳过上一级
-                                self._path_before_double = None
-                                return
-                        except Exception:
-                            pass
-                        # 继续原有判断
-                        # 如果按下时已有选中项，则认为是对项的双击
-                        before = getattr(self, '_selected_before_click', None)
-                        if before is not None:
-                            try:
-                                if int(before) > 0:
-                                    self._selected_before_click = None
-                                    return
-                            except Exception:
-                                pass
-                        # 原生 HitTest：如果命中某个项，则认为双击是针对项的，跳过 go_up
-                        if HAS_PYWIN:
-                            try:
-                                from PyQt5.QtGui import QCursor
-                                gx = QCursor.pos().x()
-                                gy = QCursor.pos().y()
-                                if self._native_listview_hit_test(gx, gy):
-                                    self._selected_before_click = None
-                                    return
-                            except Exception:
-                                pass
-                        # 尝试读取当前选中项数量
-                        cnt = None
-                        try:
-                            cnt = self.explorer.dynamicCall('SelectedItems().Count')
-                        except Exception:
-                            try:
-                                sel = self.explorer.dynamicCall('SelectedItems()')
-                                if sel is not None:
-                                    cnt = sel.property('Count') if hasattr(sel, 'property') else None
-                            except Exception:
-                                cnt = None
-                        # 如果无法确定选中项，或选中为0，则视为空白双击
-                        if cnt is None:
-                            try:
-                                self.go_up(force=True)
-                            except Exception:
-                                pass
-                            return
-                        try:
-                            if int(cnt) == 0:
-                                self.go_up(force=True)
-                        except Exception:
-                            pass
-                        finally:
-                            self._selected_before_click = None
+                    path_before = getattr(self, 'current_path', None)
+                    selected_before = getattr(self, '_selected_before_click', None)
+                    
+                    print(f"[DoubleClick] ID={current_click_id}, path_before='{path_before}', selected_before={selected_before}")
 
                     # try multiple times because folder navigation can be slower;
-                    # perform checks at 150ms, 300ms, 600ms before giving up
-                    delays = [150, 300, 600]
+                    # perform checks at 150ms, 300ms, 600ms, 1000ms before giving up
+                    delays = [150, 300, 600, 1000]
                     def attempt(idx=0):
+                        # 检查这次双击是否还是当前的双击（通过ID验证）
+                        # 如果ID不匹配，说明有新的双击发生了，放弃当前检查
+                        current_id = getattr(self, '_double_click_id', 0)
+                        if current_id != current_click_id:
+                            print(f"[DoubleClick] ID mismatch: current={current_id} vs expected={current_click_id}, abort")
+                            return
+                        
+                        cur_path = getattr(self, 'current_path', None)
+                        print(f"[DoubleClick] Check attempt {idx} (ID={current_click_id}): path_before='{path_before}' -> cur_path='{cur_path}'")
+                        
                         handled = False
                         try:
                             # reuse the same logic as _check_and_go_up body
                             # check path change first
                             try:
-                                before_path = getattr(self, '_path_before_double', None)
-                                cur_path = getattr(self, 'current_path', None)
-                                if before_path is not None and cur_path is not None and cur_path != before_path:
-                                    self._path_before_double = None
+                                if path_before is not None and cur_path is not None and cur_path != path_before:
+                                    # 路径已改变，说明双击触发了导航（进入文件夹），不需要go_up
+                                    print(f"[DoubleClick] Path changed (ID={current_click_id}): '{path_before}' -> '{cur_path}', skip go_up")
                                     return
-                            except Exception:
+                            except Exception as e:
+                                print(f"[DoubleClick] Path check exception: {e}")
                                 pass
                             # if press-time selection existed, skip
                             before = getattr(self, '_selected_before_click', None)
                             if before is not None:
                                 try:
                                     if int(before) > 0:
+                                        print(f"[DoubleClick] Had selection before click (ID={current_click_id}): {before}, skip go_up")
                                         self._selected_before_click = None
                                         return
                                 except Exception:
@@ -1644,6 +1606,7 @@ class FileExplorerTab(QWidget):
                                     gx = QCursor.pos().x()
                                     gy = QCursor.pos().y()
                                     if self._native_listview_hit_test(gx, gy):
+                                        print(f"[DoubleClick] Hit test positive (ID={current_click_id}), skip go_up")
                                         self._selected_before_click = None
                                         return
                                 except Exception:
@@ -1659,11 +1622,57 @@ class FileExplorerTab(QWidget):
                                         cnt = sel.property('Count') if hasattr(sel, 'property') else None
                                 except Exception:
                                     cnt = None
+                            
+                            print(f"[DoubleClick] SelectedItems count (ID={current_click_id}): {cnt}")
+                            
                             if cnt is None:
-                                # if there are more attempts left, retry; else treat as blank
+                                # SelectedItems().Count API不可用，使用其他方法判断
+                                
+                                # 首先检查路径是否变化
+                                try:
+                                    cur_path = getattr(self, 'current_path', None)
+                                    if path_before is not None and cur_path is not None and cur_path != path_before:
+                                        # 路径已改变，说明双击触发了导航（进入文件夹），不需要go_up
+                                        print(f"[DoubleClick] cnt=None but path changed (ID={current_click_id}): '{path_before}' -> '{cur_path}', skip go_up")
+                                        return
+                                except Exception:
+                                    pass
+                                
+                                # 路径未变化，继续判断
+                                # 如果还有重试机会，继续等待
                                 if idx < len(delays) - 1:
-                                    QTimer.singleShot(delays[idx+1] - delays[idx], lambda: attempt(idx+1))
+                                    print(f"[DoubleClick] cnt=None, schedule retry {idx+1} (ID={current_click_id})")
+                                    timer = QTimer()
+                                    timer.setSingleShot(True)
+                                    timer.timeout.connect(lambda: attempt(idx+1))
+                                    timer.start(delays[idx+1] - delays[idx])
+                                    if hasattr(self, '_pending_double_click_timers'):
+                                        self._pending_double_click_timers.append(timer)
                                     return
+                                
+                                # 最后一次尝试，路径未变化，cnt仍为None
+                                # 优先使用native hit-test判断是否点击在项目上
+                                if HAS_PYWIN:
+                                    try:
+                                        from PyQt5.QtGui import QCursor
+                                        gx = QCursor.pos().x()
+                                        gy = QCursor.pos().y()
+                                        if self._native_listview_hit_test(gx, gy):
+                                            print(f"[DoubleClick] Final check: hit test positive (ID={current_click_id}), likely clicked on item, skip go_up")
+                                            return
+                                    except Exception as e:
+                                        print(f"[DoubleClick] Hit test exception: {e}")
+                                        pass
+                                
+                                # 使用selected_before来判断：如果按下时有选中项，可能是文件双击
+                                before = getattr(self, '_selected_before_click', None)
+                                if before is not None and before > 0:
+                                    # 按下时有选中项，可能是文件双击（打开文件不改变路径）
+                                    print(f"[DoubleClick] cnt=None but had selection before (ID={current_click_id}): {before}, skip go_up")
+                                    return
+                                
+                                # 没有选中项，路径也没变化，hit-test也是负的，很可能是空白双击
+                                print(f"[DoubleClick] Execute go_up (ID={current_click_id}): cnt=None but no selection, no hit, path unchanged")
                                 try:
                                     self.go_up(force=True)
                                 except Exception:
@@ -1671,14 +1680,22 @@ class FileExplorerTab(QWidget):
                                 return
                             try:
                                 if int(cnt) == 0:
+                                    print(f"[DoubleClick] Execute go_up (ID={current_click_id}): cnt=0, blank area double-click")
                                     self.go_up(force=True)
+                                else:
+                                    print(f"[DoubleClick] Has selection (ID={current_click_id}): cnt={cnt}, skip go_up")
                                 return
                             except Exception:
                                 pass
                         finally:
                             self._selected_before_click = None
 
-                    QTimer.singleShot(delays[0], lambda: attempt(0))
+                    timer = QTimer()
+                    timer.setSingleShot(True)
+                    timer.timeout.connect(lambda: attempt(0))
+                    timer.start(delays[0])
+                    if hasattr(self, '_pending_double_click_timers'):
+                        self._pending_double_click_timers.append(timer)
         except Exception:
             pass
         return super().eventFilter(obj, event)
@@ -1691,6 +1708,9 @@ class FileExplorerTab(QWidget):
     def go_up(self, force=False):
         # 返回上一级目录，盘符根目录时导航到"此电脑"
         # 如果 force=True，则绕过鼠标位置检查（用于按钮或程序化调用）
+        current_path_before = getattr(self, 'current_path', None)
+        print(f"[go_up] Called with force={force}, current_path='{current_path_before}'")
+        
         if not force:
             # 仅在明确来自空白区域或路径栏的触发时执行，避免误由文件双击触发
             try:
@@ -1700,20 +1720,27 @@ class FileExplorerTab(QWidget):
                 w = QApplication.widgetAt(pos.x(), pos.y())
                 # 允许的触发源：底部空白标签或路径栏
                 if w is not self.blank and w is not getattr(self, 'path_bar', None):
+                    print(f"[go_up] Rejected: not from valid source (widget={w})")
                     return
             except Exception:
                 # 如果无法判断，保守退出，避免误导航
+                print(f"[go_up] Rejected: exception in widget check")
                 return
         if not self.current_path:
+            print(f"[go_up] Rejected: no current_path")
             return
         path = self.current_path
         # 判断是否为盘符根目录，导航到"此电脑"
         if path.endswith(":\\") or path.endswith(":/"):
+            print(f"[go_up] Root directory '{path}', navigate to MyComputer")
             self.navigate_to('shell:MyComputerFolder', is_shell=True)
             return
         parent_path = os.path.dirname(path)
         if parent_path and os.path.exists(parent_path):
+            print(f"[go_up] Navigate from '{path}' to '{parent_path}'")
             self.navigate_to(parent_path)
+        else:
+            print(f"[go_up] Rejected: parent_path '{parent_path}' invalid or not exists")
 
     def __init__(self, parent=None, path="", is_shell=False):
         super().__init__(parent)
@@ -1724,14 +1751,35 @@ class FileExplorerTab(QWidget):
         self.history_index = -1
         # 标志：是否正在程序化导航（用于防止sync时重复添加历史）
         self._navigating_programmatically = False
+        # 用于跟踪待处理的双击检查定时器
+        self._pending_double_click_timers = []
+        # 双击事件唯一ID，用于区分不同的双击操作
+        self._double_click_id = 0
         self.setup_ui()
         self.navigate_to(self.current_path, is_shell=is_shell)
         self.start_path_sync_timer()
-        self.start_icon_refresh_timer()  # 启动图标刷新定时器
 
     # 移除重复的setup_ui，保留带路径栏的实现
 
     def navigate_to(self, path, is_shell=False, add_to_history=True):
+        old_path = getattr(self, 'current_path', None)
+        print(f"[navigate_to] From '{old_path}' to '{path}' (is_shell={is_shell})")
+        
+        # 取消所有待处理的双击检查定时器，因为路径即将改变
+        try:
+            cancelled_count = 0
+            for timer in getattr(self, '_pending_double_click_timers', []):
+                try:
+                    timer.stop()
+                    cancelled_count += 1
+                except Exception:
+                    pass
+            self._pending_double_click_timers = []
+            if cancelled_count > 0:
+                print(f"[navigate_to] Cancelled {cancelled_count} pending double-click timers")
+        except Exception:
+            pass
+        
         # 支持本地路径和shell特殊路径
         if is_shell:
             self.explorer.dynamicCall("Navigate(const QString&)", path)
@@ -1762,10 +1810,6 @@ class FileExplorerTab(QWidget):
             # 添加到历史记录
             if add_to_history:
                 self._add_to_history(path)
-            
-            # 导航完成后强制刷新以更新图标
-            from PyQt5.QtCore import QTimer
-            QTimer.singleShot(500, self.refresh_view)  # 延迟500ms后刷新
     
     def _add_to_history(self, path):
         """添加路径到历史记录"""
@@ -1819,37 +1863,6 @@ class FileExplorerTab(QWidget):
             # 更新主窗口按钮状态
             if self.main_window and hasattr(self.main_window, 'update_navigation_buttons'):
                 self.main_window.update_navigation_buttons()
-
-    def refresh_view(self):
-        """刷新当前视图（更新文件列表和图标，包括TortoiseGit覆盖层）"""
-        try:
-            # 使用REFRESH_COMPLETELY模式强制刷新，确保图标覆盖层更新
-            # REFRESH_NORMAL = 0, REFRESH_IFEXPIRED = 1, REFRESH_COMPLETELY = 3
-            self.explorer.dynamicCall('Refresh2(int)', 3)  # 强制完全刷新
-            print(f"[Refresh] 已刷新视图: {self.current_path}")
-        except Exception as e:
-            # 如果Refresh2失败，回退到普通Refresh
-            try:
-                self.explorer.dynamicCall('Refresh()')
-                print(f"[Refresh] 已刷新视图(普通模式): {self.current_path}")
-            except Exception as e2:
-                print(f"[Refresh] 刷新视图失败: {e2}")
-    
-    def start_icon_refresh_timer(self):
-        """启动图标刷新定时器（用于TortoiseGit等图标覆盖层更新）
-        
-        注意：TortoiseGit图标覆盖层需要：
-        1. 确保TortoiseGit已安装并配置正确
-        2. 文件夹是Git仓库
-        3. Windows资源管理器中能看到图标
-        4. Shell.Explorer控件已设置FolderFlags启用文件夹视图
-        """
-        from PyQt5.QtCore import QTimer
-        self.icon_refresh_timer = QTimer(self)
-        self.icon_refresh_timer.timeout.connect(self.refresh_view)
-        # 每10秒刷新一次图标（从30秒改为10秒，更快响应Git变化）
-        self.icon_refresh_timer.start(10000)  # 10秒
-        print(f"[Refresh] 图标自动刷新已启用（10秒间隔）")
 
 
 class DragDropTabWidget(QTabWidget):
@@ -3274,7 +3287,9 @@ class MainWindow(QMainWindow):
             def enum_windows_callback(hwnd, _):
                 try:
                     class_name = win32gui.GetClassName(hwnd)
-                    if class_name == "CabinetWClass":
+                    # CabinetWClass: 标准Explorer窗口
+                    # ExploreWClass: 另一种Explorer窗口类型（如通过"打开文件夹"打开的）
+                    if class_name in ("CabinetWClass", "ExploreWClass"):
                         if win32gui.IsWindowVisible(hwnd):
                             self.known_explorer_windows.add(hwnd)
                 except:
@@ -3300,7 +3315,16 @@ class MainWindow(QMainWindow):
                 def check_windows_callback(hwnd, _):
                     try:
                         class_name = win32gui.GetClassName(hwnd)
-                        if class_name == "CabinetWClass":
+                        # 调试：记录所有可见窗口的类名（仅在检测到新窗口时）
+                        if win32gui.IsWindowVisible(hwnd):
+                            title = win32gui.GetWindowText(hwnd)
+                            # 记录可能相关的窗口信息
+                            if title and len(title) > 0 and (':\\' in title or title.startswith('C:') or title.startswith('D:')):
+                                print(f"[Explorer Monitor] Debug: Found window - Class: '{class_name}', Title: '{title}'")
+                        
+                        # CabinetWClass: 标准Explorer窗口
+                        # ExploreWClass: 另一种Explorer窗口类型
+                        if class_name in ("CabinetWClass", "ExploreWClass"):
                             if win32gui.IsWindowVisible(hwnd):
                                 current_explorer_windows.add(hwnd)
                     except:
@@ -3322,10 +3346,13 @@ class MainWindow(QMainWindow):
                 for hwnd in new_windows:
                     # 检查是否是我们自己的窗口（避免误捕获嵌入的Explorer控件）
                     try:
-                        # 获取窗口标题，避免捕获我们自己的主窗口
+                        # 获取窗口标题
                         title = win32gui.GetWindowText(hwnd)
-                        if "TabExplorer" in title or "TabEx" in title:
-                            # print(f"[Explorer Monitor] Skipping our own window: {title}")
+                        
+                        # 只排除明确是我们应用的主窗口，不要误排除路径中包含TabEx的Explorer窗口
+                        # 检查是否以"TabExplorer"开头（软件主窗口）或者窗口句柄是我们的主窗口
+                        if title.startswith("TabExplorer"):
+                            print(f"[Explorer Monitor] Skipping our main window: {title}")
                             continue
                         
                         # 获取窗口的父窗口，如果父窗口是我们的应用，则跳过
