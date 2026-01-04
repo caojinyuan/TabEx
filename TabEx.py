@@ -2037,6 +2037,46 @@ class DragDropTreeView(QTreeView):
         else:
             event.ignore()
 
+# 自定义MenuBar以支持右键菜单
+from PyQt5.QtWidgets import QMenuBar
+class CustomMenuBar(QMenuBar):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.main_window = parent
+    
+    def mousePressEvent(self, event):
+        """处理菜单栏的鼠标点击"""
+        if event.button() == Qt.RightButton:
+            pos = event.pos()
+            action = self.actionAt(pos)
+            
+            print(f"[DEBUG] CustomMenuBar right click at {pos}, action: {action}")
+            
+            if action and self.main_window:
+                if hasattr(self.main_window, 'bookmark_actions') and action in self.main_window.bookmark_actions:
+                    node = self.main_window.bookmark_actions[action]
+                    bookmark_id = node.get('id')
+                    bookmark_name = node.get('name', '')
+                    
+                    print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
+                    
+                    # 检查是否是特殊书签（不允许删除）
+                    special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
+                    is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
+                    
+                    print(f"[DEBUG] Is special bookmark: {is_special}")
+                    
+                    if not is_special:
+                        global_pos = self.mapToGlobal(pos)
+                        print(f"[DEBUG] Showing context menu at: {global_pos}")
+                        self.main_window.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
+                        event.accept()
+                        return
+                else:
+                    print(f"[DEBUG] No bookmark action found")
+        
+        super().mousePressEvent(event)
+
 # 自定义 TabBar 以支持双击空白区域打开新标签页和悬停显示关闭按钮
 from PyQt5.QtWidgets import QTabBar, QToolButton
 from PyQt5.QtCore import QEvent, QPoint
@@ -2639,6 +2679,41 @@ class MainWindow(QMainWindow):
     
     def mousePressEvent(self, event):
         """鼠标按下事件 - 用于拖动窗口或调整大小"""
+        # 处理菜单栏的右键点击
+        if event.button() == Qt.RightButton:
+            menubar = self.menu_bar
+            menubar_rect = menubar.geometry()
+            
+            # 检查点击是否在菜单栏区域
+            if menubar_rect.contains(event.pos()):
+                # 转换为menubar的局部坐标
+                local_pos = menubar.mapFrom(self, event.pos())
+                action = menubar.actionAt(local_pos)
+                
+                print(f"[DEBUG] MenuBar right click at {local_pos}, action: {action}")
+                
+                if action and hasattr(self, 'bookmark_actions') and action in self.bookmark_actions:
+                    node = self.bookmark_actions[action]
+                    bookmark_id = node.get('id')
+                    bookmark_name = node.get('name', '')
+                    
+                    print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
+                    
+                    # 检查是否是特殊书签（不允许删除）
+                    special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
+                    is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
+                    
+                    print(f"[DEBUG] Is special bookmark: {is_special}")
+                    
+                    if not is_special:
+                        global_pos = event.globalPos()
+                        print(f"[DEBUG] Showing context menu at: {global_pos}")
+                        self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
+                        event.accept()
+                        return
+                else:
+                    print(f"[DEBUG] No bookmark action found")
+        
         if event.button() == Qt.LeftButton:
             # 检测是否在边缘（调整大小）
             edge = self.detect_edge(event.pos())
@@ -2940,7 +3015,6 @@ class MainWindow(QMainWindow):
         # 保存到 bookmarks.json
         url = "file:///" + tab.current_path.replace("\\", "/")
         if bm.add_bookmark(folder_id, name, url):
-            QMessageBox.information(self, "添加成功", "书签已添加！")
             self.populate_bookmark_bar_menu()
         else:
             QMessageBox.warning(self, "添加失败", "未能添加书签，请检查父文件夹。")
@@ -3158,13 +3232,12 @@ class MainWindow(QMainWindow):
         # 创建自定义标题栏
         self.create_custom_titlebar(main_layout)
 
-        # 书签栏（菜单栏）
-        menu_bar = self.menuBar()
-        menu_bar.clear()
-        menu_bar.setFixedHeight(28)  # 设置菜单栏高度
+        # 书签栏（使用自定义菜单栏）
+        self.menu_bar = CustomMenuBar(self)
+        self.menu_bar.setFixedHeight(28)  # 设置菜单栏高度
         # 设置菜单栏的大小策略，允许它被压缩
-        menu_bar.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-        menu_bar.setStyleSheet("""
+        self.menu_bar.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self.menu_bar.setStyleSheet("""
             QMenuBar {
                 background-color: #f5f5f5;
                 border-bottom: 1px solid #ddd;
@@ -3205,7 +3278,7 @@ class MainWindow(QMainWindow):
         """)
         self.populate_bookmark_bar_menu()
         # 将菜单栏添加到主布局
-        main_layout.addWidget(menu_bar)
+        main_layout.addWidget(self.menu_bar)
 
         # 主分割器，左树右标签
         self.splitter = QSplitter()
@@ -3713,14 +3786,69 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "不支持的书签", f"暂不支持打开此类型书签: {url}")
 
+    def delete_bookmark_by_id(self, bookmark_id):
+        """根据ID删除书签"""
+        bm = self.bookmark_manager
+        tree = bm.get_tree()
+        
+        def remove_node(parent_node):
+            if 'children' in parent_node:
+                parent_node['children'] = [
+                    child for child in parent_node['children'] 
+                    if child.get('id') != bookmark_id
+                ]
+                # 递归处理子节点
+                for child in parent_node['children']:
+                    if child.get('type') == 'folder':
+                        remove_node(child)
+        
+        # 在所有根节点中查找并删除
+        for root_key, root_node in tree.items():
+            remove_node(root_node)
+        
+        bm.save_bookmarks()
+        # 清除现有菜单并重新填充
+        self.menu_bar.clear()
+        self.populate_bookmark_bar_menu()
+    
+    def show_bookmark_context_menu(self, pos, bookmark_id, bookmark_name):
+        """显示书签右键菜单"""
+        print(f"[DEBUG] show_bookmark_context_menu called: pos={pos}, id={bookmark_id}, name={bookmark_name}")
+        menu = QMenu(self)
+        
+        delete_action = menu.addAction("🗑️ 删除书签")
+        delete_action.triggered.connect(lambda: self.confirm_delete_bookmark(bookmark_id, bookmark_name))
+        
+        print(f"[DEBUG] Showing menu...")
+        menu.exec_(pos)
+        print(f"[DEBUG] Menu closed")
+    
+    def confirm_delete_bookmark(self, bookmark_id, bookmark_name):
+        """确认删除书签"""
+        reply = QMessageBox.question(
+            self, 
+            "确认删除", 
+            f"确定要删除书签 '{bookmark_name}' 吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.delete_bookmark_by_id(bookmark_id)
+
     def populate_bookmark_bar_menu(self):
         self.ensure_default_icons_on_bookmark_bar()
-        self.menuBar().clear()
+        self.menu_bar.clear()
+        
         bm = self.bookmark_manager
         tree = bm.get_tree()
         bookmark_bar = tree.get('bookmark_bar')
         if not bookmark_bar or 'children' not in bookmark_bar:
             return
+        
+        # 存储action到节点的映射
+        self.bookmark_actions = {}
+        
         def add_menu_items(parent_menu, node):
             if node.get('type') == 'folder':
                 menu = parent_menu.addMenu(f"📁 {node.get('name', '')}")
@@ -3737,8 +3865,10 @@ class MainWindow(QMainWindow):
                     action = parent_menu.addAction(f"📑 {name}")
                 url = node.get('url', '')
                 action.triggered.connect(lambda checked, u=url: self.open_bookmark_url(u))
+                # 存储action和节点的映射
+                self.bookmark_actions[action] = node
         # 直接在菜单栏顶层添加
-        menubar = self.menuBar()
+        menubar = self.menu_bar
         # 先添加所有书签和文件夹
         for child in bookmark_bar['children']:
             if child.get('type') == 'folder':
@@ -3754,7 +3884,75 @@ class MainWindow(QMainWindow):
                     action = menubar.addAction(f"📑 {name}")
                 url = child.get('url', '')
                 action.triggered.connect(lambda checked, u=url: self.open_bookmark_url(u))
+                # 存储action和节点的映射
+                self.bookmark_actions[action] = child
+                # 存储action和节点的映射
+                self.bookmark_actions[action] = child
         # 仅显示书签内容，不在菜单栏添加“设置”或“书签管理”入口
+    
+    def on_menubar_context_menu(self, pos):
+        """菜单栏右键菜单处理"""
+        menubar = self.menu_bar
+        action = menubar.actionAt(pos)
+        
+        if action and hasattr(self, 'bookmark_actions') and action in self.bookmark_actions:
+            node = self.bookmark_actions[action]
+            bookmark_id = node.get('id')
+            bookmark_name = node.get('name', '')
+            
+            # 检查是否是特殊书签（不允许删除）
+            special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
+            is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
+            
+            if not is_special:
+                global_pos = menubar.mapToGlobal(pos)
+                self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
+    
+    def eventFilter(self, obj, event):
+        """事件过滤器，处理菜单栏的右键菜单"""
+        from PyQt5.QtCore import QEvent
+        
+        if obj == self.menu_bar:
+            # 打印所有事件类型以便调试
+            # print(f"[DEBUG] MenuBar event type: {event.type()}")
+            
+            if event.type() == QEvent.MouseButtonPress:
+                print(f"[DEBUG] MenuBar MouseButtonPress, button: {event.button()}, Qt.RightButton: {Qt.RightButton}")
+                
+                if event.button() == Qt.RightButton:
+                    pos = event.pos()
+                    action = self.menu_bar.actionAt(pos)
+                    
+                    print(f"[DEBUG] MenuBar right click at {pos}, action: {action}")
+                    
+                    if action:
+                        print(f"[DEBUG] Action found, has bookmark_actions: {hasattr(self, 'bookmark_actions')}")
+                        if hasattr(self, 'bookmark_actions'):
+                            print(f"[DEBUG] bookmark_actions count: {len(self.bookmark_actions)}")
+                            print(f"[DEBUG] action in bookmark_actions: {action in self.bookmark_actions}")
+                    
+                    if action and hasattr(self, 'bookmark_actions') and action in self.bookmark_actions:
+                        node = self.bookmark_actions[action]
+                        bookmark_id = node.get('id')
+                        bookmark_name = node.get('name', '')
+                        
+                        print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
+                        
+                        # 检查是否是特殊书签（不允许删除）
+                        special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
+                        is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
+                        
+                        print(f"[DEBUG] Is special bookmark: {is_special}")
+                        
+                        if not is_special:
+                            global_pos = self.menu_bar.mapToGlobal(pos)
+                            print(f"[DEBUG] Showing context menu at: {global_pos}")
+                            self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
+                            return True  # 事件已处理
+                    else:
+                        print(f"[DEBUG] Action not in bookmark_actions or no bookmark_actions")
+        
+        return super().eventFilter(obj, event)
     
     def toggle_explorer_monitor(self, checked):
         """切换Explorer监听功能"""
