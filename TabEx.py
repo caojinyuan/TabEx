@@ -117,7 +117,7 @@ class ElideLeftDelegate(QStyledItemDelegate):
 # 搜索对话框
 from PyQt5.QtCore import pyqtSignal as _pyqtSignal
 class SearchDialog(QDialog):    
-    def __init__(self, search_path, parent=None):
+    def __init__(self, search_path, parent=None, search_history=None):
         super().__init__(parent)
         self.setWindowTitle(f"搜索 - {search_path}")
         self.resize(800, 500)
@@ -128,6 +128,7 @@ class SearchDialog(QDialog):
         self.main_window = parent
         self.search_thread = None
         self.is_searching = False
+        self.search_history = search_history or []  # 搜索历史列表
         
         # 线程安全的结果队列（限制大小防止内存溢出）
         import queue
@@ -144,11 +145,17 @@ class SearchDialog(QDialog):
         # 搜索选项区域
         search_options = QHBoxLayout()
         
-        # 搜索关键词
+        # 搜索关键词（改为QComboBox支持历史记录）
         search_options.addWidget(QLabel("搜索:"))
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("输入搜索关键词...")
-        self.search_input.returnPressed.connect(self.start_search)
+        from PyQt5.QtWidgets import QComboBox
+        self.search_input = QComboBox()
+        self.search_input.setEditable(True)
+        self.search_input.setInsertPolicy(QComboBox.NoInsert)  # 不自动插入新条目
+        self.search_input.lineEdit().setPlaceholderText("输入搜索关键词...")
+        self.search_input.lineEdit().returnPressed.connect(self.start_search)
+        # 填充历史记录
+        if self.search_history:
+            self.search_input.addItems(self.search_history)
         search_options.addWidget(self.search_input)
         
         # 搜索按钮
@@ -315,10 +322,20 @@ class SearchDialog(QDialog):
         QMessageBox.information(self, "提示", "搜索缓存已清除")
     
     def start_search(self):
-        keyword = self.search_input.text().strip()
+        keyword = self.search_input.currentText().strip()  # 改用currentText获取输入或选中的文本
         if not keyword:
             QMessageBox.warning(self, "提示", "请输入搜索关键词")
             return
+        
+        # 将搜索关键词添加到历史记录（通过主窗口）
+        if self.main_window and hasattr(self.main_window, 'add_search_history'):
+            self.main_window.add_search_history(keyword)
+            # 更新下拉列表
+            self.search_input.clear()
+            if hasattr(self.main_window, 'search_history'):
+                self.search_input.addItems(self.main_window.search_history)
+            # 设置当前文本为刚刚搜索的关键词
+            self.search_input.setCurrentText(keyword)
         
         if not self.search_filename_cb.isChecked() and not self.search_content_cb.isChecked():
             QMessageBox.warning(self, "提示", "请至少选择一种搜索类型")
@@ -812,7 +829,7 @@ import threading
 import queue
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QTreeView, QFileSystemModel, QSplitter)  # QDockWidget removed (unused)
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize  # QModelIndex removed (unused)
+from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor
 # from PyQt5.QtGui import QIcon  # unused
 
@@ -1066,6 +1083,7 @@ class BookmarkManager:
         self._pending_save = False
 
     def load_bookmarks(self):
+        # 首先尝试加载主书签文件
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
@@ -1076,8 +1094,43 @@ class BookmarkManager:
                 return data
             except Exception as e:
                 print(f"Failed to load bookmarks: {e}")
+                # 主文件损坏，尝试从备份恢复
+                backup_file = self.config_file + ".bak"
+                if os.path.exists(backup_file):
+                    print(f"Attempting to restore bookmarks from backup: {backup_file}")
+                    try:
+                        with open(backup_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        # 恢复主文件
+                        import shutil
+                        shutil.copy2(backup_file, self.config_file)
+                        print("Bookmarks restored from backup successfully")
+                        if 'roots' in data:
+                            return data['roots']
+                        return data
+                    except Exception as e2:
+                        print(f"Failed to restore from backup: {e2}")
                 return {}
-        return {}
+        else:
+            # 主文件不存在，检查是否有备份文件
+            backup_file = self.config_file + ".bak"
+            if os.path.exists(backup_file):
+                print(f"Main bookmark file not found, restoring from backup: {backup_file}")
+                try:
+                    with open(backup_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    # 恢复主文件
+                    import shutil
+                    shutil.copy2(backup_file, self.config_file)
+                    print("Bookmarks restored from backup successfully")
+                    if 'roots' in data:
+                        return data['roots']
+                    return data
+                except Exception as e:
+                    print(f"Failed to restore from backup: {e}")
+            else:
+                print("No bookmark file or backup found, starting with empty bookmarks")
+            return {}
 
     def save_bookmarks(self, immediate=False):
         # 优化：延迟保存，避免频繁操作时多次写入
@@ -1782,6 +1835,16 @@ class FileExplorerTab(QWidget):
         self._pending_double_click_timers = []
         # 双击事件唯一ID，用于区分不同的双击操作
         self._double_click_id = 0
+        
+        # 文件系统监控（监控当前路径的变化）
+        self.file_watcher = QFileSystemWatcher()
+        self.file_watcher.directoryChanged.connect(self.on_directory_changed)
+        # 延迟刷新定时器（避免频繁刷新）
+        self.refresh_timer = QTimer()
+        self.refresh_timer.setSingleShot(True)
+        self.refresh_timer.timeout.connect(self.delayed_refresh)
+        self.refresh_delay_ms = 500  # 500ms延迟
+        
         self.setup_ui()
         
         # 安装事件过滤器来处理快捷键（让Ctrl键能穿透到主窗口）
@@ -1837,6 +1900,23 @@ class FileExplorerTab(QWidget):
                 self.explorer.dynamicCall("Navigate(const QString&)", url)
             
             self.current_path = path
+            
+            # 更新文件系统监控（只监控真实文件系统路径）
+            if hasattr(self, 'file_watcher'):
+                # 移除旧路径的监控
+                if old_path and os.path.exists(old_path) and os.path.isdir(old_path) and not old_path.startswith('shell:'):
+                    watched_dirs = self.file_watcher.directories()
+                    if old_path in watched_dirs:
+                        self.file_watcher.removePath(old_path)
+                        print(f"[FileWatcher] Stopped watching: {old_path}")
+                
+                # 添加新路径的监控
+                if os.path.isdir(path):
+                    if self.file_watcher.addPath(path):
+                        print(f"[FileWatcher] Now watching: {path}")
+                    else:
+                        print(f"[FileWatcher] Failed to watch: {path}")
+            
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(path)
             self.update_tab_title()
@@ -1896,6 +1976,36 @@ class FileExplorerTab(QWidget):
             # 更新主窗口按钮状态
             if self.main_window and hasattr(self.main_window, 'update_navigation_buttons'):
                 self.main_window.update_navigation_buttons()
+    
+    def on_directory_changed(self, path):
+        """文件系统监控：目录内容发生变化"""
+        print(f"[FileWatcher] Directory changed: {path}")
+        # 只在监控的是当前路径时才刷新
+        if path == self.current_path:
+            # 使用延迟刷新，避免短时间内多次变化导致频繁刷新
+            if not self.refresh_timer.isActive():
+                print(f"[FileWatcher] Scheduling refresh in {self.refresh_delay_ms}ms")
+                self.refresh_timer.start(self.refresh_delay_ms)
+            else:
+                # 如果定时器已经在运行，重新启动（重置延迟）
+                self.refresh_timer.stop()
+                self.refresh_timer.start(self.refresh_delay_ms)
+    
+    def delayed_refresh(self):
+        """延迟刷新：避免频繁刷新"""
+        print(f"[FileWatcher] Auto-refreshing: {self.current_path}")
+        if hasattr(self, 'explorer') and self.current_path:
+            try:
+                # 重新导航到当前路径以刷新
+                is_shell = self.current_path.startswith('shell:')
+                if is_shell:
+                    self.explorer.dynamicCall('Navigate(const QString&)', self.current_path)
+                else:
+                    url = 'file:///' + self.current_path.replace('\\', '/')
+                    self.explorer.dynamicCall('Navigate2(const QVariant&)', url)
+                print(f"[FileWatcher] Refresh completed")
+            except Exception as e:
+                print(f"[FileWatcher] Refresh error: {e}")
 
 
 class DragDropTabWidget(QTabWidget):
@@ -3168,8 +3278,8 @@ class MainWindow(QMainWindow):
             self.setFocus()  # 消息框关闭后设置焦点
             return
         
-        # 创建非模态对话框
-        dlg = SearchDialog(search_path, self)
+        # 创建非模态对话框，传入搜索历史
+        dlg = SearchDialog(search_path, self, self.search_history)
         # 保存对话框引用，防止被垃圾回收
         if not hasattr(self, 'search_dialogs'):
             self.search_dialogs = []
@@ -3180,6 +3290,26 @@ class MainWindow(QMainWindow):
         
         # 非模态显示，不阻塞主窗口
         dlg.show()
+    
+    def add_search_history(self, keyword):
+        """添加搜索关键词到历史记录（最多保留20个）"""
+        if not keyword or not keyword.strip():
+            return
+        
+        keyword = keyword.strip()
+        
+        # 如果已存在，先移除（避免重复）
+        if keyword in self.search_history:
+            self.search_history.remove(keyword)
+        
+        # 添加到列表开头（最新的在前面）
+        self.search_history.insert(0, keyword)
+        
+        # 限制最多保留20个
+        if len(self.search_history) > 20:
+            self.search_history = self.search_history[:20]
+        
+        print(f"[Search History] Added '{keyword}', total: {len(self.search_history)}")
 
     def tab_context_menu(self, pos):
         tab_index = self.tab_widget.tabBar().tabAt(pos)
@@ -3348,6 +3478,9 @@ class MainWindow(QMainWindow):
         self.resize_direction = None
         self.resize_margin = 10  # 边缘检测范围（像素），增加到10像素更容易触发
         self.cursor_overridden = False  # 通过QApplication是否已覆盖光标
+        
+        # 搜索历史（内存中，软件关闭后自动清除）
+        self.search_history = []
         
         self.init_ui()
         
@@ -4140,12 +4273,19 @@ class MainWindow(QMainWindow):
         if not bookmark_bar or 'children' not in bookmark_bar:
             return
         
-        # 存储action到节点的映射
+        # 存储action/menu到节点的映射
         self.bookmark_actions = {}
+        self.bookmark_menus = {}  # 存储QMenu到节点的映射
         
         def add_menu_items(parent_menu, node):
             if node.get('type') == 'folder':
                 menu = parent_menu.addMenu(f"📁 {node.get('name', '')}")
+                # 存储QMenu和节点的映射
+                self.bookmark_menus[menu] = node
+                # 也为QMenu的menuAction存储映射（用于事件过滤）
+                self.bookmark_actions[menu.menuAction()] = node
+                # 为子菜单安装事件过滤器
+                menu.installEventFilter(self)
                 for child in node.get('children', []):
                     add_menu_items(menu, child)
             elif node.get('type') == 'url':
@@ -4203,13 +4343,12 @@ class MainWindow(QMainWindow):
                 self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
     
     def eventFilter(self, obj, event):
-        """事件过滤器，处理菜单栏的右键菜单"""
+        """事件过滤器，处理菜单栏和子菜单的右键菜单"""
         from PyQt5.QtCore import QEvent
+        from PyQt5.QtWidgets import QMenu
         
+        # 处理主菜单栏的右键点击
         if obj == self.menu_bar:
-            # 打印所有事件类型以便调试
-            # print(f"[DEBUG] MenuBar event type: {event.type()}")
-            
             if event.type() == QEvent.MouseButtonPress:
                 print(f"[DEBUG] MenuBar MouseButtonPress, button: {event.button()}, Qt.RightButton: {Qt.RightButton}")
                 
@@ -4246,6 +4385,38 @@ class MainWindow(QMainWindow):
                     else:
                         print(f"[DEBUG] Action not in bookmark_actions or no bookmark_actions")
         
+        # 处理子菜单（文件夹）的右键点击
+        elif isinstance(obj, QMenu):
+            if event.type() == QEvent.MouseButtonPress:
+                print(f"[DEBUG] QMenu MouseButtonPress, button: {event.button()}")
+                
+                if event.button() == Qt.RightButton:
+                    pos = event.pos()
+                    action = obj.actionAt(pos)
+                    
+                    print(f"[DEBUG] QMenu right click at {pos}, action: {action}")
+                    
+                    if action and hasattr(self, 'bookmark_actions') and action in self.bookmark_actions:
+                        node = self.bookmark_actions[action]
+                        bookmark_id = node.get('id')
+                        bookmark_name = node.get('name', '')
+                        
+                        print(f"[DEBUG] Found bookmark in submenu: {bookmark_name} (ID: {bookmark_id})")
+                        
+                        # 检查是否是特殊书签（不允许删除）
+                        special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
+                        is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
+                        
+                        print(f"[DEBUG] Is special bookmark: {is_special}")
+                        
+                        if not is_special:
+                            global_pos = obj.mapToGlobal(pos)
+                            print(f"[DEBUG] Showing context menu at: {global_pos}")
+                            self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
+                            return True  # 事件已处理
+                    else:
+                        print(f"[DEBUG] Action not in bookmark_actions")
+        
         return super().eventFilter(obj, event)
     
     def toggle_explorer_monitor(self, checked):
@@ -4280,19 +4451,7 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
         
-        # 添加标题说明
         from PyQt5.QtWidgets import QDialogButtonBox, QLabel, QGroupBox
-        title_label = QLabel("应用设置")
-        title_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #333;")
-        layout.addWidget(title_label)
-        
-        # 添加分隔线
-        from PyQt5.QtWidgets import QFrame
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        layout.addWidget(line)
-        
         # Explorer监听设置组
         monitor_group = QGroupBox("Explorer监听设置")
         monitor_layout = QVBoxLayout()
@@ -4519,6 +4678,18 @@ class BookmarkManagerDialog(QDialog):
         self.down_btn = QPushButton("下移")
         self.down_btn.clicked.connect(self.move_item_down)
         btn_layout.addWidget(self.down_btn)
+        
+        # 添加导入/导出按钮
+        self.export_btn = QPushButton("📤 导出")
+        self.export_btn.setToolTip("导出书签到JSON文件")
+        self.export_btn.clicked.connect(self.export_bookmarks)
+        btn_layout.addWidget(self.export_btn)
+        
+        self.import_btn = QPushButton("📥 导入")
+        self.import_btn.setToolTip("从JSON文件导入书签")
+        self.import_btn.clicked.connect(self.import_bookmarks)
+        btn_layout.addWidget(self.import_btn)
+        
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
         btn_layout.addWidget(close_btn)
@@ -4701,6 +4872,121 @@ class BookmarkManagerDialog(QDialog):
                 tree.get('bookmark_bar', {}).setdefault('children', []).append(folder)
             self.bookmark_manager.save_bookmarks()
             self.populate_tree()
+
+    def export_bookmarks(self):
+        """导出书签到JSON文件"""
+        from PyQt5.QtWidgets import QFileDialog
+        import shutil
+        from datetime import datetime
+        
+        # 生成默认文件名（包含日期时间）
+        default_name = f"bookmarks_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        # 打开保存文件对话框
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出书签",
+            default_name,
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                # 复制当前的bookmarks.json到目标位置
+                shutil.copy2("bookmarks.json", file_path)
+                QMessageBox.information(self, "导出成功", f"书签已成功导出到:\n{file_path}")
+                print(f"[Bookmark Export] Successfully exported to: {file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "导出失败", f"导出书签时出错:\n{str(e)}")
+                print(f"[Bookmark Export] Error: {e}")
+    
+    def import_bookmarks(self):
+        """从JSON文件导入书签"""
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox
+        import json
+        
+        # 打开文件选择对话框
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入书签",
+            "",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # 读取导入的JSON文件
+            with open(file_path, 'r', encoding='utf-8') as f:
+                imported_data = json.load(f)
+            
+            # 处理可能有 roots 层的书签格式（兼容Chrome书签格式）
+            if 'roots' in imported_data:
+                imported_data = imported_data['roots']
+            
+            # 验证JSON格式
+            if not isinstance(imported_data, dict) or 'bookmark_bar' not in imported_data:
+                QMessageBox.warning(self, "格式错误", "导入的文件格式不正确，必须包含 'bookmark_bar' 节点")
+                return
+            
+            # 询问用户是替换还是合并
+            reply = QMessageBox.question(
+                self,
+                "导入方式",
+                "选择导入方式:\n\n是(Yes) - 替换现有书签\n否(No) - 合并到现有书签\n取消 - 取消导入",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Cancel:
+                return
+            elif reply == QMessageBox.Yes:
+                # 替换模式：直接覆盖
+                self.bookmark_manager.bookmark_tree = imported_data
+                self.bookmark_manager.save_bookmarks(immediate=True)  # 立即保存
+                QMessageBox.information(self, "导入成功", "书签已成功替换")
+                print(f"[Bookmark Import] Replaced bookmarks from: {file_path}")
+                print(f"[Bookmark Import] New tree structure: {self.bookmark_manager.bookmark_tree.keys()}")
+            else:
+                # 合并模式：将导入的书签添加到现有书签的末尾
+                current_tree = self.bookmark_manager.get_tree()
+                imported_bar = imported_data.get('bookmark_bar', {})
+                imported_children = imported_bar.get('children', [])
+                
+                if imported_children:
+                    current_bar = current_tree.get('bookmark_bar', {})
+                    if 'children' not in current_bar:
+                        current_bar['children'] = []
+                    
+                    # 添加到末尾
+                    current_bar['children'].extend(imported_children)
+                    self.bookmark_manager.save_bookmarks(immediate=True)  # 立即保存
+                    
+                    count = len(imported_children)
+                    QMessageBox.information(self, "导入成功", f"成功导入 {count} 个书签项")
+                    print(f"[Bookmark Import] Merged {count} items from: {file_path}")
+                else:
+                    QMessageBox.information(self, "提示", "导入的文件中没有书签内容")
+            
+            # 刷新书签管理对话框显示
+            self.populate_tree()
+            
+            # 刷新主窗口书签栏
+            main_window = self.parent()
+            if main_window and hasattr(main_window, 'populate_bookmark_bar_menu'):
+                print("[Bookmark Import] Refreshing main window bookmark bar")
+                main_window.populate_bookmark_bar_menu()
+                # 确保默认图标显示
+                if hasattr(main_window, 'ensure_default_icons_on_bookmark_bar'):
+                    main_window.ensure_default_icons_on_bookmark_bar()
+                
+        except json.JSONDecodeError:
+            QMessageBox.critical(self, "格式错误", "导入的文件不是有效的JSON格式")
+            print(f"[Bookmark Import] Invalid JSON format: {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "导入失败", f"导入书签时出错:\n{str(e)}")
+            print(f"[Bookmark Import] Error: {e}")
 
 
     # BookmarkManagerDialog不再包含标签页相关方法
