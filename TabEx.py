@@ -126,6 +126,29 @@ class ElideLeftDelegate(QStyledItemDelegate):
         else:
             super().paint(painter, option, index)
 
+# Everything 搜索引擎集成
+def detect_everything():
+    """检测系统中是否安装了Everything"""
+    import shutil
+    # 检查Everything命令行工具es.exe是否在PATH中
+    es_path = shutil.which('es.exe')
+    if es_path:
+        return es_path
+    
+    # 检查常见安装路径
+    common_paths = [
+        r'C:\Program Files\Everything\es.exe',
+        r'C:\Program Files (x86)\Everything\es.exe',
+        os.path.expandvars(r'%PROGRAMFILES%\Everything\es.exe'),
+        os.path.expandvars(r'%PROGRAMFILES(X86)%\Everything\es.exe'),
+    ]
+    
+    for path in common_paths:
+        if os.path.exists(path):
+            return path
+    
+    return None
+
 # 搜索对话框
 from PyQt5.QtCore import pyqtSignal as _pyqtSignal
 class SearchDialog(QDialog):    
@@ -142,6 +165,10 @@ class SearchDialog(QDialog):
         self.is_searching = False
         self.search_history = search_history or []  # 搜索历史列表
         
+        # 检测Everything
+        self.everything_path = detect_everything()
+        debug_print(f"[Search] Everything detected: {self.everything_path}")
+        
         # 线程安全的结果队列（限制大小防止内存溢出）
         import queue
         self.result_queue = queue.Queue(maxsize=1000)  # 最多缓存1000个待显示的结果
@@ -157,19 +184,23 @@ class SearchDialog(QDialog):
         
         # 搜索选项区域
         search_options = QHBoxLayout()
+        search_options.setSpacing(5)  # 设置控件间距为5像素
         
         # 搜索关键词（改为QComboBox支持历史记录）
-        search_options.addWidget(QLabel("搜索:"))
+        search_label = QLabel("搜索:")
+        search_label.setFixedWidth(40)  # 固定标签宽度
+        search_options.addWidget(search_label)
         from PyQt5.QtWidgets import QComboBox
         self.search_input = QComboBox()
         self.search_input.setEditable(True)
         self.search_input.setInsertPolicy(QComboBox.NoInsert)  # 不自动插入新条目
+        self.search_input.setMinimumWidth(300)  # 设置最小宽度300像素
         self.search_input.lineEdit().setPlaceholderText("输入搜索关键词...")
         self.search_input.lineEdit().returnPressed.connect(self.start_search)
         # 填充历史记录
         if self.search_history:
             self.search_input.addItems(self.search_history)
-        search_options.addWidget(self.search_input)
+        search_options.addWidget(self.search_input, 1)  # 添加stretch factor，让搜索框可以拉伸
         
         # 搜索按钮
         self.search_btn = QPushButton("🔍 搜索")
@@ -208,6 +239,17 @@ class SearchDialog(QDialog):
         self.search_content_cb = QCheckBox("搜索文件内容")
         self.search_content_cb.setChecked(True)  # 默认也选中
         type_options.addWidget(self.search_content_cb)
+        
+        # Everything搜索选项
+        self.use_everything_cb = QCheckBox("使用 Everything (极速)")
+        if self.everything_path:
+            self.use_everything_cb.setChecked(True)  # 如果有Everything，默认启用
+            self.use_everything_cb.setToolTip(f"使用Everything搜索引擎\n路径: {self.everything_path}\n只搜索文件名，速度极快")
+        else:
+            self.use_everything_cb.setEnabled(False)
+            self.use_everything_cb.setToolTip("未检测到Everything，请从 https://www.voidtools.com/ 下载安装")
+        self.use_everything_cb.stateChanged.connect(self.on_everything_toggled)
+        type_options.addWidget(self.use_everything_cb)
         
         type_options.addStretch(1)
         layout.addLayout(type_options)
@@ -328,6 +370,16 @@ class SearchDialog(QDialog):
         """添加搜索结果项（通过队列，线程安全）"""
         self.result_queue.put({'type': 'result', 'text': text})
     
+    def on_everything_toggled(self, state):
+        """当Everything选项切换时"""
+        if state:
+            # 启用Everything时，禁用文件内容搜索（Everything只支持文件名）
+            self.search_content_cb.setChecked(False)
+            self.search_content_cb.setEnabled(False)
+        else:
+            # 禁用Everything时，恢复文件内容搜索选项
+            self.search_content_cb.setEnabled(True)
+    
     def clear_search_cache(self):
         """清除所有搜索缓存"""
         global _search_cache
@@ -422,9 +474,10 @@ class SearchDialog(QDialog):
         
         # 在后台线程执行搜索
         import threading
+        use_everything = self.use_everything_cb.isChecked() if self.everything_path else False
         self.search_thread = threading.Thread(
             target=self.do_search,
-            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked(), file_types, cache_key)
+            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked(), file_types, cache_key, use_everything)
         )
         self.search_thread.daemon = True
         self.search_thread.start()
@@ -435,7 +488,103 @@ class SearchDialog(QDialog):
         self.stop_btn.setEnabled(False)
         self.status_label.setText("已停止")
     
-    def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None):
+    def search_with_everything(self, keyword, search_path, file_types=""):
+        """使用Everything进行搜索"""
+        import subprocess
+        
+        try:
+            # 构建Everything命令
+            cmd = [self.everything_path]
+            
+            # 如果指定了搜索路径，添加路径过滤
+            if search_path and os.path.exists(search_path):
+                # Everything使用path:语法指定路径
+                search_pattern = f'path:"{search_path}" {keyword}'
+            else:
+                search_pattern = keyword
+            
+            # 添加文件类型过滤
+            if file_types:
+                extensions = []
+                for ft in file_types.split(','):
+                    ft = ft.strip()
+                    if ft.startswith('*.'):
+                        ft = ft[2:]  # 移除 *.
+                    extensions.append(f'ext:{ft}')
+                if extensions:
+                    search_pattern += ' ' + ' | '.join(extensions)
+            
+            cmd.append(search_pattern)
+            
+            # 执行Everything搜索
+            debug_print(f"[Everything] Executing: {' '.join(cmd)}")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                # 解析结果（每行一个文件路径）
+                lines = result.stdout.strip().split('\n')
+                results = []
+                for line in lines:
+                    line = line.strip()
+                    if line and os.path.exists(line):
+                        results.append(line)
+                
+                debug_print(f"[Everything] Found {len(results)} results")
+                return results
+            else:
+                debug_print(f"[Everything] Error: {result.stderr}")
+                return []
+        
+        except subprocess.TimeoutExpired:
+            debug_print("[Everything] Search timeout")
+            return []
+        except Exception as e:
+            debug_print(f"[Everything] Error: {e}")
+            return []
+    
+    def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None, use_everything=False):
+        # 如果使用Everything搜索
+        if use_everything and self.everything_path:
+            self.result_queue.put({'type': 'status', 'text': 'Using Everything搜索引擎...'})
+            
+            try:
+                results = self.search_with_everything(keyword, self.search_path, file_types)
+                
+                if not self.is_searching:
+                    return
+                
+                # 将Everything结果添加到显示队列
+                for file_path in results:
+                    if not self.is_searching:
+                        break
+                    
+                    try:
+                        self.add_search_result(file_path)
+                    except:
+                        pass
+                
+                # 搜索完成
+                final_count = len(results)
+                self.result_queue.put({
+                    'type': 'complete',
+                    'count': final_count,
+                    'cache_key': cache_key,
+                    'results': results[:1000] if cache_key else None  # 限制缓存大小
+                })
+                
+            except Exception as e:
+                self.result_queue.put({'type': 'error', 'text': f'Everything搜索错误: {str(e)}'})
+            
+            return
+        
+        # 原有的搜索逻辑
         found_count = 0
         keyword_lower = keyword.lower()
         results_buffer = []  # 结果缓冲区
@@ -815,21 +964,23 @@ class SearchDialog(QDialog):
         print(f"[Search] UI更新已调度（使用队列）")
     
     def on_result_double_clicked(self, row, column):
-        """双击搜索结果，打开文件所在文件夹或文件夹本身"""
+        """双击搜索结果，打开文件所在文件夹或文件夹本身，并选中文件"""
         # 从第一列获取存储的完整路径
         path_item = self.result_list.item(row, 0)
         if path_item:
             file_path = path_item.data(256)  # 获取存储的完整路径
             
             if os.path.exists(file_path):
-                # 如果是文件夹，直接打开文件夹；如果是文件，打开文件所在文件夹
+                # 如果是文件夹，直接打开文件夹；如果是文件，打开文件所在文件夹并选中文件
                 if os.path.isdir(file_path):
                     folder_path = file_path
+                    select_file = None
                 else:
                     folder_path = os.path.dirname(file_path)
+                    select_file = os.path.basename(file_path)  # 要选中的文件名
                 # 不关闭搜索对话框，保持独立
                 if self.main_window and hasattr(self.main_window, 'add_new_tab'):
-                    self.main_window.add_new_tab(folder_path)
+                    self.main_window.add_new_tab(folder_path, select_file=select_file)
 
 import sys
 import os
@@ -847,7 +998,7 @@ from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor, QDrag
 # from PyQt5.QtGui import QIcon  # unused
 
 # 全局调试开关
-_DEBUG_MODE = False
+_DEBUG_MODE = True
 
 def debug_print(*args, **kwargs):
     """根据调试开关决定是否输出调试信息"""
@@ -2036,10 +2187,11 @@ class FileExplorerTab(QWidget):
         else:
             print(f"[go_up] Rejected: parent_path '{parent_path}' invalid or not exists")
 
-    def __init__(self, parent=None, path="", is_shell=False):
+    def __init__(self, parent=None, path="", is_shell=False, select_file=None):
         super().__init__(parent)
         self.main_window = parent
         self.current_path = path if path else QDir.homePath()
+        self.select_file = select_file  # 要选中的文件名
         # 浏览历史记录
         self.history = []
         self.history_index = -1
@@ -2068,6 +2220,11 @@ class FileExplorerTab(QWidget):
         
         self.navigate_to(self.current_path, is_shell=is_shell)
         self.start_path_sync_timer()
+        
+        # 如果指定了要选中的文件，延迟选中（等待导航完成）
+        # 增加延迟时间确保文件夹完全加载
+        if self.select_file:
+            QTimer.singleShot(1500, lambda: self.select_file_in_explorer(self.select_file))
 
     # 移除重复的setup_ui，保留带路径栏的实现
 
@@ -2287,6 +2444,138 @@ class FileExplorerTab(QWidget):
                 debug_print(f"[FileWatcher] Refresh completed")
             except Exception as e:
                 debug_print(f"[FileWatcher] Refresh error: {e}")
+    
+    def select_file_in_explorer(self, filename):
+        """在Explorer控件中选中指定的文件"""
+        try:
+            debug_print(f"[SelectFile] Attempting to select file: {filename}")
+            
+            # 构建完整路径
+            full_path = os.path.join(self.current_path, filename)
+            if not os.path.exists(full_path):
+                debug_print(f"[SelectFile] File not found: {full_path}")
+                return
+            
+            # 使用Windows API选中文件（通过查找ListView控件并发送消息）
+            try:
+                import ctypes
+                from ctypes import wintypes
+                
+                # Windows API常量
+                LVM_SETITEMSTATE = 0x102B
+                LVM_ENSUREVISIBLE = 0x1013
+                LVM_GETITEMCOUNT = 0x1004
+                LVM_GETITEMTEXT = 0x102D
+                LVIF_STATE = 0x0008
+                LVIS_SELECTED = 0x0002
+                LVIS_FOCUSED = 0x0001
+                
+                # 获取当前窗口句柄
+                hwnd = int(self.explorer.winId())
+                
+                # 查找ListView控件（通常类名是 SysListView32）
+                user32 = ctypes.windll.user32
+                
+                def enum_child_windows(parent_hwnd):
+                    """枚举所有子窗口"""
+                    handles = []
+                    def callback(hwnd, lParam):
+                        handles.append(hwnd)
+                        return True
+                    
+                    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+                    enum_proc = WNDENUMPROC(callback)
+                    user32.EnumChildWindows(parent_hwnd, enum_proc, 0)
+                    return handles
+                
+                # 查找ListView控件
+                listview_hwnd = None
+                for child_hwnd in enum_child_windows(hwnd):
+                    class_name = ctypes.create_unicode_buffer(256)
+                    user32.GetClassNameW(child_hwnd, class_name, 256)
+                    if 'SysListView32' in class_name.value:
+                        listview_hwnd = child_hwnd
+                        debug_print(f"[SelectFile] Found ListView control: {listview_hwnd}")
+                        break
+                
+                if not listview_hwnd:
+                    debug_print(f"[SelectFile] ListView control not found")
+                    return
+                
+                # 获取ListView中的项目数
+                item_count = user32.SendMessageW(listview_hwnd, LVM_GETITEMCOUNT, 0, 0)
+                debug_print(f"[SelectFile] ListView has {item_count} items")
+                
+                # 遍历所有项目，查找匹配的文件名
+                for i in range(item_count):
+                    # 获取项目文本需要使用进程间通信（因为ListView在不同进程）
+                    # 这里使用简化方法：通过Document接口获取文件列表来匹配索引
+                    try:
+                        doc = self.explorer.querySubObject('Document')
+                        if doc:
+                            folder = doc.querySubObject('Folder')
+                            if folder:
+                                items = folder.querySubObject('Items()')
+                                if items and i < items.dynamicCall('Count()'):
+                                    item = items.querySubObject('Item(int)', i)
+                                    if item:
+                                        item_name = item.dynamicCall('Name()')
+                                        if item_name == filename:
+                                            debug_print(f"[SelectFile] Found file at index {i}: {filename}")
+                                            
+                                            # 定义LVITEM结构
+                                            class LVITEM(ctypes.Structure):
+                                                _fields_ = [
+                                                    ('mask', wintypes.UINT),
+                                                    ('iItem', ctypes.c_int),
+                                                    ('iSubItem', ctypes.c_int),
+                                                    ('state', wintypes.UINT),
+                                                    ('stateMask', wintypes.UINT),
+                                                    ('pszText', wintypes.LPWSTR),
+                                                    ('cchTextMax', ctypes.c_int),
+                                                    ('iImage', ctypes.c_int),
+                                                    ('lParam', wintypes.LPARAM),
+                                                ]
+                                            
+                                            # 取消所有项目的选中状态
+                                            for j in range(item_count):
+                                                lvi = LVITEM()
+                                                lvi.mask = LVIF_STATE
+                                                lvi.state = 0
+                                                lvi.stateMask = LVIS_SELECTED | LVIS_FOCUSED
+                                                user32.SendMessageW(listview_hwnd, LVM_SETITEMSTATE, j, ctypes.byref(lvi))
+                                            
+                                            # 选中并聚焦目标项
+                                            lvi = LVITEM()
+                                            lvi.mask = LVIF_STATE
+                                            lvi.state = LVIS_SELECTED | LVIS_FOCUSED
+                                            lvi.stateMask = LVIS_SELECTED | LVIS_FOCUSED
+                                            result = user32.SendMessageW(listview_hwnd, LVM_SETITEMSTATE, i, ctypes.byref(lvi))
+                                            debug_print(f"[SelectFile] SendMessage result: {result}")
+                                            
+                                            # 确保可见
+                                            user32.SendMessageW(listview_hwnd, LVM_ENSUREVISIBLE, i, 0)
+                                            
+                                            # 设置焦点到ListView
+                                            user32.SetFocus(listview_hwnd)
+                                            
+                                            debug_print(f"[SelectFile] Successfully selected file via API: {filename}")
+                                            return
+                    except Exception as e:
+                        debug_print(f"[SelectFile] Error matching item {i}: {e}")
+                        continue
+                
+                debug_print(f"[SelectFile] File not found in ListView: {filename}")
+                
+            except Exception as e:
+                debug_print(f"[SelectFile] Windows API method failed: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        except Exception as e:
+            debug_print(f"[SelectFile] Error: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 class DragDropTabWidget(QTabWidget):
@@ -2715,12 +3004,12 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     @pyqtSlot(str)
     @pyqtSlot(str, bool)
-    def add_new_tab(self, path="", is_shell=False):
+    def add_new_tab(self, path="", is_shell=False, select_file=None):
         # 默认新建标签页为“此电脑”
         if not path:
             path = 'shell:MyComputerFolder'
             is_shell = True
-        tab = FileExplorerTab(self, path, is_shell=is_shell)
+        tab = FileExplorerTab(self, path, is_shell=is_shell, select_file=select_file)
         tab.is_pinned = False
         short = path[-16:] if len(path) > 16 else path
         tab_index = self.tab_widget.addTab(tab, short)
@@ -4095,6 +4384,12 @@ class MainWindow(QMainWindow):
         # 主分割器，左树右标签
         self.splitter = QSplitter()
         self.splitter.setOrientation(Qt.Horizontal)
+        # 允许左侧目录树折叠（往左拖动时隐藏）
+        self.splitter.setCollapsible(0, True)  # 索引0是左侧目录树，允许折叠
+        self.splitter.setCollapsible(1, False)  # 索引1是右侧标签页，不允许折叠
+        # 设置子控件的拉伸因子（左侧0，右侧1，右侧会占据剩余空间）
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
 
         # 左侧目录树（应用性能优化）
         self.dir_model = QFileSystemModel()
@@ -4116,9 +4411,10 @@ class MainWindow(QMainWindow):
         self.dir_tree.setColumnHidden(1, True)
         self.dir_tree.setColumnHidden(2, True)
         self.dir_tree.setColumnHidden(3, True)
-        self.dir_tree.setMinimumWidth(150)
-        # 移除最大宽度限制，允许自由拖动调整
-        # self.dir_tree.setMaximumWidth(350)
+        # 移除最小宽度限制，允许完全隐藏（往左拖动时）
+        self.dir_tree.setMinimumWidth(0)
+        # 设置合理的最大宽度，防止拖动过宽
+        self.dir_tree.setMaximumWidth(1800)
         self.dir_tree.clicked.connect(self.on_dir_tree_clicked)
         self.splitter.addWidget(self.dir_tree)
         # 自动展开所有驱动器根节点（即“我的电脑”下所有盘符）
@@ -4231,6 +4527,10 @@ class MainWindow(QMainWindow):
 
         right_layout.addWidget(self.tab_widget)
         self.splitter.addWidget(right_widget)
+        
+        # 设置左侧目录树和右侧标签页的初始宽度比例（左:右 = 1:4，左侧更窄）
+        # 假设窗口总宽度1000px，左侧200px，右侧800px
+        self.splitter.setSizes([200, 800])
         
         # 将分割器添加到主容器
         main_layout.addWidget(self.splitter)
