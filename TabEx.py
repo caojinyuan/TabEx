@@ -1083,9 +1083,30 @@ class BookmarkManager:
         # 优化：延迟保存，避免频繁操作时多次写入
         if immediate:
             # 立即保存
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump({"roots": self.bookmark_tree}, f, ensure_ascii=False, indent=2)
-            self._pending_save = False
+            try:
+                # 先备份旧书签
+                if os.path.exists(self.config_file):
+                    import shutil
+                    try:
+                        shutil.copy2(self.config_file, self.config_file + ".bak")
+                    except Exception as e:
+                        print(f"Failed to backup bookmarks: {e}")
+                
+                # 保存新书签
+                with open(self.config_file, 'w', encoding='utf-8') as f:
+                    json.dump({"roots": self.bookmark_tree}, f, ensure_ascii=False, indent=2)
+                self._pending_save = False
+            except Exception as e:
+                print(f"Failed to save bookmarks: {e}")
+                # 尝试从备份恢复
+                backup_file = self.config_file + ".bak"
+                if os.path.exists(backup_file):
+                    try:
+                        import shutil
+                        shutil.copy2(backup_file, self.config_file)
+                        print("Bookmarks restored from backup")
+                    except Exception as e2:
+                        print(f"Failed to restore bookmarks: {e2}")
         else:
             # 延迟保存：500ms后执行
             self._pending_save = True
@@ -1239,6 +1260,9 @@ class FileExplorerTab(QWidget):
         # 嵌入Explorer控件
         self.explorer = QAxWidget(self)
         self.explorer.setControl("Shell.Explorer")
+        # 设置为NoFocus，防止QAxWidget拦截键盘事件
+        from PyQt5.QtCore import Qt
+        self.explorer.setFocusPolicy(Qt.NoFocus)
         layout.addWidget(self.explorer)
         
         # 绑定导航完成信号，自动更新路径栏
@@ -1521,7 +1545,10 @@ class FileExplorerTab(QWidget):
 
     def eventFilter(self, obj, event):
         # 通过事件过滤器捕获 Explorer 的鼠标按下与双击事件
-        from PyQt5.QtCore import QEvent, QTimer
+        from PyQt5.QtCore import QEvent, QTimer, Qt
+        
+        # 注意：快捷键处理现在由MainWindow的轮询定时器处理，不在这里处理
+        
         try:
             if obj is self.explorer:
                 if event.type() == QEvent.MouseButtonPress:
@@ -1756,6 +1783,12 @@ class FileExplorerTab(QWidget):
         # 双击事件唯一ID，用于区分不同的双击操作
         self._double_click_id = 0
         self.setup_ui()
+        
+        # 安装事件过滤器来处理快捷键（让Ctrl键能穿透到主窗口）
+        self.installEventFilter(self)
+        if hasattr(self, 'explorer'):
+            self.explorer.installEventFilter(self)
+        
         self.navigate_to(self.current_path, is_shell=is_shell)
         self.start_path_sync_timer()
 
@@ -2895,6 +2928,175 @@ class MainWindow(QMainWindow):
                     return
         super().mouseDoubleClickEvent(event)
     
+    def setup_shortcuts(self):
+        """设置全局快捷键（现在使用轮询方式，不再使用QShortcut）"""
+        # QShortcut 被 QAxWidget 拦截，所以现在使用定时器轮询方式
+        # 保留此方法以便将来扩展或备用
+        self.shortcuts = []
+    def setup_shortcuts(self):
+        """设置全局快捷键（现在使用轮询方式，不再使用QShortcut）"""
+        # QShortcut 被 QAxWidget 拦截，所以现在使用定时器轮询方式
+        # 保留此方法以便将来扩展或备用
+        self.shortcuts = []
+    
+    def refresh_current_tab(self):
+        """刷新当前标签页"""
+        current_tab = self.tab_widget.currentWidget()
+        if hasattr(current_tab, 'current_path'):
+            current_tab.navigate_to(current_tab.current_path, 
+                                  is_shell=current_tab.current_path.startswith('shell:'))
+    
+    def add_current_tab_bookmark(self):
+        """添加当前标签页到书签"""
+        current_tab = self.tab_widget.currentWidget()
+        if current_tab:
+            self.add_tab_bookmark(current_tab)
+    
+    def keyPressEvent(self, event):
+        """处理快捷键（备用方案，主要使用QShortcut）"""
+        # 保留此方法以防QShortcut在某些情况下不工作
+        super().keyPressEvent(event)
+    
+    def eventFilter(self, obj, event):
+        """应用级别的事件过滤器（暂时不使用，因为被QAxWidget拦截）"""
+        # 由于QAxWidget在底层拦截事件，eventFilter接收不到事件
+        # 现在使用定时器轮询方式处理快捷键
+        return super().eventFilter(obj, event)
+    
+    def _check_shortcuts(self):
+        """定时检查快捷键状态（用于检测被QAxWidget拦截的快捷键）"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            
+            # Windows虚拟键码
+            VK_CONTROL = 0x11
+            VK_SHIFT = 0x10
+            VK_MENU = 0x12  # Alt键
+            VK_F5 = 0x74
+            
+            # 获取键盘状态
+            def is_key_pressed(vk_code):
+                return ctypes.windll.user32.GetAsyncKeyState(vk_code) & 0x8000 != 0
+            
+            hotkeys = self.config.get("hotkeys", {})
+            
+            # 检查Ctrl组合键
+            if is_key_pressed(VK_CONTROL):
+                # Ctrl+T (0x54)
+                if is_key_pressed(0x54) and hotkeys.get("new_tab", True):
+                    key_combo = "Ctrl+T"
+                    if not self._last_keys_state.get(key_combo, False):
+                        print("[Shortcut Poll] Detected Ctrl+T")
+                        self.add_new_tab()
+                        self._last_keys_state[key_combo] = True
+                    return
+                else:
+                    self._last_keys_state["Ctrl+T"] = False
+                
+                # Ctrl+W (0x57)
+                if is_key_pressed(0x57) and hotkeys.get("close_tab", True):
+                    key_combo = "Ctrl+W"
+                    if not self._last_keys_state.get(key_combo, False):
+                        print("[Shortcut Poll] Detected Ctrl+W")
+                        self.close_current_tab()
+                        self._last_keys_state[key_combo] = True
+                    return
+                else:
+                    self._last_keys_state["Ctrl+W"] = False
+                
+                # Ctrl+F (0x46)
+                if is_key_pressed(0x46) and hotkeys.get("search", True):
+                    key_combo = "Ctrl+F"
+                    if not self._last_keys_state.get(key_combo, False):
+                        print("[Shortcut Poll] Detected Ctrl+F")
+                        self.show_search_dialog()
+                        self._last_keys_state[key_combo] = True
+                    return
+                else:
+                    self._last_keys_state["Ctrl+F"] = False
+                
+                # Ctrl+D (0x44)
+                if is_key_pressed(0x44) and hotkeys.get("add_bookmark", True):
+                    key_combo = "Ctrl+D"
+                    if not self._last_keys_state.get(key_combo, False):
+                        print("[Shortcut Poll] Detected Ctrl+D")
+                        self.add_current_tab_bookmark()
+                        self._last_keys_state[key_combo] = True
+                    return
+                else:
+                    self._last_keys_state["Ctrl+D"] = False
+                
+                # Ctrl+Tab (0x09)
+                if is_key_pressed(0x09) and hotkeys.get("switch_tab", True):
+                    if is_key_pressed(VK_SHIFT):
+                        # Ctrl+Shift+Tab
+                        key_combo = "Ctrl+Shift+Tab"
+                        if not self._last_keys_state.get(key_combo, False):
+                            print("[Shortcut Poll] Detected Ctrl+Shift+Tab")
+                            self.tab_widget.setCurrentIndex(
+                                (self.tab_widget.currentIndex() - 1) % self.tab_widget.count())
+                            self._last_keys_state[key_combo] = True
+                        return
+                    else:
+                        # Ctrl+Tab
+                        key_combo = "Ctrl+Tab"
+                        if not self._last_keys_state.get(key_combo, False):
+                            print("[Shortcut Poll] Detected Ctrl+Tab")
+                            self.tab_widget.setCurrentIndex(
+                                (self.tab_widget.currentIndex() + 1) % self.tab_widget.count())
+                            self._last_keys_state[key_combo] = True
+                        return
+                else:
+                    self._last_keys_state["Ctrl+Tab"] = False
+                    self._last_keys_state["Ctrl+Shift+Tab"] = False
+            
+            # 检查Alt组合键
+            if is_key_pressed(VK_MENU):
+                # Alt+Left (0x25)
+                if is_key_pressed(0x25) and hotkeys.get("navigate", True):
+                    key_combo = "Alt+Left"
+                    if not self._last_keys_state.get(key_combo, False):
+                        self.go_back_current_tab()
+                        self._last_keys_state[key_combo] = True
+                    return
+                else:
+                    self._last_keys_state["Alt+Left"] = False
+                
+                # Alt+Right (0x27)
+                if is_key_pressed(0x27) and hotkeys.get("navigate", True):
+                    key_combo = "Alt+Right"
+                    if not self._last_keys_state.get(key_combo, False):
+                        self.go_forward_current_tab()
+                        self._last_keys_state[key_combo] = True
+                    return
+                else:
+                    self._last_keys_state["Alt+Right"] = False
+                
+                # Alt+Up (0x26)
+                if is_key_pressed(0x26) and hotkeys.get("go_up", True):
+                    key_combo = "Alt+Up"
+                    if not self._last_keys_state.get(key_combo, False):
+                        self.go_up_current_tab()
+                        self._last_keys_state[key_combo] = True
+                    return
+                else:
+                    self._last_keys_state["Alt+Up"] = False
+            
+            # 检查F5
+            if is_key_pressed(VK_F5) and hotkeys.get("refresh", True):
+                key_combo = "F5"
+                if not self._last_keys_state.get(key_combo, False):
+                    self.refresh_current_tab()
+                    self._last_keys_state[key_combo] = True
+                return
+            else:
+                self._last_keys_state["F5"] = False
+                
+        except Exception as e:
+            # 如果轮询出错，不影响程序运行
+            pass
+    
     def show_settings_menu(self):
         """显示设置对话框"""
         dlg = SettingsDialog(self.config, self)
@@ -2909,7 +3111,29 @@ class MainWindow(QMainWindow):
             # 更新配置
             self.config["enable_explorer_monitor"] = new_monitor
             self.config["explorer_monitor_interval"] = new_interval
+            
+            # 更新快捷键配置
+            if "hotkeys" not in self.config:
+                self.config["hotkeys"] = {}
+            self.config["hotkeys"]["new_tab"] = dlg.hotkey_new_tab.isChecked()
+            self.config["hotkeys"]["close_tab"] = dlg.hotkey_close_tab.isChecked()
+            self.config["hotkeys"]["switch_tab"] = dlg.hotkey_switch_tab.isChecked()
+            self.config["hotkeys"]["search"] = dlg.hotkey_search.isChecked()
+            self.config["hotkeys"]["navigate"] = dlg.hotkey_navigate.isChecked()
+            self.config["hotkeys"]["go_up"] = dlg.hotkey_go_up.isChecked()
+            self.config["hotkeys"]["refresh"] = dlg.hotkey_refresh.isChecked()
+            self.config["hotkeys"]["add_bookmark"] = dlg.hotkey_add_bookmark.isChecked()
+            
             self.save_config()
+            
+            # 重新设置快捷键
+            # 清除旧的快捷键
+            for shortcut in getattr(self, 'shortcuts', []):
+                shortcut.setEnabled(False)
+                shortcut.deleteLater()
+            self.shortcuts = []
+            # 重新创建快捷键
+            self.setup_shortcuts()
             
             # 如果监听状态或间隔改变，重启监听
             if old_monitor != new_monitor or (new_monitor and old_interval != new_interval):
@@ -2918,10 +3142,6 @@ class MainWindow(QMainWindow):
                 if new_monitor:
                     self.monitor_interval = new_interval
                     self.start_explorer_monitor()
-                
-                status = "已启用" if new_monitor else "已禁用"
-                interval_info = f"（检查间隔: {new_interval}秒）" if new_monitor else ""
-                QMessageBox.information(self, "设置已更新", f"Explorer窗口监听{status}{interval_info}")
         
     def show_bookmark_dialog(self):
         dlg = BookmarkDialog(self.bookmark_manager, self)
@@ -2932,6 +3152,7 @@ class MainWindow(QMainWindow):
         current_tab = self.tab_widget.currentWidget()
         if not current_tab or not hasattr(current_tab, 'current_path'):
             QMessageBox.warning(self, "提示", "请先打开一个文件夹")
+            self.setFocus()  # 消息框关闭后设置焦点
             return
         
         search_path = current_tab.current_path
@@ -2939,10 +3160,12 @@ class MainWindow(QMainWindow):
         # 不支持搜索特殊路径
         if search_path.startswith('shell:'):
             QMessageBox.warning(self, "提示", "不支持搜索特殊路径（shell:）")
+            self.setFocus()  # 消息框关闭后设置焦点
             return
         
         if not os.path.exists(search_path):
             QMessageBox.warning(self, "提示", f"路径不存在: {search_path}")
+            self.setFocus()  # 消息框关闭后设置焦点
             return
         
         # 创建非模态对话框
@@ -3005,11 +3228,15 @@ class MainWindow(QMainWindow):
         folder_names = [f"{name} (id:{fid})" for fid, name in folder_list]
         from PyQt5.QtWidgets import QInputDialog
         idx, ok = QInputDialog.getItem(self, "选择书签文件夹", "请选择父文件夹：", folder_names, 0, False)
+        # 对话框关闭后，强制将焦点设回主窗口，防止QAxWidget拦截快捷键
+        self.setFocus()
         if not ok:
             return
         folder_id = folder_list[folder_names.index(idx)][0]
         # 输入书签名称
         name, ok = QInputDialog.getText(self, "书签名称", "请输入书签名称：", text=os.path.basename(tab.current_path))
+        # 对话框关闭后，强制将焦点设回主窗口
+        self.setFocus()
         if not ok or not name:
             return
         # 保存到 bookmarks.json
@@ -3123,6 +3350,20 @@ class MainWindow(QMainWindow):
         self.cursor_overridden = False  # 通过QApplication是否已覆盖光标
         
         self.init_ui()
+        
+        # 设置快捷键（在init_ui之后，确保所有组件已创建）
+        self.setup_shortcuts()
+        
+        # 安装应用级别的事件过滤器，确保快捷键始终有效
+        from PyQt5.QtWidgets import QApplication
+        from PyQt5.QtCore import QTimer
+        QApplication.instance().installEventFilter(self)
+        
+        # 启动快捷键轮询定时器（用于检测被QAxWidget拦截的快捷键）
+        self._last_keys_state = {}
+        self._shortcut_timer = QTimer(self)
+        self._shortcut_timer.timeout.connect(self._check_shortcuts)
+        self._shortcut_timer.start(50)  # 每50ms检查一次
 
         # 使用应用图标作为窗口图标
         try:
@@ -3135,7 +3376,18 @@ class MainWindow(QMainWindow):
         """加载配置文件"""
         default_config = {
             "enable_explorer_monitor": True,  # 默认启用Explorer监听
-            "pinned_tabs": []  # 默认没有固定标签页
+            "pinned_tabs": [],  # 默认没有固定标签页
+            # 快捷键配置
+            "hotkeys": {
+                "new_tab": True,           # Ctrl+T
+                "close_tab": True,         # Ctrl+W
+                "switch_tab": True,        # Ctrl+Tab / Ctrl+Shift+Tab
+                "search": True,            # Ctrl+F
+                "navigate": True,          # Alt+Left/Right
+                "go_up": True,             # Alt+Up
+                "refresh": True,           # F5
+                "add_bookmark": True       # Ctrl+D
+            }
         }
         
         try:
@@ -3146,6 +3398,11 @@ class MainWindow(QMainWindow):
                     for key, value in default_config.items():
                         if key not in config:
                             config[key] = value
+                    # 确保hotkeys存在所有键
+                    if "hotkeys" in config:
+                        for key, value in default_config["hotkeys"].items():
+                            if key not in config["hotkeys"]:
+                                config["hotkeys"][key] = value
                     return config
         except Exception as e:
             print(f"Failed to load config: {e}")
@@ -3155,10 +3412,27 @@ class MainWindow(QMainWindow):
     def save_config(self):
         """保存配置文件"""
         try:
+            # 先备份旧配置
+            if os.path.exists("config.json"):
+                import shutil
+                try:
+                    shutil.copy2("config.json", "config.json.bak")
+                except Exception as e:
+                    print(f"Failed to backup config: {e}")
+            
+            # 保存新配置
             with open("config.json", "w", encoding="utf-8") as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"Failed to save config: {e}")
+            # 尝试从备份恢复
+            if os.path.exists("config.json.bak"):
+                try:
+                    import shutil
+                    shutil.copy2("config.json.bak", "config.json")
+                    print("Config restored from backup")
+                except Exception as e2:
+                    print(f"Failed to restore config: {e2}")
 
     def ensure_default_bookmarks(self):
         bm = self.bookmark_manager
@@ -3729,15 +4003,35 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭时停止服务器和监听"""
+        # 停止服务器
         self.server_running = False
         if hasattr(self, 'server_socket'):
             try:
                 self.server_socket.close()
-            except:
-                pass
+            except Exception as e:
+                print(f"Error closing server socket: {e}")
         
         # 停止Explorer监听
-        self.stop_explorer_monitor()
+        try:
+            self.stop_explorer_monitor()
+        except Exception as e:
+            print(f"Error stopping explorer monitor: {e}")
+        
+        # 停止所有标签页中的定时器和COM对象
+        try:
+            for i in range(self.tab_widget.count()):
+                tab = self.tab_widget.widget(i)
+                if hasattr(tab, '_path_sync_timer') and tab._path_sync_timer:
+                    tab._path_sync_timer.stop()
+                    tab._path_sync_timer.deleteLater()
+                # 清理COM对象
+                if hasattr(tab, 'explorer'):
+                    try:
+                        tab.explorer.clear()
+                    except:
+                        pass
+        except Exception as e:
+            print(f"Error stopping timers: {e}")
         
         super().closeEvent(event)
 
@@ -3981,13 +4275,13 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.resize(500, 300)
+        self.resize(600, 500)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
         
         # 添加标题说明
-        from PyQt5.QtWidgets import QDialogButtonBox, QLabel
+        from PyQt5.QtWidgets import QDialogButtonBox, QLabel, QGroupBox
         title_label = QLabel("应用设置")
         title_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #333;")
         layout.addWidget(title_label)
@@ -3999,11 +4293,14 @@ class SettingsDialog(QDialog):
         line.setFrameShadow(QFrame.Sunken)
         layout.addWidget(line)
         
-        # 选项区域
+        # Explorer监听设置组
+        monitor_group = QGroupBox("Explorer监听设置")
+        monitor_layout = QVBoxLayout()
+        
         self.monitor_cb = QCheckBox("监听新Explorer窗口", self)
         self.monitor_cb.setChecked(config.get("enable_explorer_monitor", True))
         self.monitor_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        layout.addWidget(self.monitor_cb)
+        monitor_layout.addWidget(self.monitor_cb)
         
         # 监听间隔设置
         interval_layout = QHBoxLayout()
@@ -4015,12 +4312,56 @@ class SettingsDialog(QDialog):
         self.interval_spinbox.setValue(config.get("explorer_monitor_interval", 2.0))
         self.interval_spinbox.setToolTip("检查新Explorer窗口的时间间隔，更长的间隔降低CPU占用")
         interval_layout.addWidget(self.interval_spinbox)
-        interval_layout.addWidget(QLabel("（推荐: 2.0秒，降低CPU占用）"))
+        interval_layout.addWidget(QLabel("（推荐: 2.0秒）"))
         interval_layout.addStretch(1)
-        layout.addLayout(interval_layout)
+        monitor_layout.addLayout(interval_layout)
+        
+        monitor_group.setLayout(monitor_layout)
+        layout.addWidget(monitor_group)
+        
+        # 快捷键设置组
+        hotkey_group = QGroupBox("快捷键设置")
+        hotkey_layout = QVBoxLayout()
+        
+        hotkeys = config.get("hotkeys", {})
+        
+        self.hotkey_new_tab = QCheckBox("Ctrl+T - 新建标签页")
+        self.hotkey_new_tab.setChecked(hotkeys.get("new_tab", True))
+        hotkey_layout.addWidget(self.hotkey_new_tab)
+        
+        self.hotkey_close_tab = QCheckBox("Ctrl+W - 关闭当前标签页")
+        self.hotkey_close_tab.setChecked(hotkeys.get("close_tab", True))
+        hotkey_layout.addWidget(self.hotkey_close_tab)
+        
+        self.hotkey_switch_tab = QCheckBox("Ctrl+Tab / Ctrl+Shift+Tab - 切换标签页")
+        self.hotkey_switch_tab.setChecked(hotkeys.get("switch_tab", True))
+        hotkey_layout.addWidget(self.hotkey_switch_tab)
+        
+        self.hotkey_search = QCheckBox("Ctrl+F - 打开搜索对话框")
+        self.hotkey_search.setChecked(hotkeys.get("search", True))
+        hotkey_layout.addWidget(self.hotkey_search)
+        
+        self.hotkey_navigate = QCheckBox("Alt+Left/Right - 前进/后退")
+        self.hotkey_navigate.setChecked(hotkeys.get("navigate", True))
+        hotkey_layout.addWidget(self.hotkey_navigate)
+        
+        self.hotkey_go_up = QCheckBox("Alt+Up - 返回上级目录")
+        self.hotkey_go_up.setChecked(hotkeys.get("go_up", True))
+        hotkey_layout.addWidget(self.hotkey_go_up)
+        
+        self.hotkey_refresh = QCheckBox("F5 - 刷新当前路径")
+        self.hotkey_refresh.setChecked(hotkeys.get("refresh", True))
+        hotkey_layout.addWidget(self.hotkey_refresh)
+        
+        self.hotkey_add_bookmark = QCheckBox("Ctrl+D - 添加当前路径到书签")
+        self.hotkey_add_bookmark.setChecked(hotkeys.get("add_bookmark", True))
+        hotkey_layout.addWidget(self.hotkey_add_bookmark)
+        
+        hotkey_group.setLayout(hotkey_layout)
+        layout.addWidget(hotkey_group)
         
         # 提示信息
-        tip_label = QLabel("💡 提示：\n• 较短间隔(0.5-1秒)响应更快但CPU占用高\n• 较长间隔(2-5秒)CPU占用低但响应稍慢\n• 推荐使用2秒平衡性能与响应")
+        tip_label = QLabel("💡 提示：取消勾选可禁用对应的快捷键")
         tip_label.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
         layout.addWidget(tip_label)
         
