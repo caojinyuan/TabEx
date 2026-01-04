@@ -810,7 +810,7 @@ import time
 import socket
 import threading
 import queue
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy)  # QDockWidget removed (unused)
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QTreeView, QFileSystemModel, QSplitter)  # QDockWidget removed (unused)
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize  # QModelIndex removed (unused)
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor
@@ -1878,6 +1878,13 @@ class DragDropTabWidget(QTabWidget):
         else:
             event.ignore()
     
+    def dragMoveEvent(self, event):
+        """允许在整个 TabWidget 区域内拖动"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
     def mouseDoubleClickEvent(self, event):
         """捕获 TabWidget 区域的双击事件"""
         from PyQt5.QtCore import QPoint
@@ -1920,6 +1927,17 @@ class DragDropTabWidget(QTabWidget):
     def dropEvent(self, event: QDropEvent):
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
+            
+            # 获取拖拽位置
+            drop_pos = event.pos()
+            tabbar = self.tabBar()
+            tabbar_pos = tabbar.mapFrom(self, drop_pos)
+            
+            # 检查是否拖拽到标签栏区域
+            in_tabbar_area = drop_pos.y() < tabbar.height()
+            
+            print(f"[DEBUG] Drop event: pos={drop_pos}, in_tabbar_area={in_tabbar_area}")
+            
             for url in urls:
                 path = None
                 # 尝试获取本地文件路径
@@ -1939,6 +1957,7 @@ class DragDropTabWidget(QTabWidget):
                         path = '\\\\' + unquote(url_str[7:]).replace('/', '\\')
                 
                 if path and os.path.exists(path):
+                    print(f"[DEBUG] Processing dropped path: {path}")
                     if os.path.isdir(path):
                         # 如果是文件夹，打开新标签页
                         if self.main_window and hasattr(self.main_window, 'add_new_tab'):
@@ -1952,6 +1971,71 @@ class DragDropTabWidget(QTabWidget):
         else:
             event.ignore()
 
+
+
+# 自定义支持拖拽的目录树
+class DragDropTreeView(QTreeView):
+    """支持拖拽打开文件夹的自定义QTreeView"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragEnabled(True)  # 启用拖拽
+        self.setDragDropMode(QTreeView.DragDrop)  # 支持拖入和拖出
+        self.main_window = parent
+    
+    def dragEnterEvent(self, event):
+        """目录树拖拽进入事件"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            print("[DEBUG] DirTree: Drag enter accepted")
+        else:
+            event.ignore()
+    
+    def dragMoveEvent(self, event):
+        """目录树拖拽移动事件"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def dropEvent(self, event):
+        """目录树拖拽释放事件"""
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            print(f"[DEBUG] DirTree: Drop event, urls count: {len(urls)}")
+            
+            for url in urls:
+                path = None
+                # 尝试获取本地文件路径
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                else:
+                    # 尝试从 URL 字符串中提取路径（支持网络路径）
+                    url_str = url.toString()
+                    if url_str.startswith('file:///'):
+                        from urllib.parse import unquote
+                        path = unquote(url_str[8:])
+                        if os.name == 'nt' and path.startswith('/'):
+                            path = path[1:]
+                    elif url_str.startswith('file://'):
+                        from urllib.parse import unquote
+                        # 网络路径 file://server/share
+                        path = '\\\\' + unquote(url_str[7:]).replace('/', '\\')
+                
+                if path and os.path.exists(path):
+                    print(f"[DEBUG] DirTree: Processing dropped path: {path}")
+                    if os.path.isdir(path):
+                        # 如果是文件夹，打开新标签页
+                        if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+                            self.main_window.add_new_tab(path)
+                    elif os.path.isfile(path):
+                        # 如果是文件，打开其所在文件夹
+                        folder = os.path.dirname(path)
+                        if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+                            self.main_window.add_new_tab(folder)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
 # 自定义 TabBar 以支持双击空白区域打开新标签页和悬停显示关闭按钮
 from PyQt5.QtWidgets import QTabBar, QToolButton
@@ -2235,6 +2319,59 @@ class MainWindow(QMainWindow):
                 self.dir_tree.expand(p)
             self.dir_tree.setCurrentIndex(idx)
             self.dir_tree.scrollTo(idx)
+
+    def dragEnterEvent(self, event):
+        """主窗口拖拽进入事件"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            print("[DEBUG] MainWindow: Drag enter accepted")
+        else:
+            event.ignore()
+    
+    def dragMoveEvent(self, event):
+        """主窗口拖拽移动事件"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
+    def dropEvent(self, event):
+        """主窗口拖拽释放事件"""
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            print(f"[DEBUG] MainWindow: Drop event, urls count: {len(urls)}")
+            
+            for url in urls:
+                path = None
+                # 尝试获取本地文件路径
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                else:
+                    # 尝试从 URL 字符串中提取路径（支持网络路径）
+                    url_str = url.toString()
+                    if url_str.startswith('file:///'):
+                        from urllib.parse import unquote
+                        path = unquote(url_str[8:])
+                        if os.name == 'nt' and path.startswith('/'):
+                            path = path[1:]
+                    elif url_str.startswith('file://'):
+                        from urllib.parse import unquote
+                        # 网络路径 file://server/share
+                        path = '\\\\' + unquote(url_str[7:]).replace('/', '\\')
+                
+                if path and os.path.exists(path):
+                    print(f"[DEBUG] MainWindow: Processing dropped path: {path}")
+                    if os.path.isdir(path):
+                        # 如果是文件夹，打开新标签页
+                        self.add_new_tab(path)
+                    elif os.path.isfile(path):
+                        # 如果是文件，打开其所在文件夹
+                        folder = os.path.dirname(path)
+                        self.add_new_tab(folder)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+    
     def create_custom_titlebar(self, main_layout):
         """创建自定义标题栏，包含窗口控制按钮和功能按钮"""
         titlebar = QWidget()
@@ -2895,6 +3032,9 @@ class MainWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         
+        # 启用主窗口拖拽支持
+        self.setAcceptDrops(True)
+        
         # 加载配置
         self.config = self.load_config()
         
@@ -2986,7 +3126,6 @@ class MainWindow(QMainWindow):
 
 
     def init_ui(self):
-        from PyQt5.QtWidgets import QSplitter, QTreeView, QFileSystemModel
         self.setGeometry(100, 100, 1200, 800)
         
         # 设置窗口最小尺寸，允许窗口缩小到很小
@@ -3035,12 +3174,33 @@ class MainWindow(QMainWindow):
                 padding: 4px 8px;
                 background: transparent;
                 min-width: 0px;
+                color: #000000;
             }
             QMenuBar::item:selected {
                 background: #e0e0e0;
+                color: #000000;
             }
             QMenuBar::item:pressed {
                 background: #d0d0d0;
+                color: #000000;
+            }
+            QMenu {
+                background-color: #ffffff;
+                border: 1px solid #cccccc;
+                color: #000000;
+            }
+            QMenu::item {
+                padding: 5px 20px 5px 20px;
+                background: transparent;
+                color: #000000;
+            }
+            QMenu::item:selected {
+                background: #0078d7;
+                color: #ffffff;
+            }
+            QMenu::item:pressed {
+                background: #005a9e;
+                color: #ffffff;
             }
         """)
         self.populate_bookmark_bar_menu()
@@ -3056,7 +3216,7 @@ class MainWindow(QMainWindow):
         # 设置根为计算机根目录（显示所有盘符）
         root_path = QDir.rootPath()  # 通常为C:/
         self.dir_model.setRootPath(root_path)
-        self.dir_tree = QTreeView()
+        self.dir_tree = DragDropTreeView(self)
         self.dir_tree.setModel(self.dir_model)
         # 不设置setRootIndex，或者设置为index("")，这样能显示所有盘符
         # self.dir_tree.setRootIndex(self.dir_model.index(""))
