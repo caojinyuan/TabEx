@@ -2,6 +2,18 @@
 from collections import OrderedDict
 import hashlib
 
+# 性能优化配置常量
+MAX_SEARCH_CACHE_SIZE = 50  # 搜索缓存最大数量
+MAX_SEARCH_RESULTS = 1000000  # 单次搜索最大结果数
+MAX_CLOSED_TABS_HISTORY = 20  # 关闭标签页历史最大数量（从10增加到20）
+MAX_SEARCH_HISTORY = 30  # 搜索历史最大数量（从20增加到30）
+MAX_NAVIGATION_HISTORY = 50  # 导航历史最大数量
+
+# 大文件夹异步加载配置
+LARGE_FOLDER_THRESHOLD = 1000  # 超过此数量文件视为大文件夹
+FOLDER_CHECK_TIMEOUT = 500  # 文件夹检查超时时间(ms)
+ASYNC_LOAD_ENABLED = True  # 是否启用异步加载
+
 class SearchCache:
     """搜索结果缓存，使用LRU策略"""
     def __init__(self, max_size=50):
@@ -35,8 +47,8 @@ class SearchCache:
         """清空缓存"""
         self.cache.clear()
 
-# 全局搜索缓存实例
-_search_cache = SearchCache()
+# 全局搜索缓存实例（使用配置常量）
+_search_cache = SearchCache(max_size=MAX_SEARCH_CACHE_SIZE)
 
 from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton
 # 多层结构书签弹窗
@@ -136,9 +148,10 @@ class SearchDialog(QDialog):
         self.ui_update_timer = None
         self.queue_overflow_count = 0  # 队列溢出计数
         
-        # 结果限制配置（防止UI卡死）
-        self.max_results = 5000  # 最多显示5000个结果
+        # 结果限制配置（使用虚拟滚动优化，支持更多结果）
+        self.max_results = 1000000  # 最多显示100万个结果（虚拟滚动优化）
         self.current_result_count = 0
+        self.batch_insert_size = 500  # 批量插入大小
         
         layout = QVBoxLayout(self)
         
@@ -827,10 +840,10 @@ import time
 import socket
 import threading
 import queue
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QTreeView, QFileSystemModel, QSplitter)  # QDockWidget removed (unused)
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QTreeView, QFileSystemModel, QSplitter, QProgressBar, QCompleter)  # 添加QCompleter
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor
+from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer, QThread, QMutex, QMimeData
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor, QDrag
 # from PyQt5.QtGui import QIcon  # unused
 
 # 全局调试开关
@@ -840,6 +853,61 @@ def debug_print(*args, **kwargs):
     """根据调试开关决定是否输出调试信息"""
     if _DEBUG_MODE:
         print(*args, **kwargs)
+
+# ==================== 异步文件夹大小检查线程 ====================
+class FolderSizeChecker(QThread):
+    """后台线程检查文件夹大小，避免阻塞UI"""
+    finished = pyqtSignal(str, int, bool)  # path, file_count, is_large
+    
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self.should_stop = False
+        self._mutex = QMutex()
+    
+    def run(self):
+        """在后台线程中计算文件夹大小"""
+        if not os.path.exists(self.path) or not os.path.isdir(self.path):
+            self.finished.emit(self.path, 0, False)
+            return
+        
+        try:
+            file_count = 0
+            start_time = time.time()
+            
+            # 快速计数，不递归子文件夹
+            for entry in os.scandir(self.path):
+                if self.should_stop:
+                    debug_print(f"[FolderSizeChecker] Stopped checking {self.path}")
+                    return
+                
+                file_count += 1
+                
+                # 超过阈值或超时则提前返回
+                if file_count > LARGE_FOLDER_THRESHOLD:
+                    debug_print(f"[FolderSizeChecker] Large folder detected: {self.path} (>{LARGE_FOLDER_THRESHOLD} files)")
+                    self.finished.emit(self.path, file_count, True)
+                    return
+                
+                # 超时检查
+                if (time.time() - start_time) * 1000 > FOLDER_CHECK_TIMEOUT:
+                    debug_print(f"[FolderSizeChecker] Timeout checking {self.path}")
+                    self.finished.emit(self.path, file_count, file_count > LARGE_FOLDER_THRESHOLD)
+                    return
+            
+            is_large = file_count > LARGE_FOLDER_THRESHOLD
+            debug_print(f"[FolderSizeChecker] Folder {self.path}: {file_count} files (large={is_large})")
+            self.finished.emit(self.path, file_count, is_large)
+            
+        except Exception as e:
+            debug_print(f"[FolderSizeChecker] Error checking {self.path}: {e}")
+            self.finished.emit(self.path, 0, False)
+    
+    def stop(self):
+        """停止检查"""
+        self._mutex.lock()
+        self.should_stop = True
+        self._mutex.unlock()
 
 def set_debug_mode(enabled):
     """设置全局调试模式"""
@@ -918,6 +986,9 @@ class BreadcrumbPathBar(QWidget):
         self.path_edit.returnPressed.connect(self.on_edit_finished)
         self.path_edit.editingFinished.connect(self.exit_edit_mode)
         
+        # 设置路径自动补全
+        self.setup_path_completer()
+        
         # 面包屑容器（显示模式时显示）
         self.breadcrumb_widget = QWidget(self)
         self.breadcrumb_widget.setStyleSheet("QWidget { background: #e8f5e9; }")
@@ -938,6 +1009,60 @@ class BreadcrumbPathBar(QWidget):
             }
         """)
         self.setFixedHeight(30)
+    
+    def setup_path_completer(self):
+        """设置路径自动补全"""
+        # 创建文件系统模型用于路径补全
+        self.completer_model = QFileSystemModel()
+        self.completer_model.setRootPath("")  # 设置为空以显示所有驱动器
+        self.completer_model.setFilter(QDir.Drives | QDir.AllDirs | QDir.NoDotAndDotDot)
+        
+        # 创建补全器
+        self.completer = QCompleter(self.completer_model, self)
+        self.completer.setCaseSensitivity(Qt.CaseInsensitive)  # 不区分大小写
+        self.completer.setCompletionMode(QCompleter.PopupCompletion)  # 弹出补全列表
+        self.completer.setMaxVisibleItems(10)  # 最多显示10个补全项
+        
+        # 设置补全器的弹出窗口样式
+        popup = self.completer.popup()
+        popup.setStyleSheet("""
+            QListView {
+                font-size: 11pt;
+                border: 1px solid #ccc;
+                background-color: white;
+                selection-background-color: #0078d7;
+                selection-color: white;
+            }
+        """)
+        
+        # 连接信号以动态更新补全
+        self.path_edit.textChanged.connect(self.update_completer_prefix)
+        
+        # 将补全器设置到输入框
+        self.path_edit.setCompleter(self.completer)
+        
+        debug_print("[PathCompleter] Path auto-completion initialized")
+    
+    def update_completer_prefix(self, text):
+        """动态更新补全前缀"""
+        if not text:
+            return
+        
+        # 处理不同的路径格式
+        if text.startswith('shell:') or text in ['cmd', '回收站', '此电脑', '我的电脑', '桌面', '网络']:
+            # 特殊命令不需要补全
+            return
+        
+        # 标准化路径分隔符
+        normalized_path = text.replace('/', '\\') if os.name == 'nt' else text
+        
+        # 获取父目录路径
+        parent_dir = os.path.dirname(normalized_path)
+        
+        # 如果有父目录，设置为补全的根路径
+        if parent_dir and os.path.exists(parent_dir):
+            self.completer_model.setRootPath(parent_dir)
+            debug_print(f"[PathCompleter] Updated root path to: {parent_dir}")
     
     def set_path(self, path):
         """设置并显示路径"""
@@ -1053,9 +1178,11 @@ class BreadcrumbPathBar(QWidget):
         """编辑完成时触发"""
         new_path = self.path_edit.text().strip()
         if new_path and new_path != self.current_path:
-            self.current_path = new_path
+            # 先发出信号，如果导航失败，在 FileExplorerTab 中会恢复路径
             self.pathChanged.emit(new_path)
-        self.exit_edit_mode()
+        else:
+            # 如果路径未改变或为空，直接退出编辑模式（保持当前路径）
+            self.exit_edit_mode()
     
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """双击进入编辑模式"""
@@ -1073,12 +1200,14 @@ class BreadcrumbPathBar(QWidget):
 
 
 class ClickableLabel(QLabel):
-    """可点击的标签，用于面包屑导航"""
+    """可点击的标签，用于面包屑导航，支持拖拽到标签栏"""
     clicked = pyqtSignal(str)
     
     def __init__(self, text, path, parent=None):
         super().__init__(text, parent)
         self.path = path
+        self.drag_start_position = None
+        self.is_dragging = False
         self.setStyleSheet("""
             QLabel {
                 color: #003d7a;
@@ -1095,8 +1224,52 @@ class ClickableLabel(QLabel):
     
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
-            self.clicked.emit(self.path)
+            # 记录拖拽起始位置
+            self.drag_start_position = event.pos()
+            self.is_dragging = False
         super().mousePressEvent(event)
+    
+    def mouseMoveEvent(self, event: QMouseEvent):
+        # 检查是否应该开始拖拽
+        if not (event.buttons() & Qt.LeftButton):
+            return
+        if self.drag_start_position is None:
+            return
+        
+        # 计算移动距离
+        distance = (event.pos() - self.drag_start_position).manhattanLength()
+        
+        # 如果移动距离超过阈值，开始拖拽
+        if distance >= QApplication.startDragDistance():
+            self.is_dragging = True
+            self.start_drag()
+    
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            # 只有在没有拖拽的情况下才发出点击信号
+            if not self.is_dragging and self.drag_start_position is not None:
+                self.clicked.emit(self.path)
+            # 重置状态
+            self.drag_start_position = None
+            self.is_dragging = False
+        super().mouseReleaseEvent(event)
+    
+    def start_drag(self):
+        """开始拖拽操作"""
+        drag = QDrag(self)
+        mime_data = QMimeData()
+        
+        # 设置拖拽的数据（文件夹路径）
+        from PyQt5.QtCore import QUrl
+        url = QUrl.fromLocalFile(self.path)
+        mime_data.setUrls([url])
+        mime_data.setText(self.path)
+        
+        drag.setMimeData(mime_data)
+        
+        # 执行拖拽
+        debug_print(f"[Breadcrumb Drag] Starting drag for path: {self.path}")
+        drag.exec_(Qt.CopyAction | Qt.MoveAction)
 
 
 class BookmarkManager:
@@ -1334,6 +1507,15 @@ class FileExplorerTab(QWidget):
         self.path_bar = BreadcrumbPathBar(self)
         self.path_bar.pathChanged.connect(self.on_path_bar_changed)
         layout.addWidget(self.path_bar)
+        
+        # 加载指示器（初始隐藏）
+        self.loading_bar = QProgressBar(self)
+        self.loading_bar.setMaximum(0)  # 不确定进度模式
+        self.loading_bar.setTextVisible(True)
+        self.loading_bar.setFormat("正在加载大文件夹...")
+        self.loading_bar.setMaximumHeight(20)
+        self.loading_bar.hide()
+        layout.addWidget(self.loading_bar)
 
         # 嵌入Explorer控件
         self.explorer = QAxWidget(self)
@@ -1342,6 +1524,10 @@ class FileExplorerTab(QWidget):
         from PyQt5.QtCore import Qt
         self.explorer.setFocusPolicy(Qt.NoFocus)
         layout.addWidget(self.explorer)
+        
+        # 异步加载相关
+        self.folder_checker = None  # 文件夹大小检查线程
+        self.pending_navigation = None  # 待处理的导航请求
         
         # 绑定导航完成信号，自动更新路径栏
         self.explorer.dynamicCall('NavigateComplete2(QVariant,QVariant)', None, None)  # 预绑定，防止信号未注册
@@ -1517,6 +1703,9 @@ class FileExplorerTab(QWidget):
             self.navigate_to(path)
         else:
             QMessageBox.warning(self, "路径错误", f"路径不存在: {path}")
+            # 恢复路径栏显示当前正确的路径
+            if hasattr(self, 'current_path') and self.current_path:
+                self.path_bar.set_path(self.current_path)
 
     def explorer_mouse_press(self, event):
         # 在鼠标按下时记录当时的选中项数量和鼠标位置点击测试结果
@@ -1901,8 +2090,15 @@ class FileExplorerTab(QWidget):
         except Exception:
             pass
         
+        # 停止之前的文件夹检查线程
+        if hasattr(self, 'folder_checker') and self.folder_checker and self.folder_checker.isRunning():
+            self.folder_checker.stop()
+            self.folder_checker.wait(100)  # 等待最多100ms
+            debug_print(f"[navigate_to] Stopped previous folder checker")
+        
         # 支持本地路径和shell特殊路径
         if is_shell:
+            self._hide_loading_indicator()
             self.explorer.dynamicCall("Navigate(const QString&)", path)
             self.current_path = path
             if hasattr(self, 'path_bar'):
@@ -1912,45 +2108,96 @@ class FileExplorerTab(QWidget):
             if add_to_history:
                 self._add_to_history(path)
         elif os.path.exists(path):
-            url = QDir.toNativeSeparators(path)
-            # 使用Navigate2来获得更好的控制
-            # navNoHistory = 0x2, navNoReadFromCache = 0x4, navNoWriteToCache = 0x8
-            # navAllowAutosearch = 0x10, navBrowserBar = 0x20, navHyperlink = 0x40
-            try:
-                # 尝试使用Navigate2获得更好的刷新效果
-                self.explorer.dynamicCall("Navigate2(QVariant,QVariant,QVariant,QVariant,QVariant)", 
-                                         url, 0, "", None, None)
-            except:
-                # 回退到普通Navigate
-                self.explorer.dynamicCall("Navigate(const QString&)", url)
+            # 异步检查文件夹大小（仅对本地路径）
+            if ASYNC_LOAD_ENABLED and os.path.isdir(path):
+                self._check_folder_size_async(path, add_to_history)
+            else:
+                # 直接导航（不检查大小）
+                self._perform_navigation(path, add_to_history)
+        else:
+            debug_print(f"[navigate_to] Path does not exist: {path}")
+    
+    def _check_folder_size_async(self, path, add_to_history):
+        """异步检查文件夹大小并决定是否显示加载指示器"""
+        # 显示加载指示器
+        self._show_loading_indicator()
+        
+        # 创建并启动检查线程
+        self.folder_checker = FolderSizeChecker(path, self)
+        self.folder_checker.finished.connect(
+            lambda p, count, is_large: self._on_folder_size_checked(p, count, is_large, add_to_history)
+        )
+        self.folder_checker.start()
+        debug_print(f"[AsyncLoad] Started checking folder: {path}")
+    
+    def _on_folder_size_checked(self, path, file_count, is_large, add_to_history):
+        """文件夹大小检查完成的回调"""
+        debug_print(f"[AsyncLoad] Folder checked: {path}, files={file_count}, large={is_large}")
+        
+        # 执行导航
+        self._perform_navigation(path, add_to_history)
+        
+        # 隐藏加载指示器
+        if is_large:
+            # 大文件夹延迟隐藏指示器（等待Explorer加载）
+            QTimer.singleShot(1000, self._hide_loading_indicator)
+        else:
+            # 小文件夹立即隐藏
+            self._hide_loading_indicator()
+    
+    def _perform_navigation(self, path, add_to_history):
+        """执行实际的导航操作"""
+        old_path = getattr(self, 'current_path', None)
+        url = QDir.toNativeSeparators(path)
+        
+        # 使用Navigate2来获得更好的控制
+        try:
+            # 尝试使用Navigate2获得更好的刷新效果
+            self.explorer.dynamicCall("Navigate2(QVariant,QVariant,QVariant,QVariant,QVariant)", 
+                                     url, 0, "", None, None)
+        except:
+            # 回退到普通Navigate
+            self.explorer.dynamicCall("Navigate(const QString&)", url)
+        
+        self.current_path = path
+        
+        # 更新文件系统监控（只监控真实文件系统路径）
+        if hasattr(self, 'file_watcher'):
+            # 移除旧路径的监控
+            if old_path and os.path.exists(old_path) and os.path.isdir(old_path) and not old_path.startswith('shell:'):
+                watched_dirs = self.file_watcher.directories()
+                if old_path in watched_dirs:
+                    self.file_watcher.removePath(old_path)
+                    debug_print(f"[FileWatcher] Stopped watching: {old_path}")
             
-            self.current_path = path
-            
-            # 更新文件系统监控（只监控真实文件系统路径）
-            if hasattr(self, 'file_watcher'):
-                # 移除旧路径的监控
-                if old_path and os.path.exists(old_path) and os.path.isdir(old_path) and not old_path.startswith('shell:'):
-                    watched_dirs = self.file_watcher.directories()
-                    if old_path in watched_dirs:
-                        self.file_watcher.removePath(old_path)
-                        debug_print(f"[FileWatcher] Stopped watching: {old_path}")
-                
-                # 添加新路径的监控
-                if os.path.isdir(path):
-                    if self.file_watcher.addPath(path):
-                        debug_print(f"[FileWatcher] Now watching: {path}")
-                    else:
-                        debug_print(f"[FileWatcher] Failed to watch: {path}")
-            
-            if hasattr(self, 'path_bar'):
-                self.path_bar.set_path(path)
-            self.update_tab_title()
-            # 添加到历史记录
-            if add_to_history:
-                self._add_to_history(path)
+            # 添加新路径的监控
+            if os.path.isdir(path):
+                if self.file_watcher.addPath(path):
+                    debug_print(f"[FileWatcher] Now watching: {path}")
+                else:
+                    debug_print(f"[FileWatcher] Failed to watch: {path}")
+        
+        if hasattr(self, 'path_bar'):
+            self.path_bar.set_path(path)
+        self.update_tab_title()
+        # 添加到历史记录
+        if add_to_history:
+            self._add_to_history(path)
+    
+    def _show_loading_indicator(self):
+        """显示加载指示器"""
+        if hasattr(self, 'loading_bar'):
+            self.loading_bar.show()
+            debug_print("[AsyncLoad] Loading indicator shown")
+    
+    def _hide_loading_indicator(self):
+        """隐藏加载指示器"""
+        if hasattr(self, 'loading_bar'):
+            self.loading_bar.hide()
+            debug_print("[AsyncLoad] Loading indicator hidden")
     
     def _add_to_history(self, path):
-        """添加路径到历史记录"""
+        """添加路径到历史记录（应用内存优化限制）"""
         # 如果当前不在历史末尾，删除当前位置之后的所有历史
         if self.history_index < len(self.history) - 1:
             self.history = self.history[:self.history_index + 1]
@@ -1958,6 +2205,15 @@ class FileExplorerTab(QWidget):
         if not self.history or self.history[-1] != path:
             self.history.append(path)
             self.history_index = len(self.history) - 1
+            
+            # 内存优化：限制历史记录长度
+            if len(self.history) > MAX_NAVIGATION_HISTORY:
+                # 删除最旧的记录
+                remove_count = len(self.history) - MAX_NAVIGATION_HISTORY
+                self.history = self.history[remove_count:]
+                self.history_index = len(self.history) - 1
+                debug_print(f"[Navigation History] Trimmed to {MAX_NAVIGATION_HISTORY} entries")
+                
         # 更新主窗口按钮状态
         if self.main_window and hasattr(self.main_window, 'update_navigation_buttons'):
             self.main_window.update_navigation_buttons()
@@ -3378,7 +3634,7 @@ class MainWindow(QMainWindow):
         dlg.show()
     
     def add_search_history(self, keyword):
-        """添加搜索关键词到历史记录（最多保留20个）"""
+        """添加搜索关键词到历史记录（使用配置的最大值）"""
         if not keyword or not keyword.strip():
             return
         
@@ -3391,11 +3647,11 @@ class MainWindow(QMainWindow):
         # 添加到列表开头（最新的在前面）
         self.search_history.insert(0, keyword)
         
-        # 限制最多保留20个
-        if len(self.search_history) > 20:
-            self.search_history = self.search_history[:20]
+        # 限制最多保留配置的数量（内存优化）
+        if len(self.search_history) > self.max_search_history:
+            self.search_history = self.search_history[:self.max_search_history]
         
-        print(f"[Search History] Added '{keyword}', total: {len(self.search_history)}")
+        debug_print(f"[Search History] Added '{keyword}', total: {len(self.search_history)}")
 
     def tab_context_menu(self, pos):
         tab_index = self.tab_widget.tabBar().tabAt(pos)
@@ -3569,13 +3825,15 @@ class MainWindow(QMainWindow):
         self.resize_margin = 10  # 边缘检测范围（像素），增加到10像素更容易触发
         self.cursor_overridden = False  # 通过QApplication是否已覆盖光标
         
-        # 搜索历史（内存中，软件关闭后自动清除）
+        # 搜索历史（内存中，软件关闭后自动清除）- 使用常量限制大小
         self.search_history = []
+        self.max_search_history = MAX_SEARCH_HISTORY
         
-        # 关闭标签页历史（最多保存10个）
+        # 关闭标签页历史 - 使用常量限制大小
         self.closed_tabs_history = []  # 每项格式: {'path': str, 'title': str, 'is_shell': bool}
-        self.max_closed_tabs_history = 10
+        self.max_closed_tabs_history = MAX_CLOSED_TABS_HISTORY
         
+        # 性能优化：延迟初始化UI（先显示基本界面）
         self.init_ui()
         
         # 设置快捷键（在init_ui之后，确保所有组件已创建）
@@ -3591,6 +3849,9 @@ class MainWindow(QMainWindow):
         self._shortcut_timer = QTimer(self)
         self._shortcut_timer.timeout.connect(self._check_shortcuts)
         self._shortcut_timer.start(50)  # 每50ms检查一次
+        
+        # 性能优化：延迟加载非关键功能（100ms后加载）
+        QTimer.singleShot(100, self._delayed_initialization)
 
         # 使用应用图标作为窗口图标
         try:
@@ -3835,13 +4096,20 @@ class MainWindow(QMainWindow):
         self.splitter = QSplitter()
         self.splitter.setOrientation(Qt.Horizontal)
 
-        # 左侧目录树
+        # 左侧目录树（应用性能优化）
         self.dir_model = QFileSystemModel()
+        # 性能优化：启用延迟加载和过滤器
+        self.dir_model.setFilter(QDir.Dirs | QDir.NoDotAndDotDot)  # 只显示文件夹
         # 设置根为计算机根目录（显示所有盘符）
         root_path = QDir.rootPath()  # 通常为C:/
+        # 性能优化：在后台线程中加载文件系统
+        # setRootPath 本身是异步的，会在后台线程中填充
         self.dir_model.setRootPath(root_path)
         self.dir_tree = DragDropTreeView(self)
         self.dir_tree.setModel(self.dir_model)
+        # 性能优化：统一排序，减少渲染开销
+        self.dir_tree.setSortingEnabled(True)
+        self.dir_tree.sortByColumn(0, Qt.AscendingOrder)
         # 不设置setRootIndex，或者设置为index("")，这样能显示所有盘符
         # self.dir_tree.setRootIndex(self.dir_model.index(""))
         self.dir_tree.setHeaderHidden(True)
@@ -3970,11 +4238,10 @@ class MainWindow(QMainWindow):
         # 设置主容器为中心部件
         self.setCentralWidget(main_container)
 
-        # 加载固定标签页
-        has_pinned = self.load_pinned_tabs()
-        # 添加初始标签页（如无固定标签）
-        if not has_pinned and self.tab_widget.count() == 0:
-            self.add_new_tab(QDir.homePath())
+        # 性能优化：延迟加载固定标签页（移到 _delayed_initialization）
+        # 先添加一个默认标签页，避免窗口空白
+        self.add_new_tab(QDir.homePath())
+        
         # 右键标签页支持固定/取消固定
         self.tab_widget.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
         self.tab_widget.tabBar().customContextMenuRequested.connect(self.tab_context_menu)
@@ -3982,11 +4249,7 @@ class MainWindow(QMainWindow):
         # 连接信号
         self.open_path_signal.connect(self.handle_open_path_from_instance)
         
-        # 启动单实例通信服务器
-        self.start_instance_server()
-        
-        # 启动Explorer窗口监听
-        self.start_explorer_monitor()
+        # 性能优化：单实例服务器和Explorer监听移到延迟初始化
 
     def handle_open_path_from_instance(self, path):
         """处理从其他实例接收到的路径（在主线程中）"""
@@ -3995,7 +4258,43 @@ class MainWindow(QMainWindow):
         # 激活并置顶窗口
         self.activateWindow()
         self.raise_()
-        self.showNormal()  # 如果最小化则恢复
+        # 只在窗口最小化时恢复，保持最大化状态不变
+        if self.isMinimized():
+            self.showNormal()
+    
+    def _delayed_initialization(self):
+        """延迟初始化非关键功能（性能优化）"""
+        debug_print("[Performance] Starting delayed initialization...")
+        
+        # 延迟加载固定标签页
+        try:
+            has_pinned = self.load_pinned_tabs()
+            # 如果有固定标签页，关闭默认的主目录标签
+            if has_pinned and self.tab_widget.count() > 0:
+                # 检查第一个标签是否是默认的主目录
+                first_tab = self.tab_widget.widget(0)
+                if first_tab and hasattr(first_tab, 'current_path'):
+                    if first_tab.current_path == QDir.homePath():
+                        self.close_tab(0)
+        except Exception as e:
+            debug_print(f"[Performance] Failed to load pinned tabs: {e}")
+        
+        # 延迟启动实例服务器
+        try:
+            self.start_instance_server()
+        except Exception as e:
+            debug_print(f"[Performance] Failed to start instance server: {e}")
+        
+        # 延迟启动Explorer监听（如果启用）
+        try:
+            if self.config.get("enable_explorer_monitor", True):
+                from PyQt5.QtCore import QTimer
+                # 再延迟500ms启动Explorer监听，避免影响启动速度
+                QTimer.singleShot(500, self.start_explorer_monitor)
+        except Exception as e:
+            debug_print(f"[Performance] Failed to start explorer monitor: {e}")
+        
+        debug_print("[Performance] Delayed initialization completed")
     
     def start_instance_server(self):
         """启动本地服务器监听其他实例的请求"""
