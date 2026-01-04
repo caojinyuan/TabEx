@@ -2456,6 +2456,34 @@ class MainWindow(QMainWindow):
 
     def close_tab(self, index):
         tab = self.tab_widget.widget(index)
+        
+        # 调试：打印标签页信息
+        print(f"[ClosedTabs] Closing tab at index {index}")
+        print(f"[ClosedTabs] Tab type: {type(tab)}")
+        print(f"[ClosedTabs] Has current_path: {hasattr(tab, 'current_path')}")
+        if hasattr(tab, 'current_path'):
+            print(f"[ClosedTabs] current_path value: {tab.current_path}")
+        
+        # 保存到关闭历史（在移除之前）
+        if hasattr(tab, 'current_path') and tab.current_path:
+            tab_info = {
+                'path': tab.current_path,
+                'title': self.tab_widget.tabText(index),
+                'is_shell': tab.current_path.startswith('shell:') if hasattr(tab, 'current_path') else False
+            }
+            # 添加到历史列表开头
+            self.closed_tabs_history.insert(0, tab_info)
+            # 限制历史数量
+            if len(self.closed_tabs_history) > self.max_closed_tabs_history:
+                self.closed_tabs_history = self.closed_tabs_history[:self.max_closed_tabs_history]
+            print(f"[ClosedTabs] Saved to history: {tab_info['path']}, total history: {len(self.closed_tabs_history)}")
+            
+            # 更新恢复按钮状态
+            if hasattr(self, 'reopen_tab_button'):
+                self.reopen_tab_button.setEnabled(True)
+        else:
+            print(f"[ClosedTabs] Not saved - no valid current_path")
+        
         # 如果是固定标签页，关闭时自动移除固定
         if hasattr(tab, 'is_pinned') and tab.is_pinned:
             tab.is_pinned = False
@@ -2469,6 +2497,23 @@ class MainWindow(QMainWindow):
     def close_current_tab(self):
         current_index = self.tab_widget.currentIndex()
         self.close_tab(current_index)
+    
+    def reopen_closed_tab(self):
+        """恢复最近关闭的标签页"""
+        if not self.closed_tabs_history:
+            print("[ClosedTabs] No closed tabs to restore")
+            return
+        
+        # 取出最近关闭的标签页
+        tab_info = self.closed_tabs_history.pop(0)
+        print(f"[ClosedTabs] Restoring tab: {tab_info['path']}, remaining history: {len(self.closed_tabs_history)}")
+        
+        # 重新打开标签页
+        self.add_new_tab(tab_info['path'], is_shell=tab_info.get('is_shell', False))
+        
+        # 更新恢复按钮状态
+        if hasattr(self, 'reopen_tab_button'):
+            self.reopen_tab_button.setEnabled(len(self.closed_tabs_history) > 0)
 
     def on_tab_changed(self, index):
         if index >= 0:
@@ -3093,8 +3138,19 @@ class MainWindow(QMainWindow):
             
             # 检查Ctrl组合键
             if is_key_pressed(VK_CONTROL):
-                # Ctrl+T (0x54)
-                if is_key_pressed(0x54) and hotkeys.get("new_tab", True):
+                # Ctrl+Shift+T (0x54) - 恢复关闭的标签页（必须在Ctrl+T之前检测）
+                if is_key_pressed(VK_SHIFT) and is_key_pressed(0x54) and hotkeys.get("reopen_tab", True):
+                    key_combo = "Ctrl+Shift+T"
+                    if not self._last_keys_state.get(key_combo, False):
+                        print("[Shortcut Poll] Detected Ctrl+Shift+T")
+                        self.reopen_closed_tab()
+                        self._last_keys_state[key_combo] = True
+                    return
+                else:
+                    self._last_keys_state["Ctrl+Shift+T"] = False
+                
+                # Ctrl+T (0x54) - 新建标签页（不包含Shift）
+                if is_key_pressed(0x54) and not is_key_pressed(VK_SHIFT) and hotkeys.get("new_tab", True):
                     key_combo = "Ctrl+T"
                     if not self._last_keys_state.get(key_combo, False):
                         print("[Shortcut Poll] Detected Ctrl+T")
@@ -3227,6 +3283,7 @@ class MainWindow(QMainWindow):
                 self.config["hotkeys"] = {}
             self.config["hotkeys"]["new_tab"] = dlg.hotkey_new_tab.isChecked()
             self.config["hotkeys"]["close_tab"] = dlg.hotkey_close_tab.isChecked()
+            self.config["hotkeys"]["reopen_tab"] = dlg.hotkey_reopen_tab.isChecked()
             self.config["hotkeys"]["switch_tab"] = dlg.hotkey_switch_tab.isChecked()
             self.config["hotkeys"]["search"] = dlg.hotkey_search.isChecked()
             self.config["hotkeys"]["navigate"] = dlg.hotkey_navigate.isChecked()
@@ -3482,6 +3539,10 @@ class MainWindow(QMainWindow):
         # 搜索历史（内存中，软件关闭后自动清除）
         self.search_history = []
         
+        # 关闭标签页历史（最多保存10个）
+        self.closed_tabs_history = []  # 每项格式: {'path': str, 'title': str, 'is_shell': bool}
+        self.max_closed_tabs_history = 10
+        
         self.init_ui()
         
         # 设置快捷键（在init_ui之后，确保所有组件已创建）
@@ -3514,6 +3575,7 @@ class MainWindow(QMainWindow):
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
                 "close_tab": True,         # Ctrl+W
+                "reopen_tab": True,        # Ctrl+Shift+T
                 "switch_tab": True,        # Ctrl+Tab / Ctrl+Shift+Tab
                 "search": True,            # Ctrl+F
                 "navigate": True,          # Alt+Left/Right
@@ -3524,6 +3586,7 @@ class MainWindow(QMainWindow):
         }
         
         try:
+            # 首先尝试加载主配置文件
             if os.path.exists("config.json"):
                 with open("config.json", "r", encoding="utf-8") as f:
                     config = json.load(f)
@@ -3537,25 +3600,72 @@ class MainWindow(QMainWindow):
                             if key not in config["hotkeys"]:
                                 config["hotkeys"][key] = value
                     return config
+            else:
+                # 主配置文件不存在，检查是否有备份文件
+                backup_file = "config.json.bak"
+                if os.path.exists(backup_file):
+                    print(f"Main config file not found, restoring from backup: {backup_file}")
+                    try:
+                        with open(backup_file, 'r', encoding='utf-8') as f:
+                            config = json.load(f)
+                        # 恢复主配置文件
+                        import shutil
+                        shutil.copy2(backup_file, "config.json")
+                        print("Config restored from backup successfully")
+                        # 合并默认配置
+                        for key, value in default_config.items():
+                            if key not in config:
+                                config[key] = value
+                        if "hotkeys" in config:
+                            for key, value in default_config["hotkeys"].items():
+                                if key not in config["hotkeys"]:
+                                    config["hotkeys"][key] = value
+                        return config
+                    except Exception as e:
+                        print(f"Failed to restore from backup: {e}")
+                else:
+                    print("No config file or backup found, starting with default config")
         except Exception as e:
             print(f"Failed to load config: {e}")
+            # 主文件损坏，尝试从备份恢复
+            backup_file = "config.json.bak"
+            if os.path.exists(backup_file):
+                print(f"Attempting to restore config from backup: {backup_file}")
+                try:
+                    with open(backup_file, 'r', encoding='utf-8') as f:
+                        config = json.load(f)
+                    # 恢复主文件
+                    import shutil
+                    shutil.copy2(backup_file, "config.json")
+                    print("Config restored from backup successfully")
+                    # 合并默认配置
+                    for key, value in default_config.items():
+                        if key not in config:
+                            config[key] = value
+                    if "hotkeys" in config:
+                        for key, value in default_config["hotkeys"].items():
+                            if key not in config["hotkeys"]:
+                                config["hotkeys"][key] = value
+                    return config
+                except Exception as e2:
+                    print(f"Failed to restore from backup: {e2}")
         
         return default_config
     
     def save_config(self):
         """保存配置文件"""
         try:
-            # 先备份旧配置
-            if os.path.exists("config.json"):
-                import shutil
-                try:
-                    shutil.copy2("config.json", "config.json.bak")
-                except Exception as e:
-                    print(f"Failed to backup config: {e}")
-            
             # 保存新配置
             with open("config.json", "w", encoding="utf-8") as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
+            
+            # 保存成功后创建备份
+            import shutil
+            try:
+                shutil.copy2("config.json", "config.json.bak")
+            except Exception as e:
+                print(f"Failed to backup config: {e}")
+                
         except Exception as e:
             print(f"Failed to save config: {e}")
             # 尝试从备份恢复
@@ -3759,7 +3869,7 @@ class MainWindow(QMainWindow):
         
         # 后退按钮
         self.back_button = QPushButton("←")
-        self.back_button.setToolTip("后退")
+        self.back_button.setToolTip("后退 (Alt+←)")
         self.back_button.setFixedHeight(35)
         self.back_button.setFixedWidth(35)
         self.back_button.clicked.connect(self.go_back_current_tab)
@@ -3768,7 +3878,7 @@ class MainWindow(QMainWindow):
         
         # 前进按钮
         self.forward_button = QPushButton("→")
-        self.forward_button.setToolTip("前进")
+        self.forward_button.setToolTip("前进 (Alt+→)")
         self.forward_button.setFixedHeight(35)
         self.forward_button.setFixedWidth(35)
         self.forward_button.clicked.connect(self.go_forward_current_tab)
@@ -3777,15 +3887,24 @@ class MainWindow(QMainWindow):
         
         # 新建标签页按钮
         self.add_tab_button = QPushButton("➕")
-        self.add_tab_button.setToolTip("新建标签页")
+        self.add_tab_button.setToolTip("新建标签页 (Ctrl+T)")
         self.add_tab_button.setFixedHeight(35)
         self.add_tab_button.setFixedWidth(35)
         self.add_tab_button.clicked.connect(self.add_new_tab)
         btn_layout.addWidget(self.add_tab_button)
         
+        # 恢复标签页按钮
+        self.reopen_tab_button = QPushButton("↶")
+        self.reopen_tab_button.setToolTip("恢复关闭的标签页 (Ctrl+Shift+T)")
+        self.reopen_tab_button.setFixedHeight(35)
+        self.reopen_tab_button.setFixedWidth(35)
+        self.reopen_tab_button.clicked.connect(self.reopen_closed_tab)
+        self.reopen_tab_button.setEnabled(False)  # 初始禁用
+        btn_layout.addWidget(self.reopen_tab_button)
+        
         # 搜索按钮
         self.search_button = QPushButton("🔍")
-        self.search_button.setToolTip("搜索当前文件夹")
+        self.search_button.setToolTip("搜索当前文件夹 (Ctrl+F)")
         self.search_button.setFixedHeight(35)
         self.search_button.setFixedWidth(35)
         self.search_button.clicked.connect(self.show_search_dialog)
@@ -4491,6 +4610,10 @@ class SettingsDialog(QDialog):
         self.hotkey_close_tab = QCheckBox("Ctrl+W - 关闭当前标签页")
         self.hotkey_close_tab.setChecked(hotkeys.get("close_tab", True))
         hotkey_layout.addWidget(self.hotkey_close_tab)
+        
+        self.hotkey_reopen_tab = QCheckBox("Ctrl+Shift+T - 恢复关闭的标签页")
+        self.hotkey_reopen_tab.setChecked(hotkeys.get("reopen_tab", True))
+        hotkey_layout.addWidget(self.hotkey_reopen_tab)
         
         self.hotkey_switch_tab = QCheckBox("Ctrl+Tab / Ctrl+Shift+Tab - 切换标签页")
         self.hotkey_switch_tab.setChecked(hotkeys.get("switch_tab", True))
