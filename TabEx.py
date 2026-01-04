@@ -833,6 +833,31 @@ from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, Q
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor
 # from PyQt5.QtGui import QIcon  # unused
 
+# 全局调试开关
+_DEBUG_MODE = False
+
+def debug_print(*args, **kwargs):
+    """根据调试开关决定是否输出调试信息"""
+    if _DEBUG_MODE:
+        print(*args, **kwargs)
+
+def set_debug_mode(enabled):
+    """设置全局调试模式"""
+    global _DEBUG_MODE
+    _DEBUG_MODE = enabled
+
+def qt_message_handler(mode, context, message):
+    """自定义 Qt 消息处理器，过滤 QAxBase 等不需要的警告"""
+    # 只在调试模式下输出 Qt 警告
+    if _DEBUG_MODE:
+        # 如果是调试模式，输出所有消息
+        print(f"Qt Message: {message}")
+    else:
+        # 非调试模式下，只输出严重错误（Critical 和 Fatal）
+        from PyQt5.QtCore import QtCriticalMsg, QtFatalMsg
+        if mode in (QtCriticalMsg, QtFatalMsg):
+            print(f"Qt Error: {message}")
+        # 其他消息（Debug, Warning, Info）都被过滤
 
 # Optional native hit-test support (Windows)
 try:
@@ -1253,12 +1278,12 @@ class FileExplorerTab(QWidget):
                 display = display[-max_len:]
             pin_prefix = "📌" if is_pinned else ""
             title = pin_prefix + display
-            print(f"DEBUG update_tab_title: path={path}, is_pinned={is_pinned}, pin_prefix='{pin_prefix}', title='{title}'")
+            debug_print(f"DEBUG update_tab_title: path={path}, is_pinned={is_pinned}, pin_prefix='{pin_prefix}', title='{title}'")
             if self.main_window and hasattr(self.main_window, 'tab_widget'):
                 idx = self.main_window.tab_widget.indexOf(self)
                 if idx != -1:
                     self.main_window.tab_widget.setTabText(idx, title)
-                    print(f"DEBUG: Set tab {idx} text to '{title}'")
+                    debug_print(f"DEBUG: Set tab {idx} text to '{title}'")
 
     def start_path_sync_timer(self):
         from PyQt5.QtCore import QTimer
@@ -1641,7 +1666,7 @@ class FileExplorerTab(QWidget):
                     path_before = getattr(self, 'current_path', None)
                     selected_before = getattr(self, '_selected_before_click', None)
                     
-                    print(f"[DoubleClick] ID={current_click_id}, path_before='{path_before}', selected_before={selected_before}")
+                    debug_print(f"[DoubleClick] ID={current_click_id}, path_before='{path_before}', selected_before={selected_before}")
 
                     # try multiple times because folder navigation can be slower;
                     # perform checks at 150ms, 300ms, 600ms, 1000ms before giving up
@@ -1651,11 +1676,11 @@ class FileExplorerTab(QWidget):
                         # 如果ID不匹配，说明有新的双击发生了，放弃当前检查
                         current_id = getattr(self, '_double_click_id', 0)
                         if current_id != current_click_id:
-                            print(f"[DoubleClick] ID mismatch: current={current_id} vs expected={current_click_id}, abort")
+                            debug_print(f"[DoubleClick] ID mismatch: current={current_id} vs expected={current_click_id}, abort")
                             return
                         
                         cur_path = getattr(self, 'current_path', None)
-                        print(f"[DoubleClick] Check attempt {idx} (ID={current_click_id}): path_before='{path_before}' -> cur_path='{cur_path}'")
+                        debug_print(f"[DoubleClick] Check attempt {idx} (ID={current_click_id}): path_before='{path_before}' -> cur_path='{cur_path}'")
                         
                         handled = False
                         try:
@@ -1664,17 +1689,17 @@ class FileExplorerTab(QWidget):
                             try:
                                 if path_before is not None and cur_path is not None and cur_path != path_before:
                                     # 路径已改变，说明双击触发了导航（进入文件夹），不需要go_up
-                                    print(f"[DoubleClick] Path changed (ID={current_click_id}): '{path_before}' -> '{cur_path}', skip go_up")
+                                    debug_print(f"[DoubleClick] Path changed (ID={current_click_id}): '{path_before}' -> '{cur_path}', skip go_up")
                                     return
                             except Exception as e:
-                                print(f"[DoubleClick] Path check exception: {e}")
+                                debug_print(f"[DoubleClick] Path check exception: {e}")
                                 pass
                             # if press-time selection existed, skip
                             before = getattr(self, '_selected_before_click', None)
                             if before is not None:
                                 try:
                                     if int(before) > 0:
-                                        print(f"[DoubleClick] Had selection before click (ID={current_click_id}): {before}, skip go_up")
+                                        debug_print(f"[DoubleClick] Had selection before click (ID={current_click_id}): {before}, skip go_up")
                                         self._selected_before_click = None
                                         return
                                 except Exception:
@@ -1686,7 +1711,7 @@ class FileExplorerTab(QWidget):
                                     gx = QCursor.pos().x()
                                     gy = QCursor.pos().y()
                                     if self._native_listview_hit_test(gx, gy):
-                                        print(f"[DoubleClick] Hit test positive (ID={current_click_id}), skip go_up")
+                                        debug_print(f"[DoubleClick] Hit test positive (ID={current_click_id}), skip go_up")
                                         self._selected_before_click = None
                                         return
                                 except Exception:
@@ -1703,7 +1728,7 @@ class FileExplorerTab(QWidget):
                                 except Exception:
                                     cnt = None
                             
-                            print(f"[DoubleClick] SelectedItems count (ID={current_click_id}): {cnt}")
+                            debug_print(f"[DoubleClick] SelectedItems count (ID={current_click_id}): {cnt}")
                             
                             if cnt is None:
                                 # SelectedItems().Count API不可用，使用其他方法判断
@@ -1713,7 +1738,7 @@ class FileExplorerTab(QWidget):
                                     cur_path = getattr(self, 'current_path', None)
                                     if path_before is not None and cur_path is not None and cur_path != path_before:
                                         # 路径已改变，说明双击触发了导航（进入文件夹），不需要go_up
-                                        print(f"[DoubleClick] cnt=None but path changed (ID={current_click_id}): '{path_before}' -> '{cur_path}', skip go_up")
+                                        debug_print(f"[DoubleClick] cnt=None but path changed (ID={current_click_id}): '{path_before}' -> '{cur_path}', skip go_up")
                                         return
                                 except Exception:
                                     pass
@@ -1721,7 +1746,7 @@ class FileExplorerTab(QWidget):
                                 # 路径未变化，继续判断
                                 # 如果还有重试机会，继续等待
                                 if idx < len(delays) - 1:
-                                    print(f"[DoubleClick] cnt=None, schedule retry {idx+1} (ID={current_click_id})")
+                                    debug_print(f"[DoubleClick] cnt=None, schedule retry {idx+1} (ID={current_click_id})")
                                     timer = QTimer()
                                     timer.setSingleShot(True)
                                     timer.timeout.connect(lambda: attempt(idx+1))
@@ -1738,21 +1763,21 @@ class FileExplorerTab(QWidget):
                                         gx = QCursor.pos().x()
                                         gy = QCursor.pos().y()
                                         if self._native_listview_hit_test(gx, gy):
-                                            print(f"[DoubleClick] Final check: hit test positive (ID={current_click_id}), likely clicked on item, skip go_up")
+                                            debug_print(f"[DoubleClick] Final check: hit test positive (ID={current_click_id}), likely clicked on item, skip go_up")
                                             return
                                     except Exception as e:
-                                        print(f"[DoubleClick] Hit test exception: {e}")
+                                        debug_print(f"[DoubleClick] Hit test exception: {e}")
                                         pass
                                 
                                 # 使用selected_before来判断：如果按下时有选中项，可能是文件双击
                                 before = getattr(self, '_selected_before_click', None)
                                 if before is not None and before > 0:
                                     # 按下时有选中项，可能是文件双击（打开文件不改变路径）
-                                    print(f"[DoubleClick] cnt=None but had selection before (ID={current_click_id}): {before}, skip go_up")
+                                    debug_print(f"[DoubleClick] cnt=None but had selection before (ID={current_click_id}): {before}, skip go_up")
                                     return
                                 
                                 # 没有选中项，路径也没变化，hit-test也是负的，很可能是空白双击
-                                print(f"[DoubleClick] Execute go_up (ID={current_click_id}): cnt=None but no selection, no hit, path unchanged")
+                                debug_print(f"[DoubleClick] Execute go_up (ID={current_click_id}): cnt=None but no selection, no hit, path unchanged")
                                 try:
                                     self.go_up(force=True)
                                 except Exception:
@@ -1760,10 +1785,10 @@ class FileExplorerTab(QWidget):
                                 return
                             try:
                                 if int(cnt) == 0:
-                                    print(f"[DoubleClick] Execute go_up (ID={current_click_id}): cnt=0, blank area double-click")
+                                    debug_print(f"[DoubleClick] Execute go_up (ID={current_click_id}): cnt=0, blank area double-click")
                                     self.go_up(force=True)
                                 else:
-                                    print(f"[DoubleClick] Has selection (ID={current_click_id}): cnt={cnt}, skip go_up")
+                                    debug_print(f"[DoubleClick] Has selection (ID={current_click_id}): cnt={cnt}, skip go_up")
                                 return
                             except Exception:
                                 pass
@@ -1859,7 +1884,7 @@ class FileExplorerTab(QWidget):
 
     def navigate_to(self, path, is_shell=False, add_to_history=True):
         old_path = getattr(self, 'current_path', None)
-        print(f"[navigate_to] From '{old_path}' to '{path}' (is_shell={is_shell})")
+        debug_print(f"[navigate_to] From '{old_path}' to '{path}' (is_shell={is_shell})")
         
         # 取消所有待处理的双击检查定时器，因为路径即将改变
         try:
@@ -1872,7 +1897,7 @@ class FileExplorerTab(QWidget):
                     pass
             self._pending_double_click_timers = []
             if cancelled_count > 0:
-                print(f"[navigate_to] Cancelled {cancelled_count} pending double-click timers")
+                debug_print(f"[navigate_to] Cancelled {cancelled_count} pending double-click timers")
         except Exception:
             pass
         
@@ -1908,14 +1933,14 @@ class FileExplorerTab(QWidget):
                     watched_dirs = self.file_watcher.directories()
                     if old_path in watched_dirs:
                         self.file_watcher.removePath(old_path)
-                        print(f"[FileWatcher] Stopped watching: {old_path}")
+                        debug_print(f"[FileWatcher] Stopped watching: {old_path}")
                 
                 # 添加新路径的监控
                 if os.path.isdir(path):
                     if self.file_watcher.addPath(path):
-                        print(f"[FileWatcher] Now watching: {path}")
+                        debug_print(f"[FileWatcher] Now watching: {path}")
                     else:
-                        print(f"[FileWatcher] Failed to watch: {path}")
+                        debug_print(f"[FileWatcher] Failed to watch: {path}")
             
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(path)
@@ -1979,12 +2004,12 @@ class FileExplorerTab(QWidget):
     
     def on_directory_changed(self, path):
         """文件系统监控：目录内容发生变化"""
-        print(f"[FileWatcher] Directory changed: {path}")
+        debug_print(f"[FileWatcher] Directory changed: {path}")
         # 只在监控的是当前路径时才刷新
         if path == self.current_path:
             # 使用延迟刷新，避免短时间内多次变化导致频繁刷新
             if not self.refresh_timer.isActive():
-                print(f"[FileWatcher] Scheduling refresh in {self.refresh_delay_ms}ms")
+                debug_print(f"[FileWatcher] Scheduling refresh in {self.refresh_delay_ms}ms")
                 self.refresh_timer.start(self.refresh_delay_ms)
             else:
                 # 如果定时器已经在运行，重新启动（重置延迟）
@@ -1993,7 +2018,7 @@ class FileExplorerTab(QWidget):
     
     def delayed_refresh(self):
         """延迟刷新：避免频繁刷新"""
-        print(f"[FileWatcher] Auto-refreshing: {self.current_path}")
+        debug_print(f"[FileWatcher] Auto-refreshing: {self.current_path}")
         if hasattr(self, 'explorer') and self.current_path:
             try:
                 # 重新导航到当前路径以刷新
@@ -2003,9 +2028,9 @@ class FileExplorerTab(QWidget):
                 else:
                     url = 'file:///' + self.current_path.replace('\\', '/')
                     self.explorer.dynamicCall('Navigate2(const QVariant&)', url)
-                print(f"[FileWatcher] Refresh completed")
+                debug_print(f"[FileWatcher] Refresh completed")
             except Exception as e:
-                print(f"[FileWatcher] Refresh error: {e}")
+                debug_print(f"[FileWatcher] Refresh error: {e}")
 
 
 class DragDropTabWidget(QTabWidget):
@@ -2036,32 +2061,32 @@ class DragDropTabWidget(QTabWidget):
         # 将事件位置转换为 TabBar 的坐标系
         tabbar_pos = tabbar.mapFrom(self, event.pos())
         
-        print(f"[DEBUG] TabWidget double click: pos={event.pos()}, tabbar_pos={tabbar_pos}")
-        print(f"[DEBUG] TabBar rect: {tabbar.rect()}")
+        debug_print(f"[DEBUG] TabWidget double click: pos={event.pos()}, tabbar_pos={tabbar_pos}")
+        debug_print(f"[DEBUG] TabBar rect: {tabbar.rect()}")
         
         # 检查点击是否在 TabBar 的矩形范围内（使用 TabBar 自己的坐标系）
         in_tabbar = tabbar.rect().contains(tabbar_pos)
-        print(f"[DEBUG] In TabBar: {in_tabbar}")
+        debug_print(f"[DEBUG] In TabBar: {in_tabbar}")
         
         if in_tabbar:
             # 在 TabBar 内，检查是否点击在空白区域
             clicked_tab = tabbar.tabAt(tabbar_pos)
-            print(f"[DEBUG] Clicked tab index: {clicked_tab}")
+            debug_print(f"[DEBUG] Clicked tab index: {clicked_tab}")
             
             if clicked_tab == -1:
                 # 空白区域，打开新标签页
                 if self.main_window and hasattr(self.main_window, 'add_new_tab'):
-                    print(f"[DEBUG] Opening new tab from TabBar blank area...")
+                    debug_print(f"[DEBUG] Opening new tab from TabBar blank area...")
                     self.main_window.add_new_tab()
                     return
         else:
             # 不在 TabBar 内，检查是否在标签页头部区域（TabBar 右侧的空白）
             # 获取 TabWidget 的 TabBar 所在的区域高度
             if event.pos().y() < tabbar.height():
-                print(f"[DEBUG] Click is in tab header area but outside TabBar")
+                debug_print(f"[DEBUG] Click is in tab header area but outside TabBar")
                 # 这是标签头和按钮之间的空白区域，打开新标签页
                 if self.main_window and hasattr(self.main_window, 'add_new_tab'):
-                    print(f"[DEBUG] Opening new tab from header blank area...")
+                    debug_print(f"[DEBUG] Opening new tab from header blank area...")
                     self.main_window.add_new_tab()
                     return
         
@@ -2079,7 +2104,7 @@ class DragDropTabWidget(QTabWidget):
             # 检查是否拖拽到标签栏区域
             in_tabbar_area = drop_pos.y() < tabbar.height()
             
-            print(f"[DEBUG] Drop event: pos={drop_pos}, in_tabbar_area={in_tabbar_area}")
+            debug_print(f"[DEBUG] Drop event: pos={drop_pos}, in_tabbar_area={in_tabbar_area}")
             
             for url in urls:
                 path = None
@@ -2100,7 +2125,7 @@ class DragDropTabWidget(QTabWidget):
                         path = '\\\\' + unquote(url_str[7:]).replace('/', '\\')
                 
                 if path and os.path.exists(path):
-                    print(f"[DEBUG] Processing dropped path: {path}")
+                    debug_print(f"[DEBUG] Processing dropped path: {path}")
                     if os.path.isdir(path):
                         # 如果是文件夹，打开新标签页
                         if self.main_window and hasattr(self.main_window, 'add_new_tab'):
@@ -2130,7 +2155,7 @@ class DragDropTreeView(QTreeView):
         """目录树拖拽进入事件"""
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
-            print("[DEBUG] DirTree: Drag enter accepted")
+            debug_print("[DEBUG] DirTree: Drag enter accepted")
         else:
             event.ignore()
     
@@ -2145,7 +2170,7 @@ class DragDropTreeView(QTreeView):
         """目录树拖拽释放事件"""
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
-            print(f"[DEBUG] DirTree: Drop event, urls count: {len(urls)}")
+            debug_print(f"[DEBUG] DirTree: Drop event, urls count: {len(urls)}")
             
             for url in urls:
                 path = None
@@ -2166,7 +2191,7 @@ class DragDropTreeView(QTreeView):
                         path = '\\\\' + unquote(url_str[7:]).replace('/', '\\')
                 
                 if path and os.path.exists(path):
-                    print(f"[DEBUG] DirTree: Processing dropped path: {path}")
+                    debug_print(f"[DEBUG] DirTree: Processing dropped path: {path}")
                     if os.path.isdir(path):
                         # 如果是文件夹，打开新标签页
                         if self.main_window and hasattr(self.main_window, 'add_new_tab'):
@@ -2193,7 +2218,7 @@ class CustomMenuBar(QMenuBar):
             pos = event.pos()
             action = self.actionAt(pos)
             
-            print(f"[DEBUG] CustomMenuBar right click at {pos}, action: {action}")
+            debug_print(f"[DEBUG] CustomMenuBar right click at {pos}, action: {action}")
             
             if action and self.main_window:
                 if hasattr(self.main_window, 'bookmark_actions') and action in self.main_window.bookmark_actions:
@@ -2201,22 +2226,22 @@ class CustomMenuBar(QMenuBar):
                     bookmark_id = node.get('id')
                     bookmark_name = node.get('name', '')
                     
-                    print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
+                    debug_print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
                     
                     # 检查是否是特殊书签（不允许删除）
                     special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
                     is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
                     
-                    print(f"[DEBUG] Is special bookmark: {is_special}")
+                    debug_print(f"[DEBUG] Is special bookmark: {is_special}")
                     
                     if not is_special:
                         global_pos = self.mapToGlobal(pos)
-                        print(f"[DEBUG] Showing context menu at: {global_pos}")
+                        debug_print(f"[DEBUG] Showing context menu at: {global_pos}")
                         self.main_window.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
                         event.accept()
                         return
                 else:
-                    print(f"[DEBUG] No bookmark action found")
+                    debug_print(f"[DEBUG] No bookmark action found")
         
         super().mousePressEvent(event)
 
@@ -2237,34 +2262,34 @@ class CustomTabBar(QTabBar):
     def event(self, event):
         # 拦截所有事件，确保双击事件能被处理
         if event.type() == QEvent.MouseButtonDblClick:
-            print(f"[DEBUG] TabBar event: MouseButtonDblClick")
+            debug_print(f"[DEBUG] TabBar event: MouseButtonDblClick")
             self.mouseDoubleClickEvent(event)
             return True
         return super().event(event)
     
     def mouseDoubleClickEvent(self, event):
-        print(f"[DEBUG] TabBar double click event triggered")
+        debug_print(f"[DEBUG] TabBar double click event triggered")
         # 获取点击位置
         pos = event.pos()
         # 判断是否点在空白区域（没有点在任何标签页上）
         clicked_tab = self.tabAt(pos)
-        print(f"[DEBUG] Clicked tab: {clicked_tab}, pos: ({pos.x()}, {pos.y()}), count: {self.count()}")
+        debug_print(f"[DEBUG] Clicked tab: {clicked_tab}, pos: ({pos.x()}, {pos.y()}), count: {self.count()}")
         
         # 如果点击在空白区域，或点击在最后一个标签右侧的空白处
         is_blank = clicked_tab == -1
         if not is_blank and self.count() > 0:
             # 检查是否点击在最后一个标签页的右侧
             last_tab_rect = self.tabRect(self.count() - 1)
-            print(f"[DEBUG] Last tab right edge: {last_tab_rect.right()}")
+            debug_print(f"[DEBUG] Last tab right edge: {last_tab_rect.right()}")
             if pos.x() > last_tab_rect.right():
                 is_blank = True
         
-        print(f"[DEBUG] Is blank area: {is_blank}, has main_window: {self.main_window is not None}")
+        debug_print(f"[DEBUG] Is blank area: {is_blank}, has main_window: {self.main_window is not None}")
         
         if is_blank:
             # 点击在空白区域，打开新标签页
             if self.main_window and hasattr(self.main_window, 'add_new_tab'):
-                print(f"[DEBUG] Opening new tab from TabBar...")
+                debug_print(f"[DEBUG] Opening new tab from TabBar...")
                 self.main_window.add_new_tab()
                 event.accept()
                 return
@@ -2458,11 +2483,11 @@ class MainWindow(QMainWindow):
         tab = self.tab_widget.widget(index)
         
         # 调试：打印标签页信息
-        print(f"[ClosedTabs] Closing tab at index {index}")
-        print(f"[ClosedTabs] Tab type: {type(tab)}")
-        print(f"[ClosedTabs] Has current_path: {hasattr(tab, 'current_path')}")
+        debug_print(f"[ClosedTabs] Closing tab at index {index}")
+        debug_print(f"[ClosedTabs] Tab type: {type(tab)}")
+        debug_print(f"[ClosedTabs] Has current_path: {hasattr(tab, 'current_path')}")
         if hasattr(tab, 'current_path'):
-            print(f"[ClosedTabs] current_path value: {tab.current_path}")
+            debug_print(f"[ClosedTabs] current_path value: {tab.current_path}")
         
         # 保存到关闭历史（在移除之前）
         if hasattr(tab, 'current_path') and tab.current_path:
@@ -2476,13 +2501,13 @@ class MainWindow(QMainWindow):
             # 限制历史数量
             if len(self.closed_tabs_history) > self.max_closed_tabs_history:
                 self.closed_tabs_history = self.closed_tabs_history[:self.max_closed_tabs_history]
-            print(f"[ClosedTabs] Saved to history: {tab_info['path']}, total history: {len(self.closed_tabs_history)}")
+            debug_print(f"[ClosedTabs] Saved to history: {tab_info['path']}, total history: {len(self.closed_tabs_history)}")
             
             # 更新恢复按钮状态
             if hasattr(self, 'reopen_tab_button'):
                 self.reopen_tab_button.setEnabled(True)
         else:
-            print(f"[ClosedTabs] Not saved - no valid current_path")
+            debug_print(f"[ClosedTabs] Not saved - no valid current_path")
         
         # 如果是固定标签页，关闭时自动移除固定
         if hasattr(tab, 'is_pinned') and tab.is_pinned:
@@ -2501,12 +2526,12 @@ class MainWindow(QMainWindow):
     def reopen_closed_tab(self):
         """恢复最近关闭的标签页"""
         if not self.closed_tabs_history:
-            print("[ClosedTabs] No closed tabs to restore")
+            debug_print("[ClosedTabs] No closed tabs to restore")
             return
         
         # 取出最近关闭的标签页
         tab_info = self.closed_tabs_history.pop(0)
-        print(f"[ClosedTabs] Restoring tab: {tab_info['path']}, remaining history: {len(self.closed_tabs_history)}")
+        debug_print(f"[ClosedTabs] Restoring tab: {tab_info['path']}, remaining history: {len(self.closed_tabs_history)}")
         
         # 重新打开标签页
         self.add_new_tab(tab_info['path'], is_shell=tab_info.get('is_shell', False))
@@ -2552,7 +2577,7 @@ class MainWindow(QMainWindow):
         """主窗口拖拽进入事件"""
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
-            print("[DEBUG] MainWindow: Drag enter accepted")
+            debug_print("[DEBUG] MainWindow: Drag enter accepted")
         else:
             event.ignore()
     
@@ -2567,7 +2592,7 @@ class MainWindow(QMainWindow):
         """主窗口拖拽释放事件"""
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
-            print(f"[DEBUG] MainWindow: Drop event, urls count: {len(urls)}")
+            debug_print(f"[DEBUG] MainWindow: Drop event, urls count: {len(urls)}")
             
             for url in urls:
                 path = None
@@ -2588,7 +2613,7 @@ class MainWindow(QMainWindow):
                         path = '\\\\' + unquote(url_str[7:]).replace('/', '\\')
                 
                 if path and os.path.exists(path):
-                    print(f"[DEBUG] MainWindow: Processing dropped path: {path}")
+                    debug_print(f"[DEBUG] MainWindow: Processing dropped path: {path}")
                     if os.path.isdir(path):
                         # 如果是文件夹，打开新标签页
                         self.add_new_tab(path)
@@ -2878,29 +2903,29 @@ class MainWindow(QMainWindow):
                 local_pos = menubar.mapFrom(self, event.pos())
                 action = menubar.actionAt(local_pos)
                 
-                print(f"[DEBUG] MenuBar right click at {local_pos}, action: {action}")
+                debug_print(f"[DEBUG] MenuBar right click at {local_pos}, action: {action}")
                 
                 if action and hasattr(self, 'bookmark_actions') and action in self.bookmark_actions:
                     node = self.bookmark_actions[action]
                     bookmark_id = node.get('id')
                     bookmark_name = node.get('name', '')
                     
-                    print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
+                    debug_print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
                     
                     # 检查是否是特殊书签（不允许删除）
                     special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
                     is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
                     
-                    print(f"[DEBUG] Is special bookmark: {is_special}")
+                    debug_print(f"[DEBUG] Is special bookmark: {is_special}")
                     
                     if not is_special:
                         global_pos = event.globalPos()
-                        print(f"[DEBUG] Showing context menu at: {global_pos}")
+                        debug_print(f"[DEBUG] Showing context menu at: {global_pos}")
                         self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
                         event.accept()
                         return
                 else:
-                    print(f"[DEBUG] No bookmark action found")
+                    debug_print(f"[DEBUG] No bookmark action found")
         
         if event.button() == Qt.LeftButton:
             # 检测是否在边缘（调整大小）
@@ -3276,7 +3301,11 @@ class MainWindow(QMainWindow):
             
             # 更新配置
             self.config["enable_explorer_monitor"] = new_monitor
+            self.config["debug_mode"] = dlg.debug_mode_cb.isChecked()
             self.config["explorer_monitor_interval"] = new_interval
+            
+            # 更新全局调试开关
+            set_debug_mode(self.config["debug_mode"])
             
             # 更新快捷键配置
             if "hotkeys" not in self.config:
@@ -3526,6 +3555,10 @@ class MainWindow(QMainWindow):
         # 加载配置
         self.config = self.load_config()
         
+        # 初始化全局调试开关
+        set_debug_mode(self.config.get("debug_mode", False))
+        
+        # 初始化书签管理器
         self.bookmark_manager = BookmarkManager()
         # 检查并自动添加常用书签
         self.ensure_default_bookmarks()
@@ -3570,6 +3603,7 @@ class MainWindow(QMainWindow):
         """加载配置文件"""
         default_config = {
             "enable_explorer_monitor": True,  # 默认启用Explorer监听
+            "debug_mode": False,  # 默认关闭调试输出
             "pinned_tabs": [],  # 默认没有固定标签页
             # 快捷键配置
             "hotkeys": {
@@ -3915,14 +3949,14 @@ class MainWindow(QMainWindow):
         
         # 为 btn_widget 添加双击事件处理，双击空白区域打开新标签页
         def btn_widget_double_click(event):
-            print(f"[DEBUG] btn_widget double click event triggered")
+            debug_print(f"[DEBUG] btn_widget double click event triggered")
             # 检查点击位置是否在按钮之外的空白区域
             from PyQt5.QtWidgets import QApplication
             child = btn_widget.childAt(event.pos())
-            print(f"[DEBUG] Clicked child widget: {child}")
+            debug_print(f"[DEBUG] Clicked child widget: {child}")
             if child is None:
                 # 点击在空白区域
-                print(f"[DEBUG] Opening new tab from btn_widget blank area")
+                debug_print(f"[DEBUG] Opening new tab from btn_widget blank area")
                 self.add_new_tab()
         
         btn_widget.mouseDoubleClickEvent = btn_widget_double_click
@@ -3973,7 +4007,7 @@ class MainWindow(QMainWindow):
                 server.listen(5)
                 server.settimeout(1.0)  # 设置超时，使线程可以退出
                 self.server_socket = server
-                print("[Server] Instance server started on port 58923")
+                debug_print("[Server] Instance server started on port 58923")
                 
                 while getattr(self, 'server_running', True):
                     try:
@@ -3982,16 +4016,16 @@ class MainWindow(QMainWindow):
                         conn.close()
                         
                         if data:
-                            print(f"[Server] Received path: {data}")
+                            debug_print(f"[Server] Received path: {data}")
                             # 使用信号在主线程中打开新标签页
                             self.open_path_signal.emit(data)
                     except socket.timeout:
                         continue
                     except Exception as e:
-                        print(f"[Server] Connection error: {e}")
+                        debug_print(f"[Server] Connection error: {e}")
                         continue
             except Exception as e:
-                print(f"[Server] Failed to start server: {e}")
+                debug_print(f"[Server] Failed to start server: {e}")
         
         self.server_running = True
         server_thread_obj = threading.Thread(target=server_thread, daemon=True)
@@ -4003,16 +4037,16 @@ class MainWindow(QMainWindow):
         """启动Explorer窗口监听（优化版）"""
         # 检查配置是否启用
         if not self.config.get("enable_explorer_monitor", True):
-            print("[Explorer Monitor] Monitoring disabled in config")
+            debug_print("[Explorer Monitor] Monitoring disabled in config")
             return
         
         if not HAS_PYWIN:
-            print("[Explorer Monitor] Windows API not available, monitoring disabled")
+            debug_print("[Explorer Monitor] Windows API not available, monitoring disabled")
             return
         
         # 获取监听间隔配置（默认2秒，更轻量）
         self.monitor_interval = self.config.get("explorer_monitor_interval", 2.0)
-        print(f"[Explorer Monitor] Will start monitoring in 3 seconds (interval: {self.monitor_interval}s)...")
+        debug_print(f"[Explorer Monitor] Will start monitoring in 3 seconds (interval: {self.monitor_interval}s)...")
         self.explorer_monitoring = False
         self.known_explorer_windows = set()  # 记录已知的Explorer窗口
         self.last_check_time = 0  # 上次检查时间
@@ -4026,18 +4060,18 @@ class MainWindow(QMainWindow):
         try:
             self.monitor_our_window = int(self.winId())  # 记录我们自己的窗口句柄
             self.explorer_monitoring = True
-            print("[Explorer Monitor] Starting Explorer window monitoring...")
+            debug_print("[Explorer Monitor] Starting Explorer window monitoring...")
             
             # 启动监听线程
             monitor_thread = threading.Thread(target=self._explorer_monitor_loop, daemon=True)
             monitor_thread.start()
         except Exception as e:
-            print(f"[Explorer Monitor] Failed to start: {e}")
+            debug_print(f"[Explorer Monitor] Failed to start: {e}")
     
     def stop_explorer_monitor(self):
         """停止Explorer窗口监听"""
         self.explorer_monitoring = False
-        print("[Explorer Monitor] Stopped")
+        debug_print("[Explorer Monitor] Stopped")
     
     def _explorer_monitor_loop(self):
         """Explorer窗口监听循环（优化版 - 降低CPU占用）"""
@@ -4056,8 +4090,8 @@ class MainWindow(QMainWindow):
                 return True
             
             win32gui.EnumWindows(enum_windows_callback, None)
-            print(f"[Explorer Monitor] Found {len(self.known_explorer_windows)} existing Explorer windows")
-            print(f"[Explorer Monitor] Monitor interval: {self.monitor_interval}s (optimized for low CPU usage)")
+            debug_print(f"[Explorer Monitor] Found {len(self.known_explorer_windows)} existing Explorer windows")
+            debug_print(f"[Explorer Monitor] Monitor interval: {self.monitor_interval}s (optimized for low CPU usage)")
             
             # 定期检查新的Explorer窗口（优化：使用更长的间隔）
             while self.explorer_monitoring:
@@ -4079,7 +4113,7 @@ class MainWindow(QMainWindow):
                             title = win32gui.GetWindowText(hwnd)
                             # 记录可能相关的窗口信息
                             if title and len(title) > 0 and (':\\' in title or title.startswith('C:') or title.startswith('D:')):
-                                print(f"[Explorer Monitor] Debug: Found window - Class: '{class_name}', Title: '{title}'")
+                                debug_print(f"[Explorer Monitor] Debug: Found window - Class: '{class_name}', Title: '{title}'")
                         
                         # CabinetWClass: 标准Explorer窗口
                         # ExploreWClass: 另一种Explorer窗口类型
@@ -4100,7 +4134,7 @@ class MainWindow(QMainWindow):
                     self.known_explorer_windows = current_explorer_windows
                     continue
                 
-                print(f"[Explorer Monitor] Detected {len(new_windows)} new Explorer window(s)")
+                debug_print(f"[Explorer Monitor] Detected {len(new_windows)} new Explorer window(s)")
                 
                 for hwnd in new_windows:
                     # 检查是否是我们自己的窗口（避免误捕获嵌入的Explorer控件）
@@ -4111,25 +4145,25 @@ class MainWindow(QMainWindow):
                         # 只排除明确是我们应用的主窗口，不要误排除路径中包含TabEx的Explorer窗口
                         # 检查是否以"TabExplorer"开头（软件主窗口）或者窗口句柄是我们的主窗口
                         if title.startswith("TabExplorer"):
-                            print(f"[Explorer Monitor] Skipping our main window: {title}")
+                            debug_print(f"[Explorer Monitor] Skipping our main window: {title}")
                             continue
                         
                         # 获取窗口的父窗口，如果父窗口是我们的应用，则跳过
                         try:
                             parent = win32gui.GetParent(hwnd)
                             if parent == self.monitor_our_window:
-                                print(f"[Explorer Monitor] Skipping child window")
+                                debug_print(f"[Explorer Monitor] Skipping child window")
                                 continue
                         except:
                             pass
                         
-                        print(f"[Explorer Monitor] New Explorer window detected: {hwnd} - {title}")
+                        debug_print(f"[Explorer Monitor] New Explorer window detected: {hwnd} - {title}")
                         
                         # 尝试获取Explorer窗口的当前路径
                         path = self._get_explorer_path(hwnd)
                         
                         if path:
-                            print(f"[Explorer Monitor] ✓ Path: {path}")
+                            debug_print(f"[Explorer Monitor] ✓ Path: {path}")
                             
                             # 在主线程中打开新标签页
                             self.open_path_signal.emit(path)
@@ -4140,20 +4174,20 @@ class MainWindow(QMainWindow):
                             # 关闭原Explorer窗口
                             try:
                                 win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-                                print(f"[Explorer Monitor] ✓ Closed original Explorer (hwnd={hwnd})")
+                                debug_print(f"[Explorer Monitor] ✓ Closed original Explorer (hwnd={hwnd})")
                             except Exception as e:
-                                print(f"[Explorer Monitor] ✗ Failed to close: {e}")
+                                debug_print(f"[Explorer Monitor] ✗ Failed to close: {e}")
                         else:
-                            print(f"[Explorer Monitor] ✗ Could not get path from {hwnd}")
+                            debug_print(f"[Explorer Monitor] ✗ Could not get path from {hwnd}")
                     
                     except Exception as e:
-                        print(f"[Explorer Monitor] Error processing window {hwnd}: {e}")
+                        debug_print(f"[Explorer Monitor] Error processing window {hwnd}: {e}")
                 
                 # 更新已知窗口列表
                 self.known_explorer_windows = current_explorer_windows
                 
         except Exception as e:
-            print(f"[Explorer Monitor] Monitor loop error: {e}")
+            debug_print(f"[Explorer Monitor] Monitor loop error: {e}")
             import traceback
             traceback.print_exc()
     
@@ -4178,7 +4212,7 @@ class MainWindow(QMainWindow):
                                 # 获取当前路径
                                 location = window.LocationURL
                                 
-                                print(f"[Explorer Monitor] LocationURL: {location}")
+                                debug_print(f"[Explorer Monitor] LocationURL: {location}")
                                 
                                 if location:
                                     # 转换file:///格式的URL为本地路径
@@ -4193,7 +4227,7 @@ class MainWindow(QMainWindow):
                                     elif '::' in location:
                                         # CLSID 格式的特殊路径（如"此电脑"）
                                         # 例如：::{20D04FE0-3AEA-1069-A2D8-08002B30309D}
-                                        print(f"[Explorer Monitor] Special shell path detected: {location}")
+                                        debug_print(f"[Explorer Monitor] Special shell path detected: {location}")
                                         
                                         # 常见的 CLSID 映射
                                         clsid_map = {
@@ -4207,18 +4241,18 @@ class MainWindow(QMainWindow):
                                                 return shell_path
                                         
                                         # 如果是未知的特殊路径，返回默认位置
-                                        print(f"[Explorer Monitor] Unknown CLSID, using default home path")
+                                        debug_print(f"[Explorer Monitor] Unknown CLSID, using default home path")
                                         return QDir.homePath()
                                     else:
                                         # 其他格式的路径
                                         return location
                                 else:
-                                    print(f"[Explorer Monitor] LocationURL is empty, trying alternative methods...")
+                                    debug_print(f"[Explorer Monitor] LocationURL is empty, trying alternative methods...")
                                     
                                     # 尝试获取 LocationName
                                     try:
                                         location_name = window.LocationName
-                                        print(f"[Explorer Monitor] LocationName: {location_name}")
+                                        debug_print(f"[Explorer Monitor] LocationName: {location_name}")
                                         
                                         # 根据位置名称推断路径
                                         if location_name in ['此电脑', 'This PC', 'My Computer']:
@@ -4233,7 +4267,7 @@ class MainWindow(QMainWindow):
                                     # 如果都失败了，返回用户主目录
                                     return QDir.homePath()
                         except Exception as e:
-                            print(f"[Explorer Monitor] Error accessing window properties: {e}")
+                            debug_print(f"[Explorer Monitor] Error accessing window properties: {e}")
                             continue
                     
                     # 如果第一次没找到，等待一下再试
@@ -4241,14 +4275,14 @@ class MainWindow(QMainWindow):
                         time.sleep(0.2)
                         
                 except Exception as e:
-                    print(f"[Explorer Monitor] Attempt {attempt + 1} failed: {e}")
+                    debug_print(f"[Explorer Monitor] Attempt {attempt + 1} failed: {e}")
                     if attempt < 2:
                         time.sleep(0.2)
             
             return None
             
         except Exception as e:
-            print(f"[Explorer Monitor] Error getting path: {e}")
+            debug_print(f"[Explorer Monitor] Error getting path: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -4359,15 +4393,15 @@ class MainWindow(QMainWindow):
     
     def show_bookmark_context_menu(self, pos, bookmark_id, bookmark_name):
         """显示书签右键菜单"""
-        print(f"[DEBUG] show_bookmark_context_menu called: pos={pos}, id={bookmark_id}, name={bookmark_name}")
+        debug_print(f"[DEBUG] show_bookmark_context_menu called: pos={pos}, id={bookmark_id}, name={bookmark_name}")
         menu = QMenu(self)
         
         delete_action = menu.addAction("🗑️ 删除书签")
         delete_action.triggered.connect(lambda: self.confirm_delete_bookmark(bookmark_id, bookmark_name))
         
-        print(f"[DEBUG] Showing menu...")
+        debug_print(f"[DEBUG] Showing menu...")
         menu.exec_(pos)
-        print(f"[DEBUG] Menu closed")
+        debug_print(f"[DEBUG] Menu closed")
     
     def confirm_delete_bookmark(self, bookmark_id, bookmark_name):
         """确认删除书签"""
@@ -4469,72 +4503,72 @@ class MainWindow(QMainWindow):
         # 处理主菜单栏的右键点击
         if obj == self.menu_bar:
             if event.type() == QEvent.MouseButtonPress:
-                print(f"[DEBUG] MenuBar MouseButtonPress, button: {event.button()}, Qt.RightButton: {Qt.RightButton}")
+                debug_print(f"[DEBUG] MenuBar MouseButtonPress, button: {event.button()}, Qt.RightButton: {Qt.RightButton}")
                 
                 if event.button() == Qt.RightButton:
                     pos = event.pos()
                     action = self.menu_bar.actionAt(pos)
                     
-                    print(f"[DEBUG] MenuBar right click at {pos}, action: {action}")
+                    debug_print(f"[DEBUG] MenuBar right click at {pos}, action: {action}")
                     
                     if action:
-                        print(f"[DEBUG] Action found, has bookmark_actions: {hasattr(self, 'bookmark_actions')}")
+                        debug_print(f"[DEBUG] Action found, has bookmark_actions: {hasattr(self, 'bookmark_actions')}")
                         if hasattr(self, 'bookmark_actions'):
-                            print(f"[DEBUG] bookmark_actions count: {len(self.bookmark_actions)}")
-                            print(f"[DEBUG] action in bookmark_actions: {action in self.bookmark_actions}")
+                            debug_print(f"[DEBUG] bookmark_actions count: {len(self.bookmark_actions)}")
+                            debug_print(f"[DEBUG] action in bookmark_actions: {action in self.bookmark_actions}")
                     
                     if action and hasattr(self, 'bookmark_actions') and action in self.bookmark_actions:
                         node = self.bookmark_actions[action]
                         bookmark_id = node.get('id')
                         bookmark_name = node.get('name', '')
                         
-                        print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
+                        debug_print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
                         
                         # 检查是否是特殊书签（不允许删除）
                         special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
                         is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
                         
-                        print(f"[DEBUG] Is special bookmark: {is_special}")
+                        debug_print(f"[DEBUG] Is special bookmark: {is_special}")
                         
                         if not is_special:
                             global_pos = self.menu_bar.mapToGlobal(pos)
-                            print(f"[DEBUG] Showing context menu at: {global_pos}")
+                            debug_print(f"[DEBUG] Showing context menu at: {global_pos}")
                             self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
                             return True  # 事件已处理
                     else:
-                        print(f"[DEBUG] Action not in bookmark_actions or no bookmark_actions")
+                        debug_print(f"[DEBUG] Action not in bookmark_actions or no bookmark_actions")
         
         # 处理子菜单（文件夹）的右键点击
         elif isinstance(obj, QMenu):
             if event.type() == QEvent.MouseButtonPress:
-                print(f"[DEBUG] QMenu MouseButtonPress, button: {event.button()}")
+                debug_print(f"[DEBUG] QMenu MouseButtonPress, button: {event.button()}")
                 
                 if event.button() == Qt.RightButton:
                     pos = event.pos()
                     action = obj.actionAt(pos)
                     
-                    print(f"[DEBUG] QMenu right click at {pos}, action: {action}")
+                    debug_print(f"[DEBUG] QMenu right click at {pos}, action: {action}")
                     
                     if action and hasattr(self, 'bookmark_actions') and action in self.bookmark_actions:
                         node = self.bookmark_actions[action]
                         bookmark_id = node.get('id')
                         bookmark_name = node.get('name', '')
                         
-                        print(f"[DEBUG] Found bookmark in submenu: {bookmark_name} (ID: {bookmark_id})")
+                        debug_print(f"[DEBUG] Found bookmark in submenu: {bookmark_name} (ID: {bookmark_id})")
                         
                         # 检查是否是特殊书签（不允许删除）
                         special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
                         is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
                         
-                        print(f"[DEBUG] Is special bookmark: {is_special}")
+                        debug_print(f"[DEBUG] Is special bookmark: {is_special}")
                         
                         if not is_special:
                             global_pos = obj.mapToGlobal(pos)
-                            print(f"[DEBUG] Showing context menu at: {global_pos}")
+                            debug_print(f"[DEBUG] Showing context menu at: {global_pos}")
                             self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
                             return True  # 事件已处理
                     else:
-                        print(f"[DEBUG] Action not in bookmark_actions")
+                        debug_print(f"[DEBUG] Action not in bookmark_actions")
         
         return super().eventFilter(obj, event)
     
@@ -4596,6 +4630,19 @@ class SettingsDialog(QDialog):
         
         monitor_group.setLayout(monitor_layout)
         layout.addWidget(monitor_group)
+        
+        # 调试设置组
+        debug_group = QGroupBox("调试设置")
+        debug_layout = QVBoxLayout()
+        
+        self.debug_mode_cb = QCheckBox("启用调试输出（输出到终端）", self)
+        self.debug_mode_cb.setChecked(config.get("debug_mode", False))
+        self.debug_mode_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.debug_mode_cb.setToolTip("启用后将在终端输出调试信息，用于开发和问题排查")
+        debug_layout.addWidget(self.debug_mode_cb)
+        
+        debug_group.setLayout(debug_layout)
+        layout.addWidget(debug_group)
         
         # 快捷键设置组
         hotkey_group = QGroupBox("快捷键设置")
@@ -5124,14 +5171,14 @@ def try_send_to_existing_instance(path):
             client.connect(('127.0.0.1', 58923))
             client.send(path.encode('utf-8'))
             client.close()
-            print(f"[Client] Successfully sent path to existing instance: {path}")
+            debug_print(f"[Client] Successfully sent path to existing instance: {path}")
             return True
         except Exception as e:
-            print(f"[Client] Attempt {attempt + 1}/{max_retries} failed: {e}")
+            debug_print(f"[Client] Attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
                 time.sleep(0.1)  # 短暂等待后重试
             continue
-    print("[Client] No existing instance found, starting new instance")
+    debug_print("[Client] No existing instance found, starting new instance")
     return False
 
 def main():
@@ -5152,9 +5199,18 @@ def main():
                 print(f"Sent path to existing instance: {path}")
                 sys.exit(0)  # 退出程序，不启动新实例
     
+    # 禁用 Qt 的警告输出（在创建 QApplication 之前设置）
+    import os
+    os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
+    
     # 启动新实例
     app = QApplication(sys.argv)
     app.setApplicationName("TabExplorer")
+    
+    # 安装自定义 Qt 消息处理器，过滤 QAxBase 等警告
+    from PyQt5.QtCore import qInstallMessageHandler
+    qInstallMessageHandler(qt_message_handler)
+    
     # 创建并设置应用图标（用于任务栏与窗口）
     try:
         from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QIcon
@@ -5184,7 +5240,7 @@ def main():
         icon = QIcon(pix)
         app.setWindowIcon(icon)
     except Exception as e:
-        print(f"[Icon] Failed to create app icon: {e}")
+        debug_print(f"[Icon] Failed to create app icon: {e}")
     window = MainWindow()
     
     # 如果有路径参数，在新窗口中打开
