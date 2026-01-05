@@ -3781,11 +3781,12 @@ class MainWindow(QMainWindow):
                 if edge:
                     # 在边缘，显示调整大小光标
                     self.update_cursor(edge)
-                    event.accept()
-                    return
                 else:
-                    # 不在边缘，恢复默认光标（通过QApplication恢复）
+                    # 不在边缘，恢复默认光标
                     self.update_cursor(None)
+            else:
+                # 最大化状态下确保恢复默认光标
+                self.update_cursor(None)
         
         super().mouseMoveEvent(event)
     
@@ -4612,7 +4613,7 @@ class MainWindow(QMainWindow):
         
         # 创建主容器，蓝色背景作为边框
         main_container = QWidget()
-        main_container.setStyleSheet("background: #2196F3;")
+        main_container.setStyleSheet("background: #2196F3; border-radius: 8px;")
         main_container.setAttribute(Qt.WA_TransparentForMouseEvents)  # 让鼠标事件穿透到主窗口
         container_layout = QVBoxLayout(main_container)
         container_layout.setContentsMargins(4, 4, 4, 4)
@@ -4620,7 +4621,7 @@ class MainWindow(QMainWindow):
         
         # 创建内容容器，白色背景
         content_widget = QWidget()
-        content_widget.setStyleSheet("background: white;")
+        content_widget.setStyleSheet("background: white; border-radius: 6px;")
         main_layout = QVBoxLayout(content_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)

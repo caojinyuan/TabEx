@@ -11,6 +11,9 @@ TabExplorer.exe
 # Configuration
 *.json
 
+# Backup files
+*.bak
+
 # C extensions
 *.so
 
