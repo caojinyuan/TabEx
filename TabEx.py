@@ -213,12 +213,6 @@ class SearchDialog(QDialog):
         self.stop_btn.setEnabled(False)
         search_options.addWidget(self.stop_btn)
         
-        # 清除缓存按钮
-        self.clear_cache_btn = QPushButton("🗑️ 清除缓存")
-        self.clear_cache_btn.setToolTip("清除所有搜索缓存")
-        self.clear_cache_btn.clicked.connect(self.clear_search_cache)
-        search_options.addWidget(self.clear_cache_btn)
-        
         layout.addLayout(search_options)
         
         # 搜索路径输入框（可编辑）
@@ -381,10 +375,10 @@ class SearchDialog(QDialog):
             self.search_content_cb.setEnabled(True)
     
     def clear_search_cache(self):
-        """清除所有搜索缓存"""
+        """清除所有搜索缓存（内部使用，软件关闭时自动调用）"""
         global _search_cache
         _search_cache.clear()
-        QMessageBox.information(self, "提示", "搜索缓存已清除")
+        debug_print("[Search] 搜索缓存已清除")
     
     def start_search(self):
         keyword = self.search_input.currentText().strip()  # 改用currentText获取输入或选中的文本
@@ -1126,13 +1120,13 @@ class BreadcrumbPathBar(QWidget):
     
     def init_ui(self):
         self.layout = QHBoxLayout(self)
-        self.layout.setContentsMargins(3, 0, 3, 0)
+        self.layout.setContentsMargins(2, 0, 2, 0)
         self.layout.setSpacing(0)
         
         # 路径编辑框（编辑模式时显示）
         self.path_edit = QLineEdit(self)
-        self.path_edit.setFixedHeight(30)
-        self.path_edit.setStyleSheet("QLineEdit { font-size: 12pt; padding: 3px; border: 1px solid #ccc; }")
+        self.path_edit.setFixedHeight(26)
+        self.path_edit.setStyleSheet("QLineEdit { font-size: 10pt; padding: 2px; border: 1px solid #ccc; }")
         self.path_edit.hide()
         self.path_edit.returnPressed.connect(self.on_edit_finished)
         self.path_edit.editingFinished.connect(self.exit_edit_mode)
@@ -1159,7 +1153,7 @@ class BreadcrumbPathBar(QWidget):
                 border-radius: 2px;
             }
         """)
-        self.setFixedHeight(30)
+        self.setFixedHeight(26)
     
     def setup_path_completer(self):
         """设置路径自动补全"""
@@ -1299,7 +1293,7 @@ class BreadcrumbPathBar(QWidget):
             # 添加分隔符（除了最后一个）
             if i < len(parts) - 1:
                 separator = QLabel(">")
-                separator.setStyleSheet("QLabel { color: #888; font-size: 11pt; padding: 0 2px; }")
+                separator.setStyleSheet("QLabel { color: #888; font-size: 11pt; padding: 0; margin: 0 2px; }")
                 self.breadcrumb_layout.insertWidget(i * 2 + 1, separator)
     
     def on_segment_clicked(self, path):
@@ -1363,7 +1357,8 @@ class ClickableLabel(QLabel):
             QLabel {
                 color: #003d7a;
                 font-size: 11pt;
-                padding: 2px 2px;
+                padding: 1px;
+                margin: 0 2px;
                 border-radius: 2px;
             }
             QLabel:hover {
@@ -1591,16 +1586,41 @@ class FileExplorerTab(QWidget):
             }
             path = self.current_path
             display = shell_map.get(path, None)
+            
             if not display and path.startswith('shell:'):
                 display = path  # 兜底显示原始shell:路径
+            
             if not display:
-                display = path
-            # 统一对所有display做长度限制
+                # 普通路径：显示最后一层文件夹名称
+                # 标准化路径分隔符
+                normalized_path = path.replace('/', '\\') if os.name == 'nt' else path
+                # 移除末尾的分隔符
+                normalized_path = normalized_path.rstrip('\\/')
+                
+                if normalized_path:
+                    # 获取最后一层文件夹名称
+                    folder_name = os.path.basename(normalized_path)
+                    
+                    # 如果是驱动器根目录（如 C:），直接显示
+                    if not folder_name and ':' in normalized_path:
+                        folder_name = normalized_path
+                    # 如果是UNC路径根目录（如 \\server\share），显示share
+                    elif not folder_name and normalized_path.startswith('\\\\'):
+                        parts = normalized_path.split('\\')
+                        folder_name = parts[-1] if parts[-1] else parts[-2] if len(parts) > 2 else normalized_path
+                    
+                    display = folder_name if folder_name else path
+                else:
+                    display = path
+            
+            # 固定标签页和普通标签页使用相同的长度限制
             is_pinned = getattr(self, 'is_pinned', False)
-            max_len = 12 if is_pinned else 16  # 固定标签页显示更短，为📌图标留空间
+            max_len = 20  # 增加显示长度，让文件夹名称更清晰
             if len(display) > max_len:
-                display = display[-max_len:]
-            pin_prefix = "📌" if is_pinned else ""
+                # 从开头截断，保留后面部分（文件夹名称更重要）
+                display = "..." + display[-(max_len-3):]
+            
+            pin_prefix = "📌 " if is_pinned else ""
             title = pin_prefix + display
             debug_print(f"DEBUG update_tab_title: path={path}, is_pinned={is_pinned}, pin_prefix='{pin_prefix}', title='{title}'")
             if self.main_window and hasattr(self.main_window, 'tab_widget'):
@@ -3094,6 +3114,56 @@ class MainWindow(QMainWindow):
                 self.expand_dir_tree_to_path(tab.current_path)
             # 更新导航按钮状态
             self.update_navigation_buttons()
+        
+        # 更新所有标签页的字体：选中的加粗，未选中的正常
+        from PyQt5.QtGui import QFont
+        for i in range(self.tab_widget.count()):
+            font = QFont()
+            if i == index:
+                # 选中的标签页：加粗
+                font.setBold(True)
+            else:
+                # 未选中的标签页：正常
+                font.setBold(False)
+            self.tab_widget.tabBar().setTabTextColor(i, self.tab_widget.tabBar().tabTextColor(i))  # 保持颜色不变
+            # 设置字体
+            tab_bar = self.tab_widget.tabBar()
+            # 通过样式表设置字体粗细
+            if i == index:
+                # 当前标签加粗
+                current_text = self.tab_widget.tabText(i)
+                self.tab_widget.setTabText(i, current_text)  # 触发重绘
+            
+        # 使用样式表设置选中标签的字体加粗（保持与初始样式一致）
+        self.tab_widget.tabBar().setStyleSheet("""
+            QTabBar::tab {
+                border: 1px solid #b0b0b0;
+                border-bottom: none;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                padding: 2px 4px;
+                height: 24px;
+                width: 120px;
+                min-width: 120px;
+                max-width: 120px;
+                font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial, sans-serif;
+                font-size: 12px;
+                margin-top: 2px;
+                text-align: center;
+            }
+            QTabBar::tab:selected {
+                background: #FFF9CC;
+                border: 1px solid #999;
+                border-bottom: none;
+                margin-top: 0px;
+                padding-top: 3px;
+            }
+            QTabBar::tab:!selected {
+                font-weight: normal;
+            }
+        """)
+        # 设置标签文本省略模式
+        self.tab_widget.tabBar().setElideMode(Qt.ElideRight)
 
     def expand_dir_tree_to_path(self, path):
         # 展开并选中左侧目录树到指定路径
@@ -3181,7 +3251,12 @@ class MainWindow(QMainWindow):
         
         # 窗口标题
         title_label = QLabel("TabExplorer")
-        title_label.setStyleSheet("font-weight: bold; font-size: 11pt; color: #333;")
+        title_label.setStyleSheet("""
+            font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial, sans-serif;
+            font-weight: 600;
+            font-size: 12pt;
+            color: #0078D7;
+        """)
         titlebar_layout.addWidget(title_label)
         
         # 用于拖动窗口
@@ -3198,13 +3273,14 @@ class MainWindow(QMainWindow):
             QPushButton {
                 background: transparent;
                 border: none;
+                border-radius: 4px;
                 font-size: 14pt;
             }
             QPushButton:hover {
-                background: rgba(0, 0, 0, 0.1);
+                background: #e0e0e0;
             }
             QPushButton:pressed {
-                background: rgba(0, 0, 0, 0.2);
+                background: #d0d0d0;
             }
         """)
         bookmark_btn.clicked.connect(self.show_bookmark_manager_dialog)
@@ -3218,13 +3294,14 @@ class MainWindow(QMainWindow):
             QPushButton {
                 background: transparent;
                 border: none;
+                border-radius: 4px;
                 font-size: 14pt;
             }
             QPushButton:hover {
-                background: rgba(0, 0, 0, 0.1);
+                background: #e0e0e0;
             }
             QPushButton:pressed {
-                background: rgba(0, 0, 0, 0.2);
+                background: #d0d0d0;
             }
         """)
         settings_btn.clicked.connect(self.show_settings_menu)
@@ -3237,11 +3314,15 @@ class MainWindow(QMainWindow):
             QPushButton {
                 background: transparent;
                 border: none;
-                font-size: 16pt;
+                font-size: 14pt;
                 font-weight: bold;
+                color: #333;
             }
             QPushButton:hover {
-                background: rgba(0, 0, 0, 0.1);
+                background: #e0e0e0;
+            }
+            QPushButton:pressed {
+                background: #d0d0d0;
             }
         """)
         min_btn.clicked.connect(self.showMinimized)
@@ -3254,10 +3335,14 @@ class MainWindow(QMainWindow):
             QPushButton {
                 background: transparent;
                 border: none;
-                font-size: 16pt;
+                font-size: 14pt;
+                color: #333;
             }
             QPushButton:hover {
-                background: rgba(0, 0, 0, 0.1);
+                background: #e0e0e0;
+            }
+            QPushButton:pressed {
+                background: #d0d0d0;
             }
         """)
         self.max_btn.clicked.connect(self.toggle_maximize)
@@ -3325,7 +3410,12 @@ class MainWindow(QMainWindow):
         
         # 窗口标题
         title_label = QLabel("TabExplorer")
-        title_label.setStyleSheet("font-weight: bold; font-size: 11pt; color: #333;")
+        title_label.setStyleSheet("""
+            font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial, sans-serif;
+            font-weight: 600;
+            font-size: 12pt;
+            color: #0078D7;
+        """)
         titlebar_layout.addWidget(title_label)
         
         # 用于拖动窗口
@@ -3342,13 +3432,14 @@ class MainWindow(QMainWindow):
             QPushButton {
                 background: transparent;
                 border: none;
+                border-radius: 4px;
                 font-size: 14pt;
             }
             QPushButton:hover {
-                background: rgba(0, 0, 0, 0.1);
+                background: #e0e0e0;
             }
             QPushButton:pressed {
-                background: rgba(0, 0, 0, 0.2);
+                background: #d0d0d0;
             }
         """)
         bookmark_btn.clicked.connect(self.show_bookmark_manager_dialog)
@@ -3362,13 +3453,14 @@ class MainWindow(QMainWindow):
             QPushButton {
                 background: transparent;
                 border: none;
+                border-radius: 4px;
                 font-size: 14pt;
             }
             QPushButton:hover {
-                background: rgba(0, 0, 0, 0.1);
+                background: #e0e0e0;
             }
             QPushButton:pressed {
-                background: rgba(0, 0, 0, 0.2);
+                background: #d0d0d0;
             }
         """)
         settings_btn.clicked.connect(self.show_settings_menu)
@@ -3381,11 +3473,15 @@ class MainWindow(QMainWindow):
             QPushButton {
                 background: transparent;
                 border: none;
-                font-size: 16pt;
+                font-size: 14pt;
                 font-weight: bold;
+                color: #333;
             }
             QPushButton:hover {
-                background: rgba(0, 0, 0, 0.1);
+                background: #e0e0e0;
+            }
+            QPushButton:pressed {
+                background: #d0d0d0;
             }
         """)
         min_btn.clicked.connect(self.showMinimized)
@@ -3398,10 +3494,14 @@ class MainWindow(QMainWindow):
             QPushButton {
                 background: transparent;
                 border: none;
-                font-size: 16pt;
+                font-size: 14pt;
+                color: #333;
             }
             QPushButton:hover {
-                background: rgba(0, 0, 0, 0.1);
+                background: #e0e0e0;
+            }
+            QPushButton:pressed {
+                background: #d0d0d0;
             }
         """)
         self.max_btn.clicked.connect(self.toggle_maximize)
@@ -4408,6 +4508,19 @@ class MainWindow(QMainWindow):
         # 允许左侧目录树折叠（往左拖动时隐藏）
         self.splitter.setCollapsible(0, True)  # 索引0是左侧目录树，允许折叠
         self.splitter.setCollapsible(1, False)  # 索引1是右侧标签页，不允许折叠
+        # 设置分割条样式
+        self.splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #e0e0e0;
+                width: 2px;
+            }
+            QSplitter::handle:hover {
+                background-color: #0078D7;
+            }
+            QSplitter::handle:pressed {
+                background-color: #005a9e;
+            }
+        """)
         # 设置子控件的拉伸因子（左侧0，右侧1，右侧会占据剩余空间）
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
@@ -4432,6 +4545,31 @@ class MainWindow(QMainWindow):
         self.dir_tree.setColumnHidden(1, True)
         self.dir_tree.setColumnHidden(2, True)
         self.dir_tree.setColumnHidden(3, True)
+        # 设置目录树样式
+        self.dir_tree.setStyleSheet("""
+            QTreeView {
+                background-color: #fafafa;
+                border: none;
+                font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial, sans-serif;
+                font-size: 10pt;
+                outline: none;
+            }
+            QTreeView::item {
+                padding: 1px 4px;
+                border: none;
+                height: 20px;
+            }
+            QTreeView::item:hover {
+                background-color: #e8e8e8;
+            }
+            QTreeView::item:selected {
+                background-color: #cce8ff;
+                color: #000;
+            }
+            QTreeView::item:selected:active {
+                background-color: #99d1ff;
+            }
+        """)
         # 移除最小宽度限制，允许完全隐藏（往左拖动时）
         self.dir_tree.setMinimumWidth(0)
         # 设置合理的最大宽度，防止拖动过宽
@@ -4469,17 +4607,33 @@ class MainWindow(QMainWindow):
         tabbar.setAcceptDrops(True)
         tabbar.setStyleSheet("""
             QTabBar::tab {
-                border-right: 1px solid #d3d3d3;
-                padding-right: 12px;
-                padding-left: 12px;
-                min-height: 36px;
+                border: 1px solid #b0b0b0;
+                border-bottom: none;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                padding: 2px 4px;
+                height: 24px;
+                width: 120px;
                 min-width: 120px;
-                font-size: 15px;
+                max-width: 120px;
+                font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial, sans-serif;
+                font-size: 12px;
+                margin-top: 2px;
+                text-align: center;
             }
             QTabBar::tab:selected {
                 background: #FFF9CC;
+                border: 1px solid #999;
+                border-bottom: none;
+                margin-top: 0px;
+                padding-top: 3px;
+            }
+            QTabBar::tab:!selected {
+                font-weight: normal;
             }
         """)
+        # 设置标签文本省略模式
+        tabbar.setElideMode(Qt.ElideRight)
 
         # 添加导航和新标签页按钮
         btn_widget = QWidget()
@@ -4489,8 +4643,31 @@ class MainWindow(QMainWindow):
         # 后退按钮
         self.back_button = QPushButton("←")
         self.back_button.setToolTip("后退 (Alt+←)")
-        self.back_button.setFixedHeight(35)
-        self.back_button.setFixedWidth(35)
+        self.back_button.setFixedHeight(28)
+        self.back_button.setFixedWidth(28)
+        self.back_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f5f5f5;
+                border: 1px solid #d0d0d0;
+                border-radius: 4px;
+                font-size: 14px;
+                font-weight: bold;
+                color: #333;
+            }
+            QPushButton:hover:!disabled {
+                background-color: #e8e8e8;
+                border-color: #0078D7;
+            }
+            QPushButton:pressed:!disabled {
+                background-color: #d0d0d0;
+                border-color: #005a9e;
+            }
+            QPushButton:disabled {
+                background-color: #fafafa;
+                border-color: #e0e0e0;
+                color: #b0b0b0;
+            }
+        """)
         self.back_button.clicked.connect(self.go_back_current_tab)
         self.back_button.setEnabled(False)
         btn_layout.addWidget(self.back_button)
@@ -4498,8 +4675,31 @@ class MainWindow(QMainWindow):
         # 前进按钮
         self.forward_button = QPushButton("→")
         self.forward_button.setToolTip("前进 (Alt+→)")
-        self.forward_button.setFixedHeight(35)
-        self.forward_button.setFixedWidth(35)
+        self.forward_button.setFixedHeight(28)
+        self.forward_button.setFixedWidth(28)
+        self.forward_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f5f5f5;
+                border: 1px solid #d0d0d0;
+                border-radius: 4px;
+                font-size: 14px;
+                font-weight: bold;
+                color: #333;
+            }
+            QPushButton:hover:!disabled {
+                background-color: #e8e8e8;
+                border-color: #0078D7;
+            }
+            QPushButton:pressed:!disabled {
+                background-color: #d0d0d0;
+                border-color: #005a9e;
+            }
+            QPushButton:disabled {
+                background-color: #fafafa;
+                border-color: #e0e0e0;
+                color: #b0b0b0;
+            }
+        """)
         self.forward_button.clicked.connect(self.go_forward_current_tab)
         self.forward_button.setEnabled(False)
         btn_layout.addWidget(self.forward_button)
@@ -4507,16 +4707,56 @@ class MainWindow(QMainWindow):
         # 新建标签页按钮
         self.add_tab_button = QPushButton("➕")
         self.add_tab_button.setToolTip("新建标签页 (Ctrl+T)")
-        self.add_tab_button.setFixedHeight(35)
-        self.add_tab_button.setFixedWidth(35)
+        self.add_tab_button.setFixedHeight(28)
+        self.add_tab_button.setFixedWidth(28)
+        self.add_tab_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f5f5f5;
+                border: 1px solid #d0d0d0;
+                border-radius: 4px;
+                font-size: 13px;
+                color: #333;
+            }
+            QPushButton:hover {
+                background-color: #e8e8e8;
+                border-color: #0078D7;
+            }
+            QPushButton:pressed {
+                background-color: #d0d0d0;
+                border-color: #005a9e;
+            }
+        """)
         self.add_tab_button.clicked.connect(self.add_new_tab)
         btn_layout.addWidget(self.add_tab_button)
         
         # 恢复标签页按钮
         self.reopen_tab_button = QPushButton("↶")
         self.reopen_tab_button.setToolTip("恢复关闭的标签页 (Ctrl+Shift+T)")
-        self.reopen_tab_button.setFixedHeight(35)
-        self.reopen_tab_button.setFixedWidth(35)
+        self.reopen_tab_button.setFixedHeight(28)
+        self.reopen_tab_button.setFixedWidth(28)
+        self.reopen_tab_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f5f5f5;
+                border: 1px solid #d0d0d0;
+                border-radius: 4px;
+                font-size: 14px;
+                font-weight: bold;
+                color: #333;
+            }
+            QPushButton:hover:!disabled {
+                background-color: #e8e8e8;
+                border-color: #0078D7;
+            }
+            QPushButton:pressed:!disabled {
+                background-color: #d0d0d0;
+                border-color: #005a9e;
+            }
+            QPushButton:disabled {
+                background-color: #fafafa;
+                border-color: #e0e0e0;
+                color: #b0b0b0;
+            }
+        """)
         self.reopen_tab_button.clicked.connect(self.reopen_closed_tab)
         self.reopen_tab_button.setEnabled(False)  # 初始禁用
         btn_layout.addWidget(self.reopen_tab_button)
@@ -4524,8 +4764,25 @@ class MainWindow(QMainWindow):
         # 搜索按钮
         self.search_button = QPushButton("🔍")
         self.search_button.setToolTip("搜索当前文件夹 (Ctrl+F)")
-        self.search_button.setFixedHeight(35)
-        self.search_button.setFixedWidth(35)
+        self.search_button.setFixedHeight(28)
+        self.search_button.setFixedWidth(28)
+        self.search_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f5f5f5;
+                border: 1px solid #d0d0d0;
+                border-radius: 4px;
+                font-size: 13px;
+                color: #333;
+            }
+            QPushButton:hover {
+                background-color: #e8e8e8;
+                border-color: #0078D7;
+            }
+            QPushButton:pressed {
+                background-color: #d0d0d0;
+                border-color: #005a9e;
+            }
+        """)
         self.search_button.clicked.connect(self.show_search_dialog)
         btn_layout.addWidget(self.search_button)
         
@@ -4909,6 +5166,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭时停止服务器和监听"""
+        # 清除搜索缓存
+        try:
+            global _search_cache
+            _search_cache.clear()
+            debug_print("[App] 程序关闭，已清除搜索缓存")
+        except Exception as e:
+            print(f"Error clearing search cache: {e}")
+        
         # 停止服务器
         self.server_running = False
         if hasattr(self, 'server_socket'):
