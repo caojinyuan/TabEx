@@ -3691,8 +3691,29 @@ class MainWindow(QMainWindow):
     def _check_shortcuts(self):
         """定时检查快捷键状态（用于检测被QAxWidget拦截的快捷键）"""
         try:
+            # 严格检查窗口是否激活 - 使用多重检查确保只在TabEx激活时响应
+            # 1. 检查Qt窗口是否激活
+            if not self.isActiveWindow():
+                self._last_keys_state.clear()
+                return
+            
+            # 2. 检查应用程序焦点窗口
+            from PyQt5.QtWidgets import QApplication
+            if QApplication.activeWindow() != self:
+                self._last_keys_state.clear()
+                return
+            
+            # 3. 使用Windows API检查前台窗口是否是当前窗口
             import ctypes
             from ctypes import wintypes
+            
+            foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
+            current_hwnd = int(self.winId())
+            
+            # 如果前台窗口不是TabEx，则不响应快捷键
+            if foreground_hwnd != current_hwnd:
+                self._last_keys_state.clear()
+                return
             
             # Windows虚拟键码
             VK_CONTROL = 0x11
