@@ -3720,8 +3720,28 @@ class MainWindow(QMainWindow):
                 return
             
             # 拖动窗口
-            if self.drag_position is not None and not self.isMaximized():
-                self.move(event.globalPos() - self.drag_position)
+            if self.drag_position is not None:
+                if self.isMaximized():
+                    # 最大化状态下拖动：先恢复窗口，然后继续拖动
+                    # 计算恢复后窗口的位置，使鼠标保持在标题栏的相对位置
+                    mouse_global_pos = event.globalPos()
+                    
+                    # 恢复窗口
+                    self.showNormal()
+                    
+                    # 计算新的拖动位置，使鼠标在窗口宽度的相对位置保持一致
+                    # 假设鼠标在标题栏的相对位置是 drag_position 的 x 坐标
+                    window_width = self.width()
+                    # 将拖动位置调整为窗口中心附近，让拖动更自然
+                    new_drag_x = window_width // 2
+                    self.drag_position.setX(new_drag_x)
+                    
+                    # 移动窗口，使鼠标位置正确
+                    new_pos = mouse_global_pos - self.drag_position
+                    self.move(new_pos)
+                else:
+                    # 正常拖动
+                    self.move(event.globalPos() - self.drag_position)
                 event.accept()
                 return
         else:
