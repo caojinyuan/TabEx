@@ -2150,19 +2150,32 @@ class FileExplorerTab(QWidget):
                     
                     debug_print(f"[DoubleClick] path_before='{path_before}', selected_before={selected_before}")
 
-                    # 使用较短的单次延迟检查，提高响应速度
+                    # 使用延迟检查，给足够时间让文件夹导航完成
                     def check_and_handle():
                         try:
-                            cur_path = getattr(self, 'current_path', None)
+                            # 优先检查最可靠的指标
                             
-                            # 1. 检查路径是否变化（进入了文件夹）
-                            if path_before is not None and cur_path is not None and cur_path != path_before:
-                                debug_print(f"[DoubleClick] Path changed: '{path_before}' -> '{cur_path}', skip go_up")
-                                return
-                            
-                            # 2. 检查是否点击前有选中项
+                            # 1. 检查是否点击前有选中项（最可靠）
                             if selected_before is not None and int(selected_before) > 0:
                                 debug_print(f"[DoubleClick] Had selection before: {selected_before}, skip go_up")
+                                return
+                            
+                            # 2. 检查当前选中项数量
+                            cnt = None
+                            try:
+                                cnt = self.explorer.dynamicCall('SelectedItems().Count')
+                            except Exception:
+                                try:
+                                    sel = self.explorer.dynamicCall('SelectedItems()')
+                                    if sel is not None:
+                                        cnt = sel.property('Count') if hasattr(sel, 'property') else None
+                                except Exception:
+                                    pass
+                            
+                            debug_print(f"[DoubleClick] SelectedItems count: {cnt}")
+                            
+                            if cnt is not None and int(cnt) > 0:
+                                debug_print(f"[DoubleClick] Has selection: {cnt}, skip go_up")
                                 return
                             
                             # 3. 使用 native hit-test 检查是否点击在项目上
@@ -2177,23 +2190,10 @@ class FileExplorerTab(QWidget):
                                 except Exception as e:
                                     debug_print(f"[DoubleClick] Hit test exception: {e}")
                             
-                            # 4. 检查当前选中项数量
-                            cnt = None
-                            try:
-                                cnt = self.explorer.dynamicCall('SelectedItems().Count')
-                            except Exception:
-                                try:
-                                    sel = self.explorer.dynamicCall('SelectedItems()')
-                                    if sel is not None:
-                                        cnt = sel.property('Count') if hasattr(sel, 'property') else None
-                                except Exception:
-                                    pass
-                            
-                            debug_print(f"[DoubleClick] SelectedItems count: {cnt}")
-                            
-                            # 5. 根据选中项数量决定是否执行 go_up
-                            if cnt is not None and int(cnt) > 0:
-                                debug_print(f"[DoubleClick] Has selection: {cnt}, skip go_up")
+                            # 4. 最后检查路径是否变化（进入了文件夹）
+                            cur_path = getattr(self, 'current_path', None)
+                            if path_before is not None and cur_path is not None and cur_path != path_before:
+                                debug_print(f"[DoubleClick] Path changed: '{path_before}' -> '{cur_path}', skip go_up")
                                 return
                             
                             # 所有检查都通过，执行 go_up
@@ -2205,11 +2205,11 @@ class FileExplorerTab(QWidget):
                         finally:
                             self._selected_before_click = None
 
-                    # 使用单次 200ms 延迟检查，平衡响应速度和准确性
+                    # 使用 300ms 延迟，给足够时间让文件夹导航完成
                     timer = QTimer()
                     timer.setSingleShot(True)
                     timer.timeout.connect(check_and_handle)
-                    timer.start(200)
+                    timer.start(300)
                     if not hasattr(self, '_pending_double_click_timers'):
                         self._pending_double_click_timers = []
                     self._pending_double_click_timers.append(timer)
