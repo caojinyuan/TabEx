@@ -2294,39 +2294,39 @@ class FileExplorerTab(QWidget):
     def go_up(self, force=False):
         # 返回上一级目录，盘符根目录时导航到"此电脑"
         # 如果 force=True，则绕过鼠标位置检查（用于按钮或程序化调用）
-        current_path_before = getattr(self, 'current_path', None)
-        print(f"[go_up] Called with force={force}, current_path='{current_path_before}'")
+        if not self.current_path:
+            return
         
+        debug_print(f"[go_up] Called with force={force}, current_path='{self.current_path}'")
+        
+        # 快速检查：如果是force模式，直接跳过widget检查
         if not force:
             # 仅在明确来自空白区域或路径栏的触发时执行，避免误由文件双击触发
             try:
-                from PyQt5.QtWidgets import QApplication
-                from PyQt5.QtGui import QCursor
                 pos = QCursor.pos()
                 w = QApplication.widgetAt(pos.x(), pos.y())
                 # 允许的触发源：底部空白标签或路径栏
                 if w is not self.blank and w is not getattr(self, 'path_bar', None):
-                    print(f"[go_up] Rejected: not from valid source (widget={w})")
+                    debug_print(f"[go_up] Rejected: not from valid source")
                     return
             except Exception:
-                # 如果无法判断，保守退出，避免误导航
-                print(f"[go_up] Rejected: exception in widget check")
+                debug_print(f"[go_up] Rejected: exception in widget check")
                 return
-        if not self.current_path:
-            print(f"[go_up] Rejected: no current_path")
-            return
+        
         path = self.current_path
         # 判断是否为盘符根目录，导航到"此电脑"
         if path.endswith(":\\") or path.endswith(":/"):
-            print(f"[go_up] Root directory '{path}', navigate to MyComputer")
-            self.navigate_to('shell:MyComputerFolder', is_shell=True)
+            debug_print(f"[go_up] Root directory, navigate to MyComputer")
+            self.navigate_to('shell:MyComputerFolder', is_shell=True, skip_async_check=True)
             return
+        
         parent_path = os.path.dirname(path)
         if parent_path and os.path.exists(parent_path):
-            print(f"[go_up] Navigate from '{path}' to '{parent_path}'")
-            self.navigate_to(parent_path)
+            debug_print(f"[go_up] Navigate to parent: {parent_path}")
+            # 返回上一级时跳过异步检查，直接导航，提升响应速度
+            self.navigate_to(parent_path, skip_async_check=True)
         else:
-            print(f"[go_up] Rejected: parent_path '{parent_path}' invalid or not exists")
+            debug_print(f"[go_up] Invalid parent path")
 
     def __init__(self, parent=None, path="", is_shell=False, select_file=None):
         super().__init__(parent)
@@ -2369,30 +2369,22 @@ class FileExplorerTab(QWidget):
 
     # 移除重复的setup_ui，保留带路径栏的实现
 
-    def navigate_to(self, path, is_shell=False, add_to_history=True):
-        old_path = getattr(self, 'current_path', None)
-        debug_print(f"[navigate_to] From '{old_path}' to '{path}' (is_shell={is_shell})")
+    def navigate_to(self, path, is_shell=False, add_to_history=True, skip_async_check=False):
+        debug_print(f"[navigate_to] To '{path}' (is_shell={is_shell}, skip_async={skip_async_check})")
         
-        # 取消所有待处理的双击检查定时器，因为路径即将改变
-        try:
-            cancelled_count = 0
-            for timer in getattr(self, '_pending_double_click_timers', []):
+        # 快速取消所有待处理的双击检查定时器
+        if hasattr(self, '_pending_double_click_timers'):
+            for timer in self._pending_double_click_timers:
                 try:
                     timer.stop()
-                    cancelled_count += 1
                 except Exception:
                     pass
             self._pending_double_click_timers = []
-            if cancelled_count > 0:
-                debug_print(f"[navigate_to] Cancelled {cancelled_count} pending double-click timers")
-        except Exception:
-            pass
         
-        # 停止之前的文件夹检查线程
+        # 停止之前的文件夹检查线程（减少等待时间）
         if hasattr(self, 'folder_checker') and self.folder_checker and self.folder_checker.isRunning():
             self.folder_checker.stop()
-            self.folder_checker.wait(100)  # 等待最多100ms
-            debug_print(f"[navigate_to] Stopped previous folder checker")
+            self.folder_checker.wait(50)  # 减少等待时间从100ms到50ms
         
         # 支持本地路径和shell特殊路径
         if is_shell:
@@ -2406,12 +2398,12 @@ class FileExplorerTab(QWidget):
             if add_to_history:
                 self._add_to_history(path)
         elif os.path.exists(path):
-            # 异步检查文件夹大小（仅对本地路径）
-            if ASYNC_LOAD_ENABLED and os.path.isdir(path):
-                self._check_folder_size_async(path, add_to_history)
-            else:
-                # 直接导航（不检查大小）
+            # 如果skip_async_check=True或禁用异步，直接导航
+            if skip_async_check or not ASYNC_LOAD_ENABLED or not os.path.isdir(path):
                 self._perform_navigation(path, add_to_history)
+            else:
+                # 异步检查文件夹大小
+                self._check_folder_size_async(path, add_to_history)
         else:
             debug_print(f"[navigate_to] Path does not exist: {path}")
     
@@ -3031,9 +3023,23 @@ class CustomTabBar(QTabBar):
             self.main_window.close_tab(index)
     
     def on_tab_moved(self, from_index, to_index):
-        """标签页移动后的处理，确保固定标签页始终在左侧"""
+        """标签页移动后的处理，确保固定标签页始终在左侧，并同步content_stack"""
         if not self.main_window:
             return
+        
+        debug_print(f"[TabMoved] Moving tab from {from_index} to {to_index}")
+        
+        # 同步移动content_stack中的对应内容
+        if hasattr(self.main_window, 'content_stack'):
+            content_stack = self.main_window.content_stack
+            # 从content_stack中取出对应的widget
+            moved_widget = content_stack.widget(from_index)
+            if moved_widget:
+                # 先移除
+                content_stack.removeWidget(moved_widget)
+                # 插入到新位置
+                content_stack.insertWidget(to_index, moved_widget)
+                debug_print(f"[TabMoved] Synced content_stack: moved widget from {from_index} to {to_index}")
         
         # 获取被移动的标签页
         moved_tab = self.main_window.tab_widget.widget(to_index)
@@ -4150,6 +4156,7 @@ class MainWindow(QMainWindow):
             self.config["enable_explorer_monitor"] = new_monitor
             self.config["debug_mode"] = dlg.debug_mode_cb.isChecked()
             self.config["explorer_monitor_interval"] = new_interval
+            self.config["enable_cache_tabs"] = dlg.cache_tabs_cb.isChecked()
             
             # 更新全局调试开关
             set_debug_mode(self.config["debug_mode"])
@@ -4467,6 +4474,8 @@ class MainWindow(QMainWindow):
             "enable_explorer_monitor": True,  # 默认启用Explorer监听
             "debug_mode": False,  # 默认关闭调试输出
             "pinned_tabs": [],  # 默认没有固定标签页
+            "enable_cache_tabs": True,  # 默认启用缓存标签功能
+            "cached_tabs": [],  # 缓存的非固定标签页
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -4919,6 +4928,23 @@ class MainWindow(QMainWindow):
         except Exception as e:
             debug_print(f"[Performance] Failed to load pinned tabs: {e}")
         
+        # 恢复缓存的标签页
+        try:
+            if self.config.get("enable_cache_tabs", True):
+                cached_tabs = self.config.get("cached_tabs", [])
+                if cached_tabs:
+                    debug_print(f"[App] 恢复 {len(cached_tabs)} 个缓存标签页")
+                    for tab_info in cached_tabs:
+                        path = tab_info.get('path', '')
+                        if path:
+                            self.add_new_tab(path)
+                    # 恢复后清除缓存
+                    self.config['cached_tabs'] = []
+                    self.save_config()
+                    debug_print("[App] 缓存标签页已恢复并清除")
+        except Exception as e:
+            debug_print(f"[Performance] Failed to restore cached tabs: {e}")
+        
         # 延迟启动实例服务器
         try:
             self.start_instance_server()
@@ -5228,6 +5254,27 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭时停止服务器和监听"""
+        # 缓存非固定标签（如果启用）
+        try:
+            if self.config.get("enable_cache_tabs", True):
+                cached_tabs = []
+                for i in range(self.tab_widget.count()):
+                    tab = self.get_tab_widget(i)
+                    if tab and hasattr(tab, 'current_path'):
+                        # 只缓存非固定标签
+                        if not getattr(tab, 'is_pinned', False):
+                            cached_tabs.append({
+                                'path': tab.current_path,
+                                'is_shell': tab.current_path.startswith('shell:') if tab.current_path else False
+                            })
+                
+                if cached_tabs:
+                    self.config['cached_tabs'] = cached_tabs
+                    self.save_config()
+                    debug_print(f"[App] 缓存了 {len(cached_tabs)} 个非固定标签页")
+        except Exception as e:
+            print(f"Error caching tabs: {e}")
+        
         # 清除搜索缓存
         try:
             global _search_cache
@@ -5590,6 +5637,19 @@ class SettingsDialog(QDialog):
         
         debug_group.setLayout(debug_layout)
         layout.addWidget(debug_group)
+        
+        # 标签页设置组
+        tabs_group = QGroupBox("标签页设置")
+        tabs_layout = QVBoxLayout()
+        
+        self.cache_tabs_cb = QCheckBox("关闭时缓存当前标签页，下次启动时恢复", self)
+        self.cache_tabs_cb.setChecked(config.get("enable_cache_tabs", True))
+        self.cache_tabs_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.cache_tabs_cb.setToolTip("关闭软件时保存非固定标签，下次启动时自动恢复（不包括固定标签）")
+        tabs_layout.addWidget(self.cache_tabs_cb)
+        
+        tabs_group.setLayout(tabs_layout)
+        layout.addWidget(tabs_group)
         
         # 快捷键设置组
         hotkey_group = QGroupBox("快捷键设置")
