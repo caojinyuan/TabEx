@@ -1136,7 +1136,7 @@ class BreadcrumbPathBar(QWidget):
         
         # 面包屑容器（显示模式时显示）
         self.breadcrumb_widget = QWidget(self)
-        self.breadcrumb_widget.setStyleSheet("QWidget { background: #e8f5e9; }")
+        self.breadcrumb_widget.setStyleSheet("QWidget { background: transparent; }")
         # 设置最小宽度为0，允许完全缩小
         self.breadcrumb_widget.setMinimumWidth(0)
         # 设置大小策略：宽度可缩小，优先缩小而不是扩展
@@ -1153,12 +1153,11 @@ class BreadcrumbPathBar(QWidget):
         # 设置整体样式
         self.setStyleSheet("""
             BreadcrumbPathBar {
-                background: #e8f5e9;
-                border: 1px solid #ccc;
-                border-radius: 2px;
+                background: transparent;
+                border: none;
             }
         """)
-        self.setFixedHeight(26)
+        self.setFixedHeight(36)
         # 设置大小策略：宽度可扩展，高度固定
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
     
@@ -1779,6 +1778,10 @@ class FileExplorerTab(QWidget):
             pass
 
     def setup_ui(self):
+        # 设置FileExplorerTab背景为白色
+        self.setStyleSheet("background: white;")
+        self.setAutoFillBackground(True)
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -1786,6 +1789,18 @@ class FileExplorerTab(QWidget):
         self.path_bar = BreadcrumbPathBar(self)
         self.path_bar.pathChanged.connect(self.on_path_bar_changed)
         layout.addWidget(self.path_bar)
+        
+        # 添加负间距，让分隔线靠近路径栏
+        layout.addSpacing(-10)
+        
+        # 添加分隔线
+        from PyQt5.QtWidgets import QFrame
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        separator.setStyleSheet("background-color: #d0d0d0;")
+        separator.setFixedHeight(1)
+        layout.addWidget(separator)
         
         # 加载指示器（初始隐藏）
         self.loading_bar = QProgressBar(self)
@@ -4613,7 +4628,7 @@ class MainWindow(QMainWindow):
         
         # 创建主容器，蓝色背景作为边框
         main_container = QWidget()
-        main_container.setStyleSheet("background: #2196F3; border-radius: 8px;")
+        main_container.setStyleSheet("background: #2196F3;")
         main_container.setAttribute(Qt.WA_TransparentForMouseEvents)  # 让鼠标事件穿透到主窗口
         container_layout = QVBoxLayout(main_container)
         container_layout.setContentsMargins(4, 4, 4, 4)
@@ -4838,6 +4853,8 @@ class MainWindow(QMainWindow):
         # 右侧标签页内容区域（使用 StackedWidget 独立显示，不依赖 tab_widget）
         from PyQt5.QtWidgets import QStackedWidget
         self.content_stack = QStackedWidget()
+        self.content_stack.setStyleSheet("background: white;")
+        self.content_stack.setAutoFillBackground(True)
         
         self.splitter.addWidget(self.content_stack)
         
@@ -4859,6 +4876,17 @@ class MainWindow(QMainWindow):
         self.open_path_signal.connect(self.handle_open_path_from_instance)
         
         # 性能优化：单实例服务器和Explorer监听移到延迟初始化
+    
+    def resizeEvent(self, event):
+        """窗口大小改变时更新圆角mask"""
+        super().resizeEvent(event)
+        # 创建圆角矩形mask
+        from PyQt5.QtGui import QRegion, QPainterPath
+        from PyQt5.QtCore import QRectF
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 8, 8)
+        region = QRegion(path.toFillPolygon().toPolygon())
+        self.setMask(region)
 
     def handle_open_path_from_instance(self, path):
         """处理从其他实例接收到的路径（在主线程中）"""
