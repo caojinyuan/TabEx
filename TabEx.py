@@ -985,7 +985,7 @@ import time
 import socket
 import threading
 import queue
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QTreeView, QFileSystemModel, QSplitter, QProgressBar, QCompleter)  # 添加QCompleter
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QTreeView, QFileSystemModel, QSplitter, QProgressBar, QCompleter, QFrame)  # 添加QFrame
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer, QThread, QMutex, QMimeData
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor, QDrag
@@ -1794,7 +1794,6 @@ class FileExplorerTab(QWidget):
         layout.addSpacing(-10)
         
         # 添加分隔线
-        from PyQt5.QtWidgets import QFrame
         separator = QFrame()
         separator.setFrameShape(QFrame.HLine)
         separator.setFrameShadow(QFrame.Sunken)
@@ -1815,7 +1814,6 @@ class FileExplorerTab(QWidget):
         self.explorer = QAxWidget(self)
         self.explorer.setControl("Shell.Explorer")
         # 设置为NoFocus，防止QAxWidget拦截键盘事件
-        from PyQt5.QtCore import Qt
         self.explorer.setFocusPolicy(Qt.NoFocus)
         layout.addWidget(self.explorer)
         
@@ -4880,7 +4878,12 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         """窗口大小改变时更新圆角mask"""
         super().resizeEvent(event)
-        # 创建圆角矩形mask
+        # 只在大小真正改变时更新mask
+        if event.oldSize() != event.size():
+            self._update_rounded_mask()
+    
+    def _update_rounded_mask(self):
+        """更新窗口圆角mask"""
         from PyQt5.QtGui import QRegion, QPainterPath
         from PyQt5.QtCore import QRectF
         path = QPainterPath()
