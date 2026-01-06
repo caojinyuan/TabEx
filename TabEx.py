@@ -1893,6 +1893,10 @@ class FileExplorerTab(QWidget):
         except Exception:
             pass
         
+        # 初始设置路径栏（确保路径栏显示初始路径）
+        if hasattr(self, 'path_bar'):
+            self.path_bar.set_path(self.current_path)
+        
         # 初始导航到当前路径（在setup_ui最后调用，确保所有设置已应用）
         self.explorer.dynamicCall('Navigate(const QString&)', QDir.toNativeSeparators(self.current_path))
 
@@ -2129,7 +2133,7 @@ class FileExplorerTab(QWidget):
                     except Exception:
                         self._selected_before_click = None
                 elif event.type() == QEvent.MouseButtonDblClick:
-                    # 取消所有之前待处理的双击检查，避免多次操作时的累积效应
+                    # 取消所有之前待处理的双击检查
                     try:
                         for timer in getattr(self, '_pending_double_click_timers', []):
                             try:
@@ -2140,66 +2144,40 @@ class FileExplorerTab(QWidget):
                     except Exception:
                         self._pending_double_click_timers = []
                     
-                    # 为这次双击生成唯一ID
-                    self._double_click_id = getattr(self, '_double_click_id', 0) + 1
-                    current_click_id = self._double_click_id
-                    
-                    # 延迟检查，避免与控件自身处理产生竞态
-                    # 记录双击发生前的路径，以便判断双击是否触发了导航
+                    # 记录双击发生时的状态
                     path_before = getattr(self, 'current_path', None)
                     selected_before = getattr(self, '_selected_before_click', None)
                     
-                    debug_print(f"[DoubleClick] ID={current_click_id}, path_before='{path_before}', selected_before={selected_before}")
+                    debug_print(f"[DoubleClick] path_before='{path_before}', selected_before={selected_before}")
 
-                    # try multiple times because folder navigation can be slower;
-                    # perform checks at 150ms, 300ms, 600ms, 1000ms before giving up
-                    delays = [150, 300, 600, 1000]
-                    def attempt(idx=0):
-                        # 检查这次双击是否还是当前的双击（通过ID验证）
-                        # 如果ID不匹配，说明有新的双击发生了，放弃当前检查
-                        current_id = getattr(self, '_double_click_id', 0)
-                        if current_id != current_click_id:
-                            debug_print(f"[DoubleClick] ID mismatch: current={current_id} vs expected={current_click_id}, abort")
-                            return
-                        
-                        cur_path = getattr(self, 'current_path', None)
-                        debug_print(f"[DoubleClick] Check attempt {idx} (ID={current_click_id}): path_before='{path_before}' -> cur_path='{cur_path}'")
-                        
-                        handled = False
+                    # 使用较短的单次延迟检查，提高响应速度
+                    def check_and_handle():
                         try:
-                            # reuse the same logic as _check_and_go_up body
-                            # check path change first
-                            try:
-                                if path_before is not None and cur_path is not None and cur_path != path_before:
-                                    # 路径已改变，说明双击触发了导航（进入文件夹），不需要go_up
-                                    debug_print(f"[DoubleClick] Path changed (ID={current_click_id}): '{path_before}' -> '{cur_path}', skip go_up")
-                                    return
-                            except Exception as e:
-                                debug_print(f"[DoubleClick] Path check exception: {e}")
-                                pass
-                            # if press-time selection existed, skip
-                            before = getattr(self, '_selected_before_click', None)
-                            if before is not None:
-                                try:
-                                    if int(before) > 0:
-                                        debug_print(f"[DoubleClick] Had selection before click (ID={current_click_id}): {before}, skip go_up")
-                                        self._selected_before_click = None
-                                        return
-                                except Exception:
-                                    pass
-                            # native hit-test
+                            cur_path = getattr(self, 'current_path', None)
+                            
+                            # 1. 检查路径是否变化（进入了文件夹）
+                            if path_before is not None and cur_path is not None and cur_path != path_before:
+                                debug_print(f"[DoubleClick] Path changed: '{path_before}' -> '{cur_path}', skip go_up")
+                                return
+                            
+                            # 2. 检查是否点击前有选中项
+                            if selected_before is not None and int(selected_before) > 0:
+                                debug_print(f"[DoubleClick] Had selection before: {selected_before}, skip go_up")
+                                return
+                            
+                            # 3. 使用 native hit-test 检查是否点击在项目上
                             if HAS_PYWIN:
                                 try:
                                     from PyQt5.QtGui import QCursor
                                     gx = QCursor.pos().x()
                                     gy = QCursor.pos().y()
                                     if self._native_listview_hit_test(gx, gy):
-                                        debug_print(f"[DoubleClick] Hit test positive (ID={current_click_id}), skip go_up")
-                                        self._selected_before_click = None
+                                        debug_print(f"[DoubleClick] Hit test positive, skip go_up")
                                         return
-                                except Exception:
-                                    pass
-                            # finally check SelectedItems
+                                except Exception as e:
+                                    debug_print(f"[DoubleClick] Hit test exception: {e}")
+                            
+                            # 4. 检查当前选中项数量
                             cnt = None
                             try:
                                 cnt = self.explorer.dynamicCall('SelectedItems().Count')
@@ -2209,81 +2187,32 @@ class FileExplorerTab(QWidget):
                                     if sel is not None:
                                         cnt = sel.property('Count') if hasattr(sel, 'property') else None
                                 except Exception:
-                                    cnt = None
-                            
-                            debug_print(f"[DoubleClick] SelectedItems count (ID={current_click_id}): {cnt}")
-                            
-                            if cnt is None:
-                                # SelectedItems().Count API不可用，使用其他方法判断
-                                
-                                # 首先检查路径是否变化
-                                try:
-                                    cur_path = getattr(self, 'current_path', None)
-                                    if path_before is not None and cur_path is not None and cur_path != path_before:
-                                        # 路径已改变，说明双击触发了导航（进入文件夹），不需要go_up
-                                        debug_print(f"[DoubleClick] cnt=None but path changed (ID={current_click_id}): '{path_before}' -> '{cur_path}', skip go_up")
-                                        return
-                                except Exception:
                                     pass
-                                
-                                # 路径未变化，继续判断
-                                # 如果还有重试机会，继续等待
-                                if idx < len(delays) - 1:
-                                    debug_print(f"[DoubleClick] cnt=None, schedule retry {idx+1} (ID={current_click_id})")
-                                    timer = QTimer()
-                                    timer.setSingleShot(True)
-                                    timer.timeout.connect(lambda: attempt(idx+1))
-                                    timer.start(delays[idx+1] - delays[idx])
-                                    if hasattr(self, '_pending_double_click_timers'):
-                                        self._pending_double_click_timers.append(timer)
-                                    return
-                                
-                                # 最后一次尝试，路径未变化，cnt仍为None
-                                # 优先使用native hit-test判断是否点击在项目上
-                                if HAS_PYWIN:
-                                    try:
-                                        from PyQt5.QtGui import QCursor
-                                        gx = QCursor.pos().x()
-                                        gy = QCursor.pos().y()
-                                        if self._native_listview_hit_test(gx, gy):
-                                            debug_print(f"[DoubleClick] Final check: hit test positive (ID={current_click_id}), likely clicked on item, skip go_up")
-                                            return
-                                    except Exception as e:
-                                        debug_print(f"[DoubleClick] Hit test exception: {e}")
-                                        pass
-                                
-                                # 使用selected_before来判断：如果按下时有选中项，可能是文件双击
-                                before = getattr(self, '_selected_before_click', None)
-                                if before is not None and before > 0:
-                                    # 按下时有选中项，可能是文件双击（打开文件不改变路径）
-                                    debug_print(f"[DoubleClick] cnt=None but had selection before (ID={current_click_id}): {before}, skip go_up")
-                                    return
-                                
-                                # 没有选中项，路径也没变化，hit-test也是负的，很可能是空白双击
-                                debug_print(f"[DoubleClick] Execute go_up (ID={current_click_id}): cnt=None but no selection, no hit, path unchanged")
-                                try:
-                                    self.go_up(force=True)
-                                except Exception:
-                                    pass
+                            
+                            debug_print(f"[DoubleClick] SelectedItems count: {cnt}")
+                            
+                            # 5. 根据选中项数量决定是否执行 go_up
+                            if cnt is not None and int(cnt) > 0:
+                                debug_print(f"[DoubleClick] Has selection: {cnt}, skip go_up")
                                 return
-                            try:
-                                if int(cnt) == 0:
-                                    debug_print(f"[DoubleClick] Execute go_up (ID={current_click_id}): cnt=0, blank area double-click")
-                                    self.go_up(force=True)
-                                else:
-                                    debug_print(f"[DoubleClick] Has selection (ID={current_click_id}): cnt={cnt}, skip go_up")
-                                return
-                            except Exception:
-                                pass
+                            
+                            # 所有检查都通过，执行 go_up
+                            debug_print(f"[DoubleClick] Execute go_up: blank area double-click detected")
+                            self.go_up(force=True)
+                            
+                        except Exception as e:
+                            debug_print(f"[DoubleClick] Exception in check_and_handle: {e}")
                         finally:
                             self._selected_before_click = None
 
+                    # 使用单次 200ms 延迟检查，平衡响应速度和准确性
                     timer = QTimer()
                     timer.setSingleShot(True)
-                    timer.timeout.connect(lambda: attempt(0))
-                    timer.start(delays[0])
-                    if hasattr(self, '_pending_double_click_timers'):
-                        self._pending_double_click_timers.append(timer)
+                    timer.timeout.connect(check_and_handle)
+                    timer.start(200)
+                    if not hasattr(self, '_pending_double_click_timers'):
+                        self._pending_double_click_timers = []
+                    self._pending_double_click_timers.append(timer)
         except Exception:
             pass
         return super().eventFilter(obj, event)
