@@ -1453,7 +1453,9 @@ class ClickableLabel(QLabel):
         self.setStyleSheet("""
             QLabel {
                 color: #003d7a;
+                font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif;
                 font-size: 11pt;
+                font-weight: 500;
                 padding: 1px;
                 margin: 0 2px;
                 border-radius: 2px;
