@@ -1116,6 +1116,15 @@ class BreadcrumbPathBar(QWidget):
         super().__init__(parent)
         self.current_path = ""
         self.edit_mode = False
+        # 绑定resize节流定时器，避免拖动卡顿
+        try:
+            from PyQt5.QtCore import QTimer
+            self._resize_timer = QTimer(self)
+            self._resize_timer.setSingleShot(True)
+            self._resize_timer.setInterval(75)
+            self._resize_timer.timeout.connect(self.update_breadcrumbs)
+        except Exception:
+            self._resize_timer = None
         self.init_ui()
     
     def init_ui(self):
@@ -1125,7 +1134,8 @@ class BreadcrumbPathBar(QWidget):
         
         # 路径编辑框（编辑模式时显示）
         self.path_edit = QLineEdit(self)
-        self.path_edit.setFixedHeight(26)
+        path_edit_height = int(26 * getattr(self, 'parent_window', self).dpi_scale if hasattr(getattr(self, 'parent_window', self), 'dpi_scale') else 26)
+        self.path_edit.setFixedHeight(path_edit_height)
         self.path_edit.setStyleSheet("QLineEdit { font-size: 10pt; padding: 2px; border: 1px solid #ccc; }")
         self.path_edit.hide()
         self.path_edit.returnPressed.connect(self.on_edit_finished)
@@ -1139,8 +1149,8 @@ class BreadcrumbPathBar(QWidget):
         self.breadcrumb_widget.setStyleSheet("QWidget { background: transparent; }")
         # 设置最小宽度为0，允许完全缩小
         self.breadcrumb_widget.setMinimumWidth(0)
-        # 设置大小策略：宽度可缩小，优先缩小而不是扩展
-        self.breadcrumb_widget.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
+        # 设置大小策略：宽度不强制扩展，允许压缩
+        self.breadcrumb_widget.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         
         self.breadcrumb_layout = QHBoxLayout(self.breadcrumb_widget)
         self.breadcrumb_layout.setContentsMargins(0, 0, 0, 0)
@@ -1157,9 +1167,22 @@ class BreadcrumbPathBar(QWidget):
                 border: none;
             }
         """)
-        self.setFixedHeight(36)
-        # 设置大小策略：宽度可扩展，高度固定
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFixedHeight(int(36 * getattr(self, 'parent_window', self).dpi_scale if hasattr(getattr(self, 'parent_window', self), 'dpi_scale') else 36))
+        # 设置大小策略：宽度不强制扩展，高度固定；允许被压缩，避免影响左侧目录树
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+
+    def resizeEvent(self, event):
+        """当路径栏宽度变化时，节流更新面包屑，减少重绘卡顿"""
+        try:
+            if getattr(self, '_resize_timer', None):
+                # 重启定时器以合并连续的resize事件
+                self._resize_timer.start()
+            else:
+                self.update_breadcrumbs()
+        except Exception:
+            pass
+        super().resizeEvent(event)
     
     def setup_path_completer(self):
         """设置路径自动补全"""
@@ -1365,11 +1388,24 @@ class BreadcrumbPathBar(QWidget):
         
         # 创建面包屑标签
         widget_index = 0
+        # 计算缩放后的最小宽度，避免完全压缩不可见
+        try:
+            from PyQt5.QtWidgets import QApplication
+            dpi = QApplication.primaryScreen().logicalDotsPerInch()
+            scale = dpi / 96.0
+        except Exception:
+            scale = 1.0
+        min_label_w = int(40 * scale)
+        min_sep_w = int(8 * scale)
+        min_ellipsis_w = int(20 * scale)
         for i, (name, full_path) in enumerate(visible_parts):
             # 如果需要在这个位置插入省略号
             if show_ellipsis and i == insert_ellipsis_at:
                 ellipsis = QLabel("...")
                 ellipsis.setStyleSheet("QLabel { color: #888; font-size: 11pt; padding: 0; margin: 0 2px; }")
+                # 允许在横向上被压缩，但保留最小可见宽度
+                ellipsis.setMinimumWidth(min_ellipsis_w)
+                ellipsis.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
                 ellipsis.setToolTip(self.current_path)  # 鼠标悬停显示完整路径
                 self.breadcrumb_layout.insertWidget(widget_index, ellipsis)
                 widget_index += 1
@@ -1377,11 +1413,16 @@ class BreadcrumbPathBar(QWidget):
                 # 添加分隔符
                 separator = QLabel(">")
                 separator.setStyleSheet("QLabel { color: #888; font-size: 11pt; padding: 0; margin: 0 2px; }")
+                separator.setMinimumWidth(min_sep_w)
+                separator.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
                 self.breadcrumb_layout.insertWidget(widget_index, separator)
                 widget_index += 1
             
             # 创建可点击的标签
             label = ClickableLabel(name, full_path)
+            # 允许横向压缩，但保留最小可见宽度；内部自动使用省略显示
+            label.setMinimumWidth(min_label_w)
+            label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
             label.clicked.connect(self.on_segment_clicked)
             self.breadcrumb_layout.insertWidget(widget_index, label)
             widget_index += 1
@@ -1390,6 +1431,8 @@ class BreadcrumbPathBar(QWidget):
             if i < len(visible_parts) - 1:
                 separator = QLabel(">")
                 separator.setStyleSheet("QLabel { color: #888; font-size: 11pt; padding: 0; margin: 0 2px; }")
+                separator.setMinimumWidth(min_sep_w)
+                separator.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
                 self.breadcrumb_layout.insertWidget(widget_index, separator)
                 widget_index += 1
     
@@ -1448,8 +1491,20 @@ class ClickableLabel(QLabel):
     def __init__(self, text, path, parent=None):
         super().__init__(text, parent)
         self.path = path
+        # 保存完整文本以便在缩小时进行省略显示
+        self.full_text = text
         self.drag_start_position = None
         self.is_dragging = False
+        # 设置最小宽度，允许横向压缩但保持可见
+        try:
+            from PyQt5.QtWidgets import QApplication
+            dpi = QApplication.primaryScreen().logicalDotsPerInch()
+            scale = dpi / 96.0
+        except Exception:
+            scale = 1.0
+        min_label_w = int(40 * scale)
+        self.setMinimumWidth(min_label_w)
+        self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.setStyleSheet("""
             QLabel {
                 color: #003d7a;
@@ -1466,6 +1521,18 @@ class ClickableLabel(QLabel):
             }
         """)
         self.setCursor(Qt.PointingHandCursor)
+
+    def resizeEvent(self, event):
+        """根据当前宽度使用中间省略显示文本"""
+        try:
+            from PyQt5.QtGui import QFontMetrics
+            fm = QFontMetrics(self.font())
+            # 使用中间省略，保留路径前后信息
+            elided = fm.elidedText(self.full_text, Qt.ElideMiddle, max(10, self.width()))
+            super().setText(elided)
+        except Exception:
+            pass
+        super().resizeEvent(event)
     
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
@@ -1789,6 +1856,11 @@ class FileExplorerTab(QWidget):
 
         # 面包屑路径栏
         self.path_bar = BreadcrumbPathBar(self)
+        # 允许路径栏在横向上被压缩（不限制最小宽度），以避免影响splitter拖动
+        try:
+            self.path_bar.setMinimumWidth(0)
+        except Exception:
+            pass
         self.path_bar.pathChanged.connect(self.on_path_bar_changed)
         layout.addWidget(self.path_bar)
         
@@ -1817,6 +1889,11 @@ class FileExplorerTab(QWidget):
         self.explorer.setControl("Shell.Explorer")
         # 设置为NoFocus，防止QAxWidget拦截键盘事件
         self.explorer.setFocusPolicy(Qt.NoFocus)
+        # 允许Explorer控件横向压缩，减小右侧面板最小宽度
+        try:
+            self.explorer.setMinimumWidth(0)
+        except Exception:
+            pass
         layout.addWidget(self.explorer)
         
         # 异步加载相关
@@ -2204,23 +2281,65 @@ class FileExplorerTab(QWidget):
                                 return
                             
                             # 严格判断：只有在明确确认是空白区域时才执行 go_up
-                            # 如果 SelectedItems 无法获取（cnt=None），为了安全不执行 go_up
+                            # 如果 SelectedItems 无法获取（cnt=None），检查其他信号
                             if cnt is None:
-                                # Fallback: 当命中测试明确为空白、且路径未变化时，认为是空白双击
-                                cur_path2 = getattr(self, 'current_path', None)
-                                if hit_test_result is False and (path_before is not None and cur_path2 == path_before):
-                                    debug_print(f"[DoubleClick] Fallback: cnt=None + hit-test blank + path unchanged -> go_up")
-                                    self.go_up(force=True)
+                                # 当 cnt=None 时，使用多重信号确认是否为空白双击：
+                                # 1. hit-test 必须明确为 False（空白区域）
+                                # 2. selected_before 必须为 None 或 0（双击前无选中）
+                                # 3. 路径未改变（未进入文件夹）
+                                cur_path_check = getattr(self, 'current_path', None)
+                                if (hit_test_result is False and 
+                                    (selected_before is None or selected_before == 0) and
+                                    path_before is not None and cur_path_check == path_before):
+                                    # 满足所有条件，执行最终确认后 go_up
+                                    debug_print(f"[DoubleClick] cnt=None but all other signals confirm blank area, proceed to final check")
+                                else:
+                                    debug_print(f"[DoubleClick] Cannot determine selection state (cnt=None), insufficient signals for go_up")
                                     self._selected_before_click = None
                                     return
-                                debug_print(f"[DoubleClick] Cannot determine selection state (cnt=None), skip go_up for safety")
-                                self._selected_before_click = None
-                                return
                             
-                            # 如果 hit-test 明确返回 False (空白区域) 且 cnt=0，才执行 go_up
-                            if hit_test_result is False and cnt == 0:
-                                debug_print(f"[DoubleClick] Execute go_up: blank area confirmed (hit-test=False, cnt=0)")
-                                self.go_up(force=True)
+                            # 如果 hit-test 明确返回 False (空白区域) 且 cnt=0 或满足上述fallback条件，执行最终确认后再 go_up
+                            if hit_test_result is False and (cnt == 0 or cnt is None):
+                                # 终次确认：延迟500ms确认路径仍未变化且无导航活动，再执行 go_up，避免误判
+                                def final_confirm_and_go_up():
+                                    try:
+                                        cur_path3 = getattr(self, 'current_path', None)
+                                        # 检查路径是否变化（包括正在导航的情况）
+                                        if path_before is not None and cur_path3 != path_before:
+                                            debug_print(f"[DoubleClick] Final confirm: path changed to '{cur_path3}', skip go_up")
+                                            return
+                                        
+                                        # 再次检查是否有选中项（可能导航过程中有选中）
+                                        try:
+                                            cnt_final = self.explorer.dynamicCall('SelectedItems().Count')
+                                            if cnt_final is not None and int(cnt_final) > 0:
+                                                debug_print(f"[DoubleClick] Final confirm: found selection ({cnt_final}), skip go_up")
+                                                return
+                                        except Exception:
+                                            pass
+                                        
+                                        # 再次命中测试以提高准确性
+                                        r2 = hit_test_result
+                                        if HAS_PYWIN:
+                                            try:
+                                                r2 = self._native_listview_hit_test(double_click_pos.x(), double_click_pos.y())
+                                            except Exception:
+                                                pass
+                                        
+                                        if r2 is False:
+                                            debug_print(f"[DoubleClick] Execute go_up after final confirm (blank area)")
+                                            self.go_up(force=True)
+                                        else:
+                                            debug_print(f"[DoubleClick] Final confirm hit-test not blank (r2={r2}), skip go_up")
+                                    except Exception as e:
+                                        debug_print(f"[DoubleClick] Final confirm exception: {e}")
+                                t2 = QTimer()
+                                t2.setSingleShot(True)
+                                t2.timeout.connect(final_confirm_and_go_up)
+                                t2.start(500)
+                                if not hasattr(self, '_pending_double_click_timers'):
+                                    self._pending_double_click_timers = []
+                                self._pending_double_click_timers.append(t2)
                             else:
                                 debug_print(f"[DoubleClick] Uncertain state (hit_test={hit_test_result}, cnt={cnt}), skip go_up for safety")
                             
@@ -2943,7 +3062,8 @@ class CustomTabBar(QTabBar):
             if self.hovered_tab >= 0:
                 close_btn = QToolButton(self)
                 close_btn.setText("×")
-                close_btn.setFixedSize(16, 16)
+                tab_close_btn_size = int(16 * getattr(self, 'parent_window', self).dpi_scale if hasattr(getattr(self, 'parent_window', self), 'dpi_scale') else 16)
+                close_btn.setFixedSize(tab_close_btn_size, tab_close_btn_size)
                 close_btn.setStyleSheet("""
                     QToolButton {
                         border: none;
@@ -3083,12 +3203,34 @@ class MainWindow(QMainWindow):
         return self.get_tab_widget(current_index)
     
     def _on_splitter_moved(self, pos, index):
-        """当splitter移动时，保存目录树宽度"""
+        """当splitter移动时，保存目录树宽度（节流）"""
         if hasattr(self, 'splitter'):
             sizes = self.splitter.sizes()
             if len(sizes) >= 2:
-                self._saved_dir_tree_width = sizes[0]  # 保存左侧目录树宽度
+                # 暂存宽度，使用定时器节流写入，减少频繁日志和重算
+                self._pending_dir_tree_width = sizes[0]
+                try:
+                    if not hasattr(self, '_splitter_save_timer') or self._splitter_save_timer is None:
+                        from PyQt5.QtCore import QTimer
+                        self._splitter_save_timer = QTimer(self)
+                        self._splitter_save_timer.setSingleShot(True)
+                        self._splitter_save_timer.setInterval(100)
+                        self._splitter_save_timer.timeout.connect(self._commit_splitter_size)
+                    # 重启定时器以合并连续的拖动事件
+                    self._splitter_save_timer.start()
+                except Exception:
+                    # 兜底：无定时器则直接保存
+                    self._saved_dir_tree_width = self._pending_dir_tree_width
+                    debug_print(f"[Splitter] Dir tree width saved: {self._saved_dir_tree_width}px")
+
+    def _commit_splitter_size(self):
+        """实际保存分割器左侧宽度并记录日志（被节流调用）"""
+        try:
+            if hasattr(self, '_pending_dir_tree_width'):
+                self._saved_dir_tree_width = self._pending_dir_tree_width
                 debug_print(f"[Splitter] Dir tree width saved: {self._saved_dir_tree_width}px")
+        except Exception:
+            pass
 
 
     def go_up_current_tab(self):
@@ -3120,6 +3262,30 @@ class MainWindow(QMainWindow):
             self.forward_button.setEnabled(current_tab.can_go_forward())
         else:
             self.forward_button.setEnabled(False)
+
+    def _update_window_title(self, current_path: str = None):
+        """根据当前状态更新窗口标题和自定义标题栏文本。
+        当处于恢复状态时，在标题中附加“窗口恢复中”。
+        """
+        base_title = "TabExplorer"
+        # 更新自定义标题栏文本
+        if hasattr(self, 'title_label'):
+            if self.is_restoring:
+                self.title_label.setText(f"{base_title} - 窗口恢复中")
+            else:
+                self.title_label.setText(base_title)
+
+        # 组合窗口标题
+        if current_path:
+            title = f"{base_title} - {current_path}"
+        else:
+            title = base_title
+        if self.is_restoring:
+            title = f"{title} - 窗口恢复中"
+        try:
+            self.setWindowTitle(title)
+        except Exception:
+            pass
 
 
     @pyqtSlot()
@@ -3254,7 +3420,8 @@ class MainWindow(QMainWindow):
             # 从 content_stack 获取实际的标签页内容
             tab = self.content_stack.widget(index) if hasattr(self, 'content_stack') else self.tab_widget.widget(index)
             if hasattr(tab, 'current_path'):
-                self.setWindowTitle(f"TabExplorer - {tab.current_path}")
+                # 统一通过内部方法更新窗口标题（可带“窗口恢复中”标记）
+                self._update_window_title(tab.current_path)
                 # 展开并选中左侧目录树到当前目录
                 self.expand_dir_tree_to_path(tab.current_path)
             # 更新导航按钮状态
@@ -3387,22 +3554,26 @@ class MainWindow(QMainWindow):
     
     def create_custom_titlebar(self, main_layout):
         """创建自定义标题栏，包含窗口控制按钮和功能按钮"""
+        # 根据DPI调整标题栏高度
+        titlebar_height = int(32 * getattr(self, 'dpi_scale', 1.0))
         titlebar = QWidget()
-        titlebar.setFixedHeight(32)
+        titlebar.setFixedHeight(titlebar_height)
         titlebar.setStyleSheet("background-color: #f0f0f0; border-bottom: 1px solid #ccc;")
         titlebar_layout = QHBoxLayout(titlebar)
         titlebar_layout.setContentsMargins(10, 0, 0, 0)
         titlebar_layout.setSpacing(0)
         
         # 窗口标题
-        title_label = QLabel("TabExplorer")
-        title_label.setStyleSheet("""
+        self.title_label = QLabel("TabExplorer")
+        # 根据DPI调整标题字体大小
+        title_font_size = int(12 * getattr(self, 'dpi_scale', 1.0))
+        self.title_label.setStyleSheet(f"""
             font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial, sans-serif;
             font-weight: 600;
             font-size: 12pt;
             color: #0078D7;
         """)
-        titlebar_layout.addWidget(title_label)
+        titlebar_layout.addWidget(self.title_label)
         
         # 用于拖动窗口
         self.titlebar_widget = titlebar
@@ -3414,25 +3585,28 @@ class MainWindow(QMainWindow):
         # 后退按钮
         self.back_button = QPushButton("←")
         self.back_button.setToolTip("后退 (Alt+←)")
-        self.back_button.setFixedSize(32, 32)
-        self.back_button.setStyleSheet("""
-            QPushButton {
+        btn_size = int(32 * getattr(self, 'dpi_scale', 1.0))
+        self.back_button.setFixedSize(btn_size, btn_size)
+        btn_font_size = int(14 * getattr(self, 'dpi_scale', 1.0))
+        btn_radius = int(4 * getattr(self, 'dpi_scale', 1.0))
+        self.back_button.setStyleSheet(f"""
+            QPushButton {{
                 background: transparent;
                 border: none;
-                border-radius: 4px;
-                font-size: 14pt;
+                border-radius: {btn_radius}px;
+                font-size: {btn_font_size}pt;
                 font-weight: bold;
                 color: #333;
-            }
-            QPushButton:hover:!disabled {
+            }}
+            QPushButton:hover:!disabled {{
                 background: #e0e0e0;
-            }
-            QPushButton:pressed:!disabled {
+            }}
+            QPushButton:pressed:!disabled {{
                 background: #d0d0d0;
-            }
-            QPushButton:disabled {
+            }}
+            QPushButton:disabled {{
                 color: #b0b0b0;
-            }
+            }}
         """)
         self.back_button.clicked.connect(self.go_back_current_tab)
         self.back_button.setEnabled(False)
@@ -3441,25 +3615,25 @@ class MainWindow(QMainWindow):
         # 前进按钮
         self.forward_button = QPushButton("→")
         self.forward_button.setToolTip("前进 (Alt+→)")
-        self.forward_button.setFixedSize(32, 32)
-        self.forward_button.setStyleSheet("""
-            QPushButton {
+        self.forward_button.setFixedSize(btn_size, btn_size)
+        self.forward_button.setStyleSheet(f"""
+            QPushButton {{
                 background: transparent;
                 border: none;
-                border-radius: 4px;
-                font-size: 14pt;
+                border-radius: {btn_radius}px;
+                font-size: {btn_font_size}pt;
                 font-weight: bold;
                 color: #333;
-            }
-            QPushButton:hover:!disabled {
+            }}
+            QPushButton:hover:!disabled {{
                 background: #e0e0e0;
-            }
-            QPushButton:pressed:!disabled {
+            }}
+            QPushButton:pressed:!disabled {{
                 background: #d0d0d0;
-            }
-            QPushButton:disabled {
+            }}
+            QPushButton:disabled {{
                 color: #b0b0b0;
-            }
+            }}
         """)
         self.forward_button.clicked.connect(self.go_forward_current_tab)
         self.forward_button.setEnabled(False)
@@ -3468,21 +3642,21 @@ class MainWindow(QMainWindow):
         # 新建标签页按钮
         self.add_tab_button = QPushButton("➕")
         self.add_tab_button.setToolTip("新建标签页 (Ctrl+T)")
-        self.add_tab_button.setFixedSize(32, 32)
-        self.add_tab_button.setStyleSheet("""
-            QPushButton {
+        self.add_tab_button.setFixedSize(btn_size, btn_size)
+        self.add_tab_button.setStyleSheet(f"""
+            QPushButton {{
                 background: transparent;
                 border: none;
-                border-radius: 4px;
-                font-size: 13pt;
+                border-radius: {btn_radius}px;
+                font-size: {btn_font_size}pt;
                 color: #333;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background: #e0e0e0;
-            }
-            QPushButton:pressed {
+            }}
+            QPushButton:pressed {{
                 background: #d0d0d0;
-            }
+            }}
         """)
         self.add_tab_button.clicked.connect(self.add_new_tab)
         titlebar_layout.addWidget(self.add_tab_button)
@@ -3490,25 +3664,25 @@ class MainWindow(QMainWindow):
         # 恢复标签页按钮
         self.reopen_tab_button = QPushButton("↶")
         self.reopen_tab_button.setToolTip("恢复关闭的标签页 (Ctrl+Shift+T)")
-        self.reopen_tab_button.setFixedSize(32, 32)
-        self.reopen_tab_button.setStyleSheet("""
-            QPushButton {
+        self.reopen_tab_button.setFixedSize(btn_size, btn_size)
+        self.reopen_tab_button.setStyleSheet(f"""
+            QPushButton {{
                 background: transparent;
                 border: none;
-                border-radius: 4px;
-                font-size: 14pt;
+                border-radius: {btn_radius}px;
+                font-size: {btn_font_size}pt;
                 font-weight: bold;
                 color: #333;
-            }
-            QPushButton:hover:!disabled {
+            }}
+            QPushButton:hover:!disabled {{
                 background: #e0e0e0;
-            }
-            QPushButton:pressed:!disabled {
+            }}
+            QPushButton:pressed:!disabled {{
                 background: #d0d0d0;
-            }
-            QPushButton:disabled {
+            }}
+            QPushButton:disabled {{
                 color: #b0b0b0;
-            }
+            }}
         """)
         self.reopen_tab_button.clicked.connect(self.reopen_closed_tab)
         self.reopen_tab_button.setEnabled(False)
@@ -3517,48 +3691,51 @@ class MainWindow(QMainWindow):
         # 搜索按钮
         self.search_button = QPushButton("🔍")
         self.search_button.setToolTip("搜索当前文件夹 (Ctrl+F)")
-        self.search_button.setFixedSize(32, 32)
-        self.search_button.setStyleSheet("""
-            QPushButton {
+        self.search_button.setFixedSize(btn_size, btn_size)
+        self.search_button.setStyleSheet(f"""
+            QPushButton {{
                 background: transparent;
                 border: none;
-                border-radius: 4px;
-                font-size: 13pt;
+                border-radius: {btn_radius}px;
+                font-size: {btn_font_size}pt;
                 color: #333;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background: #e0e0e0;
-            }
-            QPushButton:pressed {
+            }}
+            QPushButton:pressed {{
                 background: #d0d0d0;
-            }
+            }}
         """)
         self.search_button.clicked.connect(self.show_search_dialog)
         titlebar_layout.addWidget(self.search_button)
         
         # 添加竖杠分隔符
         separator = QLabel("|")
-        separator.setStyleSheet("color: #999; font-size: 18pt; padding: 0px 8px;")
-        separator.setFixedHeight(32)
+        sep_font_size = int(18 * getattr(self, 'dpi_scale', 1.0))
+        sep_padding = int(8 * getattr(self, 'dpi_scale', 1.0))
+        separator.setStyleSheet(f"color: #999; font-size: {sep_font_size}pt; padding: 0px {sep_padding}px;")
+        separator.setFixedHeight(titlebar_height)
         titlebar_layout.addWidget(separator)
         
         # 书签管理按钮
         bookmark_btn = QPushButton("📑")
         bookmark_btn.setToolTip("书签管理")
-        bookmark_btn.setFixedSize(40, 32)
-        bookmark_btn.setStyleSheet("""
-            QPushButton {
+        bookmark_btn_width = int(40 * getattr(self, 'dpi_scale', 1.0))
+        bookmark_btn.setFixedSize(bookmark_btn_width, titlebar_height)
+        bookmark_btn.setStyleSheet(f"""
+            QPushButton {{
                 background: transparent;
                 border: none;
-                border-radius: 4px;
-                font-size: 14pt;
-            }
-            QPushButton:hover {
+                border-radius: {btn_radius}px;
+                font-size: {btn_font_size}pt;
+            }}
+            QPushButton:hover {{
                 background: #e0e0e0;
-            }
-            QPushButton:pressed {
+            }}
+            QPushButton:pressed {{
                 background: #d0d0d0;
-            }
+            }}
         """)
         bookmark_btn.clicked.connect(self.show_bookmark_manager_dialog)
         titlebar_layout.addWidget(bookmark_btn)
@@ -3566,78 +3743,81 @@ class MainWindow(QMainWindow):
         # 设置按钮
         settings_btn = QPushButton("⚙️")
         settings_btn.setToolTip("设置")
-        settings_btn.setFixedSize(40, 32)
-        settings_btn.setStyleSheet("""
-            QPushButton {
+        settings_btn.setFixedSize(bookmark_btn_width, titlebar_height)
+        settings_btn.setStyleSheet(f"""
+            QPushButton {{
                 background: transparent;
                 border: none;
-                border-radius: 4px;
-                font-size: 14pt;
-            }
-            QPushButton:hover {
+                border-radius: {btn_radius}px;
+                font-size: {btn_font_size}pt;
+            }}
+            QPushButton:hover {{
                 background: #e0e0e0;
-            }
-            QPushButton:pressed {
+            }}
+            QPushButton:pressed {{
                 background: #d0d0d0;
-            }
+            }}
         """)
         settings_btn.clicked.connect(self.show_settings_menu)
         titlebar_layout.addWidget(settings_btn)
         
         # 最小化按钮
         min_btn = QPushButton("—")
-        min_btn.setFixedSize(45, 32)
-        min_btn.setStyleSheet("""
-            QPushButton {
+        win_btn_width = int(45 * getattr(self, 'dpi_scale', 1.0))
+        min_btn.setFixedSize(win_btn_width, titlebar_height)
+        min_btn.setStyleSheet(f"""
+            QPushButton {{
                 background: transparent;
                 border: none;
-                font-size: 14pt;
+                font-size: {btn_font_size}pt;
                 font-weight: bold;
                 color: #333;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background: #e0e0e0;
-            }
-            QPushButton:pressed {
+            }}
+            QPushButton:pressed {{
                 background: #d0d0d0;
-            }
+            }}
         """)
         min_btn.clicked.connect(self.showMinimized)
         titlebar_layout.addWidget(min_btn)
         
         # 最大化/还原按钮
         self.max_btn = QPushButton("□")
-        self.max_btn.setFixedSize(45, 32)
-        self.max_btn.setStyleSheet("""
-            QPushButton {
+        self.max_btn.setFixedSize(win_btn_width, titlebar_height)
+        self.max_btn.setStyleSheet(f"""
+            QPushButton {{
                 background: transparent;
                 border: none;
-                font-size: 14pt;
+                font-size: {btn_font_size}pt;
+                font-weight: bold;
                 color: #333;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background: #e0e0e0;
-            }
-            QPushButton:pressed {
+            }}
+            QPushButton:pressed {{
                 background: #d0d0d0;
-            }
+            }}
         """)
         self.max_btn.clicked.connect(self.toggle_maximize)
         titlebar_layout.addWidget(self.max_btn)
         
         # 关闭按钮
         close_btn = QPushButton("✕")
-        close_btn.setFixedSize(45, 32)
-        close_btn.setStyleSheet("""
-            QPushButton {
+        close_btn.setFixedSize(win_btn_width, titlebar_height)
+        close_btn_font_size = int(16 * getattr(self, 'dpi_scale', 1.0))
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
                 background: transparent;
                 border: none;
-                font-size: 16pt;
-            }
-            QPushButton:hover {
+                font-size: {close_btn_font_size}pt;
+            }}
+            QPushButton:hover {{
                 background: #e81123;
                 color: white;
-            }
+            }}
         """)
         close_btn.clicked.connect(self.close)
         titlebar_layout.addWidget(close_btn)
@@ -4415,6 +4595,10 @@ class MainWindow(QMainWindow):
         # 关闭标签页历史 - 使用常量限制大小
         self.closed_tabs_history = []  # 每项格式: {'path': str, 'title': str, 'is_shell': bool}
         self.max_closed_tabs_history = MAX_CLOSED_TABS_HISTORY
+
+        # 窗口恢复状态标记（用于在标题上显示“窗口恢复中”）
+        self.is_restoring = False
+        self._restore_title_suffix = " - 窗口恢复中"
         
         # 性能优化：延迟初始化UI（先显示基本界面）
         self.init_ui()
@@ -4597,10 +4781,24 @@ class MainWindow(QMainWindow):
 
 
     def init_ui(self):
-        self.setGeometry(100, 100, 1200, 800)
+        # 获取DPI缩放因子
+        from PyQt5.QtWidgets import QApplication
+        screen = QApplication.primaryScreen()
+        dpi = screen.logicalDotsPerInch()
+        self.dpi_scale = dpi / 96.0
+        debug_print(f"[MainWindow] DPI scale factor: {self.dpi_scale:.2f}")
+        
+        # 根据DPI调整窗口初始大小
+        base_width = 1200
+        base_height = 800
+        scaled_width = int(base_width * self.dpi_scale)
+        scaled_height = int(base_height * self.dpi_scale)
+        self.setGeometry(100, 100, scaled_width, scaled_height)
         
         # 设置窗口最小尺寸，允许窗口缩小到很小
-        self.setMinimumSize(400, 300)
+        min_width = int(400 * self.dpi_scale)
+        min_height = int(300 * self.dpi_scale)
+        self.setMinimumSize(min_width, min_height)
         
         # 启用鼠标追踪，以便在边缘时显示调整大小光标
         self.setMouseTracking(True)
@@ -4642,45 +4840,56 @@ class MainWindow(QMainWindow):
         # 设置选中标签页背景色为淡黄色
         tabbar = self.tab_widget.tabBar()
         tabbar.setAcceptDrops(True)
-        tabbar.setStyleSheet("""
-            QTabBar::tab {
+        
+        # 根据DPI缩放标签栏尺寸
+        tab_height = int(24 * self.dpi_scale)
+        tab_width = int(120 * self.dpi_scale)
+        tab_padding_v = int(2 * self.dpi_scale)
+        tab_padding_h = int(4 * self.dpi_scale)
+        tab_radius = int(6 * self.dpi_scale)
+        tab_font_size = int(12 * self.dpi_scale)
+        tab_margin = int(2 * self.dpi_scale)
+        
+        tabbar.setStyleSheet(f"""
+            QTabBar::tab {{
                 border: 1px solid #b0b0b0;
                 border-bottom: none;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                padding: 2px 4px;
-                height: 24px;
-                width: 120px;
-                min-width: 120px;
-                max-width: 120px;
+                border-top-left-radius: {tab_radius}px;
+                border-top-right-radius: {tab_radius}px;
+                padding: {tab_padding_v}px {tab_padding_h}px;
+                height: {tab_height}px;
+                width: {tab_width}px;
+                min-width: {tab_width}px;
+                max-width: {tab_width}px;
                 font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial, sans-serif;
-                font-size: 12px;
-                margin-top: 2px;
+                font-size: {tab_font_size}px;
+                margin-top: {tab_margin}px;
                 text-align: center;
-            }
-            QTabBar::tab:selected {
+            }}
+            QTabBar::tab:selected {{
                 background: #FFF9CC;
                 border: 1px solid #999;
                 border-bottom: none;
                 margin-top: 0px;
-                padding-top: 3px;
-            }
-            QTabBar::tab:!selected {
+                padding-top: {tab_padding_v + 1}px;
+            }}
+            QTabBar::tab:!selected {{
                 font-weight: normal;
-            }
+            }}
         """)
         # 设置标签文本省略模式 - 左边省略，保留右侧文件/文件夹名称
         tabbar.setElideMode(Qt.ElideLeft)
 
         # 创建标签栏容器（只显示标签和按钮，不显示内容）
         tab_bar_container = QWidget()
-        tab_bar_container.setFixedHeight(32)  # 固定高度，只显示标签栏
+        tab_bar_height = int(32 * getattr(self, 'dpi_scale', 1.0))
+        tab_bar_container.setFixedHeight(tab_bar_height)  # 固定高度，只显示标签栏
         tab_bar_layout = QHBoxLayout(tab_bar_container)
         tab_bar_layout.setContentsMargins(0, 0, 0, 0)
         tab_bar_layout.setSpacing(0)
         
         # 将 tab_widget 添加到标签栏容器（只显示标签栏部分）
-        self.tab_widget.setMaximumHeight(32)  # 限制最大高度
+        self.tab_widget.setMaximumHeight(tab_bar_height)  # 限制最大高度
         tab_bar_layout.addWidget(self.tab_widget)
         
         # 将标签栏容器添加到主布局
@@ -4692,7 +4901,8 @@ class MainWindow(QMainWindow):
 
         # 书签栏（使用自定义菜单栏）
         self.menu_bar = CustomMenuBar(self)
-        self.menu_bar.setFixedHeight(28)  # 设置菜单栏高度
+        menu_bar_height = int(28 * getattr(self, 'dpi_scale', 1.0))
+        self.menu_bar.setFixedHeight(menu_bar_height)  # 设置菜单栏高度
         # 设置菜单栏的大小策略，允许它被压缩
         self.menu_bar.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.menu_bar.setStyleSheet("""
@@ -4837,12 +5047,16 @@ class MainWindow(QMainWindow):
         self.content_stack = QStackedWidget()
         self.content_stack.setStyleSheet("background: white;")
         self.content_stack.setAutoFillBackground(True)
+        # 允许右侧内容在窗口缩小时被压缩，避免阻止左侧目录树向左拖动
+        self.content_stack.setMinimumWidth(0)
         
         self.splitter.addWidget(self.content_stack)
         
         # 设置左侧目录树和右侧内容的初始宽度比例（左:右 = 3:7，使用保存的默认宽度）
-        # 假设窗口总宽度1000px，左侧300px，右侧700px
-        self.splitter.setSizes([300, 700])
+        # 假设窗口总宽度1000px，左侧300px，右侧700px，根据DPI缩放
+        left_width = int(300 * self.dpi_scale)
+        right_width = int(700 * self.dpi_scale)
+        self.splitter.setSizes([left_width, right_width])
         
         # 将分割器添加到主容器
         main_layout.addWidget(self.splitter)
@@ -4889,6 +5103,10 @@ class MainWindow(QMainWindow):
     def _delayed_initialization(self):
         """延迟初始化非关键功能（性能优化）"""
         debug_print("[Performance] Starting delayed initialization...")
+        # 进入恢复状态：在标题上显示提示
+        self.is_restoring = True
+        # 初次更新标题（无路径）
+        self._update_window_title()
         
         # 延迟加载固定标签页
         try:
@@ -4935,6 +5153,15 @@ class MainWindow(QMainWindow):
         except Exception as e:
             debug_print(f"[Performance] Failed to start explorer monitor: {e}")
         
+        # 恢复完成：取消恢复状态并更新标题
+        self.is_restoring = False
+        # 使用当前标签路径刷新标题
+        try:
+            current_tab = self.get_current_tab_widget()
+            current_path = getattr(current_tab, 'current_path', None)
+        except Exception:
+            current_path = None
+        self._update_window_title(current_path)
         debug_print("[Performance] Delayed initialization completed")
     
     def start_instance_server(self):
@@ -6185,9 +6412,29 @@ def main():
     import os
     os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
     
+    # 启用高DPI支持（在创建QApplication之前）
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    
     # 启动新实例
     app = QApplication(sys.argv)
     app.setApplicationName("TabExplorer")
+    
+    # 获取屏幕DPI和缩放因子
+    screen = app.primaryScreen()
+    dpi = screen.logicalDotsPerInch()
+    scale_factor = dpi / 96.0  # 96是标准DPI
+    debug_print(f"[DPI] Screen DPI: {dpi}, Scale Factor: {scale_factor:.2f}")
+    
+    # 根据DPI动态调整全局样式
+    base_font_size = 9  # 基础字体大小 (pt)
+    scaled_font_size = int(base_font_size * scale_factor)
+    
+    # 设置全局字体
+    from PyQt5.QtGui import QFont
+    app_font = QFont("Microsoft YaHei UI", scaled_font_size)
+    app.setFont(app_font)
+    debug_print(f"[DPI] Global font size: {scaled_font_size}pt")
     
     # 安装自定义 Qt 消息处理器，过滤 QAxBase 等警告
     from PyQt5.QtCore import qInstallMessageHandler
