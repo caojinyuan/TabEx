@@ -2144,20 +2144,37 @@ class FileExplorerTab(QWidget):
                     except Exception:
                         self._pending_double_click_timers = []
                     
-                    # 记录双击发生时的状态
+                    # 记录双击发生时的状态和鼠标位置
                     path_before = getattr(self, 'current_path', None)
                     selected_before = getattr(self, '_selected_before_click', None)
+                    # 保存双击时的鼠标全局位置，用于后续hit-test
+                    double_click_pos = QCursor.pos()
                     
                     debug_print(f"[DoubleClick] path_before='{path_before}', selected_before={selected_before}")
 
                     # 使用延迟检查，给足够时间让文件夹导航完成
                     def check_and_handle():
                         try:
-                            # 优先检查最可靠的指标
+                            # 优先使用 native hit-test 检查双击位置是否有项目（最可靠）
+                            hit_test_result = None
+                            if HAS_PYWIN:
+                                try:
+                                    # 使用保存的双击位置进行检测
+                                    hit_test_result = self._native_listview_hit_test(double_click_pos.x(), double_click_pos.y())
+                                    if hit_test_result:
+                                        debug_print(f"[DoubleClick] Hit test positive at double-click position, skip go_up")
+                                        self._selected_before_click = None
+                                        return
+                                    else:
+                                        debug_print(f"[DoubleClick] Hit test negative (no item at click position)")
+                                except Exception as e:
+                                    debug_print(f"[DoubleClick] Hit test exception: {e}")
+                                    hit_test_result = None
                             
-                            # 1. 检查是否点击前有选中项（最可靠）
+                            # 1. 检查是否点击前有选中项
                             if selected_before is not None and int(selected_before) > 0:
                                 debug_print(f"[DoubleClick] Had selection before: {selected_before}, skip go_up")
+                                self._selected_before_click = None
                                 return
                             
                             # 2. 检查当前选中项数量
@@ -2176,40 +2193,40 @@ class FileExplorerTab(QWidget):
                             
                             if cnt is not None and int(cnt) > 0:
                                 debug_print(f"[DoubleClick] Has selection: {cnt}, skip go_up")
+                                self._selected_before_click = None
                                 return
                             
-                            # 3. 使用 native hit-test 检查是否点击在项目上
-                            if HAS_PYWIN:
-                                try:
-                                    from PyQt5.QtGui import QCursor
-                                    gx = QCursor.pos().x()
-                                    gy = QCursor.pos().y()
-                                    if self._native_listview_hit_test(gx, gy):
-                                        debug_print(f"[DoubleClick] Hit test positive, skip go_up")
-                                        return
-                                except Exception as e:
-                                    debug_print(f"[DoubleClick] Hit test exception: {e}")
-                            
-                            # 4. 最后检查路径是否变化（进入了文件夹）
+                            # 3. 检查路径是否变化（进入了文件夹）
                             cur_path = getattr(self, 'current_path', None)
                             if path_before is not None and cur_path is not None and cur_path != path_before:
                                 debug_print(f"[DoubleClick] Path changed: '{path_before}' -> '{cur_path}', skip go_up")
+                                self._selected_before_click = None
                                 return
                             
-                            # 所有检查都通过，执行 go_up
-                            debug_print(f"[DoubleClick] Execute go_up: blank area double-click detected")
-                            self.go_up(force=True)
+                            # 严格判断：只有在明确确认是空白区域时才执行 go_up
+                            # 如果 SelectedItems 无法获取（cnt=None），为了安全不执行 go_up
+                            if cnt is None:
+                                debug_print(f"[DoubleClick] Cannot determine selection state (cnt=None), skip go_up for safety")
+                                self._selected_before_click = None
+                                return
+                            
+                            # 如果 hit-test 明确返回 False (空白区域) 且 cnt=0，才执行 go_up
+                            if hit_test_result is False and cnt == 0:
+                                debug_print(f"[DoubleClick] Execute go_up: blank area confirmed (hit-test=False, cnt=0)")
+                                self.go_up(force=True)
+                            else:
+                                debug_print(f"[DoubleClick] Uncertain state (hit_test={hit_test_result}, cnt={cnt}), skip go_up for safety")
                             
                         except Exception as e:
                             debug_print(f"[DoubleClick] Exception in check_and_handle: {e}")
                         finally:
                             self._selected_before_click = None
 
-                    # 使用 300ms 延迟，给足够时间让文件夹导航完成
+                    # 使用 400ms 延迟，给更多时间让文件夹导航完成
                     timer = QTimer()
                     timer.setSingleShot(True)
                     timer.timeout.connect(check_and_handle)
-                    timer.start(300)
+                    timer.start(400)
                     if not hasattr(self, '_pending_double_click_timers'):
                         self._pending_double_click_timers = []
                     self._pending_double_click_timers.append(timer)
