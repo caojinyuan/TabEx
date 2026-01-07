@@ -2206,6 +2206,13 @@ class FileExplorerTab(QWidget):
                             # 严格判断：只有在明确确认是空白区域时才执行 go_up
                             # 如果 SelectedItems 无法获取（cnt=None），为了安全不执行 go_up
                             if cnt is None:
+                                # Fallback: 当命中测试明确为空白、且路径未变化时，认为是空白双击
+                                cur_path2 = getattr(self, 'current_path', None)
+                                if hit_test_result is False and (path_before is not None and cur_path2 == path_before):
+                                    debug_print(f"[DoubleClick] Fallback: cnt=None + hit-test blank + path unchanged -> go_up")
+                                    self.go_up(force=True)
+                                    self._selected_before_click = None
+                                    return
                                 debug_print(f"[DoubleClick] Cannot determine selection state (cnt=None), skip go_up for safety")
                                 self._selected_before_click = None
                                 return
