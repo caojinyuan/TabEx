@@ -2300,43 +2300,55 @@ class FileExplorerTab(QWidget):
                             
                             # 如果 hit-test 明确返回 False (空白区域) 且 cnt=0 或满足上述fallback条件，执行最终确认后再 go_up
                             if hit_test_result is False and (cnt == 0 or cnt is None):
-                                # 终次确认：延迟500ms确认路径仍未变化且无导航活动，再执行 go_up，避免误判
+                                # 终次确认：延迟700ms确认路径仍未变化且无导航活动，再执行 go_up，避免误判
                                 def final_confirm_and_go_up():
                                     try:
                                         cur_path3 = getattr(self, 'current_path', None)
+                                        debug_print(f"[DoubleClick] Final confirm: path_before='{path_before}', cur_path='{cur_path3}'")
+                                        
                                         # 检查路径是否变化（包括正在导航的情况）
                                         if path_before is not None and cur_path3 != path_before:
                                             debug_print(f"[DoubleClick] Final confirm: path changed to '{cur_path3}', skip go_up")
                                             return
                                         
                                         # 再次检查是否有选中项（可能导航过程中有选中）
+                                        cnt_final = None
                                         try:
                                             cnt_final = self.explorer.dynamicCall('SelectedItems().Count')
+                                            debug_print(f"[DoubleClick] Final confirm: selection count = {cnt_final}")
                                             if cnt_final is not None and int(cnt_final) > 0:
                                                 debug_print(f"[DoubleClick] Final confirm: found selection ({cnt_final}), skip go_up")
                                                 return
-                                        except Exception:
+                                        except Exception as e:
+                                            debug_print(f"[DoubleClick] Final confirm: cannot get selection count: {e}")
                                             pass
                                         
-                                        # 再次命中测试以提高准确性
+                                        # 再次执行 hit-test 以提高准确性（最关键的检查）
                                         r2 = hit_test_result
                                         if HAS_PYWIN:
                                             try:
                                                 r2 = self._native_listview_hit_test(double_click_pos.x(), double_click_pos.y())
-                                            except Exception:
+                                                debug_print(f"[DoubleClick] Final confirm: re-run hit-test result = {r2}")
+                                            except Exception as e:
+                                                debug_print(f"[DoubleClick] Final confirm: hit-test exception: {e}")
                                                 pass
                                         
+                                        # 只有当 hit-test 仍然确认是空白区域时才执行 go_up
                                         if r2 is False:
                                             debug_print(f"[DoubleClick] Execute go_up after final confirm (blank area)")
                                             self.go_up(force=True)
+                                        elif r2 is True:
+                                            debug_print(f"[DoubleClick] Final confirm: hit-test found item, skip go_up")
                                         else:
-                                            debug_print(f"[DoubleClick] Final confirm hit-test not blank (r2={r2}), skip go_up")
+                                            debug_print(f"[DoubleClick] Final confirm: hit-test inconclusive (r2={r2}), skip go_up for safety")
                                     except Exception as e:
                                         debug_print(f"[DoubleClick] Final confirm exception: {e}")
+                                        import traceback
+                                        traceback.print_exc()
                                 t2 = QTimer()
                                 t2.setSingleShot(True)
                                 t2.timeout.connect(final_confirm_and_go_up)
-                                t2.start(500)
+                                t2.start(700)  # 增加到 700ms 以确保导航有足够时间完成
                                 if not hasattr(self, '_pending_double_click_timers'):
                                     self._pending_double_click_timers = []
                                 self._pending_double_click_timers.append(t2)
