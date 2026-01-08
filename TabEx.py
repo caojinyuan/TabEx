@@ -5125,13 +5125,13 @@ class MainWindow(QMainWindow):
         # 设置分割条样式
         self.splitter.setStyleSheet("""
             QSplitter::handle {
-                background-color: #d0d0d0;
+                background-color: transparent;
             }
             QSplitter::handle:hover {
-                background-color: #0078D7;
+                background-color: #e0e0e0;
             }
             QSplitter::handle:pressed {
-                background-color: #005a9e;
+                background-color: #d0d0d0;
             }
         """)
         # 设置子控件的拉伸因子（左侧0，右侧1，右侧会占据剩余空间）
@@ -5139,7 +5139,7 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 1)
         
         # 保存目录树宽度，用于在添加新标签页时强制保持
-        self._saved_dir_tree_width = 300  # 初始宽度
+        self._saved_dir_tree_width = 240  # 初始宽度 (约占总宽度的 20%)
         
         # 监听splitter移动事件，保存用户设置的目录树宽度
         self.splitter.splitterMoved.connect(self._on_splitter_moved)
@@ -5249,10 +5249,10 @@ class MainWindow(QMainWindow):
         
         self.splitter.addWidget(self.content_stack)
         
-        # 设置左侧目录树和右侧内容的初始宽度比例（左:右 = 3:7，使用保存的默认宽度）
-        # 假设窗口总宽度1000px，左侧300px，右侧700px，根据DPI缩放
-        left_width = int(300 * self.dpi_scale)
-        right_width = int(700 * self.dpi_scale)
+        # 设置左侧目录树和右侧内容的初始宽度比例（左:右 = 2:8，符合 Windows 11 风格）
+        # 假设窗口总宽度1200px，左侧240px，右侧960px，根据DPI缩放
+        left_width = int(240 * self.dpi_scale)
+        right_width = int(960 * self.dpi_scale)
         self.splitter.setSizes([left_width, right_width])
         
         # 将分割器添加到主容器
