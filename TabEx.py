@@ -1011,6 +1011,7 @@ class ToastMessage(QWidget):
         super().__init__(parent)
         self.duration = duration
         self.level = level
+        self.remaining_seconds = duration // 1000  # 剩余秒数
         self.setWindowFlags(
             Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint
         )
@@ -1030,23 +1031,52 @@ class ToastMessage(QWidget):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(4)
 
+        # 标题行（标题 + 倒计时）
+        title_layout = QHBoxLayout()
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(8)
+        
         title_label = QLabel(title)
         title_label.setStyleSheet("font-weight: bold; color: white;")
+        title_layout.addWidget(title_label)
+        
+        title_layout.addStretch()
+        
+        self.countdown_label = QLabel(f"{self.remaining_seconds}s")
+        self.countdown_label.setStyleSheet("color: rgba(255, 255, 255, 0.8); font-size: 11px;")
+        title_layout.addWidget(self.countdown_label)
+        
+        layout.addLayout(title_layout)
+        
         msg_label = QLabel(message)
         msg_label.setWordWrap(True)
         msg_label.setStyleSheet("color: white;")
 
-        layout.addWidget(title_label)
         layout.addWidget(msg_label)
 
         self.setStyleSheet(
             f"background-color: {bg_color}; border-radius: 8px;"
         )
 
+        # 倒计时定时器（每秒更新一次）
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.timeout.connect(self._update_countdown)
+        self._countdown_timer.start(1000)  # 每1秒触发一次
+
+        # 关闭定时器
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.close)
         self._timer.start(self.duration)
+
+    def _update_countdown(self):
+        """更新倒计时显示"""
+        self.remaining_seconds -= 1
+        if self.remaining_seconds > 0:
+            self.countdown_label.setText(f"{self.remaining_seconds}s")
+        else:
+            self.countdown_label.setText("0s")
+            self._countdown_timer.stop()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1069,6 +1099,9 @@ class ToastMessage(QWidget):
     def closeEvent(self, event):
         if self in _active_toasts:
             _active_toasts.remove(self)
+        # 停止倒计时定时器
+        if hasattr(self, '_countdown_timer'):
+            self._countdown_timer.stop()
         super().closeEvent(event)
 
 
@@ -3521,7 +3554,7 @@ class MainWindow(QMainWindow):
     
     def apply_tortoisegit_buttons_config(self):
         """根据配置显示/隐藏 TortoiseGit 按钮"""
-        enable = self.config.get("enable_tortoisegit_buttons", True)
+        enable = self.config.get("enable_tortoisegit_buttons", False)
         if hasattr(self, 'git_log_button'):
             self.git_log_button.setVisible(enable)
         if hasattr(self, 'git_commit_button'):
@@ -5051,7 +5084,7 @@ class MainWindow(QMainWindow):
             "pinned_tabs": [],  # 默认没有固定标签页
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
-            "enable_tortoisegit_buttons": True,  # 默认启用TortoiseGit按钮
+            "enable_tortoisegit_buttons": False,  # 默认关闭TortoiseGit按钮
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -6311,7 +6344,7 @@ class SettingsDialog(QDialog):
         git_layout = QVBoxLayout()
         
         self.tortoisegit_buttons_cb = QCheckBox("显示 TortoiseGit 快捷按钮（标题栏）", self)
-        self.tortoisegit_buttons_cb.setChecked(config.get("enable_tortoisegit_buttons", True))
+        self.tortoisegit_buttons_cb.setChecked(config.get("enable_tortoisegit_buttons", False))
         self.tortoisegit_buttons_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.tortoisegit_buttons_cb.setToolTip("在标题栏显示 Git Log 和 Git Commit 快捷按钮")
         git_layout.addWidget(self.tortoisegit_buttons_cb)
