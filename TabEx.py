@@ -103,7 +103,7 @@ class BookmarkDialog(QDialog):
                 if self.parent() and hasattr(self.parent(), 'add_new_tab'):
                     self.parent().add_new_tab(local_path)
             else:
-                QMessageBox.warning(self, "路径错误", f"路径不存在: {local_path}")
+                show_toast(self, "路径错误", f"路径不存在: {local_path}", level="warning")
 
 # 自定义委托：在文件名列实现省略号在开头
 from PyQt5.QtWidgets import QStyledItemDelegate
@@ -383,7 +383,7 @@ class SearchDialog(QDialog):
     def start_search(self):
         keyword = self.search_input.currentText().strip()  # 改用currentText获取输入或选中的文本
         if not keyword:
-            QMessageBox.warning(self, "提示", "请输入搜索关键词")
+            show_toast(self, "提示", "请输入搜索关键词", level="warning")
             return
         
         # 将搜索关键词添加到历史记录（通过主窗口）
@@ -397,28 +397,28 @@ class SearchDialog(QDialog):
             self.search_input.setCurrentText(keyword)
         
         if not self.search_filename_cb.isChecked() and not self.search_content_cb.isChecked():
-            QMessageBox.warning(self, "提示", "请至少选择一种搜索类型")
+            show_toast(self, "提示", "请至少选择一种搜索类型", level="warning")
             return
         
         # 获取并验证搜索路径
         search_path = self.path_input.text().strip()
         if not search_path:
-            QMessageBox.warning(self, "提示", "请输入搜索路径")
+            show_toast(self, "提示", "请输入搜索路径", level="warning")
             return
         
         # 检查路径是否存在
         if not os.path.exists(search_path):
-            QMessageBox.warning(self, "路径错误", f"路径不存在:\n{search_path}")
+            show_toast(self, "路径错误", f"路径不存在:\n{search_path}", level="warning")
             return
         
         # 检查是否是目录
         if not os.path.isdir(search_path):
-            QMessageBox.warning(self, "路径错误", f"路径不是文件夹:\n{search_path}")
+            show_toast(self, "路径错误", f"路径不是文件夹:\n{search_path}", level="warning")
             return
         
         # 检查是否是特殊路径（不支持搜索）
         if search_path.startswith('shell:'):
-            QMessageBox.warning(self, "不支持", "不支持搜索特殊路径（shell:）")
+            show_toast(self, "不支持", "不支持搜索特殊路径（shell:）", level="warning")
             return
         
         # 更新搜索路径
@@ -985,7 +985,7 @@ import time
 import socket
 import threading
 import queue
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QMessageBox, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QTreeView, QFileSystemModel, QSplitter, QProgressBar, QCompleter, QFrame)  # 添加QFrame
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QTreeView, QFileSystemModel, QSplitter, QProgressBar, QCompleter, QFrame)  # 添加QFrame
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer, QThread, QMutex, QMimeData
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor, QDrag
@@ -998,6 +998,86 @@ def debug_print(*args, **kwargs):
     """根据调试开关决定是否输出调试信息"""
     if _DEBUG_MODE:
         print(*args, **kwargs)
+
+
+# 全局轻量提示气泡，用于替换阻塞式消息框
+_active_toasts = []
+
+
+class ToastMessage(QWidget):
+    """右下角弹出的轻量提示，5s 自动消失"""
+
+    def __init__(self, parent, title, message, level="info", duration=5000):
+        super().__init__(parent)
+        self.duration = duration
+        self.level = level
+        self.setWindowFlags(
+            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        bg_map = {
+            "info": "#2d8cf0",
+            "warning": "#f0ad4e",
+            "error": "#d9534f",
+            "critical": "#d9534f",
+            "success": "#5cb85c",
+        }
+        bg_color = bg_map.get(level, "#2d8cf0")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-weight: bold; color: white;")
+        msg_label = QLabel(message)
+        msg_label.setWordWrap(True)
+        msg_label.setStyleSheet("color: white;")
+
+        layout.addWidget(title_label)
+        layout.addWidget(msg_label)
+
+        self.setStyleSheet(
+            f"background-color: {bg_color}; border-radius: 8px;"
+        )
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.close)
+        self._timer.start(self.duration)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.adjustSize()
+        anchor = self.parent() if isinstance(self.parent(), QWidget) else None
+        
+        # 使用软件窗口的几何信息，而不是屏幕的几何信息
+        if anchor and anchor.window():
+            window_geo = anchor.window().geometry()
+        else:
+            # 如果没有父窗口，使用屏幕几何作为后备
+            window_geo = QApplication.primaryScreen().availableGeometry()
+        
+        margin = 20
+        existing = len(_active_toasts) - 1 if self in _active_toasts else len(_active_toasts)
+        x = window_geo.right() - self.width() - margin
+        y = window_geo.bottom() - self.height() - margin - existing * (self.height() + 10)
+        self.move(x, y)
+
+    def closeEvent(self, event):
+        if self in _active_toasts:
+            _active_toasts.remove(self)
+        super().closeEvent(event)
+
+
+def show_toast(parent, title, message, level="info", duration=5000):
+    """在右下角显示非阻塞提示"""
+    anchor = parent.window() if isinstance(parent, QWidget) else None
+    toast = ToastMessage(anchor, title, message, level=level, duration=duration)
+    _active_toasts.append(toast)
+    toast.show()
 
 # ==================== 异步文件夹大小检查线程 ====================
 class FolderSizeChecker(QThread):
@@ -1884,9 +1964,13 @@ class FileExplorerTab(QWidget):
         self.loading_bar.hide()
         layout.addWidget(self.loading_bar)
 
-        # 嵌入Explorer控件
+        # 嵌入Explorer控件 - 使用 Shell.Explorer（IE控件）
+        # 注意：Shell.Explorer 不支持 TortoiseGit 图标覆盖层
+        # ExplorerBrowser COM 接口过于复杂，无法通过 QAxWidget 简单集成
         self.explorer = QAxWidget(self)
         self.explorer.setControl("Shell.Explorer")
+        debug_print("[WindowsShellExplorer] Using Shell.Explorer (no TortoiseGit overlay support)")
+        
         # 设置为NoFocus，防止QAxWidget拦截键盘事件
         self.explorer.setFocusPolicy(Qt.NoFocus)
         # 允许Explorer控件横向压缩，减小右侧面板最小宽度
@@ -2044,6 +2128,118 @@ class FileExplorerTab(QWidget):
         # 延迟150ms检查，给Explorer充足的时间完成导航
         QTimer.singleShot(150, _check_and_go_up)
 
+    def open_tortoisegit_log(self):
+        """打开 TortoiseGit 日志查看器"""
+        try:
+            current_path = self.current_path
+            if not current_path or not os.path.exists(current_path):
+                show_toast(self, "提示", "当前路径无效", level="warning")
+                return
+
+            repo_root = self._find_git_root(current_path)
+            if not repo_root:
+                show_toast(self, "提示", "当前目录不是 Git 仓库，未找到 .git", level="warning")
+                return
+            
+            # TortoiseGit 命令行：TortoiseGitProc.exe /command:log /path:"路径"
+            # 尝试找到 TortoiseGitProc.exe
+            tortoisegit_paths = [
+                r"C:\Program Files\TortoiseGit\bin\TortoiseGitProc.exe",
+                r"C:\Program Files (x86)\TortoiseGit\bin\TortoiseGitProc.exe",
+            ]
+            
+            tortoisegit_exe = None
+            for path in tortoisegit_paths:
+                if os.path.exists(path):
+                    tortoisegit_exe = path
+                    break
+            
+            if not tortoisegit_exe:
+                show_toast(
+                    self,
+                    "提示",
+                    "未找到 TortoiseGit，请确认已安装 TortoiseGit\n下载地址: https://tortoisegit.org/download/",
+                    level="warning",
+                )
+                return
+            
+            # 启动 TortoiseGit Log
+            subprocess.Popen([tortoisegit_exe, '/command:log', f'/path:{repo_root}'])
+            debug_print(f"[TortoiseGit] Opened log for: {repo_root}")
+            
+        except Exception as e:
+            show_toast(self, "错误", f"无法打开 TortoiseGit Log: {e}", level="error")
+            debug_print(f"[TortoiseGit] Failed to open log: {e}")
+    
+    def open_tortoisegit_commit(self):
+        """打开 TortoiseGit 提交窗口"""
+        try:
+            current_path = self.current_path
+            if not current_path or not os.path.exists(current_path):
+                show_toast(self, "提示", "当前路径无效", level="warning")
+                return
+
+            repo_root = self._find_git_root(current_path)
+            if not repo_root:
+                show_toast(self, "提示", "当前目录不是 Git 仓库，未找到 .git", level="warning")
+                return
+            
+            # TortoiseGit 命令行：TortoiseGitProc.exe /command:commit /path:"路径"
+            tortoisegit_paths = [
+                r"C:\Program Files\TortoiseGit\bin\TortoiseGitProc.exe",
+                r"C:\Program Files (x86)\TortoiseGit\bin\TortoiseGitProc.exe",
+            ]
+            
+            tortoisegit_exe = None
+            for path in tortoisegit_paths:
+                if os.path.exists(path):
+                    tortoisegit_exe = path
+                    break
+            
+            if not tortoisegit_exe:
+                show_toast(
+                    self,
+                    "提示",
+                    "未找到 TortoiseGit，请确认已安装 TortoiseGit\n下载地址: https://tortoisegit.org/download/",
+                    level="warning",
+                )
+                return
+            
+            # 启动 TortoiseGit Commit
+            subprocess.Popen([tortoisegit_exe, '/command:commit', f'/path:{repo_root}'])
+            debug_print(f"[TortoiseGit] Opened commit for: {repo_root}")
+            
+        except Exception as e:
+            show_toast(self, "错误", f"无法打开 TortoiseGit Commit: {e}", level="error")
+            debug_print(f"[TortoiseGit] Failed to open commit: {e}")
+
+    def _find_git_root(self, start_path):
+        """向上查找包含 .git 的目录，找到则返回仓库根路径，否则返回 None"""
+        if not start_path:
+            return None
+        path = os.path.abspath(start_path)
+        while True:
+            git_marker = os.path.join(path, '.git')
+            if os.path.isdir(git_marker):
+                return path
+            if os.path.isfile(git_marker):
+                try:
+                    with open(git_marker, 'r', encoding='utf-8', errors='ignore') as f:
+                        line = f.readline().strip()
+                    if line.lower().startswith('gitdir:'):
+                        gitdir_path = line[7:].strip()
+                        if not os.path.isabs(gitdir_path):
+                            gitdir_path = os.path.abspath(os.path.join(path, gitdir_path))
+                        if os.path.exists(gitdir_path):
+                            return path
+                except Exception:
+                    pass
+            parent = os.path.dirname(path)
+            if parent == path:
+                break
+            path = parent
+        return None
+
     def on_path_bar_changed(self, path):
         """处理面包屑路径栏的路径变化"""
         path = path.strip()
@@ -2056,9 +2252,9 @@ class FileExplorerTab(QWidget):
                     # 恢复路径栏显示当前路径
                     self.path_bar.set_path(current_dir)
                 else:
-                    QMessageBox.warning(self, "错误", "当前路径无效，无法打开命令行")
+                    show_toast(self, "错误", "当前路径无效，无法打开命令行", level="error")
             except Exception as e:
-                QMessageBox.warning(self, "错误", f"无法打开命令行: {e}")
+                show_toast(self, "错误", f"无法打开命令行: {e}", level="error")
             return
         # 支持中文特殊路径
         special_map = {
@@ -2077,7 +2273,7 @@ class FileExplorerTab(QWidget):
         elif os.path.exists(path):
             self.navigate_to(path)
         else:
-            QMessageBox.warning(self, "路径错误", f"路径不存在: {path}")
+            show_toast(self, "路径错误", f"路径不存在: {path}", level="warning")
             # 恢复路径栏显示当前正确的路径
             if hasattr(self, 'current_path') and self.current_path:
                 self.path_bar.set_path(self.current_path)
@@ -3274,6 +3470,26 @@ class MainWindow(QMainWindow):
             self.forward_button.setEnabled(current_tab.can_go_forward())
         else:
             self.forward_button.setEnabled(False)
+    
+    def open_tortoisegit_log_current_tab(self):
+        """打开当前标签页的 TortoiseGit 日志"""
+        current_tab = self.get_current_tab_widget()
+        if current_tab and hasattr(current_tab, 'open_tortoisegit_log'):
+            current_tab.open_tortoisegit_log()
+    
+    def open_tortoisegit_commit_current_tab(self):
+        """打开当前标签页的 TortoiseGit 提交窗口"""
+        current_tab = self.get_current_tab_widget()
+        if current_tab and hasattr(current_tab, 'open_tortoisegit_commit'):
+            current_tab.open_tortoisegit_commit()
+    
+    def apply_tortoisegit_buttons_config(self):
+        """根据配置显示/隐藏 TortoiseGit 按钮"""
+        enable = self.config.get("enable_tortoisegit_buttons", True)
+        if hasattr(self, 'git_log_button'):
+            self.git_log_button.setVisible(enable)
+        if hasattr(self, 'git_commit_button'):
+            self.git_commit_button.setVisible(enable)
 
     def _update_window_title(self, current_path: str = None):
         """根据当前状态更新窗口标题和自定义标题栏文本。
@@ -3593,14 +3809,57 @@ class MainWindow(QMainWindow):
         
         titlebar_layout.addStretch()
         
+        # TortoiseGit 按钮（可在设置中启用/禁用）
+        btn_size = int(32 * getattr(self, 'dpi_scale', 1.0))
+        btn_font_size = int(14 * getattr(self, 'dpi_scale', 1.0))
+        btn_radius = int(4 * getattr(self, 'dpi_scale', 1.0))
+        
+        git_btn_style = f"""
+            QPushButton {{
+                background: transparent;
+                border: none;
+                border-radius: {btn_radius}px;
+                font-size: {btn_font_size}pt;
+                font-weight: bold;
+                color: #333;
+            }}
+            QPushButton:hover {{
+                background: #e0e0e0;
+            }}
+            QPushButton:pressed {{
+                background: #d0d0d0;
+            }}
+        """
+        
+        # Git Log 按钮
+        self.git_log_button = QPushButton("🐢")
+        self.git_log_button.setToolTip("打开 TortoiseGit 日志")
+        self.git_log_button.setFixedSize(btn_size, btn_size)
+        self.git_log_button.setStyleSheet(git_btn_style)
+        self.git_log_button.clicked.connect(self.open_tortoisegit_log_current_tab)
+        titlebar_layout.addWidget(self.git_log_button)
+        
+        # Git Commit 按钮
+        self.git_commit_button = QPushButton("📤")
+        self.git_commit_button.setToolTip("打开 TortoiseGit 提交窗口")
+        self.git_commit_button.setFixedSize(btn_size, btn_size)
+        self.git_commit_button.setStyleSheet(git_btn_style)
+        self.git_commit_button.clicked.connect(self.open_tortoisegit_commit_current_tab)
+        titlebar_layout.addWidget(self.git_commit_button)
+        
+        # 分隔线（可选）
+        separator = QFrame()
+        separator.setFrameShape(QFrame.VLine)
+        separator.setFrameShadow(QFrame.Plain)
+        separator.setStyleSheet("background-color: #d0d0d0; max-width: 1px;")
+        separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
+        titlebar_layout.addWidget(separator)
+        
         # 标签栏导航按钮（从标签栏移到这里）
         # 后退按钮
         self.back_button = QPushButton("←")
         self.back_button.setToolTip("后退 (Alt+←)")
-        btn_size = int(32 * getattr(self, 'dpi_scale', 1.0))
         self.back_button.setFixedSize(btn_size, btn_size)
-        btn_font_size = int(14 * getattr(self, 'dpi_scale', 1.0))
-        btn_radius = int(4 * getattr(self, 'dpi_scale', 1.0))
         self.back_button.setStyleSheet(f"""
             QPushButton {{
                 background: transparent;
@@ -4368,21 +4627,21 @@ class MainWindow(QMainWindow):
         """显示搜索对话框（非模态）"""
         current_tab = self.get_current_tab_widget()
         if not current_tab or not hasattr(current_tab, 'current_path'):
-            QMessageBox.warning(self, "提示", "请先打开一个文件夹")
-            self.setFocus()  # 消息框关闭后设置焦点
+            show_toast(self, "提示", "请先打开一个文件夹", level="warning")
+            self.setFocus()
             return
         
         search_path = current_tab.current_path
         
         # 不支持搜索特殊路径
         if search_path.startswith('shell:'):
-            QMessageBox.warning(self, "提示", "不支持搜索特殊路径（shell:）")
-            self.setFocus()  # 消息框关闭后设置焦点
+            show_toast(self, "提示", "不支持搜索特殊路径（shell:）", level="warning")
+            self.setFocus()
             return
         
         if not os.path.exists(search_path):
-            QMessageBox.warning(self, "提示", f"路径不存在: {search_path}")
-            self.setFocus()  # 消息框关闭后设置焦点
+            show_toast(self, "提示", f"路径不存在: {search_path}", level="warning")
+            self.setFocus()
             return
         
         # 创建非模态对话框，传入搜索历史
@@ -4459,7 +4718,7 @@ class MainWindow(QMainWindow):
         for root in tree.values():
             collect_folders(root)
         if not folder_list:
-            QMessageBox.warning(self, "无可用书签文件夹", "请先在 bookmarks.json 中添加至少一个文件夹。")
+            show_toast(self, "无可用书签文件夹", "请先在 bookmarks.json 中添加至少一个文件夹。", level="warning")
             return
         # 选择父文件夹
         folder_names = [f"{name} (id:{fid})" for fid, name in folder_list]
@@ -4481,7 +4740,7 @@ class MainWindow(QMainWindow):
         if bm.add_bookmark(folder_id, name, url):
             self.populate_bookmark_bar_menu()
         else:
-            QMessageBox.warning(self, "添加失败", "未能添加书签，请检查父文件夹。")
+            show_toast(self, "添加失败", "未能添加书签，请检查父文件夹。", level="warning")
 
     def pin_tab(self, tab_index):
         tab = self.get_tab_widget(tab_index)
@@ -4615,6 +4874,9 @@ class MainWindow(QMainWindow):
         # 性能优化：延迟初始化UI（先显示基本界面）
         self.init_ui()
         
+        # 根据配置显示/隐藏 TortoiseGit 按钮
+        self.apply_tortoisegit_buttons_config()
+        
         # 设置快捷键（在init_ui之后，确保所有组件已创建）
         self.setup_shortcuts()
         
@@ -4647,6 +4909,7 @@ class MainWindow(QMainWindow):
             "pinned_tabs": [],  # 默认没有固定标签页
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
+            "enable_tortoisegit_buttons": True,  # 默认启用TortoiseGit按钮
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -5566,13 +5829,13 @@ class MainWindow(QMainWindow):
             elif os.path.exists(local_path):
                 self.add_new_tab(local_path)
             else:
-                QMessageBox.warning(self, "路径错误", f"路径不存在: {local_path}")
+                show_toast(self, "路径错误", f"路径不存在: {local_path}", level="warning")
         elif url.startswith('shell:'):
             self.add_new_tab(url, is_shell=True)
         elif os.path.isabs(url) and os.path.exists(url):
             self.add_new_tab(url)
         else:
-            QMessageBox.warning(self, "不支持的书签", f"暂不支持打开此类型书签: {url}")
+            show_toast(self, "不支持的书签", f"暂不支持打开此类型书签: {url}", level="warning")
 
     def delete_bookmark_by_id(self, bookmark_id):
         """根据ID删除书签"""
@@ -5612,17 +5875,9 @@ class MainWindow(QMainWindow):
         debug_print(f"[DEBUG] Menu closed")
     
     def confirm_delete_bookmark(self, bookmark_id, bookmark_name):
-        """确认删除书签"""
-        reply = QMessageBox.question(
-            self, 
-            "确认删除", 
-            f"确定要删除书签 '{bookmark_name}' 吗？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        
-        if reply == QMessageBox.Yes:
-            self.delete_bookmark_by_id(bookmark_id)
+        """直接删除书签并给出轻量提示"""
+        self.delete_bookmark_by_id(bookmark_id)
+        show_toast(self, "已删除", f"书签 '{bookmark_name}' 已删除", level="info")
 
     def populate_bookmark_bar_menu(self):
         self.ensure_default_icons_on_bookmark_bar()
@@ -5792,10 +6047,11 @@ class MainWindow(QMainWindow):
             print("[Settings] Disabling Explorer monitoring")
             self.stop_explorer_monitor()
         
-        QMessageBox.information(
-            self, 
-            "设置已更新", 
-            f"Explorer窗口监听已{'启用' if checked else '禁用'}\n{'新打开的文件管理器窗口将自动嵌入到标签页中' if checked else '新打开的文件管理器窗口将独立显示'}"
+        show_toast(
+            self,
+            "设置已更新",
+            f"Explorer窗口监听已{'启用' if checked else '禁用'}\n{'新打开的文件管理器窗口将自动嵌入到标签页中' if checked else '新打开的文件管理器窗口将独立显示'}",
+            level="info",
         )
 
     def show_bookmark_manager_dialog(self):
@@ -5865,6 +6121,19 @@ class SettingsDialog(QDialog):
         tabs_group.setLayout(tabs_layout)
         layout.addWidget(tabs_group)
         
+        # Git 工具设置组
+        git_group = QGroupBox("Git 工具设置")
+        git_layout = QVBoxLayout()
+        
+        self.tortoisegit_buttons_cb = QCheckBox("显示 TortoiseGit 快捷按钮（标题栏）", self)
+        self.tortoisegit_buttons_cb.setChecked(config.get("enable_tortoisegit_buttons", True))
+        self.tortoisegit_buttons_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.tortoisegit_buttons_cb.setToolTip("在标题栏显示 Git Log 和 Git Commit 快捷按钮")
+        git_layout.addWidget(self.tortoisegit_buttons_cb)
+        
+        git_group.setLayout(git_layout)
+        layout.addWidget(git_group)
+        
         # 快捷键设置组
         hotkey_group = QGroupBox("快捷键设置")
         hotkey_layout = QVBoxLayout()
@@ -5923,15 +6192,50 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+    
+    def accept(self):
+        """保存设置"""
+        # 保存所有设置到 parent (MainWindow)
+        if self.parent():
+            self.parent().config["enable_explorer_monitor"] = self.monitor_cb.isChecked()
+            self.parent().config["explorer_monitor_interval"] = self.interval_spinbox.value()
+            self.parent().config["debug_mode"] = self.debug_mode_cb.isChecked()
+            self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
+            self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
+            
+            # 保存快捷键配置
+            self.parent().config["hotkeys"] = {
+                "new_tab": self.hotkey_new_tab.isChecked(),
+                "close_tab": self.hotkey_close_tab.isChecked(),
+                "reopen_tab": self.hotkey_reopen_tab.isChecked(),
+                "switch_tab": self.hotkey_switch_tab.isChecked(),
+                "search": self.hotkey_search.isChecked(),
+                "navigate": self.hotkey_navigate.isChecked(),
+                "go_up": self.hotkey_go_up.isChecked(),
+                "refresh": self.hotkey_refresh.isChecked(),
+                "add_bookmark": self.hotkey_add_bookmark.isChecked()
+            }
+            
+            # 保存到文件
+            self.parent().save_config()
+            
+            # 应用设置
+            set_debug_mode(self.parent().config.get("debug_mode", False))
+            self.parent().apply_tortoisegit_buttons_config()
+            
+            # 重新设置快捷键
+            self.parent().setup_shortcuts()
+        
+        super().accept()
 
 # 书签管理对话框（初步框架，后续可扩展重命名/新建/删除等功能）
-from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton, QHBoxLayout, QInputDialog, QMessageBox
+from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton, QHBoxLayout, QInputDialog
 class BookmarkManagerDialog(QDialog):
 
     def move_item_up(self):
         item = self.tree.currentItem()
         if not item:
-            QMessageBox.warning(self, "未选择", "请先选择要上移的书签或文件夹。")
+            show_toast(self, "未选择", "请先选择要上移的书签或文件夹。", level="warning")
             return
         parent = item.parent()
         if parent:
@@ -5958,7 +6262,7 @@ class BookmarkManagerDialog(QDialog):
     def move_item_down(self):
         item = self.tree.currentItem()
         if not item:
-            QMessageBox.warning(self, "未选择", "请先选择要下移的书签或文件夹。")
+            show_toast(self, "未选择", "请先选择要下移的书签或文件夹。", level="warning")
             return
         parent = item.parent()
         if parent:
@@ -6088,7 +6392,7 @@ class BookmarkManagerDialog(QDialog):
     def edit_item(self):
         item = self.tree.currentItem()
         if not item:
-            QMessageBox.warning(self, "未选择", "请先选择要编辑的书签或文件夹。")
+            show_toast(self, "未选择", "请先选择要编辑的书签或文件夹。", level="warning")
             return
         node_type = item.text(1)
         old_name = item.text(0).lstrip("📁 ").lstrip("📑 ")
@@ -6138,12 +6442,11 @@ class BookmarkManagerDialog(QDialog):
     def delete_item(self):
         item = self.tree.currentItem()
         if not item:
-            QMessageBox.warning(self, "未选择", "请先选择要删除的书签或文件夹。")
+            show_toast(self, "未选择", "请先选择要删除的书签或文件夹。", level="warning")
             return
         node_id = item.data(0, 1)
-        reply = QMessageBox.question(self, "确认删除", "确定要删除选中的项目及其所有子项吗？", QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
+        # 直接执行删除并给出提示，避免阻塞
+        show_toast(self, "已删除", "选中的书签/文件夹已删除", level="info")
         def delete_node(parent, node_list):
             for i, node in enumerate(node_list):
                 if isinstance(node, dict) and node.get('id') == node_id:
@@ -6193,7 +6496,7 @@ class BookmarkManagerDialog(QDialog):
     def rename_item(self):
         item = self.tree.currentItem()
         if not item:
-            QMessageBox.warning(self, "未选择", "请先选择要重命名的书签或文件夹。")
+            show_toast(self, "未选择", "请先选择要重命名的书签或文件夹。", level="warning")
             return
         old_name = item.text(0)
         new_name, ok = QInputDialog.getText(self, "重命名", "请输入新名称：", text=old_name)
@@ -6285,15 +6588,15 @@ class BookmarkManagerDialog(QDialog):
             try:
                 # 复制当前的bookmarks.json到目标位置
                 shutil.copy2("bookmarks.json", file_path)
-                QMessageBox.information(self, "导出成功", f"书签已成功导出到:\n{file_path}")
+                show_toast(self, "导出成功", f"书签已成功导出到:\n{file_path}", level="success")
                 print(f"[Bookmark Export] Successfully exported to: {file_path}")
             except Exception as e:
-                QMessageBox.critical(self, "导出失败", f"导出书签时出错:\n{str(e)}")
+                show_toast(self, "导出失败", f"导出书签时出错:\n{str(e)}", level="error")
                 print(f"[Bookmark Export] Error: {e}")
     
     def import_bookmarks(self):
         """从JSON文件导入书签"""
-        from PyQt5.QtWidgets import QFileDialog, QMessageBox
+        from PyQt5.QtWidgets import QFileDialog
         import json
         
         # 打开文件选择对话框
@@ -6318,47 +6621,30 @@ class BookmarkManagerDialog(QDialog):
             
             # 验证JSON格式
             if not isinstance(imported_data, dict) or 'bookmark_bar' not in imported_data:
-                QMessageBox.warning(self, "格式错误", "导入的文件格式不正确，必须包含 'bookmark_bar' 节点")
+                show_toast(self, "格式错误", "导入的文件格式不正确，必须包含 'bookmark_bar' 节点", level="warning")
                 return
             
-            # 询问用户是替换还是合并
-            reply = QMessageBox.question(
-                self,
-                "导入方式",
-                "选择导入方式:\n\n是(Yes) - 替换现有书签\n否(No) - 合并到现有书签\n取消 - 取消导入",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-                QMessageBox.No
-            )
+            # 默认选择更安全的“合并”模式，避免阻塞确认
+            show_toast(self, "导入方式", "已自动选择合并模式，将导入内容追加到现有书签。", level="info")
+            # 合并模式：将导入的书签添加到现有书签的末尾
+            current_tree = self.bookmark_manager.get_tree()
+            imported_bar = imported_data.get('bookmark_bar', {})
+            imported_children = imported_bar.get('children', [])
             
-            if reply == QMessageBox.Cancel:
-                return
-            elif reply == QMessageBox.Yes:
-                # 替换模式：直接覆盖
-                self.bookmark_manager.bookmark_tree = imported_data
-                self.bookmark_manager.save_bookmarks(immediate=True)  # 立即保存
-                QMessageBox.information(self, "导入成功", "书签已成功替换")
-                print(f"[Bookmark Import] Replaced bookmarks from: {file_path}")
-                print(f"[Bookmark Import] New tree structure: {self.bookmark_manager.bookmark_tree.keys()}")
-            else:
-                # 合并模式：将导入的书签添加到现有书签的末尾
-                current_tree = self.bookmark_manager.get_tree()
-                imported_bar = imported_data.get('bookmark_bar', {})
-                imported_children = imported_bar.get('children', [])
+            if imported_children:
+                current_bar = current_tree.get('bookmark_bar', {})
+                if 'children' not in current_bar:
+                    current_bar['children'] = []
                 
-                if imported_children:
-                    current_bar = current_tree.get('bookmark_bar', {})
-                    if 'children' not in current_bar:
-                        current_bar['children'] = []
-                    
-                    # 添加到末尾
-                    current_bar['children'].extend(imported_children)
-                    self.bookmark_manager.save_bookmarks(immediate=True)  # 立即保存
-                    
-                    count = len(imported_children)
-                    QMessageBox.information(self, "导入成功", f"成功导入 {count} 个书签项")
-                    print(f"[Bookmark Import] Merged {count} items from: {file_path}")
-                else:
-                    QMessageBox.information(self, "提示", "导入的文件中没有书签内容")
+                # 添加到末尾
+                current_bar['children'].extend(imported_children)
+                self.bookmark_manager.save_bookmarks(immediate=True)  # 立即保存
+                
+                count = len(imported_children)
+                show_toast(self, "导入成功", f"成功导入 {count} 个书签项", level="success")
+                print(f"[Bookmark Import] Merged {count} items from: {file_path}")
+            else:
+                show_toast(self, "提示", "导入的文件中没有书签内容", level="info")
             
             # 刷新书签管理对话框显示
             self.populate_tree()
@@ -6373,10 +6659,10 @@ class BookmarkManagerDialog(QDialog):
                     main_window.ensure_default_icons_on_bookmark_bar()
                 
         except json.JSONDecodeError:
-            QMessageBox.critical(self, "格式错误", "导入的文件不是有效的JSON格式")
+            show_toast(self, "格式错误", "导入的文件不是有效的JSON格式", level="error")
             print(f"[Bookmark Import] Invalid JSON format: {file_path}")
         except Exception as e:
-            QMessageBox.critical(self, "导入失败", f"导入书签时出错:\n{str(e)}")
+            show_toast(self, "导入失败", f"导入书签时出错:\n{str(e)}", level="error")
             print(f"[Bookmark Import] Error: {e}")
 
 
