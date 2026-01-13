@@ -3855,7 +3855,7 @@ class MainWindow(QMainWindow):
         titlebar_height = int(32 * getattr(self, 'dpi_scale', 1.0))
         titlebar = QWidget()
         titlebar.setFixedHeight(titlebar_height)
-        titlebar.setStyleSheet("background-color: #fafafa; border-bottom: 1px solid #e0e0e0;")
+        titlebar.setStyleSheet("background-color: #f3f3f3;")
         titlebar_layout = QHBoxLayout(titlebar)
         titlebar_layout.setContentsMargins(10, 0, 0, 0)
         titlebar_layout.setSpacing(0)
@@ -5598,6 +5598,7 @@ class MainWindow(QMainWindow):
         tab_bar_container = QWidget()
         tab_bar_height = int(32 * getattr(self, 'dpi_scale', 1.0))
         tab_bar_container.setFixedHeight(tab_bar_height)  # 固定高度，只显示标签栏
+        tab_bar_container.setStyleSheet("background-color: #f3f3f3;")
         tab_bar_layout = QHBoxLayout(tab_bar_container)
         tab_bar_layout.setContentsMargins(0, 0, 0, 0)
         tab_bar_layout.setSpacing(0)
@@ -5621,7 +5622,7 @@ class MainWindow(QMainWindow):
         self.menu_bar.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.menu_bar.setStyleSheet("""
             QMenuBar {
-                background-color: #fafafa;
+                background-color: #f3f3f3;
                 border-bottom: 1px solid #e0e0e0;
                 padding: 2px;
             }
