@@ -4283,22 +4283,25 @@ class MainWindow(QMainWindow):
                     debug_print(f"[DEBUG] No bookmark action found")
         
         if event.button() == Qt.LeftButton:
-            # 检测是否在边缘（调整大小）
-            edge = self.detect_edge(event.pos())
-            if edge and not self.isMaximized():
-                self.resizing = True
-                self.resize_direction = edge
-                self.resize_start_pos = event.globalPos()
-                self.resize_start_geometry = self.geometry()
-                event.accept()
-                return
-            
-            # 检查点击位置是否在标题栏内（拖动窗口）
+            # 检查点击位置是否在标题栏内（拖动窗口）- 优先检查以避免误触发边缘调整
             if hasattr(self, 'titlebar_widget'):
                 titlebar_rect = self.titlebar_widget.geometry()
                 if titlebar_rect.contains(event.pos()):
                     self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
                     event.accept()
+                    return
+            
+            # 检测是否在边缘（调整大小）- 排除标题栏+标签栏区域
+            titlebar_exclusion_height = int(70 * getattr(self, 'dpi_scale', 1.0))
+            if event.pos().y() > titlebar_exclusion_height:  # 只在标题栏+标签栏下方才检测边缘
+                edge = self.detect_edge(event.pos())
+                if edge and not self.isMaximized():
+                    self.resizing = True
+                    self.resize_direction = edge
+                    self.resize_start_pos = event.globalPos()
+                    self.resize_start_geometry = self.geometry()
+                    event.accept()
+                    return
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event):
@@ -4376,13 +4379,51 @@ class MainWindow(QMainWindow):
     def detect_edge(self, pos):
         """检测鼠标是否在窗口边缘，返回边缘方向"""
         rect = self.rect()
-        margin = self.resize_margin
+        margin = max(self.resize_margin, 15)
         
         left = pos.x() <= margin
         right = pos.x() >= rect.width() - margin
         top = pos.y() <= margin
         bottom = pos.y() >= rect.height() - margin
         
+        if top and left:
+            return 'top-left'
+        elif top and right:
+            return 'top-right'
+        elif bottom and left:
+            return 'bottom-left'
+        elif bottom and right:
+            return 'bottom-right'
+        elif top:
+            return 'top'
+        elif bottom:
+            return 'bottom'
+        elif left:
+            return 'left'
+        elif right:
+            return 'right'
+        return None
+
+    def detect_edge_global(self, global_pos):
+        """基于全局坐标检测边缘命中（包含阴影区域）"""
+        margin = max(self.resize_margin, 15)
+        frame_rect = self.frameGeometry()
+
+        # 检测是否在标题栏+标签栏区域内，如果是则排除上边缘检测
+        # 标题栏32px + 标签栏32px + 额外缓冲6px = 70px
+        titlebar_exclusion_height = int(70 * getattr(self, 'dpi_scale', 1.0))
+        local_pos = self.mapFromGlobal(global_pos)
+        in_titlebar = (hasattr(self, 'titlebar_widget') and 
+                      local_pos.y() >= 0 and 
+                      local_pos.y() <= titlebar_exclusion_height and
+                      local_pos.x() >= 0 and 
+                      local_pos.x() <= self.width())
+
+        left = global_pos.x() <= frame_rect.left() + margin
+        right = global_pos.x() >= frame_rect.right() - margin
+        top = global_pos.y() <= frame_rect.top() + margin and not in_titlebar  # 标题栏内不触发上边缘
+        bottom = global_pos.y() >= frame_rect.bottom() - margin
+
         if top and left:
             return 'top-left'
         elif top and right:
@@ -4493,6 +4534,67 @@ class MainWindow(QMainWindow):
                 
                 # 解析消息结构
                 msg = cast(int(message), POINTER(wintypes.MSG)).contents
+
+                # WM_NCHITTEST - 让 Windows 自己处理无边框窗口的拖动调整大小
+                if msg.message == 0x0084:  # WM_NCHITTEST
+                    from PyQt5.QtCore import QPoint
+
+                    # 最大化时不允许调整大小
+                    if self.isMaximized():
+                        return False, 0
+
+                    # 从 lParam 解析全局坐标
+                    x = ctypes.c_short(msg.lParam & 0xFFFF).value
+                    y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+                    global_pos = QPoint(x, y)
+
+                    margin = max(self.resize_margin, 15)  # 阴影+命中容差
+
+                    # 先用客户端坐标检测（无标题栏区域）
+                    client_pos = self.mapFromGlobal(global_pos)
+                    client_rect = self.rect()
+
+                    left = client_pos.x() <= margin
+                    right = client_pos.x() >= client_rect.width() - margin
+                    top = client_pos.y() <= margin
+                    bottom = client_pos.y() >= client_rect.height() - margin
+
+                    # 如果坐标在客户端之外，使用 frameGeometry 兜底（阴影区域）
+                    if not client_rect.contains(client_pos):
+                        frame_rect = self.frameGeometry()
+                        left = global_pos.x() <= frame_rect.left() + margin
+                        right = global_pos.x() >= frame_rect.right() - margin
+                        top = global_pos.y() <= frame_rect.top() + margin
+                        bottom = global_pos.y() >= frame_rect.bottom() - margin
+
+                    # 命中测试结果常量
+                    HTLEFT = 10
+                    HTRIGHT = 11
+                    HTTOP = 12
+                    HTTOPLEFT = 13
+                    HTTOPRIGHT = 14
+                    HTBOTTOM = 15
+                    HTBOTTOMLEFT = 16
+                    HTBOTTOMRIGHT = 17
+
+                    if top and left:
+                        return True, HTTOPLEFT
+                    if top and right:
+                        return True, HTTOPRIGHT
+                    if bottom and left:
+                        return True, HTBOTTOMLEFT
+                    if bottom and right:
+                        return True, HTBOTTOMRIGHT
+                    if top:
+                        return True, HTTOP
+                    if bottom:
+                        return True, HTBOTTOM
+                    if left:
+                        return True, HTLEFT
+                    if right:
+                        return True, HTRIGHT
+                    # 非边缘区域，交回默认处理
+                    return False, 0
                 
                 # WM_SYSCOMMAND = 0x0112
                 if msg.message == 0x0112:  # WM_SYSCOMMAND
@@ -4506,6 +4608,65 @@ class MainWindow(QMainWindow):
                             self.showMinimized()
                             return True, 0
                         # 如果已经最小化，返回 False 让系统执行默认恢复
+
+                # WM_SETCURSOR - 在命中边缘时主动切换调整大小光标
+                if msg.message == 0x0020:  # WM_SETCURSOR
+                    from PyQt5.QtCore import QPoint
+
+                    if self.isMaximized():
+                        return False, 0
+
+                    # 获取当前全局鼠标位置
+                    import ctypes
+                    from ctypes import wintypes
+                    pt = wintypes.POINT()
+                    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                    global_pos = QPoint(pt.x, pt.y)
+
+                    margin = max(self.resize_margin, 15)
+
+                    # 首先用客户端坐标检测
+                    client_pos = self.mapFromGlobal(global_pos)
+                    client_rect = self.rect()
+
+                    left = client_pos.x() <= margin
+                    right = client_pos.x() >= client_rect.width() - margin
+                    top = client_pos.y() <= margin
+                    bottom = client_pos.y() >= client_rect.height() - margin
+
+                    # 客户端外部则使用 frame 几何（包含阴影）
+                    if not client_rect.contains(client_pos):
+                        frame_rect = self.frameGeometry()
+                        left = global_pos.x() <= frame_rect.left() + margin
+                        right = global_pos.x() >= frame_rect.right() - margin
+                        top = global_pos.y() <= frame_rect.top() + margin
+                        bottom = global_pos.y() >= frame_rect.bottom() - margin
+
+                    edge = None
+                    if top and left:
+                        edge = 'top-left'
+                    elif top and right:
+                        edge = 'top-right'
+                    elif bottom and left:
+                        edge = 'bottom-left'
+                    elif bottom and right:
+                        edge = 'bottom-right'
+                    elif top:
+                        edge = 'top'
+                    elif bottom:
+                        edge = 'bottom'
+                    elif left:
+                        edge = 'left'
+                    elif right:
+                        edge = 'right'
+
+                    # 主动设置光标；若无边缘命中，交给默认处理
+                    if edge:
+                        self.update_cursor(edge)
+                        return True, 1  # 告诉系统已处理，防止重置光标
+                    else:
+                        self.update_cursor(None)
+                        return False, 0
         except Exception:
             pass
         
@@ -4517,6 +4678,9 @@ class MainWindow(QMainWindow):
             # 保存最后的非最小化状态，用于任务栏点击判断
             if not (self.windowState() & Qt.WindowMinimized):
                 self._last_active_state = self.windowState()
+            
+            # 根据窗口状态切换阴影显示
+            self._update_window_shadow()
         
         super().changeEvent(event)
     
@@ -5031,7 +5195,7 @@ class MainWindow(QMainWindow):
         # 窗口调整大小相关变量
         self.resizing = False
         self.resize_direction = None
-        self.resize_margin = 10  # 边缘检测范围（像素），增加到10像素更容易触发
+        self.resize_margin = 15  # 边缘检测范围（像素），与阴影边距一致以便更容易触发
         self.cursor_overridden = False  # 通过QApplication是否已覆盖光标
         
         # 搜索历史（内存中，软件关闭后自动清除）- 使用常量限制大小
@@ -5229,6 +5393,91 @@ class MainWindow(QMainWindow):
             ]
             bm.save_bookmarks()
 
+    def _setup_window_shadow(self):
+        """设置窗口阴影效果"""
+        # 初始化阴影状态标志
+        self._shadow_enabled = False
+    
+    def _update_window_shadow(self):
+        """根据窗口状态更新阴影显示 - 使用 Windows DWM 原生阴影"""
+        # 只在窗口化状态（非最大化、非最小化、非全屏）时显示阴影
+        is_normal = not (self.windowState() & (Qt.WindowMaximized | Qt.WindowMinimized | Qt.WindowFullScreen))
+        
+        if is_normal and not self._shadow_enabled:
+            # 需要显示阴影且当前未启用，使用 Windows DWM 阴影
+            if HAS_PYWIN:
+                try:
+                    import win32gui
+                    import win32con
+                    hwnd = int(self.winId())
+                    import ctypes
+                    from ctypes import wintypes
+                    dwmapi = ctypes.windll.dwmapi
+                    
+                    # 启用窗口阴影
+                    DWMWA_NCRENDERING_POLICY = 2
+                    DWMNCRP_ENABLED = 2
+                    dwmapi.DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_NCRENDERING_POLICY,
+                        ctypes.byref(wintypes.DWORD(DWMNCRP_ENABLED)),
+                        ctypes.sizeof(wintypes.DWORD)
+                    )
+                    
+                    # 不扩展玻璃框架到客户区，避免产生半透明缝隙
+                    # WS_THICKFRAME 本身会提供系统阴影，无需调用 DwmExtendFrameIntoClientArea
+                    
+                    # 设置窗口圆角（Windows 11 风格）
+                    try:
+                        DWM_WINDOW_CORNER_PREFERENCE = 33
+                        DWMWCP_ROUND = 2  # 圆角
+                        dwmapi.DwmSetWindowAttribute(
+                            hwnd,
+                            DWM_WINDOW_CORNER_PREFERENCE,
+                            ctypes.byref(wintypes.DWORD(DWMWCP_ROUND)),
+                            ctypes.sizeof(wintypes.DWORD)
+                        )
+                    except:
+                        pass  # Windows 10 不支持此属性，忽略错误
+                    
+                    # 添加可见边框和可调整大小的样式（WS_THICKFRAME/WS_SIZEBOX）
+                    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+                    # WS_THICKFRAME 允许通过命中测试调整大小
+                    win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style | win32con.WS_BORDER | win32con.WS_THICKFRAME)
+                    
+                    self._shadow_enabled = True
+                    debug_print("[Shadow] Windows shadow enabled with enhanced border")
+                except Exception as e:
+                    debug_print(f"[Shadow] Failed to enable Windows shadow: {e}")
+        elif not is_normal and self._shadow_enabled:
+            # 最大化时移除阴影和边框
+            if HAS_PYWIN:
+                try:
+                    import win32gui
+                    import win32con
+                    hwnd = int(self.winId())
+                    import ctypes
+                    from ctypes import wintypes
+                    dwmapi = ctypes.windll.dwmapi
+                    
+                    # 禁用窗口阴影
+                    DWMWA_NCRENDERING_POLICY = 2
+                    DWMNCRP_DISABLED = 1
+                    dwmapi.DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_NCRENDERING_POLICY,
+                        ctypes.byref(wintypes.DWORD(DWMNCRP_DISABLED)),
+                        ctypes.sizeof(wintypes.DWORD)
+                    )
+                    
+                    # 移除边框和可调整大小样式
+                    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+                    win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style & ~win32con.WS_BORDER & ~win32con.WS_THICKFRAME)
+                    
+                    self._shadow_enabled = False
+                    debug_print("[Shadow] Windows shadow disabled")
+                except Exception as e:
+                    debug_print(f"[Shadow] Failed to disable Windows shadow: {e}")
 
     def init_ui(self):
         # 获取DPI缩放因子
@@ -5248,24 +5497,37 @@ class MainWindow(QMainWindow):
         
         # 隐藏默认标题栏
         self.setWindowFlags(Qt.FramelessWindowHint)
+
+        # 填充窗口背景，避免边框与内容之间出现半透明缝隙
+        self.setAutoFillBackground(True)
+        from PyQt5.QtGui import QPalette, QColor
+        pal = self.palette()
+        pal.setColor(QPalette.Window, QColor(255, 255, 255))
+        self.setPalette(pal)
+        # 再次用样式表确保非客户区也以白色填充
+        self.setStyleSheet("QMainWindow { background: white; }")
         
-        # 创建主容器，无边框
+        # 添加窗口阴影效果（仅在非最大化时显示）
+        self._setup_window_shadow()
+        
+        # 创建主容器，无边距，纯白填充
         main_container = QWidget()
-        main_container.setStyleSheet("background: white;")
-        main_container.setAttribute(Qt.WA_TransparentForMouseEvents)  # 让鼠标事件穿透到主窗口
+        main_container.setAutoFillBackground(True)
+        pal_container = main_container.palette()
+        pal_container.setColor(QPalette.Window, QColor(255, 255, 255))
+        main_container.setPalette(pal_container)
+        main_container.setStyleSheet("QWidget { background: white; margin: 0px; padding: 0px; border: none; }")
         container_layout = QVBoxLayout(main_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(0)
         
-        # 创建内容容器，白色背景
-        content_widget = QWidget()
-        content_widget.setStyleSheet("background: white; border-radius: 6px;")
-        main_layout = QVBoxLayout(content_widget)
+        # 保存主容器引用，用于应用阴影效果
+        self._main_container = main_container
+        
+        # 创建内容布局
+        main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        
-        # 将内容容器添加到主容器
-        container_layout.addWidget(content_widget)
         
         # 创建自定义标题栏
         self.create_custom_titlebar(main_layout)
@@ -5554,6 +5816,9 @@ class MainWindow(QMainWindow):
         # 将分割器添加到主容器
         main_layout.addWidget(self.splitter)
         
+        # 将内容布局添加到主容器
+        container_layout.addLayout(main_layout)
+        
         # 设置主容器为中心部件
         self.setCentralWidget(main_container)
 
@@ -5567,20 +5832,8 @@ class MainWindow(QMainWindow):
         # 性能优化：单实例服务器和Explorer监听移到延迟初始化
     
     def resizeEvent(self, event):
-        """窗口大小改变时更新圆角mask"""
+        """窗口大小改变事件"""
         super().resizeEvent(event)
-        # 只在大小真正改变时更新mask
-        if event.oldSize() != event.size():
-            self._update_rounded_mask()
-    
-    def _update_rounded_mask(self):
-        """更新窗口圆角mask"""
-        from PyQt5.QtGui import QRegion, QPainterPath
-        from PyQt5.QtCore import QRectF
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(self.rect()), 8, 8)
-        region = QRegion(path.toFillPolygon().toPolygon())
-        self.setMask(region)
 
     def handle_open_path_from_instance(self, path):
         """处理从其他实例接收到的路径（在主线程中）"""
@@ -6180,7 +6433,55 @@ class MainWindow(QMainWindow):
         """事件过滤器，处理菜单栏和子菜单的右键菜单"""
         from PyQt5.QtCore import QEvent
         from PyQt5.QtWidgets import QMenu
+        from PyQt5.QtGui import QMouseEvent
         
+        # 边框命中优先：在全局范围内拦截鼠标用于调整大小，避免子控件抢占事件
+        if event.type() in (QEvent.MouseMove, QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+            if isinstance(event, QMouseEvent):
+                # 最大化时不处理边框
+                if not self.isMaximized():
+                    global_pos = event.globalPos()
+                    local_pos = self.mapFromGlobal(global_pos)
+                    
+                    # 检查是否在标题栏+标签栏区域，如果是则跳过边缘检测（允许拖动窗口）
+                    # 标题栏32px + 标签栏32px + 额外缓冲6px = 70px
+                    titlebar_exclusion_height = int(70 * getattr(self, 'dpi_scale', 1.0))
+                    in_titlebar = (hasattr(self, 'titlebar_widget') and 
+                                  local_pos.y() >= 0 and 
+                                  local_pos.y() <= titlebar_exclusion_height and
+                                  local_pos.x() >= 0 and 
+                                  local_pos.x() <= self.width())
+                    
+                    edge = self.detect_edge_global(global_pos) if not in_titlebar else None
+
+                    if event.type() == QEvent.MouseMove:
+                        if self.resizing and self.resize_direction:
+                            self.resize_window(global_pos)
+                            self.update_cursor(self.resize_direction)
+                            return True  # 吃掉事件，避免子控件触发
+                        if edge:
+                            self.update_cursor(edge)
+                        else:
+                            self.update_cursor(None)
+                        # 鼠标移动仅更新光标，不吃掉事件
+                        return False
+
+                    if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                        if edge:
+                            self.resizing = True
+                            self.resize_direction = edge
+                            self.resize_start_pos = global_pos
+                            self.resize_start_geometry = self.geometry()
+                            self.update_cursor(edge)
+                            return True  # 吃掉事件，防止按钮/目录树收到点击
+
+                    if event.type() == QEvent.MouseButtonRelease:
+                        if self.resizing:
+                            self.resizing = False
+                            self.resize_direction = None
+                            self.update_cursor(None)
+                            return True
+
         # 处理主菜单栏的右键点击
         if obj == self.menu_bar:
             if event.type() == QEvent.MouseButtonPress:
@@ -6996,6 +7297,10 @@ def main():
     
     # 启动时最大化显示
     window.showMaximized()
+    
+    # 确保启动时阴影状态正确（最大化时无阴影）
+    window._update_window_shadow()
+    
     sys.exit(app.exec_())
 
 if __name__ == "__main__":
