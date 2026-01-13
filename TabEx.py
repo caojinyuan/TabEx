@@ -1553,7 +1553,8 @@ class BreadcrumbPathBar(QWidget):
         """点击某个层级时触发"""
         self.current_path = path
         self.pathChanged.emit(path)
-        self.update_breadcrumbs()
+        # 不在这里立即更新面包屑，等待navigate_to完成后会自动调用set_path更新
+        # self.update_breadcrumbs()  # 注释掉，避免竟态条件
     
     def enter_edit_mode(self):
         """进入编辑模式"""
@@ -2090,6 +2091,9 @@ class FileExplorerTab(QWidget):
         # 初始设置路径栏（确保路径栏显示初始路径）
         if hasattr(self, 'path_bar'):
             self.path_bar.set_path(self.current_path)
+        
+        # 启动路径同步定时器
+        self.start_path_sync_timer()
         
         # 初始导航到当前路径（在setup_ui最后调用，确保所有设置已应用）
         self.explorer.dynamicCall('Navigate(const QString&)', QDir.toNativeSeparators(self.current_path))
@@ -2675,7 +2679,7 @@ class FileExplorerTab(QWidget):
             self.explorer.installEventFilter(self)
         
         self.navigate_to(self.current_path, is_shell=is_shell)
-        self.start_path_sync_timer()
+        # 路径同步定时器已在setup_ui中启动，这里不需要重复启动
         
         # 如果指定了要选中的文件，延迟选中（等待导航完成）
         # 增加延迟时间确保文件夹完全加载
