@@ -2684,6 +2684,29 @@ class FileExplorerTab(QWidget):
 
     # 移除重复的setup_ui，保留带路径栏的实现
 
+    def get_selected_filenames(self):
+        """获取选中的文件名列表（仅文件名，含后缀）"""
+        filenames = []
+        try:
+            # 通过Document接口获取SelectedItems
+            doc = self.explorer.querySubObject('Document')
+            if doc:
+                # 获取选中项集合
+                selected = doc.querySubObject('SelectedItems()')
+                if selected:
+                    count = selected.dynamicCall('Count()')
+                    if count and count > 0:
+                        for i in range(count):
+                            item = selected.querySubObject('Item(int)', i)
+                            if item:
+                                name = item.dynamicCall('Name()')
+                                if name:
+                                    filenames.append(str(name))
+                                    debug_print(f"[get_selected_filenames] Found: {name}")
+        except Exception as e:
+            debug_print(f"[get_selected_filenames] Error: {e}")
+        return filenames
+
     def navigate_to(self, path, is_shell=False, add_to_history=True, skip_async_check=False):
         debug_print(f"[navigate_to] To '{path}' (is_shell={is_shell}, skip_async={skip_async_check})")
         
@@ -4728,6 +4751,32 @@ class MainWindow(QMainWindow):
         current_tab = self.get_current_tab_widget()
         if current_tab:
             self.add_tab_bookmark(current_tab)
+
+    def copy_selected_filename(self):
+        """复制当前选中文件名（含后缀）到剪贴板并提示"""
+        debug_print("[copy_selected_filename] Called")
+        current_tab = self.get_current_tab_widget()
+        debug_print(f"[copy_selected_filename] current_tab: {current_tab}")
+        if not current_tab or not hasattr(current_tab, 'get_selected_filenames'):
+            debug_print("[copy_selected_filename] No tab or no get_selected_filenames method")
+            show_toast(self, "提示", "请先选择一个文件", level="warning")
+            return
+        names = current_tab.get_selected_filenames()
+        debug_print(f"[copy_selected_filename] Selected names: {names}")
+        if not names:
+            debug_print("[copy_selected_filename] No files selected")
+            show_toast(self, "提示", "请先选择一个文件", level="warning")
+            return
+        from PyQt5.QtWidgets import QApplication
+        # 将所有选中的文件名用", "连接
+        filenames_text = ", ".join(names)
+        QApplication.clipboard().setText(filenames_text)
+        debug_print(f"[copy_selected_filename] Copied to clipboard: {filenames_text}")
+        # 根据文件数量显示不同的提示
+        if len(names) == 1:
+            show_toast(self, "复制成功", f"文件名: {names[0]}", level="info")
+        else:
+            show_toast(self, "复制成功", f"已复制 {len(names)} 个文件名", level="info")
     
     def keyPressEvent(self, event):
         """处理快捷键（备用方案，主要使用QShortcut）"""
@@ -4778,6 +4827,17 @@ class MainWindow(QMainWindow):
                 return ctypes.windll.user32.GetAsyncKeyState(vk_code) & 0x8000 != 0
             
             hotkeys = self.config.get("hotkeys", {})
+            
+            # 首先检查Ctrl+Alt组合键（优先级最高，避免被其他快捷键拦截）
+            if is_key_pressed(VK_CONTROL) and is_key_pressed(VK_MENU) and hotkeys.get("copy_filename", True):
+                key_combo = "Ctrl+Alt"
+                if not self._last_keys_state.get(key_combo, False):
+                    debug_print("[Shortcut Poll] Detected Ctrl+Alt")
+                    self.copy_selected_filename()
+                    self._last_keys_state[key_combo] = True
+                return
+            else:
+                self._last_keys_state["Ctrl+Alt"] = False
             
             # 检查Ctrl组合键
             if is_key_pressed(VK_CONTROL):
@@ -4938,6 +4998,7 @@ class MainWindow(QMainWindow):
             self.config["hotkeys"]["go_up"] = dlg.hotkey_go_up.isChecked()
             self.config["hotkeys"]["refresh"] = dlg.hotkey_refresh.isChecked()
             self.config["hotkeys"]["add_bookmark"] = dlg.hotkey_add_bookmark.isChecked()
+            self.config["hotkeys"]["copy_filename"] = dlg.hotkey_copy_filename.isChecked()
             
             self.save_config()
             
@@ -5259,7 +5320,8 @@ class MainWindow(QMainWindow):
                 "navigate": True,          # Alt+Left/Right
                 "go_up": True,             # Alt+Up
                 "refresh": True,           # F5
-                "add_bookmark": True       # Ctrl+D
+                "add_bookmark": True,      # Ctrl+D
+                "copy_filename": True      # Ctrl+Alt - 复制选中文件名
             }
         }
         
@@ -6695,6 +6757,10 @@ class SettingsDialog(QDialog):
         self.hotkey_add_bookmark = QCheckBox("Ctrl+D - 添加当前路径到书签")
         self.hotkey_add_bookmark.setChecked(hotkeys.get("add_bookmark", True))
         hotkey_layout.addWidget(self.hotkey_add_bookmark)
+
+        self.hotkey_copy_filename = QCheckBox("Ctrl+Alt - 复制选中文件名（含后缀）")
+        self.hotkey_copy_filename.setChecked(hotkeys.get("copy_filename", True))
+        hotkey_layout.addWidget(self.hotkey_copy_filename)
         
         hotkey_group.setLayout(hotkey_layout)
         layout.addWidget(hotkey_group)
