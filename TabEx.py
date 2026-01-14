@@ -4362,6 +4362,30 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self.show_settings_menu)
         titlebar_layout.addWidget(settings_btn)
         
+        # 更新按钮
+        update_btn = QPushButton("🔄")
+        update_btn.setToolTip("检查更新")
+        update_btn.setFixedSize(bookmark_btn_width, titlebar_height)
+        update_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: none;
+                border-radius: {btn_radius}px;
+                font-size: {btn_font_size}pt;
+                color: #202020;
+            }}
+            QPushButton:hover {{
+                background: #e5e5e5;
+                color: #000000;
+            }}
+            QPushButton:pressed {{
+                background: #d5d5d5;
+                color: #000000;
+            }}
+        """)
+        update_btn.clicked.connect(self.check_for_updates)
+        titlebar_layout.addWidget(update_btn)
+        
         # 最小化按钮
         min_btn = QPushButton("─")
         win_btn_width = int(45 * getattr(self, 'dpi_scale', 1.0))
@@ -5223,6 +5247,15 @@ class MainWindow(QMainWindow):
     def show_bookmark_dialog(self):
         dlg = BookmarkDialog(self.bookmark_manager, self)
         dlg.exec_()
+    
+    def check_for_updates(self):
+        """打开 GitHub Releases 页面检查更新"""
+        import webbrowser
+        try:
+            webbrowser.open("https://github.com/caojinyuan/TabEx/releases")
+            show_toast(self, "检查更新", "已在浏览器中打开更新页面", level="info")
+        except Exception as e:
+            show_toast(self, "错误", f"无法打开浏览器: {e}", level="error")
     
     def show_search_dialog(self):
         """显示搜索对话框（非模态）"""
