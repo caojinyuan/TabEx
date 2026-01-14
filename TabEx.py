@@ -1961,6 +1961,7 @@ class FileExplorerTab(QWidget):
             pass
 
     def setup_ui(self):
+        from PyQt5.QtWidgets import QLabel
         # 设置FileExplorerTab背景为白色
         self.setStyleSheet("background: white;")
         self.setAutoFillBackground(True)
@@ -2013,6 +2014,15 @@ class FileExplorerTab(QWidget):
         except Exception:
             pass
         layout.addWidget(self.explorer)
+
+        # 状态栏（参考系统 Explorer 样式：细高、浅底色、顶部分割线）
+        self.status_bar = QLabel("就绪")
+        self.status_bar.setFixedHeight(20)
+        self.status_bar.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.status_bar.setStyleSheet(
+            "QLabel { padding: 2px 8px; background: white; border-top: 1px solid #e0e0e0; font-size: 12px; color: #444; }"
+        )
+        layout.addWidget(self.status_bar)
         
         # 异步加载相关
         self.folder_checker = None  # 文件夹大小检查线程
@@ -2072,14 +2082,13 @@ class FileExplorerTab(QWidget):
         self.explorer.dynamicCall('OnNewWindow3(QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None)
 
 
-        # 兼容原有空白双击
-        from PyQt5.QtWidgets import QLabel
+        # 兼容原有空白双击（保留控件但不占用空间，避免底部留白）
         self.blank = QLabel()
-        # 保持空白区域为固定高度，避免其扩展占满右侧空间
-        self.blank.setFixedHeight(10)
+        self.blank.setFixedHeight(0)
         self.blank.setStyleSheet("background: transparent;")
         self.blank.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         self.blank.mouseDoubleClickEvent = self.blank_double_click
+        # 不再额外增加可见高度
         layout.addWidget(self.blank)
 
         # 安装事件过滤器以捕获 Explorer 的鼠标按下与双击事件
@@ -2094,6 +2103,13 @@ class FileExplorerTab(QWidget):
         
         # 启动路径同步定时器
         self.start_path_sync_timer()
+
+        # 启动状态栏定时更新（轮询选中状态与目录计数）
+        self.status_timer = QTimer(self)
+        self.status_timer.setInterval(800)  # 低频轮询，避免性能影响
+        self.status_timer.timeout.connect(self.update_explorer_status)
+        self.status_timer.start()
+        self.update_explorer_status()
         
         # 初始导航到当前路径（在setup_ui最后调用，确保所有设置已应用）
         self.explorer.dynamicCall('Navigate(const QString&)', QDir.toNativeSeparators(self.current_path))
@@ -2670,6 +2686,12 @@ class FileExplorerTab(QWidget):
         self.refresh_timer.setSingleShot(True)
         self.refresh_timer.timeout.connect(self.delayed_refresh)
         self.refresh_delay_ms = 500  # 500ms延迟
+
+        # 目录轮询刷新（作为 QFileSystemWatcher 的兜底，解决某些场景下未触发刷新）
+        self.dir_mtime = None
+        self.dir_poll_timer = QTimer()
+        self.dir_poll_timer.setInterval(2000)  # 2s 低频轮询，开销很小
+        self.dir_poll_timer.timeout.connect(self._poll_directory_changes)
         
         self.setup_ui()
         
@@ -2733,12 +2755,15 @@ class FileExplorerTab(QWidget):
             self._hide_loading_indicator()
             self.explorer.dynamicCall("Navigate(const QString&)", path)
             self.current_path = path
+            # shell 路径不做文件系统监控与轮询
+            self._update_dir_polling(None)
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(path)
             self.update_tab_title()
             # 添加到历史记录
             if add_to_history:
                 self._add_to_history(path)
+            self.update_explorer_status()
         elif os.path.exists(path):
             # 如果skip_async_check=True或禁用异步，直接导航
             if skip_async_check or not ASYNC_LOAD_ENABLED or not os.path.isdir(path):
@@ -2792,6 +2817,12 @@ class FileExplorerTab(QWidget):
             self.explorer.dynamicCall("Navigate(const QString&)", url)
         
         self.current_path = path
+
+        # 更新目录轮询（兜底刷新）
+        self._update_dir_polling(path)
+
+        # 更新状态栏
+        self.update_explorer_status()
         
         # 更新文件系统监控（只监控真实文件系统路径）
         if hasattr(self, 'file_watcher'):
@@ -2895,14 +2926,17 @@ class FileExplorerTab(QWidget):
         debug_print(f"[FileWatcher] Directory changed: {path}")
         # 只在监控的是当前路径时才刷新
         if path == self.current_path:
-            # 使用延迟刷新，避免短时间内多次变化导致频繁刷新
-            if not self.refresh_timer.isActive():
-                debug_print(f"[FileWatcher] Scheduling refresh in {self.refresh_delay_ms}ms")
-                self.refresh_timer.start(self.refresh_delay_ms)
-            else:
-                # 如果定时器已经在运行，重新启动（重置延迟）
-                self.refresh_timer.stop()
-                self.refresh_timer.start(self.refresh_delay_ms)
+            self._schedule_refresh(reason="watcher")
+
+    def _schedule_refresh(self, reason="manual"):
+        """统一的刷新调度，避免重复代码"""
+        if not self.refresh_timer.isActive():
+            debug_print(f"[AutoRefresh] Scheduling refresh in {self.refresh_delay_ms}ms (reason={reason})")
+            self.refresh_timer.start(self.refresh_delay_ms)
+        else:
+            self.refresh_timer.stop()
+            self.refresh_timer.start(self.refresh_delay_ms)
+            debug_print(f"[AutoRefresh] Refresh timer restarted (reason={reason})")
     
     def delayed_refresh(self):
         """延迟刷新：避免频繁刷新"""
@@ -2919,6 +2953,169 @@ class FileExplorerTab(QWidget):
                 debug_print(f"[FileWatcher] Refresh completed")
             except Exception as e:
                 debug_print(f"[FileWatcher] Refresh error: {e}")
+        # 刷新后更新状态栏
+        self.update_explorer_status()
+
+    def _poll_directory_changes(self):
+        """兜底轮询目录修改时间，解决部分环境下 watcher 不触发的问题"""
+        path = self.current_path
+        if not path or not os.path.isdir(path):
+            return
+        current_mtime = self._get_dir_mtime(path)
+        if current_mtime is None:
+            return
+        if self.dir_mtime is None:
+            self.dir_mtime = current_mtime
+            return
+        if current_mtime != self.dir_mtime:
+            debug_print(f"[DirPoll] Detected mtime change for {path}, scheduling refresh")
+            self.dir_mtime = current_mtime
+            self._schedule_refresh(reason="poll")
+
+    def _update_dir_polling(self, path):
+        """根据当前路径启动或停止兜底轮询"""
+        if not hasattr(self, 'dir_poll_timer'):
+            return
+        if path and os.path.isdir(path):
+            self.dir_mtime = self._get_dir_mtime(path)
+            if not self.dir_poll_timer.isActive():
+                self.dir_poll_timer.start()
+                debug_print(f"[DirPoll] Started polling {path}")
+        else:
+            self.dir_mtime = None
+            if self.dir_poll_timer.isActive():
+                self.dir_poll_timer.stop()
+                debug_print("[DirPoll] Stopped polling (non-directory or shell path)")
+
+    def _get_dir_mtime(self, path):
+        """安全获取目录修改时间"""
+        try:
+            return os.stat(path).st_mtime
+        except Exception:
+            return None
+
+    def update_explorer_status(self):
+        """更新嵌入 Explorer 下方状态栏"""
+        if not hasattr(self, 'status_bar'):
+            return
+        path = getattr(self, 'current_path', None)
+        if not path:
+            self.status_bar.setText("就绪")
+            return
+
+        # shell 路径直接展示提示
+        if path.startswith('shell:') or '::' in path:
+            self.status_bar.setText(f"{path}")
+            return
+
+        # 目录总项目数始终显示
+        total = self._count_dir_entries(path)
+        total_text = f"（共 {total} 项）" if total is not None else ""
+
+        # 统计选中项
+        selection = self._get_selection_entries()
+        if selection is None:
+            text = f"{total} 项" if total is not None else "就绪"
+            self.status_bar.setText(text)
+            return
+
+        sel_count = len(selection)
+        if sel_count == 0:
+            text = f"{total} 项" if total is not None else "就绪"
+            self.status_bar.setText(text)
+            return
+
+        # 选中状态
+        text = f"已选 {sel_count} 项{total_text}"
+        if all(entry['is_file'] for entry in selection):
+            size_sum = sum(entry['size'] for entry in selection if entry['size'] is not None)
+            text += f"，总大小 {self._format_size(size_sum)}"
+        if sel_count == 1:
+            entry = selection[0]
+            mtime = self._get_mtime(entry['path'])
+            if mtime:
+                text += f"，修改时间 {mtime}"
+        self.status_bar.setText(text)
+
+    def _get_selection_entries(self):
+        """返回选中条目列表，每项包含 is_file 与 size"""
+        try:
+            doc = self.explorer.querySubObject('Document')
+            if not doc:
+                return []
+            selected = doc.querySubObject('SelectedItems()')
+            if not selected:
+                return []
+            count = selected.dynamicCall('Count()')
+            if not count or count <= 0:
+                return []
+            entries = []
+            for i in range(int(count)):
+                item = selected.querySubObject('Item(int)', i)
+                if not item:
+                    continue
+                path = item.dynamicCall('Path()')
+                name = item.dynamicCall('Name()')
+                if not path and name:
+                    # 部分场景仅返回名称，尝试拼接
+                    path = os.path.join(self.current_path, str(name))
+                if not path:
+                    continue
+                path_str = str(path)
+                is_file = os.path.isfile(path_str)
+                size = None
+                if is_file:
+                    try:
+                        size = os.path.getsize(path_str)
+                    except Exception:
+                        size = None
+                entries.append({
+                    'path': path_str,
+                    'is_file': is_file,
+                    'size': size,
+                })
+            return entries
+        except Exception:
+            return None
+
+    def _count_dir_entries(self, path):
+        """计算目录下的项目数"""
+        try:
+            with os.scandir(path) as it:
+                return sum(1 for _ in it)
+        except Exception:
+            return None
+
+    def _format_size(self, size):
+        """格式化文件大小"""
+        try:
+            units = ['B', 'KB', 'MB', 'GB', 'TB']
+            s = float(size)
+            idx = 0
+            while s >= 1024 and idx < len(units) - 1:
+                s /= 1024
+                idx += 1
+            if idx == 0:
+                return f"{int(s)} {units[idx]}"
+            return f"{s:.2f} {units[idx]}"
+        except Exception:
+            return "-"
+
+    def _get_mtime(self, path):
+        """获取文件/文件夹修改时间字符串"""
+        try:
+            ts = os.path.getmtime(path)
+            return self._format_mtime(ts)
+        except Exception:
+            return None
+
+    def _format_mtime(self, ts):
+        try:
+            import datetime
+            dt = datetime.datetime.fromtimestamp(ts)
+            return dt.strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            return None
     
     def select_file_in_explorer(self, filename):
         """在Explorer控件中选中指定的文件"""
