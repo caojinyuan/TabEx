@@ -2769,6 +2769,9 @@ class FileExplorerTab(QWidget):
         self.refresh_timer.setSingleShot(True)
         self.refresh_timer.timeout.connect(self.delayed_refresh)
         self.refresh_delay_ms = 500  # 500ms延迟
+        # 防抖机制：记录最近处理的路径和时间，避免事件风暴
+        self._last_watcher_event = {}  # {path: timestamp}
+        self._watcher_debounce_ms = 300  # 300ms内的重复事件会被忽略
 
         # 目录轮询刷新（已禁用，QFileSystemWatcher已足够，轮询会造成不必要的刷新）
         # self.dir_mtime = None
@@ -3017,7 +3020,27 @@ class FileExplorerTab(QWidget):
                 self.main_window.update_navigation_buttons()
     
     def on_directory_changed(self, path):
-        """文件系统监控：目录内容发生变化"""
+        """文件系统监控：目录内容发生变化（带防抖）"""
+        # 防抖：检查是否在短时间内已处理过此路径
+        import time
+        current_time = time.time() * 1000  # 转为毫秒
+        
+        if hasattr(self, '_last_watcher_event'):
+            last_time = self._last_watcher_event.get(path, 0)
+            time_since_last = current_time - last_time
+            
+            if time_since_last < self._watcher_debounce_ms:
+                # 忽略短时间内的重复事件，但不打印日志避免刷屏
+                return
+            
+            self._last_watcher_event[path] = current_time
+            # 清理旧记录（保留最近10个）
+            if len(self._last_watcher_event) > 10:
+                sorted_items = sorted(self._last_watcher_event.items(), key=lambda x: x[1], reverse=True)
+                self._last_watcher_event = dict(sorted_items[:10])
+        else:
+            self._last_watcher_event = {path: current_time}
+        
         debug_print(f"[FileWatcher] Directory changed: {path}")
         # 如果设置了抑制标志，不触发刷新
         if getattr(self, '_suppress_auto_refresh', False):
