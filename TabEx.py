@@ -993,11 +993,44 @@ from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor, QDrag
 
 # 全局调试开关
 _DEBUG_MODE = True
+_EXPLORER_MONITOR_DEBUG = False  # Explorer Monitor 单独的日志开关
 
 def debug_print(*args, **kwargs):
     """根据调试开关决定是否输出调试信息"""
     if _DEBUG_MODE:
-        print(*args, **kwargs)
+        # 检查是否是 Explorer Monitor 日志
+        if args and isinstance(args[0], str) and '[Explorer Monitor]' in args[0]:
+            if _EXPLORER_MONITOR_DEBUG:
+                print(*args, **kwargs)
+        else:
+            print(*args, **kwargs)
+
+
+def set_explorer_monitor_debug(enabled):
+    """设置 Explorer Monitor 日志开关"""
+    global _EXPLORER_MONITOR_DEBUG
+    _EXPLORER_MONITOR_DEBUG = enabled
+    debug_print(f"[Config] Explorer Monitor debug output: {'enabled' if enabled else 'disabled'}")
+
+
+# 启动外部进程时与当前进程解耦，避免主程序退出时连带关闭子进程
+_DETACHED_FLAGS = 0
+_NEW_PROCESS_GROUP = 0
+_BREAKAWAY_FROM_JOB = 0
+if os.name == 'nt':
+    _DETACHED_FLAGS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    _NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    # break away 确保即使当前进程被放入 Job 对象，子进程也能独立存活
+    _BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def launch_detached(cmd, cwd=None, extra_creationflags=0):
+    """以与主进程解耦的方式启动外部程序"""
+    if os.name == 'nt':
+        flags = _DETACHED_FLAGS | _NEW_PROCESS_GROUP | _BREAKAWAY_FROM_JOB | extra_creationflags
+        return subprocess.Popen(cmd, cwd=cwd, creationflags=flags, close_fds=True)
+    # 非 Windows 环境使用新 session，避免收到父进程信号
+    return subprocess.Popen(cmd, cwd=cwd, start_new_session=True, close_fds=True)
 
 
 # 全局轻量提示气泡，用于替换阻塞式消息框
@@ -2226,7 +2259,7 @@ class FileExplorerTab(QWidget):
                 return
             
             # 启动 TortoiseGit Log
-            subprocess.Popen([tortoisegit_exe, '/command:log', f'/path:{repo_root}'])
+            launch_detached([tortoisegit_exe, '/command:log', f'/path:{repo_root}'])
             debug_print(f"[TortoiseGit] Opened log for: {repo_root}")
             
         except Exception as e:
@@ -2268,7 +2301,7 @@ class FileExplorerTab(QWidget):
                 return
             
             # 启动 TortoiseGit Commit
-            subprocess.Popen([tortoisegit_exe, '/command:commit', f'/path:{repo_root}'])
+            launch_detached([tortoisegit_exe, '/command:commit', f'/path:{repo_root}'])
             debug_print(f"[TortoiseGit] Opened commit for: {repo_root}")
             
         except Exception as e:
@@ -2310,7 +2343,7 @@ class FileExplorerTab(QWidget):
             try:
                 current_dir = self.current_path
                 if current_dir and os.path.exists(current_dir):
-                    subprocess.Popen(['cmd', '/K', 'cd', '/d', current_dir], creationflags=subprocess.CREATE_NEW_CONSOLE)
+                    launch_detached(['cmd', '/K', 'cd', '/d', current_dir], extra_creationflags=subprocess.CREATE_NEW_CONSOLE)
                     # 恢复路径栏显示当前路径
                     self.path_bar.set_path(current_dir)
                 else:
@@ -5529,6 +5562,7 @@ class MainWindow(QMainWindow):
         
         # 初始化全局调试开关
         set_debug_mode(self.config.get("debug_mode", False))
+        set_explorer_monitor_debug(self.config.get("explorer_monitor_debug", False))
         
         # 初始化书签管理器
         self.bookmark_manager = BookmarkManager()
@@ -5588,6 +5622,7 @@ class MainWindow(QMainWindow):
         default_config = {
             "enable_explorer_monitor": True,  # 默认启用Explorer监听
             "debug_mode": False,  # 默认关闭调试输出
+            "explorer_monitor_debug": False,  # 默认关闭Explorer Monitor调试输出
             "pinned_tabs": [],  # 默认没有固定标签页
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
@@ -6968,6 +7003,12 @@ class SettingsDialog(QDialog):
         self.debug_mode_cb.setToolTip("启用后将在终端输出调试信息，用于开发和问题排查")
         debug_layout.addWidget(self.debug_mode_cb)
         
+        self.explorer_monitor_debug_cb = QCheckBox("启用 Explorer Monitor 调试输出", self)
+        self.explorer_monitor_debug_cb.setChecked(config.get("explorer_monitor_debug", False))
+        self.explorer_monitor_debug_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.explorer_monitor_debug_cb.setToolTip("单独控制 Explorer Monitor 的日志输出（需要先启用调试输出）")
+        debug_layout.addWidget(self.explorer_monitor_debug_cb)
+        
         debug_group.setLayout(debug_layout)
         layout.addWidget(debug_group)
         
@@ -7167,6 +7208,7 @@ class SettingsDialog(QDialog):
             self.parent().config["enable_explorer_monitor"] = self.monitor_cb.isChecked()
             self.parent().config["explorer_monitor_interval"] = self.interval_spinbox.value()
             self.parent().config["debug_mode"] = self.debug_mode_cb.isChecked()
+            self.parent().config["explorer_monitor_debug"] = self.explorer_monitor_debug_cb.isChecked()
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
             
@@ -7188,6 +7230,7 @@ class SettingsDialog(QDialog):
             
             # 应用设置
             set_debug_mode(self.parent().config.get("debug_mode", False))
+            set_explorer_monitor_debug(self.parent().config.get("explorer_monitor_debug", False))
             self.parent().apply_tortoisegit_buttons_config()
             
             # 重新设置快捷键
