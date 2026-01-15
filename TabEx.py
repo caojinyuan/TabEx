@@ -3664,7 +3664,6 @@ class MainWindow(QMainWindow):
             ("🖥️", "此电脑", "shell:MyComputerFolder"),
             ("🗔", "桌面", "shell:Desktop"),
             ("🗑️", "回收站", "shell:RecycleBinFolder"),
-            ("🚀", "启动项", "shell:Startup"),
             ("⬇️", "下载", downloads_path),
         ]
         # 移除所有同名（无论有无emoji）
@@ -4361,30 +4360,6 @@ class MainWindow(QMainWindow):
         """)
         settings_btn.clicked.connect(self.show_settings_menu)
         titlebar_layout.addWidget(settings_btn)
-        
-        # 更新按钮
-        update_btn = QPushButton("🔄")
-        update_btn.setToolTip("检查更新")
-        update_btn.setFixedSize(bookmark_btn_width, titlebar_height)
-        update_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                border: none;
-                border-radius: {btn_radius}px;
-                font-size: {btn_font_size}pt;
-                color: #202020;
-            }}
-            QPushButton:hover {{
-                background: #e5e5e5;
-                color: #000000;
-            }}
-            QPushButton:pressed {{
-                background: #d5d5d5;
-                color: #000000;
-            }}
-        """)
-        update_btn.clicked.connect(self.check_for_updates)
-        titlebar_layout.addWidget(update_btn)
         
         # 最小化按钮
         min_btn = QPushButton("─")
@@ -5685,7 +5660,6 @@ class MainWindow(QMainWindow):
                 make_bm("此电脑", "shell:MyComputerFolder", "🖥️"),
                 make_bm("桌面", "shell:Desktop", "🗔"),
                 make_bm("回收站", "shell:RecycleBinFolder", "🗑️"),
-                make_bm("启动项", "shell:Startup", "🚀"),
             ]
             bm.save_bookmarks()
 
@@ -6937,6 +6911,19 @@ class SettingsDialog(QDialog):
         tabs_group.setLayout(tabs_layout)
         layout.addWidget(tabs_group)
         
+        # 开机启动设置组
+        startup_group = QGroupBox("开机启动设置")
+        startup_layout = QVBoxLayout()
+        
+        self.auto_startup_cb = QCheckBox("开机自动启动 TabExplorer", self)
+        self.auto_startup_cb.setChecked(self._is_auto_startup_enabled())
+        self.auto_startup_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.auto_startup_cb.setToolTip("在 Windows 启动时自动运行 TabExplorer.exe")
+        startup_layout.addWidget(self.auto_startup_cb)
+        
+        startup_group.setLayout(startup_layout)
+        layout.addWidget(startup_group)
+        
         # Git 工具设置组
         git_group = QGroupBox("Git 工具设置")
         git_layout = QVBoxLayout()
@@ -6996,16 +6983,25 @@ class SettingsDialog(QDialog):
         self.hotkey_copy_filename.setChecked(hotkeys.get("copy_filename", True))
         hotkey_layout.addWidget(self.hotkey_copy_filename)
         
+        # 提示信息（放在快捷键设置框内）
+        tip_label = QLabel("💡 提示：取消勾选可禁用对应的快捷键")
+        tip_label.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
+        hotkey_layout.addWidget(tip_label)
+        
         hotkey_group.setLayout(hotkey_layout)
         layout.addWidget(hotkey_group)
         
-        # 提示信息
-        tip_label = QLabel("💡 提示：取消勾选可禁用对应的快捷键")
-        tip_label.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
-        layout.addWidget(tip_label)
-        
         # 添加弹性空间，将按钮推到底部
         layout.addStretch(1)
+        
+        # 检查更新链接
+        update_link = QLabel()
+        update_link.setText('检查更新: <a href="https://github.com/caojinyuan/TabEx/releases">https://github.com/caojinyuan/TabEx/releases</a>')
+        update_link.setOpenExternalLinks(True)
+        update_link.setStyleSheet("QLabel { padding: 10px; font-size: 10pt; }")
+        update_link.setTextFormat(Qt.RichText)
+        update_link.setToolTip("点击链接在浏览器中打开 GitHub Releases 页面")
+        layout.addWidget(update_link)
         
         # 按钮区域
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
@@ -7013,10 +7009,88 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
     
+    def _is_auto_startup_enabled(self):
+        """检查是否已启用开机启动"""
+        try:
+            startup_path = self._get_startup_shortcut_path()
+            return os.path.exists(startup_path)
+        except Exception:
+            return False
+    
+    def _get_startup_shortcut_path(self):
+        """获取启动项快捷方式路径"""
+        # 使用环境变量获取启动文件夹，避免依赖 winshell
+        startup_folder = os.path.join(
+            os.environ.get('APPDATA', ''),
+            'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'
+        )
+        return os.path.join(startup_folder, "TabExplorer.lnk")
+    
+    def _set_auto_startup(self, enabled):
+        """设置开机启动"""
+        try:
+            shortcut_path = self._get_startup_shortcut_path()
+            
+            if enabled:
+                # 获取 TabExplorer.exe 路径
+                exe_path = self._get_exe_path()
+                if not exe_path or not os.path.exists(exe_path):
+                    show_toast(self.parent(), "错误", "未找到 TabExplorer.exe，请确保程序已正确安装", level="error")
+                    return False
+                
+                # 创建快捷方式（使用 win32com）
+                from win32com.client import Dispatch
+                
+                shell = Dispatch('WScript.Shell')
+                shortcut = shell.CreateShortCut(shortcut_path)
+                shortcut.Targetpath = exe_path
+                shortcut.WorkingDirectory = os.path.dirname(exe_path)
+                shortcut.IconLocation = exe_path
+                shortcut.save()
+                
+                show_toast(self.parent(), "成功", "已启用开机自动启动", level="success")
+                return True
+            else:
+                # 删除快捷方式
+                if os.path.exists(shortcut_path):
+                    os.remove(shortcut_path)
+                    show_toast(self.parent(), "成功", "已禁用开机自动启动", level="success")
+                return True
+        except Exception as e:
+            show_toast(self.parent(), "错误", f"设置开机启动失败: {e}", level="error")
+            return False
+    
+    def _get_exe_path(self):
+        """获取 TabExplorer.exe 路径"""
+        # 如果是打包的exe，使用sys.executable
+        import sys
+        if getattr(sys, 'frozen', False):
+            return sys.executable
+        
+        # 如果是开发环境，尝试查找同目录下的 TabExplorer.exe
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        exe_path = os.path.join(script_dir, "TabExplorer.exe")
+        if os.path.exists(exe_path):
+            return exe_path
+        
+        # 查找上级目录
+        parent_dir = os.path.dirname(script_dir)
+        exe_path = os.path.join(parent_dir, "TabExplorer.exe")
+        if os.path.exists(exe_path):
+            return exe_path
+        
+        return None
+    
     def accept(self):
         """保存设置"""
         # 保存所有设置到 parent (MainWindow)
         if self.parent():
+            # 处理开机启动设置
+            auto_startup_enabled = self.auto_startup_cb.isChecked()
+            current_enabled = self._is_auto_startup_enabled()
+            if auto_startup_enabled != current_enabled:
+                self._set_auto_startup(auto_startup_enabled)
+            
             self.parent().config["enable_explorer_monitor"] = self.monitor_cb.isChecked()
             self.parent().config["explorer_monitor_interval"] = self.interval_spinbox.value()
             self.parent().config["debug_mode"] = self.debug_mode_cb.isChecked()
@@ -7049,7 +7123,7 @@ class SettingsDialog(QDialog):
         super().accept()
 
 # 书签管理对话框（初步框架，后续可扩展重命名/新建/删除等功能）
-from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton, QHBoxLayout, QInputDialog
+from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton, QHBoxLayout, QInputDialog, QLabel
 class BookmarkManagerDialog(QDialog):
 
     def move_item_up(self):
@@ -7161,6 +7235,96 @@ class BookmarkManagerDialog(QDialog):
         recursive_reorder(tree.get('bookmark_bar'))
         self.bookmark_manager.save_bookmarks()
         self.populate_tree()
+    
+    def on_items_moved(self):
+        """拖拽完成后重建书签数据结构"""
+        try:
+            debug_print("[BookmarkDrag] Starting to rebuild structure after drag")
+            
+            # 从树形控件重建书签结构
+            new_structure = self._rebuild_bookmark_structure()
+            
+            debug_print(f"[BookmarkDrag] Rebuilt {len(new_structure)} top-level items")
+            
+            # 更新书签管理器
+            tree = self.bookmark_manager.get_tree()
+            if 'bookmark_bar' in tree:
+                tree['bookmark_bar']['children'] = new_structure
+                self.bookmark_manager.save_bookmarks()
+                
+                # 刷新主窗口书签栏
+                self.refresh_main_window_bookmark_bar()
+                
+                debug_print("[BookmarkDrag] Bookmark structure updated and saved")
+                show_toast(self, "已保存", "书签已保存", level="success")
+        except Exception as e:
+            debug_print(f"[BookmarkDrag] Error updating structure: {e}")
+            import traceback
+            traceback.print_exc()
+            show_toast(self, "保存失败", f"拖拽保存失败: {e}", level="error")
+    
+    def _rebuild_bookmark_structure(self):
+        """从树形控件重建书签数据结构"""
+        # 首先获取原始数据，以便保留date_added等字段
+        original_tree = self.bookmark_manager.get_tree()
+        original_nodes = {}
+        
+        def collect_original_nodes(node):
+            if isinstance(node, dict):
+                node_id = node.get('id')
+                if node_id:
+                    original_nodes[node_id] = node
+                if 'children' in node:
+                    for child in node['children']:
+                        collect_original_nodes(child)
+        
+        if 'bookmark_bar' in original_tree:
+            collect_original_nodes(original_tree['bookmark_bar'])
+        
+        def process_item(item):
+            node_id = item.data(0, 1)
+            node_type = item.text(1)
+            name = item.text(0).lstrip("📁 ").lstrip("📑 ")
+            
+            # 尝试从原始数据中获取节点
+            original = original_nodes.get(node_id, {})
+            
+            if node_type == '文件夹':
+                node = {
+                    'id': node_id,
+                    'name': name,
+                    'type': 'folder',
+                    'date_added': original.get('date_added', node_id),
+                    'children': []
+                }
+                # 递归处理子项
+                for i in range(item.childCount()):
+                    child = item.child(i)
+                    child_node = process_item(child)
+                    if child_node:
+                        node['children'].append(child_node)
+                return node
+            elif node_type == '书签':
+                url = item.text(2)
+                return {
+                    'id': node_id,
+                    'name': name,
+                    'type': 'url',
+                    'url': url,
+                    'date_added': original.get('date_added', node_id)
+                }
+            return None
+        
+        # 处理所有顶层项
+        result = []
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            node = process_item(item)
+            if node:
+                result.append(node)
+        
+        return result
+    
     def __init__(self, bookmark_manager, parent=None):
         super().__init__(parent)
         self.setWindowTitle("书签管理")
@@ -7168,10 +7332,26 @@ class BookmarkManagerDialog(QDialog):
         self.resize(600, 500)
         self.bookmark_manager = bookmark_manager
         layout = QVBoxLayout(self)
+        
+        # 使用标准树形控件（拖拽不自动保存）
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["名称", "类型", "路径"])
         self.tree.setColumnWidth(0, 250)  # 第一列宽一些
+        
+        # 启用拖拽
+        self.tree.setDragEnabled(True)
+        self.tree.setAcceptDrops(True)
+        self.tree.setDropIndicatorShown(True)
+        self.tree.setDragDropMode(QTreeWidget.InternalMove)
+        self.tree.setSelectionMode(QTreeWidget.SingleSelection)
+        
         layout.addWidget(self.tree)
+        
+        # 添加拖拽提示
+        drag_hint = QLabel("💡 提示：可以拖动书签和文件夹调整顺序和层级，调整后点击【保存】按钮保存更改")
+        drag_hint.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
+        layout.addWidget(drag_hint)
+        
         self.populate_tree()
 
         btn_layout = QHBoxLayout()
@@ -7205,10 +7385,24 @@ class BookmarkManagerDialog(QDialog):
         self.import_btn.clicked.connect(self.import_bookmarks)
         btn_layout.addWidget(self.import_btn)
         
+        # 添加手动保存按钮
+        self.save_btn = QPushButton("💾 保存")
+        self.save_btn.setToolTip("保存当前书签顺序和层级")
+        self.save_btn.clicked.connect(self.manual_save)
+        btn_layout.addWidget(self.save_btn)
+        
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
+    
+    def manual_save(self):
+        """手动保存书签"""
+        try:
+            self.on_items_moved()
+        except Exception as e:
+            show_toast(self, "保存失败", f"保存失败: {e}", level="error")
+    
     def edit_item(self):
         item = self.tree.currentItem()
         if not item:
