@@ -2376,16 +2376,7 @@ class FileExplorerTab(QWidget):
     def explorer_mouse_press(self, event):
         # 在鼠标按下时记录当时的选中项数量和鼠标位置点击测试结果
         try:
-            cnt = None
-            try:
-                cnt = self.explorer.dynamicCall('SelectedItems().Count')
-            except Exception:
-                try:
-                    sel = self.explorer.dynamicCall('SelectedItems()')
-                    if sel is not None:
-                        cnt = sel.property('Count') if hasattr(sel, 'property') else None
-                except Exception:
-                    cnt = None
+            cnt = self._get_selected_count_safe()
             self._selected_before_click = int(cnt) if cnt is not None else None
             
             # 使用原生点击测试来判断是否点击在项目上（更准确）
@@ -2406,6 +2397,30 @@ class FileExplorerTab(QWidget):
         # 继续默认处理（不阻止控件行为）
         # 直接返回 None — 不尝试调用 ActiveX 的原始处理（事件仍会被控件处理）
         return None
+
+    def _get_selected_count_safe(self):
+        """安全地获取当前选中项数量，避免触发 ActiveX 属性不存在的警告"""
+        try:
+            sel = self.explorer.dynamicCall('SelectedItems()')
+            if sel is None:
+                return None
+
+            count = None
+            try:
+                if hasattr(sel, 'property'):
+                    count = sel.property('Count')
+            except Exception:
+                count = None
+
+            if count is None:
+                try:
+                    count = len(sel)
+                except Exception:
+                    count = None
+
+            return int(count) if count is not None else None
+        except Exception:
+            return None
 
     # --- Windows native helpers for listview hit-testing ---
     def _find_syslistview_hwnd(self):
@@ -2487,16 +2502,7 @@ class FileExplorerTab(QWidget):
                 if event.type() == QEvent.MouseButtonPress:
                     # 记录按下时的选中项数
                     try:
-                        cnt = None
-                        try:
-                            cnt = self.explorer.dynamicCall('SelectedItems().Count')
-                        except Exception:
-                            try:
-                                sel = self.explorer.dynamicCall('SelectedItems()')
-                                if sel is not None:
-                                    cnt = sel.property('Count') if hasattr(sel, 'property') else None
-                            except Exception:
-                                cnt = None
+                        cnt = self._get_selected_count_safe()
                         self._selected_before_click = int(cnt) if cnt is not None else None
                     except Exception:
                         self._selected_before_click = None
@@ -2519,16 +2525,7 @@ class FileExplorerTab(QWidget):
                     double_click_pos = QCursor.pos()
                     
                     # 立即检查当前选中项数量（双击时刻）
-                    current_selection = None
-                    try:
-                        current_selection = self.explorer.dynamicCall('SelectedItems().Count')
-                    except Exception:
-                        try:
-                            sel = self.explorer.dynamicCall('SelectedItems()')
-                            if sel is not None:
-                                current_selection = sel.property('Count') if hasattr(sel, 'property') else None
-                        except Exception:
-                            pass
+                    current_selection = self._get_selected_count_safe()
                     
                     debug_print(f"[DoubleClick] path_before='{path_before}', selected_before={selected_before}, current_selection={current_selection}")
                     
@@ -2573,16 +2570,7 @@ class FileExplorerTab(QWidget):
                                 return
                             
                             # 2. 检查当前选中项数量
-                            cnt = None
-                            try:
-                                cnt = self.explorer.dynamicCall('SelectedItems().Count')
-                            except Exception:
-                                try:
-                                    sel = self.explorer.dynamicCall('SelectedItems()')
-                                    if sel is not None:
-                                        cnt = sel.property('Count') if hasattr(sel, 'property') else None
-                                except Exception:
-                                    pass
+                            cnt = self._get_selected_count_safe()
                             
                             debug_print(f"[DoubleClick] SelectedItems count: {cnt}")
                             
@@ -2636,16 +2624,11 @@ class FileExplorerTab(QWidget):
                                             return
                                         
                                         # 再次检查是否有选中项（可能导航过程中有选中）
-                                        cnt_final = None
-                                        try:
-                                            cnt_final = self.explorer.dynamicCall('SelectedItems().Count')
-                                            debug_print(f"[DoubleClick] Final confirm: selection count = {cnt_final}")
-                                            if cnt_final is not None and int(cnt_final) > 0:
-                                                debug_print(f"[DoubleClick] Final confirm: found selection ({cnt_final}), skip go_up")
-                                                return
-                                        except Exception as e:
-                                            debug_print(f"[DoubleClick] Final confirm: cannot get selection count: {e}")
-                                            pass
+                                        cnt_final = self._get_selected_count_safe()
+                                        debug_print(f"[DoubleClick] Final confirm: selection count = {cnt_final}")
+                                        if cnt_final is not None and int(cnt_final) > 0:
+                                            debug_print(f"[DoubleClick] Final confirm: found selection ({cnt_final}), skip go_up")
+                                            return
                                         
                                         # 再次执行 hit-test 以提高准确性（最关键的检查）
                                         r2 = hit_test_result
@@ -2771,7 +2754,7 @@ class FileExplorerTab(QWidget):
         self.refresh_delay_ms = 500  # 500ms延迟
         # 防抖机制：记录最近处理的路径和时间，避免事件风暴
         self._last_watcher_event = {}  # {path: timestamp}
-        self._watcher_debounce_ms = 300  # 300ms内的重复事件会被忽略
+        self._watcher_debounce_ms = 1200  # 1.2s 内的重复事件会被忽略，进一步抑制风暴
 
         # 目录轮询刷新（已禁用，QFileSystemWatcher已足够，轮询会造成不必要的刷新）
         # self.dir_mtime = None
@@ -3028,11 +3011,15 @@ class FileExplorerTab(QWidget):
         if hasattr(self, '_last_watcher_event'):
             last_time = self._last_watcher_event.get(path, 0)
             time_since_last = current_time - last_time
-            
+
+            # 如果已经有刷新定时器在跑且是当前路径，则直接忽略此次事件，避免重复排队
+            if path == getattr(self, 'current_path', None) and self.refresh_timer.isActive():
+                return
+
             if time_since_last < self._watcher_debounce_ms:
                 # 忽略短时间内的重复事件，但不打印日志避免刷屏
                 return
-            
+
             self._last_watcher_event[path] = current_time
             # 清理旧记录（保留最近10个）
             if len(self._last_watcher_event) > 10:
@@ -3077,6 +3064,19 @@ class FileExplorerTab(QWidget):
                 debug_print(f"[FileWatcher] Refresh error: {e}")
         # 刷新后更新状态栏
         self.update_explorer_status()
+
+    def on_dir_model_directory_loaded(self, path):
+        """目录树模型加载完成时，若当前显示路径匹配，则触发一次刷新"""
+        try:
+            if not path or not self.current_path:
+                return
+            # QFileSystemModel 传入的 path 可能不带末尾分隔符，统一规范后比较
+            norm_loaded = os.path.abspath(path)
+            norm_current = os.path.abspath(self.current_path)
+            if norm_loaded == norm_current:
+                self._schedule_refresh(reason="dir_tree_loaded")
+        except Exception as e:
+            debug_print(f"[DirModel] directoryLoaded handler error: {e}")
 
     def _poll_directory_changes(self):
         """兜底轮询目录修改时间，解决部分环境下 watcher 不触发的问题"""
@@ -6108,6 +6108,8 @@ class MainWindow(QMainWindow):
         self.dir_model = QFileSystemModel()
         # 性能优化：启用延迟加载和过滤器
         self.dir_model.setFilter(QDir.Dirs | QDir.NoDotAndDotDot)  # 只显示文件夹
+        # 当目录模型加载完成时，如果正显示的路径有更新，主动刷新右侧Explorer
+        self.dir_model.directoryLoaded.connect(self.on_dir_model_directory_loaded)
         # 设置根为计算机根目录（显示所有盘符）
         root_path = QDir.rootPath()  # 通常为C:/
         # 性能优化：在后台线程中加载文件系统
@@ -6674,6 +6676,20 @@ class MainWindow(QMainWindow):
         current_tab = self.get_current_tab_widget()
         if hasattr(current_tab, 'navigate_to'):
             current_tab.navigate_to(path)
+
+    def on_dir_model_directory_loaded(self, path):
+        """目录树模型加载完成时，如果当前标签页正在显示该路径，则触发刷新"""
+        try:
+            tab = self.get_current_tab_widget()
+            if not tab or not getattr(tab, 'current_path', None):
+                return
+            norm_loaded = os.path.abspath(path) if path else None
+            norm_tab = os.path.abspath(tab.current_path) if tab.current_path else None
+            if norm_loaded and norm_tab and norm_loaded == norm_tab:
+                if hasattr(tab, '_schedule_refresh'):
+                    tab._schedule_refresh(reason="dir_tree_loaded")
+        except Exception as e:
+            debug_print(f"[DirModel] directoryLoaded handler error: {e}")
 
     def open_bookmark_url(self, url):
         # 支持 file:///、file://、shell: 路径和本地绝对路径
