@@ -1947,6 +1947,10 @@ class FileExplorerTab(QWidget):
                     return
                 
                 if local_path and local_path != self.current_path:
+                    # 避免在导航过程中同步（减少干扰）
+                    if getattr(self, '_navigating_folder', False):
+                        return
+                    
                     self.current_path = local_path
                     if hasattr(self, 'path_bar'):
                         self.path_bar.set_path(local_path)
@@ -1954,7 +1958,7 @@ class FileExplorerTab(QWidget):
                     # 只在非程序化导航时添加到历史记录
                     if not self._navigating_programmatically and hasattr(self, '_add_to_history'):
                         self._add_to_history(local_path)
-                    # 同步左侧目录树
+                    # 同步左侧目录树（仅在非导航状态下）
                     if self.main_window and hasattr(self.main_window, 'expand_dir_tree_to_path'):
                         self.main_window.expand_dir_tree_to_path(local_path)
         except Exception:
@@ -2128,6 +2132,11 @@ class FileExplorerTab(QWidget):
                         self.current_path = local_path
                         if hasattr(self, 'path_bar'):
                             self.path_bar.set_path(local_path)
+                        # 导航完成，延迟清除导航标志（等待双击检查完成，避免时序问题）
+                        if hasattr(self, '_navigating_folder') and self._navigating_folder:
+                            from PyQt5.QtCore import QTimer
+                            # 延迟1500ms清除，确保700ms的双击最终确认已完成
+                            QTimer.singleShot(1500, lambda: setattr(self, '_navigating_folder', False))
         return super().event(e)
 
     def explorer_double_click(self, event):
@@ -2476,11 +2485,38 @@ class FileExplorerTab(QWidget):
                     # 保存双击时的鼠标全局位置，用于后续hit-test
                     double_click_pos = QCursor.pos()
                     
-                    debug_print(f"[DoubleClick] path_before='{path_before}', selected_before={selected_before}")
+                    # 立即检查当前选中项数量（双击时刻）
+                    current_selection = None
+                    try:
+                        current_selection = self.explorer.dynamicCall('SelectedItems().Count')
+                    except Exception:
+                        try:
+                            sel = self.explorer.dynamicCall('SelectedItems()')
+                            if sel is not None:
+                                current_selection = sel.property('Count') if hasattr(sel, 'property') else None
+                        except Exception:
+                            pass
+                    
+                    debug_print(f"[DoubleClick] path_before='{path_before}', selected_before={selected_before}, current_selection={current_selection}")
+                    
+                    # 如果双击时有选中项，设置导航标志（防止误判为空白双击）
+                    if current_selection is not None and int(current_selection) > 0:
+                        self._navigating_folder = True
+                        debug_print(f"[DoubleClick] Set navigation flag (has selection)")
+                        # 暂停路径同步定时器，避免导航期间的干扰
+                        if hasattr(self, '_path_sync_timer') and self._path_sync_timer:
+                            self._path_sync_timer.stop()
+                            debug_print(f"[DoubleClick] Path sync timer paused")
 
                     # 使用延迟检查，给足够时间让文件夹导航完成
                     def check_and_handle():
                         try:
+                            # 优先检查导航标志
+                            if getattr(self, '_navigating_folder', False):
+                                debug_print(f"[DoubleClick] Navigation flag is set, skip go_up")
+                                self._selected_before_click = None
+                                return
+                            
                             # 优先使用 native hit-test 检查双击位置是否有项目（最可靠）
                             hit_test_result = None
                             if HAS_PYWIN:
@@ -2552,6 +2588,12 @@ class FileExplorerTab(QWidget):
                                 # 终次确认：延迟700ms确认路径仍未变化且无导航活动，再执行 go_up，避免误判
                                 def final_confirm_and_go_up():
                                     try:
+                                        # 首先检查导航标志
+                                        if getattr(self, '_navigating_folder', False):
+                                            debug_print(f"[DoubleClick] Final confirm: navigation flag is set, skip go_up")
+                                            self._navigating_folder = False
+                                            return
+                                        
                                         cur_path3 = getattr(self, 'current_path', None)
                                         debug_print(f"[DoubleClick] Final confirm: path_before='{path_before}', cur_path='{cur_path3}'")
                                         
@@ -2594,6 +2636,14 @@ class FileExplorerTab(QWidget):
                                         debug_print(f"[DoubleClick] Final confirm exception: {e}")
                                         import traceback
                                         traceback.print_exc()
+                                    finally:
+                                        # 最终确认完成，清除导航标志（双保险）
+                                        if hasattr(self, '_navigating_folder'):
+                                            self._navigating_folder = False
+                                        # 重启路径同步定时器
+                                        if hasattr(self, '_path_sync_timer') and self._path_sync_timer and not self._path_sync_timer.isActive():
+                                            self._path_sync_timer.start(1000)
+                                            debug_print(f"[Navigation] Path sync timer restarted after navigation complete")
                                 t2 = QTimer()
                                 t2.setSingleShot(True)
                                 t2.timeout.connect(final_confirm_and_go_up)
@@ -2687,11 +2737,11 @@ class FileExplorerTab(QWidget):
         self.refresh_timer.timeout.connect(self.delayed_refresh)
         self.refresh_delay_ms = 500  # 500ms延迟
 
-        # 目录轮询刷新（作为 QFileSystemWatcher 的兜底，解决某些场景下未触发刷新）
-        self.dir_mtime = None
-        self.dir_poll_timer = QTimer()
-        self.dir_poll_timer.setInterval(2000)  # 2s 低频轮询，开销很小
-        self.dir_poll_timer.timeout.connect(self._poll_directory_changes)
+        # 目录轮询刷新（已禁用，QFileSystemWatcher已足够，轮询会造成不必要的刷新）
+        # self.dir_mtime = None
+        # self.dir_poll_timer = QTimer()
+        # self.dir_poll_timer.setInterval(2000)  # 2s 低频轮询，开销很小
+        # self.dir_poll_timer.timeout.connect(self._poll_directory_changes)
         
         self.setup_ui()
         
@@ -2756,7 +2806,7 @@ class FileExplorerTab(QWidget):
             self.explorer.dynamicCall("Navigate(const QString&)", path)
             self.current_path = path
             # shell 路径不做文件系统监控与轮询
-            self._update_dir_polling(None)
+            # self._update_dir_polling(None)  # 已禁用目录轮询
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(path)
             self.update_tab_title()
@@ -2807,6 +2857,14 @@ class FileExplorerTab(QWidget):
         old_path = getattr(self, 'current_path', None)
         url = QDir.toNativeSeparators(path)
         
+        # 停止目录轮询定时器，避免误触发刷新
+        if hasattr(self, 'dir_poll_timer') and self.dir_poll_timer.isActive():
+            self.dir_poll_timer.stop()
+            debug_print(f"[Navigation] Stopped dir polling timer")
+        
+        # 设置标志，防止导航期间的自动刷新
+        self._suppress_auto_refresh = True
+        
         # 使用Navigate2来获得更好的控制
         try:
             # 尝试使用Navigate2获得更好的刷新效果
@@ -2818,8 +2876,8 @@ class FileExplorerTab(QWidget):
         
         self.current_path = path
 
-        # 更新目录轮询（兜底刷新）
-        self._update_dir_polling(path)
+        # 不再启动目录轮询（QFileSystemWatcher已足够，轮询会造成不必要的刷新）
+        # self._update_dir_polling(path)  # 已禁用
 
         # 更新状态栏
         self.update_explorer_status()
@@ -2846,6 +2904,10 @@ class FileExplorerTab(QWidget):
         # 添加到历史记录
         if add_to_history:
             self._add_to_history(path)
+        
+        # 延迟3秒后允许自动刷新（避免刚导航完就因为文件监视器触发刷新）
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(3000, lambda: setattr(self, '_suppress_auto_refresh', False))
     
     def _show_loading_indicator(self):
         """显示加载指示器"""
@@ -2924,6 +2986,10 @@ class FileExplorerTab(QWidget):
     def on_directory_changed(self, path):
         """文件系统监控：目录内容发生变化"""
         debug_print(f"[FileWatcher] Directory changed: {path}")
+        # 如果设置了抑制标志，不触发刷新
+        if getattr(self, '_suppress_auto_refresh', False):
+            debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
+            return
         # 只在监控的是当前路径时才刷新
         if path == self.current_path:
             self._schedule_refresh(reason="watcher")
@@ -2958,6 +3024,11 @@ class FileExplorerTab(QWidget):
 
     def _poll_directory_changes(self):
         """兜底轮询目录修改时间，解决部分环境下 watcher 不触发的问题"""
+        # 如果设置了抑制标志，不触发刷新
+        if getattr(self, '_suppress_auto_refresh', False):
+            debug_print(f"[DirPoll] Auto-refresh suppressed during navigation")
+            return
+            
         path = self.current_path
         if not path or not os.path.isdir(path):
             return
@@ -2977,15 +3048,17 @@ class FileExplorerTab(QWidget):
         if not hasattr(self, 'dir_poll_timer'):
             return
         if path and os.path.isdir(path):
+            # 立即更新mtime，避免误判为变化（特别是刚导航到新目录时）
             self.dir_mtime = self._get_dir_mtime(path)
+            debug_print(f"[DirPoll] Updated mtime for {path}: {self.dir_mtime}")
             if not self.dir_poll_timer.isActive():
                 self.dir_poll_timer.start()
                 debug_print(f"[DirPoll] Started polling {path}")
         else:
-            self.dir_mtime = None
             if self.dir_poll_timer.isActive():
                 self.dir_poll_timer.stop()
-                debug_print("[DirPoll] Stopped polling (non-directory or shell path)")
+                debug_print(f"[DirPoll] Stopped polling")
+            self.dir_mtime = None
 
     def _get_dir_mtime(self, path):
         """安全获取目录修改时间"""
