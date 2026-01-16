@@ -1740,85 +1740,31 @@ class BookmarkManager:
         self._pending_save = False
 
     def load_bookmarks(self):
-        # 首先尝试加载主书签文件
+        # 只加载主书签文件，不做备份和恢复
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                # 兼容Chrome风格的多层结构
                 if 'roots' in data:
                     return data['roots']
                 return data
             except Exception as e:
                 print(f"Failed to load bookmarks: {e}")
-                # 主文件损坏，尝试从备份恢复
-                backup_file = self.config_file + ".bak"
-                if os.path.exists(backup_file):
-                    print(f"Attempting to restore bookmarks from backup: {backup_file}")
-                    try:
-                        with open(backup_file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                        # 恢复主文件
-                        import shutil
-                        shutil.copy2(backup_file, self.config_file)
-                        print("Bookmarks restored from backup successfully")
-                        if 'roots' in data:
-                            return data['roots']
-                        return data
-                    except Exception as e2:
-                        print(f"Failed to restore from backup: {e2}")
                 return {}
         else:
-            # 主文件不存在，检查是否有备份文件
-            backup_file = self.config_file + ".bak"
-            if os.path.exists(backup_file):
-                print(f"Main bookmark file not found, restoring from backup: {backup_file}")
-                try:
-                    with open(backup_file, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    # 恢复主文件
-                    import shutil
-                    shutil.copy2(backup_file, self.config_file)
-                    print("Bookmarks restored from backup successfully")
-                    if 'roots' in data:
-                        return data['roots']
-                    return data
-                except Exception as e:
-                    print(f"Failed to restore from backup: {e}")
-            else:
-                print("No bookmark file or backup found, starting with empty bookmarks")
+            print("No bookmark file found, starting with empty bookmarks")
             return {}
 
     def save_bookmarks(self, immediate=False):
         # 优化：延迟保存，避免频繁操作时多次写入
         if immediate:
-            # 立即保存
             try:
-                # 先备份旧书签
-                if os.path.exists(self.config_file):
-                    import shutil
-                    try:
-                        shutil.copy2(self.config_file, self.config_file + ".bak")
-                    except Exception as e:
-                        print(f"Failed to backup bookmarks: {e}")
-                
-                # 保存新书签
                 with open(self.config_file, 'w', encoding='utf-8') as f:
                     json.dump({"roots": self.bookmark_tree}, f, ensure_ascii=False, indent=2)
                 self._pending_save = False
             except Exception as e:
                 print(f"Failed to save bookmarks: {e}")
-                # 尝试从备份恢复
-                backup_file = self.config_file + ".bak"
-                if os.path.exists(backup_file):
-                    try:
-                        import shutil
-                        shutil.copy2(backup_file, self.config_file)
-                        print("Bookmarks restored from backup")
-                    except Exception as e2:
-                        print(f"Failed to restore bookmarks: {e2}")
         else:
-            # 延迟保存：500ms后执行
             self._pending_save = True
             if self._save_timer is None:
                 from PyQt5.QtCore import QTimer
@@ -5769,81 +5715,18 @@ class MainWindow(QMainWindow):
                                 config["hotkeys"][key] = value
                     return config
             else:
-                # 主配置文件不存在，检查是否有备份文件
-                backup_file = "config.json.bak"
-                if os.path.exists(backup_file):
-                    print(f"Main config file not found, restoring from backup: {backup_file}")
-                    try:
-                        with open(backup_file, 'r', encoding='utf-8') as f:
-                            config = json.load(f)
-                        # 恢复主配置文件
-                        import shutil
-                        shutil.copy2(backup_file, "config.json")
-                        print("Config restored from backup successfully")
-                        # 合并默认配置
-                        for key, value in default_config.items():
-                            if key not in config:
-                                config[key] = value
-                        if "hotkeys" in config:
-                            for key, value in default_config["hotkeys"].items():
-                                if key not in config["hotkeys"]:
-                                    config["hotkeys"][key] = value
-                        return config
-                    except Exception as e:
-                        print(f"Failed to restore from backup: {e}")
-                else:
-                    print("No config file or backup found, starting with default config")
+                print("No config file found, starting with default config")
         except Exception as e:
             print(f"Failed to load config: {e}")
-            # 主文件损坏，尝试从备份恢复
-            backup_file = "config.json.bak"
-            if os.path.exists(backup_file):
-                print(f"Attempting to restore config from backup: {backup_file}")
-                try:
-                    with open(backup_file, 'r', encoding='utf-8') as f:
-                        config = json.load(f)
-                    # 恢复主文件
-                    import shutil
-                    shutil.copy2(backup_file, "config.json")
-                    print("Config restored from backup successfully")
-                    # 合并默认配置
-                    for key, value in default_config.items():
-                        if key not in config:
-                            config[key] = value
-                    if "hotkeys" in config:
-                        for key, value in default_config["hotkeys"].items():
-                            if key not in config["hotkeys"]:
-                                config["hotkeys"][key] = value
-                    return config
-                except Exception as e2:
-                    print(f"Failed to restore from backup: {e2}")
-        
-        return default_config
+            return default_config
     
     def save_config(self):
         """保存配置文件"""
         try:
-            # 保存新配置
             with open("config.json", "w", encoding="utf-8") as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
-            
-            # 保存成功后创建备份
-            import shutil
-            try:
-                shutil.copy2("config.json", "config.json.bak")
-            except Exception as e:
-                print(f"Failed to backup config: {e}")
-                
         except Exception as e:
             print(f"Failed to save config: {e}")
-            # 尝试从备份恢复
-            if os.path.exists("config.json.bak"):
-                try:
-                    import shutil
-                    shutil.copy2("config.json.bak", "config.json")
-                    print("Config restored from backup")
-                except Exception as e2:
-                    print(f"Failed to restore config: {e2}")
 
     def ensure_default_bookmarks(self):
         bm = self.bookmark_manager
