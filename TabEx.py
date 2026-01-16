@@ -2157,6 +2157,15 @@ class FileExplorerTab(QWidget):
             if hasattr(e, 'arguments') and hasattr(e, 'signal'):
                 if e.signal == 'NavigateComplete2(IDispatch*, QVariant&)':
                     url = str(e.arguments[1])
+                    # 检查是否为控制面板及其子目录
+                    if self._is_control_panel_path(url):
+                        show_toast(self, "不支持嵌入", "控制面板及其子目录无法嵌入到标签页中，标签页将自动关闭。", level="warning")
+                        # 关闭当前标签页
+                        if self.main_window and hasattr(self.main_window, 'tab_widget'):
+                            idx = self.main_window.tab_widget.indexOf(self)
+                            if idx != -1:
+                                self.main_window.close_tab(idx)
+                        return True
                     if url.startswith('file:///'):
                         from urllib.parse import unquote
                         local_path = unquote(url[8:])
@@ -2804,7 +2813,14 @@ class FileExplorerTab(QWidget):
 
     def navigate_to(self, path, is_shell=False, add_to_history=True, skip_async_check=False):
         debug_print(f"[navigate_to] To '{path}' (is_shell={is_shell}, skip_async={skip_async_check})")
-        
+
+        # 屏蔽控制面板及其子目录的嵌入
+        if self._is_control_panel_path(path):
+            show_toast(self, "不支持嵌入", "控制面板及其子目录无法嵌入到标签页中。", level="warning")
+            if hasattr(self, 'path_bar'):
+                self.path_bar.set_path(self.current_path)
+            return
+
         # 快速取消所有待处理的双击检查定时器
         if hasattr(self, '_pending_double_click_timers'):
             for timer in self._pending_double_click_timers:
@@ -2813,12 +2829,12 @@ class FileExplorerTab(QWidget):
                 except Exception:
                     pass
             self._pending_double_click_timers = []
-        
+
         # 停止之前的文件夹检查线程（减少等待时间）
         if hasattr(self, 'folder_checker') and self.folder_checker and self.folder_checker.isRunning():
             self.folder_checker.stop()
             self.folder_checker.wait(50)  # 减少等待时间从100ms到50ms
-        
+
         # 支持本地路径和shell特殊路径
         if is_shell:
             self._hide_loading_indicator()
@@ -2842,6 +2858,31 @@ class FileExplorerTab(QWidget):
                 self._check_folder_size_async(path, add_to_history)
         else:
             debug_print(f"[navigate_to] Path does not exist: {path}")
+
+    def _is_control_panel_path(self, path):
+        """判断路径是否为控制面板或其子目录"""
+        if not path:
+            return False
+        s = path.lower()
+        # shell:ControlPanelFolder
+        if s.startswith('shell:controlpanelfolder'):
+            return True
+        # 控制面板 CLSID
+        if '::{26ee0668-a00a-44d7-9371-beb064c98683}' in s:
+            return True
+        # 控制面板的子项目通常以 control panel/ 或 control panel\\ 开头
+        if s.startswith('control panel') or s.startswith('control panel/') or s.startswith('control panel\\'):
+            return True
+        # 也可能是 file:///C:/Windows/System32/control.exe 或类似
+        if 'control.exe' in s:
+            return True
+        # 也可能是 shell:::{26ee0668-a00a-44d7-9371-beb064c98683} 或其子路径
+        if s.startswith('shell:::{26ee0668-a00a-44d7-9371-beb064c98683}'):
+            return True
+        # 也可能是 explorer.exe 打开的控制面板子页面，带有 control panel 字样
+        if '/control panel/' in s or '\\control panel\\' in s:
+            return True
+        return False
     
     def _check_folder_size_async(self, path, add_to_history):
         """异步检查文件夹大小并决定是否显示加载指示器"""
@@ -3385,6 +3426,17 @@ class DragDropTabWidget(QTabWidget):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.main_window = parent
+        self.currentChanged.connect(self._refresh_close_button)
+
+    def _refresh_close_button(self, idx):
+        tabbar = self.tabBar()
+        if hasattr(tabbar, 'show_close_button_under_cursor'):
+            tabbar.show_close_button_under_cursor()
+    """支持拖放文件夹的自定义QTabWidget"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.main_window = parent
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -3723,43 +3775,79 @@ class CustomTabBar(QTabBar):
         super().leaveEvent(event)
     
     def close_tab_at_index(self, index):
-        """关闭指定索引的标签页"""
+        """关闭指定索引的标签页，并刷新关闭按钮显示"""
         if self.main_window and hasattr(self.main_window, 'close_tab'):
             self.main_window.close_tab(index)
+            self.show_close_button_under_cursor()
+
+    def show_close_button_under_cursor(self):
+        """在鼠标当前位置自动显示关闭按钮（用于标签切换/关闭/移动后）"""
+        from PyQt5.QtGui import QCursor
+        pos = self.mapFromGlobal(QCursor.pos())
+        tab_index = self.tabAt(pos)
+        if tab_index != self.hovered_tab:
+            if self.hovered_tab >= 0:
+                self.setTabButton(self.hovered_tab, QTabBar.RightSide, None)
+            self.hovered_tab = tab_index
+        if self.hovered_tab >= 0:
+            close_btn = QToolButton(self)
+            close_btn.setText("×")
+            tab_close_btn_size = int(16 * getattr(self, 'parent_window', self).dpi_scale if hasattr(getattr(self, 'parent_window', self), 'dpi_scale') else 16)
+            close_btn.setFixedSize(tab_close_btn_size, tab_close_btn_size)
+            close_btn.setStyleSheet("""
+                QToolButton {
+                    border: none;
+                    background: transparent;
+                    color: #666;
+                    font-size: 18px;
+                    font-weight: bold;
+                    padding: 0px;
+                    margin: 0px;
+                }
+                QToolButton:hover, QToolButton:pressed, QToolButton[forceHover="true"] {
+                    background: #ff6b6b;
+                    color: white;
+                    border-radius: 8px;
+                }
+            """)
+            close_btn.clicked.connect(lambda: self.close_tab_at_index(self.hovered_tab))
+            self.setTabButton(self.hovered_tab, QTabBar.RightSide, close_btn)
+            # 检查鼠标是否在按钮rect内，若在则强制高亮
+            from PyQt5.QtGui import QCursor
+            btn_rect = close_btn.rect()
+            btn_pos = close_btn.mapFromGlobal(QCursor.pos())
+            if btn_rect.contains(btn_pos):
+                close_btn.setProperty("forceHover", True)
+                close_btn.setStyle(close_btn.style())
+            else:
+                close_btn.setProperty("forceHover", False)
+                close_btn.setStyle(close_btn.style())
     
     def on_tab_moved(self, from_index, to_index):
-        """标签页移动后的处理，确保固定标签页始终在左侧，并同步content_stack"""
+        """标签页移动后的处理，确保固定标签页始终在左侧，并同步content_stack，并刷新关闭按钮显示"""
         if not self.main_window:
             return
-        
         debug_print(f"[TabMoved] Moving tab from {from_index} to {to_index}")
-        
         # 同步移动content_stack中的对应内容
         if hasattr(self.main_window, 'content_stack'):
             content_stack = self.main_window.content_stack
-            # 从content_stack中取出对应的widget
             moved_widget = content_stack.widget(from_index)
             if moved_widget:
-                # 先移除
                 content_stack.removeWidget(moved_widget)
-                # 插入到新位置
                 content_stack.insertWidget(to_index, moved_widget)
                 debug_print(f"[TabMoved] Synced content_stack: moved widget from {from_index} to {to_index}")
-        
         # 获取被移动的标签页
         moved_tab = self.main_window.tab_widget.widget(to_index)
         if not moved_tab:
             return
-        
-        # 检查是否违反固定标签页规则
         is_pinned = getattr(moved_tab, 'is_pinned', False)
-        
-        # 统计固定标签页的数量
         pinned_count = 0
         for i in range(self.count()):
             tab = self.main_window.tab_widget.widget(i)
             if tab and getattr(tab, 'is_pinned', False):
                 pinned_count += 1
+        # 移动后自动检测鼠标下的tab并显示关闭按钮
+        self.show_close_button_under_cursor()
         
         # 如果是固定标签页移动到非固定区域，或非固定标签页移动到固定区域，需要纠正
         if is_pinned and to_index >= pinned_count:
@@ -6117,6 +6205,16 @@ class MainWindow(QMainWindow):
         self.dir_model.setRootPath(root_path)
         self.dir_tree = DragDropTreeView(self)
         self.dir_tree.setModel(self.dir_model)
+        # 修复横向滚动条不显示问题：始终根据内容自动调整列宽
+        self.dir_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.dir_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        # 展开目录时自动调整列宽，确保横轴弹出逻辑正确
+        def auto_resize_on_expand(index):
+            self.dir_tree.resizeColumnToContents(0)
+        self.dir_tree.expanded.connect(auto_resize_on_expand)
+        self.dir_tree.collapsed.connect(auto_resize_on_expand)
+        # 如果有多列，隐藏的不用管，显示的都设置为 ResizeToContents
+        # self.dir_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         # 性能优化：统一排序，减少渲染开销
         self.dir_tree.setSortingEnabled(True)
         self.dir_tree.sortByColumn(0, Qt.AscendingOrder)
@@ -6482,18 +6580,46 @@ class MainWindow(QMainWindow):
                         if path:
                             debug_print(f"[Explorer Monitor] ✓ Path: {path}")
                             
-                            # 在主线程中打开新标签页
-                            self.open_path_signal.emit(path)
-                            
+                            # 屏蔽控制面板及其子目录的自动嵌入
+                            if self._is_control_panel_path_for_monitor(path):
+                                show_toast(self, "不支持嵌入", "控制面板及其子目录无法嵌入到标签页中。", level="warning")
+                            else:
+                                self.open_path_signal.emit(path)
                             # 优化：减少等待时间（从500ms到200ms）
                             time.sleep(0.2)
-                            
                             # 关闭原Explorer窗口
                             try:
                                 win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
                                 debug_print(f"[Explorer Monitor] ✓ Closed original Explorer (hwnd={hwnd})")
                             except Exception as e:
                                 debug_print(f"[Explorer Monitor] ✗ Failed to close: {e}")
+                            def _is_control_panel_path_for_monitor(self, path):
+                                """判断路径是否为控制面板或其子目录（用于Explorer Monitor拦截）"""
+                                if not path:
+                                    return False
+                                s = str(path).lower()
+                                # shell:ControlPanelFolder
+                                if s.startswith('shell:controlpanelfolder'):
+                                    return True
+                                # 控制面板 CLSID
+                                if '::{26ee0668-a00a-44d7-9371-beb064c98683}' in s:
+                                    return True
+                                # 控制面板的子项目通常以 control panel/ 或 control panel\\ 开头
+                                if s.startswith('control panel') or s.startswith('control panel/') or s.startswith('control panel\\'):
+                                    return True
+                                # 也可能是 file:///c:/windows/system32/control.exe 或类似
+                                if 'control.exe' in s:
+                                    return True
+                                # 也可能是 shell:::{26ee0668-a00a-44d7-9371-beb064c98683} 或其子路径
+                                if s.startswith('shell:::{26ee0668-a00a-44d7-9371-beb064c98683}'):
+                                    return True
+                                # 也可能是 explorer.exe 打开的控制面板子页面，带有 control panel 字样
+                                if '/control panel/' in s or '\\control panel\\' in s:
+                                    return True
+                                # 也可能是 LocationName 为“用户帐户”等典型控制面板子页面
+                                if s in ['用户帐户', 'user accounts', 'useraccount', 'useraccountcontrol']:
+                                    return True
+                                return False
                         else:
                             debug_print(f"[Explorer Monitor] ✗ Could not get path from {hwnd}")
                     
