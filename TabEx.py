@@ -1,6 +1,64 @@
 ﻿# 全局搜索缓存（LRU缓存，最多缓存50个搜索结果）
+
 from collections import OrderedDict
 import hashlib
+import os
+
+# 常用中英文目录名对照表
+_COMMON_PATH_PAIRS = [
+    ("Users", "用户"),
+    ("Documents", "文档"),
+    ("Desktop", "桌面"),
+    ("Downloads", "下载"),
+    ("Pictures", "图片"),
+    ("Music", "音乐"),
+    ("Videos", "视频"),
+    ("Favorites", "收藏夹"),
+    ("OneDrive", "OneDrive"),
+    ("AppData", "AppData"),
+    ("Roaming", "Roaming"),
+    ("Local", "Local"),
+    ("Public", "Public"),
+]
+
+def translate_common_path(path):
+    """
+    尝试将路径中的中英文常用目录名互相转换，递归尝试所有组合，返回第一个存在的路径。
+    若找不到存在的路径，则返回原始 path。
+    """
+    if not path or os.path.exists(path):
+        return path
+    # 只处理本地绝对路径
+    norm_path = os.path.normpath(path)
+    # 分割为各级目录
+    parts = norm_path.split(os.sep)
+    # 记录所有可替换的目录位置
+    replace_indices = []
+    replace_options = []
+    for i, part in enumerate(parts):
+        opts = [part]
+        for en, zh in _COMMON_PATH_PAIRS:
+            if part == en:
+                opts.append(zh)
+            elif part == zh:
+                opts.append(en)
+        if len(opts) > 1:
+            replace_indices.append(i)
+            replace_options.append(opts)
+    # 如果没有可替换的，直接返回原始
+    if not replace_indices:
+        return path
+    # 递归生成所有组合
+    from itertools import product
+    for combo in product(*replace_options):
+        new_parts = parts[:]
+        for idx, val in zip(replace_indices, combo):
+            new_parts[idx] = val
+        candidate = os.sep.join(new_parts)
+        if os.path.exists(candidate):
+            return candidate
+    # 没找到存在的路径，返回原始
+    return path
 
 # 性能优化配置常量
 MAX_SEARCH_CACHE_SIZE = 50  # 搜索缓存最大数量
@@ -97,13 +155,13 @@ class BookmarkDialog(QDialog):
             local_path = unquote(url[8:])
             if os.name == 'nt' and local_path.startswith('/'):
                 local_path = local_path[1:]
-            if os.path.exists(local_path):
+            local_path2 = translate_common_path(local_path)
+            if os.path.exists(local_path2):
                 self.accept()
-                # 通知主窗口打开新标签页
                 if self.parent() and hasattr(self.parent(), 'add_new_tab'):
-                    self.parent().add_new_tab(local_path)
+                    self.parent().add_new_tab(local_path2)
             else:
-                show_toast(self, "路径错误", f"路径不存在: {local_path}", level="warning")
+                show_toast(self, "路径错误", f"路径不存在: {local_path2}", level="warning")
 
 # 自定义委托：在文件名列实现省略号在开头
 from PyQt5.QtWidgets import QStyledItemDelegate
@@ -2356,13 +2414,16 @@ class FileExplorerTab(QWidget):
         }
         if path in special_map:
             self.navigate_to(special_map[path], is_shell=True)
-        elif os.path.exists(path):
-            self.navigate_to(path)
         else:
-            show_toast(self, "路径错误", f"路径不存在: {path}", level="warning")
-            # 恢复路径栏显示当前正确的路径
-            if hasattr(self, 'current_path') and self.current_path:
-                self.path_bar.set_path(self.current_path)
+            # 尝试中英文目录互转
+            path2 = translate_common_path(path)
+            if os.path.exists(path2):
+                self.navigate_to(path2)
+            else:
+                show_toast(self, "路径错误", f"路径不存在: {path2}", level="warning")
+                # 恢复路径栏显示当前正确的路径
+                if hasattr(self, 'current_path') and self.current_path:
+                    self.path_bar.set_path(self.current_path)
 
     def explorer_mouse_press(self, event):
         # 在鼠标按下时记录当时的选中项数量和鼠标位置点击测试结果
