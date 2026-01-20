@@ -1253,10 +1253,24 @@ if HAS_PYWIN:
     except Exception as e:
         print(f"Failed to setup Windows API monitoring: {e}")
 
-# 面包屑导航路径栏
 class BreadcrumbPathBar(QWidget):
     """类似Windows资源管理器的面包屑路径栏，支持点击层级跳转"""
     pathChanged = pyqtSignal(str)  # 当路径改变时发出信号
+    def get_path_for_copy(self, separator=None):
+        """返回当前路径，始终按设置分隔符格式化，无论原始格式。编辑模式下对QLineEdit内容也做替换。"""
+        # 优先取编辑框内容（如果在编辑模式）
+        if getattr(self, 'edit_mode', False) and hasattr(self, 'path_edit') and self.path_edit.isVisible():
+            path = self.path_edit.text()
+        else:
+            path = self.current_path
+        if not path:
+            return ""
+        if separator is None:
+            separator = "\\" if os.name == 'nt' else "/"
+        if separator == "/":
+            return path.replace("\\", "/").replace("/", "/")
+        else:
+            return path.replace("/", "\\").replace("\\", "\\")
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1385,8 +1399,30 @@ class BreadcrumbPathBar(QWidget):
             debug_print(f"[PathCompleter] Updated root path to: {parent_dir}")
     
     def set_path(self, path):
-        """设置并显示路径"""
-        self.current_path = path
+        """设置并显示路径，始终按全局设置分隔符存储和显示"""
+        # 优先从主窗口(MainWindow)获取config
+        separator = "/"
+        mainwin = None
+        p = self.parent()
+        # 向上查找MainWindow
+        for _ in range(5):
+            if p is None:
+                break
+            if hasattr(p, 'config') and hasattr(p, 'copy_selected_filename'):
+                mainwin = p
+                break
+            if hasattr(p, 'parent'):
+                p = p.parent()
+            else:
+                break
+        if mainwin and hasattr(mainwin, 'config'):
+            separator = mainwin.config.get("breadcrumb_copy_separator", "/")
+        # 统一替换为设置的分隔符
+        if separator == "/":
+            norm_path = path.replace("\\", "/").replace("/", "/")
+        else:
+            norm_path = path.replace("/", "\\").replace("\\", "\\")
+        self.current_path = norm_path
         if not self.edit_mode:
             self.update_breadcrumbs()
     
@@ -5116,30 +5152,39 @@ class MainWindow(QMainWindow):
             self.add_tab_bookmark(current_tab)
 
     def copy_selected_filename(self):
-        """复制当前选中文件名（含后缀）到剪贴板并提示"""
+        """复制当前选中文件名（含后缀）或路径栏地址到剪贴板并提示"""
         debug_print("[copy_selected_filename] Called")
         current_tab = self.get_current_tab_widget()
         debug_print(f"[copy_selected_filename] current_tab: {current_tab}")
-        if not current_tab or not hasattr(current_tab, 'get_selected_filenames'):
-            debug_print("[copy_selected_filename] No tab or no get_selected_filenames method")
-            show_toast(self, "提示", "请先选择一个文件", level="warning")
-            return
-        names = current_tab.get_selected_filenames()
+        # 优先复制选中文件名，否则复制路径栏地址
+        names = []
+        if current_tab and hasattr(current_tab, 'get_selected_filenames'):
+            names = current_tab.get_selected_filenames()
         debug_print(f"[copy_selected_filename] Selected names: {names}")
-        if not names:
-            debug_print("[copy_selected_filename] No files selected")
-            show_toast(self, "提示", "请先选择一个文件", level="warning")
-            return
         from PyQt5.QtWidgets import QApplication
-        # 将所有选中的文件名用", "连接
-        filenames_text = ", ".join(names)
-        QApplication.clipboard().setText(filenames_text)
-        debug_print(f"[copy_selected_filename] Copied to clipboard: {filenames_text}")
-        # 根据文件数量显示不同的提示
-        if len(names) == 1:
-            show_toast(self, "复制成功", f"文件名: {names[0]}", level="info")
+        if names:
+            filenames_text = ", ".join(names)
+            QApplication.clipboard().setText(filenames_text)
+            debug_print(f"[copy_selected_filename] Copied to clipboard: {filenames_text}")
+            if len(names) == 1:
+                show_toast(self, "复制成功", f"文件名: {names[0]}", level="info")
+            else:
+                show_toast(self, "复制成功", f"已复制 {len(names)} 个文件名", level="info")
         else:
-            show_toast(self, "复制成功", f"已复制 {len(names)} 个文件名", level="info")
+            # 未选中文件时，复制路径栏地址，按设置分隔符
+            separator = self.config.get("breadcrumb_copy_separator", "/")
+            # 获取当前tab的path_bar
+            path_bar = None
+            if current_tab and hasattr(current_tab, 'path_bar'):
+                path_bar = current_tab.path_bar
+            elif hasattr(self, 'path_bar'):
+                path_bar = self.path_bar
+            if path_bar and hasattr(path_bar, 'get_path_for_copy'):
+                path_text = path_bar.get_path_for_copy(separator)
+                QApplication.clipboard().setText(path_text)
+                show_toast(self, "复制成功", f"路径: {path_text}", level="info")
+            else:
+                show_toast(self, "提示", "未选中文件，也无法获取路径栏地址", level="warning")
     
     def keyPressEvent(self, event):
         """处理快捷键（备用方案，主要使用QShortcut）"""
@@ -7005,25 +7050,60 @@ class MainWindow(QMainWindow):
         dlg.exec_()
 
 class SettingsDialog(QDialog):
+
     def __init__(self, config, parent=None):
+        from PyQt5.QtWidgets import QDialogButtonBox, QLabel, QGroupBox, QComboBox, QHBoxLayout, QVBoxLayout, QCheckBox
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.resize(600, 500)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
-        
-        from PyQt5.QtWidgets import QDialogButtonBox, QLabel, QGroupBox
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(12)
+        left_col = QVBoxLayout()
+        left_col.setSpacing(6)
+        right_col = QVBoxLayout()
+        right_col.setSpacing(6)
+
+        # 紧凑化所有GroupBox和控件的布局
+        def compact_groupbox(groupbox):
+            lay = groupbox.layout()
+            if lay:
+                lay.setContentsMargins(6, 6, 6, 6)
+                lay.setSpacing(4)
+
+        # 控件紧凑化工具
+        def compact_widget(widget):
+            if hasattr(widget, 'setStyleSheet'):
+                widget.setStyleSheet("font-size: 10.5pt; padding: 2px 4px;")
+
+        # 路径栏分隔符设置组
+        pathbar_group = QGroupBox("路径栏分隔符设置")
+        pathbar_layout = QHBoxLayout()
+        pathbar_layout.addWidget(QLabel("路径栏拷贝分隔符:"))
+        self.path_separator_combo = QComboBox(self)
+        self.path_separator_combo.addItem("/", "/")
+        self.path_separator_combo.addItem("\\", "\\")
+        sep = config.get("breadcrumb_copy_separator", "/")
+        idx = 0 if sep == "/" else 1
+        self.path_separator_combo.setCurrentIndex(idx)
+        self.path_separator_combo.setToolTip("设置从路径栏拷贝时使用的分隔符")
+        pathbar_layout.addWidget(self.path_separator_combo)
+        pathbar_layout.addStretch(1)
+        pathbar_group.setLayout(pathbar_layout)
+        compact_groupbox(pathbar_group)
+        for i in range(pathbar_layout.count()):
+            w = pathbar_layout.itemAt(i).widget()
+            if w: compact_widget(w)
+        left_col.addWidget(pathbar_group)
+
         # Explorer监听设置组
         monitor_group = QGroupBox("Explorer监听设置")
         monitor_layout = QVBoxLayout()
-        
         self.monitor_cb = QCheckBox("监听新Explorer窗口", self)
         self.monitor_cb.setChecked(config.get("enable_explorer_monitor", True))
         self.monitor_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         monitor_layout.addWidget(self.monitor_cb)
-        
         # 监听间隔设置
         interval_layout = QHBoxLayout()
         interval_layout.addWidget(QLabel("监听间隔（秒）:"))
@@ -7037,125 +7117,133 @@ class SettingsDialog(QDialog):
         interval_layout.addWidget(QLabel("（推荐: 2.0秒）"))
         interval_layout.addStretch(1)
         monitor_layout.addLayout(interval_layout)
-        
         monitor_group.setLayout(monitor_layout)
-        layout.addWidget(monitor_group)
-        
+        compact_groupbox(monitor_group)
+        for i in range(monitor_layout.count()):
+            item = monitor_layout.itemAt(i)
+            if item.layout():
+                for j in range(item.layout().count()):
+                    w = item.layout().itemAt(j).widget()
+                    if w: compact_widget(w)
+            elif item.widget():
+                compact_widget(item.widget())
+        left_col.addWidget(monitor_group)
+
         # 调试设置组
         debug_group = QGroupBox("调试设置")
         debug_layout = QVBoxLayout()
-        
         self.debug_mode_cb = QCheckBox("启用调试输出（输出到终端）", self)
         self.debug_mode_cb.setChecked(config.get("debug_mode", False))
         self.debug_mode_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.debug_mode_cb.setToolTip("启用后将在终端输出调试信息，用于开发和问题排查")
         debug_layout.addWidget(self.debug_mode_cb)
-        
         self.explorer_monitor_debug_cb = QCheckBox("启用 Explorer Monitor 调试输出", self)
         self.explorer_monitor_debug_cb.setChecked(config.get("explorer_monitor_debug", False))
         self.explorer_monitor_debug_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.explorer_monitor_debug_cb.setToolTip("单独控制 Explorer Monitor 的日志输出（需要先启用调试输出）")
         debug_layout.addWidget(self.explorer_monitor_debug_cb)
-        
         debug_group.setLayout(debug_layout)
-        layout.addWidget(debug_group)
-        
+        compact_groupbox(debug_group)
+        for i in range(debug_layout.count()):
+            w = debug_layout.itemAt(i).widget()
+            if w: compact_widget(w)
+        left_col.addWidget(debug_group)
+
         # 标签页设置组
         tabs_group = QGroupBox("标签页设置")
         tabs_layout = QVBoxLayout()
-        
         self.cache_tabs_cb = QCheckBox("关闭时缓存当前标签页，下次启动时恢复", self)
         self.cache_tabs_cb.setChecked(config.get("enable_cache_tabs", True))
         self.cache_tabs_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.cache_tabs_cb.setToolTip("关闭软件时保存非固定标签，下次启动时自动恢复（不包括固定标签）")
         tabs_layout.addWidget(self.cache_tabs_cb)
-        
         tabs_group.setLayout(tabs_layout)
-        layout.addWidget(tabs_group)
-        
+        compact_groupbox(tabs_group)
+        for i in range(tabs_layout.count()):
+            w = tabs_layout.itemAt(i).widget()
+            if w: compact_widget(w)
+        left_col.addWidget(tabs_group)
+
         # 开机启动设置组
         startup_group = QGroupBox("开机启动设置")
         startup_layout = QVBoxLayout()
-        
         self.auto_startup_cb = QCheckBox("开机自动启动 TabExplorer", self)
         self.auto_startup_cb.setChecked(self._is_auto_startup_enabled())
         self.auto_startup_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.auto_startup_cb.setToolTip("在 Windows 启动时自动运行 TabExplorer.exe")
         startup_layout.addWidget(self.auto_startup_cb)
-        
         startup_group.setLayout(startup_layout)
-        layout.addWidget(startup_group)
-        
+        compact_groupbox(startup_group)
+        for i in range(startup_layout.count()):
+            w = startup_layout.itemAt(i).widget()
+            if w: compact_widget(w)
+        left_col.addWidget(startup_group)
+
         # Git 工具设置组
         git_group = QGroupBox("Git 工具设置")
         git_layout = QVBoxLayout()
-        
         self.tortoisegit_buttons_cb = QCheckBox("显示 TortoiseGit 快捷按钮（标题栏）", self)
         self.tortoisegit_buttons_cb.setChecked(config.get("enable_tortoisegit_buttons", False))
         self.tortoisegit_buttons_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.tortoisegit_buttons_cb.setToolTip("在标题栏显示 Git Log 和 Git Commit 快捷按钮")
         git_layout.addWidget(self.tortoisegit_buttons_cb)
-        
         git_group.setLayout(git_layout)
-        layout.addWidget(git_group)
-        
+        compact_groupbox(git_group)
+        for i in range(git_layout.count()):
+            w = git_layout.itemAt(i).widget()
+            if w: compact_widget(w)
+        left_col.addWidget(git_group)
+
         # 快捷键设置组
         hotkey_group = QGroupBox("快捷键设置")
         hotkey_layout = QVBoxLayout()
-        
         hotkeys = config.get("hotkeys", {})
-        
         self.hotkey_new_tab = QCheckBox("Ctrl+T - 新建标签页")
         self.hotkey_new_tab.setChecked(hotkeys.get("new_tab", True))
         hotkey_layout.addWidget(self.hotkey_new_tab)
-        
         self.hotkey_close_tab = QCheckBox("Ctrl+W - 关闭当前标签页")
         self.hotkey_close_tab.setChecked(hotkeys.get("close_tab", True))
         hotkey_layout.addWidget(self.hotkey_close_tab)
-        
         self.hotkey_reopen_tab = QCheckBox("Ctrl+Shift+T - 恢复关闭的标签页")
         self.hotkey_reopen_tab.setChecked(hotkeys.get("reopen_tab", True))
         hotkey_layout.addWidget(self.hotkey_reopen_tab)
-        
         self.hotkey_switch_tab = QCheckBox("Ctrl+Tab / Ctrl+Shift+Tab - 切换标签页")
         self.hotkey_switch_tab.setChecked(hotkeys.get("switch_tab", True))
         hotkey_layout.addWidget(self.hotkey_switch_tab)
-        
         self.hotkey_search = QCheckBox("Ctrl+F - 打开搜索对话框")
         self.hotkey_search.setChecked(hotkeys.get("search", True))
         hotkey_layout.addWidget(self.hotkey_search)
-        
         self.hotkey_navigate = QCheckBox("Alt+Left/Right - 前进/后退")
         self.hotkey_navigate.setChecked(hotkeys.get("navigate", True))
         hotkey_layout.addWidget(self.hotkey_navigate)
-        
         self.hotkey_go_up = QCheckBox("Alt+Up - 返回上级目录")
         self.hotkey_go_up.setChecked(hotkeys.get("go_up", True))
         hotkey_layout.addWidget(self.hotkey_go_up)
-        
         self.hotkey_refresh = QCheckBox("F5 - 刷新当前路径")
         self.hotkey_refresh.setChecked(hotkeys.get("refresh", True))
         hotkey_layout.addWidget(self.hotkey_refresh)
-        
         self.hotkey_add_bookmark = QCheckBox("Ctrl+D - 添加当前路径到书签")
         self.hotkey_add_bookmark.setChecked(hotkeys.get("add_bookmark", True))
         hotkey_layout.addWidget(self.hotkey_add_bookmark)
-
         self.hotkey_copy_filename = QCheckBox("Ctrl+Alt - 复制选中文件名（含后缀）")
         self.hotkey_copy_filename.setChecked(hotkeys.get("copy_filename", True))
         hotkey_layout.addWidget(self.hotkey_copy_filename)
-        
         # 提示信息（放在快捷键设置框内）
         tip_label = QLabel("💡 提示：取消勾选可禁用对应的快捷键")
         tip_label.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
         hotkey_layout.addWidget(tip_label)
-        
         hotkey_group.setLayout(hotkey_layout)
-        layout.addWidget(hotkey_group)
-        
+        compact_groupbox(hotkey_group)
+        for i in range(hotkey_layout.count()):
+            w = hotkey_layout.itemAt(i).widget()
+            if w: compact_widget(w)
+        # 右侧放快捷键设置组
+        right_col.addWidget(hotkey_group)
+        # 右侧添加弹性空间，使快捷键组底部与左侧对齐
+        right_col.addStretch(1)
+
         # 添加弹性空间，将按钮推到底部
-        layout.addStretch(1)
-        
+        left_col.addStretch(1)
         # 检查更新链接
         update_link = QLabel()
         update_link.setText('检查更新: <a href="https://github.com/caojinyuan/TabEx/releases">https://github.com/caojinyuan/TabEx/releases</a>')
@@ -7163,13 +7251,15 @@ class SettingsDialog(QDialog):
         update_link.setStyleSheet("QLabel { padding: 10px; font-size: 10pt; }")
         update_link.setTextFormat(Qt.RichText)
         update_link.setToolTip("点击链接在浏览器中打开 GitHub Releases 页面")
-        layout.addWidget(update_link)
-        
+        left_col.addWidget(update_link)
         # 按钮区域
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        left_col.addWidget(buttons)
+        # 主布局拼接
+        main_layout.addLayout(left_col, 2)
+        main_layout.addLayout(right_col, 1)
     
     def _is_auto_startup_enabled(self):
         """检查是否已启用开机启动"""
@@ -7259,6 +7349,8 @@ class SettingsDialog(QDialog):
             self.parent().config["explorer_monitor_debug"] = self.explorer_monitor_debug_cb.isChecked()
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
+            # 保存路径栏分隔符设置
+            self.parent().config["breadcrumb_copy_separator"] = self.path_separator_combo.currentData()
             
             # 保存快捷键配置
             self.parent().config["hotkeys"] = {
@@ -7275,12 +7367,18 @@ class SettingsDialog(QDialog):
             
             # 保存到文件
             self.parent().save_config()
-            
+            # 刷新所有tab的路径栏分隔符显示（立即生效）
+            mainwin = self.parent()
+            if hasattr(mainwin, 'tab_widget') and hasattr(mainwin, 'get_tab_widget'):
+                for i in range(mainwin.tab_widget.count()):
+                    tab = mainwin.get_tab_widget(i)
+                    if hasattr(tab, 'path_bar') and hasattr(tab, 'current_path'):
+                        # 强制重设路径，确保分隔符立即生效
+                        tab.path_bar.set_path(tab.current_path)
             # 应用设置
             set_debug_mode(self.parent().config.get("debug_mode", False))
             set_explorer_monitor_debug(self.parent().config.get("explorer_monitor_debug", False))
             self.parent().apply_tortoisegit_buttons_config()
-            
             # 重新设置快捷键
             self.parent().setup_shortcuts()
         
