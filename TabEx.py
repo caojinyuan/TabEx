@@ -2385,7 +2385,8 @@ class FileExplorerTab(QWidget):
         return None
 
     def on_path_bar_changed(self, path):
-        """处理面包屑路径栏的路径变化"""
+        """处理面包屑路径栏的路径变化，支持特殊shell路径自动跳转"""
+        import os
         path = path.strip()
         # 处理cmd命令
         if path.lower() == 'cmd':
@@ -2393,14 +2394,14 @@ class FileExplorerTab(QWidget):
                 current_dir = self.current_path
                 if current_dir and os.path.exists(current_dir):
                     launch_detached(['cmd', '/K', 'cd', '/d', current_dir], extra_creationflags=subprocess.CREATE_NEW_CONSOLE)
-                    # 恢复路径栏显示当前路径
                     self.path_bar.set_path(current_dir)
                 else:
                     show_toast(self, "错误", "当前路径无效，无法打开命令行", level="error")
             except Exception as e:
                 show_toast(self, "错误", f"无法打开命令行: {e}", level="error")
             return
-        # 支持中文特殊路径
+
+        # 支持特殊shell路径映射
         special_map = {
             '回收站': 'shell:RecycleBinFolder',
             '此电脑': 'shell:MyComputerFolder',
@@ -2412,18 +2413,50 @@ class FileExplorerTab(QWidget):
             '启动文件夹': 'shell:Startup',
             'Startup': 'shell:Startup',
         }
+        # shell:Startup 等特殊路径，自动解析为真实系统路径
+        shell_path_map = {
+            'shell:Startup': lambda: os.path.join(os.environ.get('APPDATA', ''), r'Microsoft\Windows\Start Menu\Programs\Startup'),
+        }
+
         if path in special_map:
-            self.navigate_to(special_map[path], is_shell=True)
-        else:
-            # 尝试中英文目录互转
-            path2 = translate_common_path(path)
-            if os.path.exists(path2):
-                self.navigate_to(path2)
+            shell_path = special_map[path]
+            # 如果是 shell:Startup，自动跳转到真实路径
+            if shell_path in shell_path_map:
+                real_path = shell_path_map[shell_path]()
+                if os.path.exists(real_path):
+                    self.navigate_to(real_path)
+                else:
+                    show_toast(self, "路径错误", f"启动文件夹不存在: {real_path}", level="warning")
+                    if hasattr(self, 'current_path') and self.current_path:
+                        self.path_bar.set_path(self.current_path)
+                return
             else:
-                show_toast(self, "路径错误", f"路径不存在: {path2}", level="warning")
-                # 恢复路径栏显示当前正确的路径
-                if hasattr(self, 'current_path') and self.current_path:
-                    self.path_bar.set_path(self.current_path)
+                self.navigate_to(shell_path, is_shell=True)
+                return
+
+        # 允许直接输入 shell:XXX 跳转
+        if path.lower().startswith('shell:'):
+            # shell:Startup 也做特殊处理
+            if path.lower() == 'shell:startup' and 'shell:Startup' in shell_path_map:
+                real_path = shell_path_map['shell:Startup']()
+                if os.path.exists(real_path):
+                    self.navigate_to(real_path)
+                else:
+                    show_toast(self, "路径错误", f"启动文件夹不存在: {real_path}", level="warning")
+                    if hasattr(self, 'current_path') and self.current_path:
+                        self.path_bar.set_path(self.current_path)
+                return
+            self.navigate_to(path, is_shell=True)
+            return
+
+        # 尝试中英文目录互转
+        path2 = translate_common_path(path)
+        if os.path.exists(path2):
+            self.navigate_to(path2)
+        else:
+            show_toast(self, "路径错误", f"路径不存在: {path2}", level="warning")
+            if hasattr(self, 'current_path') and self.current_path:
+                self.path_bar.set_path(self.current_path)
 
     def explorer_mouse_press(self, event):
         # 在鼠标按下时记录当时的选中项数量和鼠标位置点击测试结果
@@ -3902,6 +3935,25 @@ class CustomTabBar(QTabBar):
 
 
 class MainWindow(QMainWindow):
+    def _is_control_panel_path_for_monitor(self, path):
+        """判断路径是否为控制面板或其子目录（供Explorer Monitor用）"""
+        if not path:
+            return False
+        s = path.lower()
+        if s.startswith('shell:controlpanelfolder'):
+            return True
+        if '::{26ee0668-a00a-44d7-9371-beb064c98683}' in s:
+            return True
+        if s.startswith('control panel') or s.startswith('control panel/') or s.startswith('control panel\\'):
+            return True
+        if 'control.exe' in s:
+            return True
+        if s.startswith('shell:::{26ee0668-a00a-44d7-9371-beb064c98683}'):
+            return True
+        if '/control panel/' in s or '\\control panel\\' in s:
+            return True
+        return False
+
     # 定义信号用于从服务器线程通知主线程打开新标签
     open_path_signal = pyqtSignal(str)
     
