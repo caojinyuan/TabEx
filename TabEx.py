@@ -4330,7 +4330,9 @@ class MainWindow(QMainWindow):
             for p in reversed(parents):
                 self.dir_tree.expand(p)
             self.dir_tree.setCurrentIndex(idx)
-            self.dir_tree.scrollTo(idx)
+            # 让当前目录显示在目录树偏上位置
+            # QAbstractItemView.PositionAtTop = 0, PositionAtCenter = 1, PositionAtBottom = 2
+            self.dir_tree.scrollTo(idx, 1)  # 0=QAbstractItemView.PositionAtTop
 
     def dragEnterEvent(self, event):
         """主窗口拖拽进入事件"""
