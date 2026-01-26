@@ -213,10 +213,9 @@ class SearchDialog(QDialog):
     def __init__(self, search_path, parent=None, search_history=None):
         super().__init__(parent)
         self.setWindowTitle(f"搜索 - {search_path}")
-        self.resize(800, 500)
-        # 设置窗口标志：可调整大小，带最大化/最小化按钮
-        from PyQt5.QtCore import Qt
-        self.setWindowFlags(Qt.Window | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
+        # 设置为不可调边框的对话框
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        self.setFixedSize(800, 500)
         self.search_path = search_path
         self.main_window = parent
         self.search_thread = None
@@ -4843,6 +4842,13 @@ class MainWindow(QMainWindow):
     
     def mouseMoveEvent(self, event):
         """鼠标移动事件 - 拖动窗口或调整大小"""
+        # 如果有设置界面、书签管理器或搜索对话框弹出，则不进行边界判断和光标改变
+        has_settings = hasattr(self, 'settings_dialog') and self.settings_dialog and self.settings_dialog.isVisible()
+        has_bookmark = hasattr(self, 'bookmark_manager_dialog') and self.bookmark_manager_dialog and self.bookmark_manager_dialog.isVisible()
+        has_search = hasattr(self, 'search_dialogs') and any(d.isVisible() for d in getattr(self, 'search_dialogs', []))
+        if has_settings or has_bookmark or has_search:
+            self.update_cursor(None)
+            return
         if event.buttons() == Qt.LeftButton:
             # 调整窗口大小
             if self.resizing and self.resize_direction:
@@ -4851,24 +4857,20 @@ class MainWindow(QMainWindow):
                 self.update_cursor(self.resize_direction)
                 event.accept()
                 return
-            
             # 拖动窗口
             if self.drag_position is not None:
                 if self.isMaximized():
                     # 最大化状态下拖动：先恢复窗口，然后继续拖动
                     # 计算恢复后窗口的位置，使鼠标保持在标题栏的相对位置
                     mouse_global_pos = event.globalPos()
-                    
                     # 恢复窗口
                     self.showNormal()
-                    
                     # 计算新的拖动位置，使鼠标在窗口宽度的相对位置保持一致
                     # 假设鼠标在标题栏的相对位置是 drag_position 的 x 坐标
                     window_width = self.width()
                     # 将拖动位置调整为窗口中心附近，让拖动更自然
                     new_drag_x = window_width // 2
                     self.drag_position.setX(new_drag_x)
-                    
                     # 移动窗口，使鼠标位置正确
                     new_pos = mouse_global_pos - self.drag_position
                     self.move(new_pos)
@@ -4890,7 +4892,6 @@ class MainWindow(QMainWindow):
             else:
                 # 最大化状态下确保恢复默认光标
                 self.update_cursor(None)
-        
         super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event):
@@ -5491,29 +5492,32 @@ class MainWindow(QMainWindow):
     
     def show_settings_menu(self):
         """显示设置对话框"""
-        dlg = SettingsDialog(self.config, self)
-        if dlg.exec_():
+        self.settings_dialog = SettingsDialog(self.config, self)
+        dlg = self.settings_dialog
+        result = dlg.exec_()
+        if result:
             # 获取新配置
             old_monitor = self.config.get("enable_explorer_monitor", True)
             old_interval = self.config.get("explorer_monitor_interval", 2.0)
-            
+
             new_monitor = dlg.monitor_cb.isChecked()
             new_interval = dlg.interval_spinbox.value()
-            
+
             # 更新配置
             self.config["enable_explorer_monitor"] = new_monitor
             self.config["debug_mode"] = dlg.debug_mode_cb.isChecked()
             self.config["explorer_monitor_interval"] = new_interval
             self.config["enable_cache_tabs"] = dlg.cache_tabs_cb.isChecked()
-            
+
             # 更新全局调试开关
             set_debug_mode(self.config["debug_mode"])
-            
+
             # 更新快捷键配置
             if "hotkeys" not in self.config:
                 self.config["hotkeys"] = {}
             self.config["hotkeys"]["new_tab"] = dlg.hotkey_new_tab.isChecked()
             self.config["hotkeys"]["close_tab"] = dlg.hotkey_close_tab.isChecked()
+            self.settings_dialog = None
             self.config["hotkeys"]["reopen_tab"] = dlg.hotkey_reopen_tab.isChecked()
             self.config["hotkeys"]["switch_tab"] = dlg.hotkey_switch_tab.isChecked()
             self.config["hotkeys"]["search"] = dlg.hotkey_search.isChecked()
@@ -7161,8 +7165,9 @@ class MainWindow(QMainWindow):
         )
 
     def show_bookmark_manager_dialog(self):
-        dlg = BookmarkManagerDialog(self.bookmark_manager, self)
-        dlg.exec_()
+        self.bookmark_manager_dialog = BookmarkManagerDialog(self.bookmark_manager, self)
+        self.bookmark_manager_dialog.exec_()
+        self.bookmark_manager_dialog = None
 
 class SettingsDialog(QDialog):
 
@@ -7170,8 +7175,9 @@ class SettingsDialog(QDialog):
         from PyQt5.QtWidgets import QDialogButtonBox, QLabel, QGroupBox, QComboBox, QHBoxLayout, QVBoxLayout, QCheckBox
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.resize(600, 500)
+        # 设置为不可调边框的对话框
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        self.setFixedSize(600, 500)
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(12)
@@ -7502,6 +7508,11 @@ class SettingsDialog(QDialog):
 # 书签管理对话框（初步框架，后续可扩展重命名/新建/删除等功能）
 from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton, QHBoxLayout, QInputDialog, QLabel
 class BookmarkManagerDialog(QDialog):
+    def __init__(self, bookmark_manager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("书签管理器")
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        self.setFixedSize(600, 500)
 
     def move_item_up(self):
         item = self.tree.currentItem()
