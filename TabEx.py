@@ -1927,6 +1927,16 @@ class BookmarkManager:
 
 
 class FileExplorerTab(QWidget):
+    def _force_remove_watcher(self, path):
+        """强制移除watcher路径，防止事件风暴"""
+        try:
+            if path in self.file_watcher.directories():
+                self.file_watcher.removePath(path)
+                debug_print(f"[FileWatcher] Force removed: {path}")
+        except Exception as e:
+            debug_print(f"[FileWatcher] Exception in force_remove_watcher: {e}")
+        debug_print(f"[FileWatcher] Now watching: {self.file_watcher.directories()}")
+
     def update_tab_title(self):
         if hasattr(self, 'current_path'):
             # shell: 路径中文映射
@@ -3021,17 +3031,15 @@ class FileExplorerTab(QWidget):
         if hasattr(self, 'file_watcher'):
             # 移除旧路径的监控
             if old_path and os.path.exists(old_path) and os.path.isdir(old_path) and not old_path.startswith('shell:'):
-                watched_dirs = self.file_watcher.directories()
-                if old_path in watched_dirs:
-                    self.file_watcher.removePath(old_path)
-                    debug_print(f"[FileWatcher] Stopped watching: {old_path}")
-            
+                self._force_remove_watcher(old_path)
             # 添加新路径的监控
             if os.path.isdir(path):
+                self._force_remove_watcher(path)
                 if self.file_watcher.addPath(path):
                     debug_print(f"[FileWatcher] Now watching: {path}")
                 else:
                     debug_print(f"[FileWatcher] Failed to watch: {path}")
+                debug_print(f"[FileWatcher] Now watching: {self.file_watcher.directories()}")
         
         if hasattr(self, 'path_bar'):
             self.path_bar.set_path(path)
@@ -3120,36 +3128,31 @@ class FileExplorerTab(QWidget):
     
     def on_directory_changed(self, path):
         """文件系统监控：目录内容发生变化（带防抖）"""
-        # 防抖：检查是否在短时间内已处理过此路径
-        import time
+        import time, os
         current_time = time.time() * 1000  # 转为毫秒
-        
+        # 目录已不存在，强制移除watcher，防止事件风暴
+        if not os.path.exists(path):
+            debug_print(f"[FileWatcher] Directory not exist, remove watcher: {path}")
+            self._force_remove_watcher(path)
+            return
         if hasattr(self, '_last_watcher_event'):
             last_time = self._last_watcher_event.get(path, 0)
             time_since_last = current_time - last_time
-
-            # 如果已经有刷新定时器在跑且是当前路径，则直接忽略此次事件，避免重复排队
             if path == getattr(self, 'current_path', None) and self.refresh_timer.isActive():
                 return
-
             if time_since_last < self._watcher_debounce_ms:
-                # 忽略短时间内的重复事件，但不打印日志避免刷屏
                 return
-
             self._last_watcher_event[path] = current_time
-            # 清理旧记录（保留最近10个）
             if len(self._last_watcher_event) > 10:
                 sorted_items = sorted(self._last_watcher_event.items(), key=lambda x: x[1], reverse=True)
                 self._last_watcher_event = dict(sorted_items[:10])
         else:
             self._last_watcher_event = {path: current_time}
-        
         debug_print(f"[FileWatcher] Directory changed: {path}")
-        # 如果设置了抑制标志，不触发刷新
+        debug_print(f"[FileWatcher] Now watching: {self.file_watcher.directories()}")
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
             return
-        # 只在监控的是当前路径时才刷新
         if path == self.current_path:
             self._schedule_refresh(reason="watcher")
 
