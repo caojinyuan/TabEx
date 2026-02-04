@@ -2396,13 +2396,17 @@ class FileExplorerTab(QWidget):
     def on_path_bar_changed(self, path):
         """处理面包屑路径栏的路径变化，支持特殊shell路径自动跳转"""
         import os
+        import subprocess
         path = path.strip()
         # 处理cmd命令
         if path.lower() == 'cmd':
             try:
                 current_dir = self.current_path
                 if current_dir and os.path.exists(current_dir):
-                    launch_detached(['cmd', '/K', 'cd', '/d', current_dir], extra_creationflags=subprocess.CREATE_NEW_CONSOLE)
+                    # 直接使用subprocess.Popen，CREATE_NEW_CONSOLE不能与DETACHED_PROCESS同时使用
+                    subprocess.Popen(['cmd', '/K', 'cd', '/d', current_dir], 
+                                   creationflags=subprocess.CREATE_NEW_CONSOLE,
+                                   cwd=current_dir)
                     self.path_bar.set_path(current_dir)
                 else:
                     show_toast(self, "错误", "当前路径无效，无法打开命令行", level="error")
