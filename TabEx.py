@@ -2206,9 +2206,14 @@ class FileExplorerTab(QWidget):
             if hasattr(e, 'arguments') and hasattr(e, 'signal'):
                 if e.signal == 'NavigateComplete2(IDispatch*, QVariant&)':
                     url = str(e.arguments[1])
-                    # 检查是否为控制面板及其子目录
+                    # 检查是否为控制面板及其子目录，若是则用原生窗口打开
                     if self._is_control_panel_path(url):
-                        show_toast(self, "不支持嵌入", "控制面板及其子目录无法嵌入到标签页中，标签页将自动关闭。", level="warning")
+                        try:
+                            import subprocess
+                            subprocess.Popen(['explorer.exe', url])
+                            show_toast(self, "已打开", "控制面板已在新窗口打开", level="info", duration=2000)
+                        except Exception as ex:
+                            show_toast(self, "错误", f"无法打开控制面板: {ex}", level="error")
                         # 关闭当前标签页
                         if self.main_window and hasattr(self.main_window, 'tab_widget'):
                             idx = self.main_window.tab_widget.indexOf(self)
@@ -2903,9 +2908,14 @@ class FileExplorerTab(QWidget):
     def navigate_to(self, path, is_shell=False, add_to_history=True, skip_async_check=False):
         debug_print(f"[navigate_to] To '{path}' (is_shell={is_shell}, skip_async={skip_async_check})")
 
-        # 屏蔽控制面板及其子目录的嵌入
+        # 控制面板及其子目录用原生窗口打开，不嵌入
         if self._is_control_panel_path(path):
-            show_toast(self, "不支持嵌入", "控制面板及其子目录无法嵌入到标签页中。", level="warning")
+            try:
+                import subprocess
+                subprocess.Popen(['explorer.exe', path])
+                show_toast(self, "已打开", "控制面板已在新窗口打开", level="info", duration=2000)
+            except Exception as e:
+                show_toast(self, "错误", f"无法打开控制面板: {e}", level="error")
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(self.current_path)
             return
@@ -6611,6 +6621,16 @@ class MainWindow(QMainWindow):
                         # 获取窗口标题
                         title = win32gui.GetWindowText(hwnd)
                         
+                        debug_print(f"[Explorer Monitor] Checking window: {hwnd} - {title}")
+                        
+                        # 检查窗口标题是否为控制面板或其子项
+                        if (title in ['控制面板', 'Control Panel'] or 
+                            title.startswith('控制面板\\') or title.startswith('控制面板 - ') or 
+                            title.startswith('Control Panel\\') or title.startswith('Control Panel - ') or
+                            '\\控制面板\\' in title):
+                            debug_print(f"[Explorer Monitor] Control Panel detected by title, keeping original window")
+                            continue
+                        
                         # 只排除明确是我们应用的主窗口，不要误排除路径中包含TabEx的Explorer窗口
                         # 检查是否以"TabExplorer"开头（软件主窗口）或者窗口句柄是我们的主窗口
                         if title.startswith("TabExplorer"):
@@ -6634,11 +6654,14 @@ class MainWindow(QMainWindow):
                         if path:
                             debug_print(f"[Explorer Monitor] ✓ Path: {path}")
                             
-                            # 屏蔽控制面板及其子目录的自动嵌入
+                            # 控制面板及其子目录直接在原窗口打开，不拦截
                             if self._is_control_panel_path_for_monitor(path):
-                                show_toast(self, "不支持嵌入", "控制面板及其子目录无法嵌入到标签页中。", level="warning")
-                            else:
-                                self.open_path_signal.emit(path)
+                                debug_print(f"[Explorer Monitor] Control Panel detected, keeping original window")
+                                # 不关闭原窗口，让控制面板在原生Explorer中打开
+                                continue
+                            
+                            # 非控制面板路径，发送信号并关闭原窗口
+                            self.open_path_signal.emit(path)
                             # 优化：减少等待时间（从500ms到200ms）
                             time.sleep(0.2)
                             # 关闭原Explorer窗口
@@ -6706,10 +6729,23 @@ class MainWindow(QMainWindow):
                             window_hwnd = window.HWND
                             
                             if window_hwnd == hwnd:
+                                # 先尝试获取 LocationName，用于识别控制面板
+                                location_name = None
+                                try:
+                                    location_name = window.LocationName
+                                    debug_print(f"[Explorer Monitor] LocationName: {location_name}")
+                                except:
+                                    pass
+                                
                                 # 获取当前路径
                                 location = window.LocationURL
                                 
                                 debug_print(f"[Explorer Monitor] LocationURL: {location}")
+                                
+                                # 检查是否为控制面板
+                                if location_name and location_name in ['控制面板', 'Control Panel']:
+                                    debug_print(f"[Explorer Monitor] Control Panel detected by LocationName")
+                                    return 'shell:ControlPanelFolder'
                                 
                                 if location:
                                     # 转换file:///格式的URL为本地路径
@@ -6758,6 +6794,12 @@ class MainWindow(QMainWindow):
                                             return 'shell:NetworkPlacesFolder'
                                         elif location_name in ['回收站', 'Recycle Bin']:
                                             return 'shell:RecycleBinFolder'
+                                        # 检查是否为控制面板相关项
+                                        elif location_name in ['控制面板', 'Control Panel', '用户帐户', 'User Accounts', 
+                                                              '程序和功能', 'Programs and Features', '系统', 'System',
+                                                              '设备管理器', 'Device Manager', '网络和共享中心', 'Network and Sharing Center']:
+                                            debug_print(f"[Explorer Monitor] Control Panel item detected by LocationName")
+                                            return 'shell:ControlPanelFolder'
                                     except:
                                         pass
                                     
