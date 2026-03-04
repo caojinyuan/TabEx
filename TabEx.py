@@ -5289,27 +5289,20 @@ class MainWindow(QMainWindow):
         复制当前选中文件名或路径+文件名到剪贴板并提示。
         mode: "filename" 只拷贝文件名，"path" 拷贝全路径+文件名。
         """
-        debug_print(f"[copy_selected_filename] Called, mode={mode}")
         current_tab = self.get_current_tab_widget()
-        debug_print(f"[copy_selected_filename] current_tab: {current_tab}")
         names = []
         if current_tab and hasattr(current_tab, 'get_selected_filenames'):
             names = current_tab.get_selected_filenames()
-        debug_print(f"[copy_selected_filename] Selected names: {names}")
         from PyQt5.QtWidgets import QApplication
         if names:
             if mode == "path":
                 # 拷贝全路径+文件名，使用设置中定义的分隔符
                 separator = self.config.get("breadcrumb_copy_separator", "/")
-                debug_print(f"[copy_selected_filename] separator={repr(separator)}, config={self.config.get('breadcrumb_copy_separator')}")
                 # 获取当前路径，并用设置的分隔符替换所有反斜杠和正斜杠
                 current_path = current_tab.current_path.replace("\\", "/").replace("/", separator)
-                debug_print(f"[copy_selected_filename] original_path={repr(current_tab.current_path)}, after_replace={repr(current_path)}")
                 full_paths = [f"{current_path}{separator}{name}" for name in names]
-                debug_print(f"[copy_selected_filename] full_paths={full_paths}")
                 text = ", ".join(full_paths)
                 QApplication.clipboard().setText(text)
-                debug_print(f"[copy_selected_filename] Copied to clipboard: {text}")
                 if len(full_paths) == 1:
                     show_toast(self, "复制成功", f"路径: {full_paths[0]}", level="info")
                 else:
@@ -5318,7 +5311,6 @@ class MainWindow(QMainWindow):
                 # 只拷贝文件名
                 filenames_text = ", ".join(names)
                 QApplication.clipboard().setText(filenames_text)
-                debug_print(f"[copy_selected_filename] Copied to clipboard: {filenames_text}")
                 if len(names) == 1:
                     show_toast(self, "复制成功", f"文件名: {names[0]}", level="info")
                 else:
@@ -5389,15 +5381,11 @@ class MainWindow(QMainWindow):
             
             hotkeys = self.config.get("hotkeys", {})
             
-            # 调试：打印当前按键状态（仅在调试模式且按下Alt时）
-            if is_key_pressed(VK_MENU):
-                debug_print(f"[Shortcut Poll] Alt is pressed, Z={is_key_pressed(0x5A)}, X={is_key_pressed(0x58)}")
-            
             # Alt+Z - 拷贝文件名
             if is_key_pressed(VK_MENU) and is_key_pressed(0x5A) and hotkeys.get("copy_filename", True):
                 key_combo = "Alt+Z"
                 if not self._last_keys_state.get(key_combo, False):
-                    debug_print("[Shortcut Poll] Detected Alt+Z - calling copy_selected_filename")
+                    debug_print("[Shortcut Poll] Detected Alt+Z")
                     self.copy_selected_filename(mode="filename")
                     self._last_keys_state[key_combo] = True
                 return
@@ -5408,7 +5396,7 @@ class MainWindow(QMainWindow):
             if is_key_pressed(VK_MENU) and is_key_pressed(0x58) and hotkeys.get("copy_filepath", True):
                 key_combo = "Alt+X"
                 if not self._last_keys_state.get(key_combo, False):
-                    debug_print("[Shortcut Poll] Detected Alt+X - calling copy_selected_filename")
+                    debug_print("[Shortcut Poll] Detected Alt+X")
                     self.copy_selected_filename(mode="path")
                     self._last_keys_state[key_combo] = True
                 return
@@ -5878,7 +5866,7 @@ class MainWindow(QMainWindow):
         self._last_keys_state = {}
         self._shortcut_timer = QTimer(self)
         self._shortcut_timer.timeout.connect(self._check_shortcuts)
-        self._shortcut_timer.start(50)  # 每50ms检查一次
+        self._shortcut_timer.start(100)  # 每100ms检查一次
         
         # 性能优化：延迟加载非关键功能（100ms后加载）
         QTimer.singleShot(100, self._delayed_initialization)
