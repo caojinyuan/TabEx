@@ -5284,25 +5284,45 @@ class MainWindow(QMainWindow):
         if current_tab:
             self.add_tab_bookmark(current_tab)
 
-    def copy_selected_filename(self):
-        """复制当前选中文件名（含后缀）或路径栏地址到剪贴板并提示"""
-        debug_print("[copy_selected_filename] Called")
+    def copy_selected_filename(self, mode="filename"):
+        """
+        复制当前选中文件名或路径+文件名到剪贴板并提示。
+        mode: "filename" 只拷贝文件名，"path" 拷贝全路径+文件名。
+        """
+        debug_print(f"[copy_selected_filename] Called, mode={mode}")
         current_tab = self.get_current_tab_widget()
         debug_print(f"[copy_selected_filename] current_tab: {current_tab}")
-        # 优先复制选中文件名，否则复制路径栏地址
         names = []
         if current_tab and hasattr(current_tab, 'get_selected_filenames'):
             names = current_tab.get_selected_filenames()
         debug_print(f"[copy_selected_filename] Selected names: {names}")
         from PyQt5.QtWidgets import QApplication
         if names:
-            filenames_text = ", ".join(names)
-            QApplication.clipboard().setText(filenames_text)
-            debug_print(f"[copy_selected_filename] Copied to clipboard: {filenames_text}")
-            if len(names) == 1:
-                show_toast(self, "复制成功", f"文件名: {names[0]}", level="info")
+            if mode == "path":
+                # 拷贝全路径+文件名，使用设置中定义的分隔符
+                separator = self.config.get("breadcrumb_copy_separator", "/")
+                debug_print(f"[copy_selected_filename] separator={repr(separator)}, config={self.config.get('breadcrumb_copy_separator')}")
+                # 获取当前路径，并用设置的分隔符替换所有反斜杠和正斜杠
+                current_path = current_tab.current_path.replace("\\", "/").replace("/", separator)
+                debug_print(f"[copy_selected_filename] original_path={repr(current_tab.current_path)}, after_replace={repr(current_path)}")
+                full_paths = [f"{current_path}{separator}{name}" for name in names]
+                debug_print(f"[copy_selected_filename] full_paths={full_paths}")
+                text = ", ".join(full_paths)
+                QApplication.clipboard().setText(text)
+                debug_print(f"[copy_selected_filename] Copied to clipboard: {text}")
+                if len(full_paths) == 1:
+                    show_toast(self, "复制成功", f"路径: {full_paths[0]}", level="info")
+                else:
+                    show_toast(self, "复制成功", f"已复制 {len(full_paths)} 个路径", level="info")
             else:
-                show_toast(self, "复制成功", f"已复制 {len(names)} 个文件名", level="info")
+                # 只拷贝文件名
+                filenames_text = ", ".join(names)
+                QApplication.clipboard().setText(filenames_text)
+                debug_print(f"[copy_selected_filename] Copied to clipboard: {filenames_text}")
+                if len(names) == 1:
+                    show_toast(self, "复制成功", f"文件名: {names[0]}", level="info")
+                else:
+                    show_toast(self, "复制成功", f"已复制 {len(names)} 个文件名", level="info")
         else:
             # 未选中文件时，复制路径栏地址，按设置分隔符
             separator = self.config.get("breadcrumb_copy_separator", "/")
@@ -5369,16 +5389,31 @@ class MainWindow(QMainWindow):
             
             hotkeys = self.config.get("hotkeys", {})
             
-            # 首先检查Ctrl+Alt组合键（优先级最高，避免被其他快捷键拦截）
-            if is_key_pressed(VK_CONTROL) and is_key_pressed(VK_MENU) and hotkeys.get("copy_filename", True):
-                key_combo = "Ctrl+Alt"
+            # 调试：打印当前按键状态（仅在调试模式且按下Alt时）
+            if is_key_pressed(VK_MENU):
+                debug_print(f"[Shortcut Poll] Alt is pressed, Z={is_key_pressed(0x5A)}, X={is_key_pressed(0x58)}")
+            
+            # Alt+Z - 拷贝文件名
+            if is_key_pressed(VK_MENU) and is_key_pressed(0x5A) and hotkeys.get("copy_filename", True):
+                key_combo = "Alt+Z"
                 if not self._last_keys_state.get(key_combo, False):
-                    debug_print("[Shortcut Poll] Detected Ctrl+Alt")
-                    self.copy_selected_filename()
+                    debug_print("[Shortcut Poll] Detected Alt+Z - calling copy_selected_filename")
+                    self.copy_selected_filename(mode="filename")
                     self._last_keys_state[key_combo] = True
                 return
             else:
-                self._last_keys_state["Ctrl+Alt"] = False
+                self._last_keys_state["Alt+Z"] = False
+            
+            # Alt+X - 拷贝路径+文件名
+            if is_key_pressed(VK_MENU) and is_key_pressed(0x58) and hotkeys.get("copy_filepath", True):
+                key_combo = "Alt+X"
+                if not self._last_keys_state.get(key_combo, False):
+                    debug_print("[Shortcut Poll] Detected Alt+X - calling copy_selected_filename")
+                    self.copy_selected_filename(mode="path")
+                    self._last_keys_state[key_combo] = True
+                return
+            else:
+                self._last_keys_state["Alt+X"] = False
             
             # 检查Ctrl组合键
             if is_key_pressed(VK_CONTROL):
@@ -5876,7 +5911,8 @@ class MainWindow(QMainWindow):
                 "go_up": True,             # Alt+Up
                 "refresh": True,           # F5
                 "add_bookmark": True,      # Ctrl+D
-                "copy_filename": True      # Ctrl+Alt - 复制选中文件名
+                "copy_filename": True,     # Alt+Z - 复制选中文件名
+                "copy_filepath": True      # Alt+X - 复制文件路径\文件名
             }
         }
         
@@ -7395,9 +7431,12 @@ class SettingsDialog(QDialog):
         self.hotkey_add_bookmark = QCheckBox("Ctrl+D - 添加当前路径到书签")
         self.hotkey_add_bookmark.setChecked(hotkeys.get("add_bookmark", True))
         hotkey_layout.addWidget(self.hotkey_add_bookmark)
-        self.hotkey_copy_filename = QCheckBox("Ctrl+Alt - 复制选中文件名（含后缀）")
+        self.hotkey_copy_filename = QCheckBox("Alt+Z - 复制选中文件名（含后缀）")
         self.hotkey_copy_filename.setChecked(hotkeys.get("copy_filename", True))
         hotkey_layout.addWidget(self.hotkey_copy_filename)
+        self.hotkey_copy_filepath = QCheckBox("Alt+X - 复制文件路径\\文件名")
+        self.hotkey_copy_filepath.setChecked(hotkeys.get("copy_filepath", True))
+        hotkey_layout.addWidget(self.hotkey_copy_filepath)
         # 提示信息（放在快捷键设置框内）
         tip_label = QLabel("💡 提示：取消勾选可禁用对应的快捷键")
         tip_label.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
@@ -7532,7 +7571,9 @@ class SettingsDialog(QDialog):
                 "navigate": self.hotkey_navigate.isChecked(),
                 "go_up": self.hotkey_go_up.isChecked(),
                 "refresh": self.hotkey_refresh.isChecked(),
-                "add_bookmark": self.hotkey_add_bookmark.isChecked()
+                "add_bookmark": self.hotkey_add_bookmark.isChecked(),
+                "copy_filename": self.hotkey_copy_filename.isChecked(),
+                "copy_filepath": self.hotkey_copy_filepath.isChecked()
             }
             
             # 保存到文件
