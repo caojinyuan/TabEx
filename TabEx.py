@@ -2005,8 +2005,8 @@ class FileExplorerTab(QWidget):
         from PyQt5.QtCore import QTimer
         self._path_sync_timer = QTimer(self)
         self._path_sync_timer.timeout.connect(self.sync_path_bar_with_explorer)
-        # 优化：从500ms改为1000ms，减少CPU占用
-        self._path_sync_timer.start(1000)
+        # 改为200ms，确保路径栏实时更新
+        self._path_sync_timer.start(200)
 
     def sync_path_bar_with_explorer(self):
         # 通过QAxWidget的LocationURL属性获取当前路径
@@ -2029,10 +2029,6 @@ class FileExplorerTab(QWidget):
                     return
                 
                 if local_path and local_path != self.current_path:
-                    # 避免在导航过程中同步（减少干扰）
-                    if getattr(self, '_navigating_folder', False):
-                        return
-                    
                     self.current_path = local_path
                     if hasattr(self, 'path_bar'):
                         self.path_bar.set_path(local_path)
@@ -2043,6 +2039,19 @@ class FileExplorerTab(QWidget):
                     # 同步左侧目录树（仅在非导航状态下）
                     if self.main_window and hasattr(self.main_window, 'expand_dir_tree_to_path'):
                         self.main_window.expand_dir_tree_to_path(local_path)
+                    # 导航完成后清理标志并恢复同步
+                    if getattr(self, '_navigating_folder', False):
+                        self._navigating_folder = False
+                    self._resume_path_sync_after_navigation()
+        except Exception:
+            pass
+
+    def _resume_path_sync_after_navigation(self):
+        """恢复路径同步定时器并清理导航标志"""
+        try:
+            if hasattr(self, '_path_sync_timer') and self._path_sync_timer and not self._path_sync_timer.isActive():
+                self._path_sync_timer.start(200)
+                debug_print(f"[Navigation] Path sync timer resumed")
         except Exception:
             pass
 
@@ -2504,7 +2513,20 @@ class FileExplorerTab(QWidget):
     def _get_selected_count_safe(self):
         """安全地获取当前选中项数量，避免触发 ActiveX 属性不存在的警告"""
         try:
-            sel = self.explorer.dynamicCall('SelectedItems()')
+            # 优先通过 Document 接口获取 SelectedItems（避免 WebBrowser 直接调用警告）
+            doc = None
+            try:
+                doc = self.explorer.querySubObject('Document') if hasattr(self, 'explorer') else None
+            except Exception:
+                doc = None
+
+            sel = None
+            if doc:
+                try:
+                    sel = doc.querySubObject('SelectedItems()')
+                except Exception:
+                    sel = None
+
             if sel is None:
                 return None
 
@@ -2640,6 +2662,12 @@ class FileExplorerTab(QWidget):
                         if hasattr(self, '_path_sync_timer') and self._path_sync_timer:
                             self._path_sync_timer.stop()
                             debug_print(f"[DoubleClick] Path sync timer paused")
+                        # 导航后兜底恢复路径同步（防止计时器永久停止）
+                        try:
+                            from PyQt5.QtCore import QTimer
+                            QTimer.singleShot(1200, self._resume_path_sync_after_navigation)
+                        except Exception:
+                            pass
 
                     # 使用延迟检查，给足够时间让文件夹导航完成
                     def check_and_handle():
@@ -3034,6 +3062,10 @@ class FileExplorerTab(QWidget):
             self.explorer.dynamicCall("Navigate(const QString&)", url)
         
         self.current_path = path
+        # 导航完成后清理标志并恢复路径同步
+        if getattr(self, '_navigating_folder', False):
+            self._navigating_folder = False
+        self._resume_path_sync_after_navigation()
 
         # 不再启动目录轮询（QFileSystemWatcher已足够，轮询会造成不必要的刷新）
         # self._update_dir_polling(path)  # 已禁用
@@ -3172,6 +3204,9 @@ class FileExplorerTab(QWidget):
 
     def _schedule_refresh(self, reason="manual"):
         """统一的刷新调度，避免重复代码"""
+        if getattr(self, '_suppress_auto_refresh', False):
+            debug_print(f"[AutoRefresh] Suppressed during navigation (reason={reason})")
+            return
         if not self.refresh_timer.isActive():
             debug_print(f"[AutoRefresh] Scheduling refresh in {self.refresh_delay_ms}ms (reason={reason})")
             self.refresh_timer.start(self.refresh_delay_ms)
@@ -3182,6 +3217,9 @@ class FileExplorerTab(QWidget):
     
     def delayed_refresh(self):
         """延迟刷新：避免频繁刷新"""
+        if getattr(self, '_suppress_auto_refresh', False):
+            debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
+            return
         debug_print(f"[FileWatcher] Auto-refreshing: {self.current_path}")
         if hasattr(self, 'explorer') and self.current_path:
             try:
@@ -5548,6 +5586,7 @@ class MainWindow(QMainWindow):
             self.config["debug_mode"] = dlg.debug_mode_cb.isChecked()
             self.config["explorer_monitor_interval"] = new_interval
             self.config["enable_cache_tabs"] = dlg.cache_tabs_cb.isChecked()
+            self.config["enable_daily_restart"] = dlg.daily_restart_cb.isChecked()
 
             # 更新全局调试开关
             set_debug_mode(self.config["debug_mode"])
@@ -5568,6 +5607,7 @@ class MainWindow(QMainWindow):
             self.config["hotkeys"]["copy_filename"] = dlg.hotkey_copy_filename.isChecked()
             
             self.save_config()
+            self._setup_daily_restart_timer()
             
             # 重新设置快捷键
             # 清除旧的快捷键
@@ -5871,6 +5911,10 @@ class MainWindow(QMainWindow):
         # 性能优化：延迟加载非关键功能（100ms后加载）
         QTimer.singleShot(100, self._delayed_initialization)
 
+        # 每日凌晨自动重启（可在设置中开启）
+        self._daily_restart_timer = None
+        self._setup_daily_restart_timer()
+
         # 使用应用图标作为窗口图标
         try:
             from PyQt5.QtWidgets import QApplication
@@ -5888,6 +5932,7 @@ class MainWindow(QMainWindow):
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
             "enable_tortoisegit_buttons": False,  # 默认关闭TortoiseGit按钮
+            "enable_daily_restart": False,  # 每天凌晨自动重启释放内存
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -5932,6 +5977,66 @@ class MainWindow(QMainWindow):
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"Failed to save config: {e}")
+
+    def _setup_daily_restart_timer(self):
+        """根据设置启用每日凌晨自动重启"""
+        try:
+            if hasattr(self, '_daily_restart_timer') and self._daily_restart_timer:
+                self._daily_restart_timer.stop()
+                self._daily_restart_timer.deleteLater()
+                self._daily_restart_timer = None
+        except Exception:
+            self._daily_restart_timer = None
+
+        if not self.config.get("enable_daily_restart", False):
+            return
+
+        try:
+            from PyQt5.QtCore import QTimer
+            ms = self._ms_to_next_midnight()
+            self._daily_restart_timer = QTimer(self)
+            self._daily_restart_timer.setSingleShot(True)
+            self._daily_restart_timer.timeout.connect(self._on_daily_restart_timeout)
+            self._daily_restart_timer.start(ms)
+            debug_print(f"[DailyRestart] Scheduled in {ms}ms")
+        except Exception as e:
+            debug_print(f"[DailyRestart] Failed to schedule: {e}")
+
+    def _ms_to_next_midnight(self):
+        try:
+            from datetime import datetime, timedelta
+            now = datetime.now()
+            next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            delta = next_midnight - now
+            ms = int(delta.total_seconds() * 1000)
+            return ms if ms > 1000 else 1000
+        except Exception:
+            return 60 * 1000
+
+    def _on_daily_restart_timeout(self):
+        self._perform_daily_restart()
+
+    def _perform_daily_restart(self):
+        """立即重启应用（用于每日释放内存）"""
+        try:
+            import sys
+            import subprocess
+            import os
+            args = [sys.executable] + sys.argv
+            subprocess.Popen(args, cwd=os.getcwd(), close_fds=True)
+        except Exception as e:
+            debug_print(f"[DailyRestart] Failed to relaunch: {e}")
+            return
+
+        try:
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(300, self.close)
+        except Exception:
+            try:
+                from PyQt5.QtWidgets import QApplication
+                QApplication.quit()
+            except Exception:
+                pass
 
     def ensure_default_bookmarks(self):
         bm = self.bookmark_manager
@@ -7358,6 +7463,21 @@ class SettingsDialog(QDialog):
             if w: compact_widget(w)
         left_col.addWidget(tabs_group)
 
+        # 内存释放设置组
+        memory_group = QGroupBox("内存释放设置")
+        memory_layout = QVBoxLayout()
+        self.daily_restart_cb = QCheckBox("每天凌晨自动重启一次（释放内存）", self)
+        self.daily_restart_cb.setChecked(config.get("enable_daily_restart", False))
+        self.daily_restart_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.daily_restart_cb.setToolTip("每天凌晨自动重启一次，以释放长期占用的内存")
+        memory_layout.addWidget(self.daily_restart_cb)
+        memory_group.setLayout(memory_layout)
+        compact_groupbox(memory_group)
+        for i in range(memory_layout.count()):
+            w = memory_layout.itemAt(i).widget()
+            if w: compact_widget(w)
+        left_col.addWidget(memory_group)
+
         # 开机启动设置组
         startup_group = QGroupBox("开机启动设置")
         startup_layout = QVBoxLayout()
@@ -7546,6 +7666,7 @@ class SettingsDialog(QDialog):
             self.parent().config["explorer_monitor_debug"] = self.explorer_monitor_debug_cb.isChecked()
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
+            self.parent().config["enable_daily_restart"] = self.daily_restart_cb.isChecked()
             # 保存路径栏分隔符设置
             self.parent().config["breadcrumb_copy_separator"] = self.path_separator_combo.currentData()
             
@@ -7566,6 +7687,9 @@ class SettingsDialog(QDialog):
             
             # 保存到文件
             self.parent().save_config()
+            # 重新设置每日重启计时器
+            if hasattr(self.parent(), '_setup_daily_restart_timer'):
+                self.parent()._setup_daily_restart_timer()
             # 刷新所有tab的路径栏分隔符显示（立即生效）
             mainwin = self.parent()
             if hasattr(mainwin, 'tab_widget') and hasattr(mainwin, 'get_tab_widget'):
