@@ -5966,6 +5966,7 @@ class MainWindow(QMainWindow):
                     return config
             else:
                 print("No config file found, starting with default config")
+                return default_config
         except Exception as e:
             print(f"Failed to load config: {e}")
             return default_config
@@ -7355,10 +7356,15 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("设置")
         # 设置为不可调边框的对话框
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.setFixedSize(600, 500)
+        self.setFixedSize(600, 750)
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(12)
+        
+        # 创建内容布局（左右两列）
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(12)
+        
         left_col = QVBoxLayout()
         left_col.setSpacing(6)
         right_col = QVBoxLayout()
@@ -7558,9 +7564,19 @@ class SettingsDialog(QDialog):
         right_col.addWidget(hotkey_group)
         # 右侧添加弹性空间，使快捷键组底部与左侧对齐
         right_col.addStretch(1)
-
-        # 添加弹性空间，将按钮推到底部
-        left_col.addStretch(1)
+        
+        # 添加左右两列到内容布局
+        content_layout.addLayout(left_col, 2)
+        content_layout.addLayout(right_col, 1)
+        
+        # 创建主垂直布局，放置内容和底部区域
+        main_vertical_layout = QVBoxLayout()
+        main_vertical_layout.addLayout(content_layout, 1)
+        
+        # 底部区域（横跨整个宽度）
+        bottom_layout = QVBoxLayout()
+        bottom_layout.setSpacing(8)
+        
         # 检查更新链接
         update_link = QLabel()
         update_link.setText('检查更新: <a href="https://github.com/caojinyuan/TabEx/releases">https://github.com/caojinyuan/TabEx/releases</a>')
@@ -7568,15 +7584,19 @@ class SettingsDialog(QDialog):
         update_link.setStyleSheet("QLabel { padding: 10px; font-size: 10pt; }")
         update_link.setTextFormat(Qt.RichText)
         update_link.setToolTip("点击链接在浏览器中打开 GitHub Releases 页面")
-        left_col.addWidget(update_link)
+        update_link.setWordWrap(True)
+        bottom_layout.addWidget(update_link)
+        
         # 按钮区域
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        left_col.addWidget(buttons)
+        bottom_layout.addWidget(buttons)
+        
+        main_vertical_layout.addLayout(bottom_layout)
+        
         # 主布局拼接
-        main_layout.addLayout(left_col, 2)
-        main_layout.addLayout(right_col, 1)
+        main_layout.addLayout(main_vertical_layout)
     
     def _is_auto_startup_enabled(self):
         """检查是否已启用开机启动"""
