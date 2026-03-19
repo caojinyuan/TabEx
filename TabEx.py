@@ -1338,10 +1338,12 @@ class BreadcrumbPathBar(QWidget):
             from PyQt5.QtCore import QTimer
             self._resize_timer = QTimer(self)
             self._resize_timer.setSingleShot(True)
-            self._resize_timer.setInterval(75)
+            self._resize_timer.setInterval(50)  # 减少到50ms以加快响应
             self._resize_timer.timeout.connect(self.update_breadcrumbs)
         except Exception:
             self._resize_timer = None
+        # 标志：导航触发的更新（跳过节流），vs resize触发的更新（使用节流）
+        self._is_navigation_update = False
         self.init_ui()
     
     def init_ui(self):
@@ -1392,8 +1394,13 @@ class BreadcrumbPathBar(QWidget):
     def resizeEvent(self, event):
         """当路径栏宽度变化时，节流更新面包屑，减少重绘卡顿"""
         try:
-            if getattr(self, '_resize_timer', None):
-                # 重启定时器以合并连续的resize事件
+            # 只在非导航更新时进行节流，导航时立即更新
+            if self._is_navigation_update:
+                # 导航更新直接执行，不等待
+                self.update_breadcrumbs()
+                self._is_navigation_update = False
+            elif getattr(self, '_resize_timer', None):
+                # Resize事件使用节流定时器，合并连续events
                 self._resize_timer.start()
             else:
                 self.update_breadcrumbs()
@@ -1480,11 +1487,18 @@ class BreadcrumbPathBar(QWidget):
         else:
             norm_path = path.replace("/", "\\").replace("\\", "\\")
         self.current_path = norm_path
-        if not self.edit_mode:
-            self.update_breadcrumbs()
+        # 标记这是来自导航的更新（需要立即刷新，不节流）
+        self._is_navigation_update = True
+        # 总是更新面包屑，无论是否处于编辑模式
+        # 这是因为导航操作通常会调用set_path，需要立即刷新显示
+        self.update_breadcrumbs()
     
     def update_breadcrumbs(self):
         """更新面包屑显示"""
+        # 如果处于编辑模式，则不更新面包屑显示（只显示编辑框）
+        if self.edit_mode:
+            return
+        
         # 清空现有的面包屑
         while self.breadcrumb_layout.count() > 1:  # 保留最后的stretch
             item = self.breadcrumb_layout.takeAt(0)
@@ -4979,6 +4993,17 @@ class MainWindow(QMainWindow):
         top = pos.y() <= margin
         bottom = pos.y() >= rect.height() - margin
         
+        # 检测是否在菜单栏区域，如果是则排除右边缘检测（防止干扰菜单栏溢出按钮">>）
+        in_menubar_area = False
+        if hasattr(self, 'menu_bar') and self.menu_bar:
+            menubar_rect = self.menu_bar.geometry()
+            in_menubar_area = (pos.y() >= menubar_rect.top() and 
+                              pos.y() <= menubar_rect.bottom())
+        
+        # 如果在菜单栏区域，排除右边缘检测
+        if in_menubar_area:
+            right = False
+        
         if top and left:
             return 'top-left'
         elif top and right:
@@ -5012,8 +5037,15 @@ class MainWindow(QMainWindow):
                       local_pos.x() >= 0 and 
                       local_pos.x() <= self.width())
 
+        # 检测是否在菜单栏区域，如果是则排除右边缘检测（防止干扰菜单栏溢出按钮">>）
+        in_menubar_area = False
+        if hasattr(self, 'menu_bar') and self.menu_bar:
+            menubar_rect = self.menu_bar.geometry()
+            in_menubar_area = (local_pos.y() >= menubar_rect.top() and 
+                              local_pos.y() <= menubar_rect.bottom())
+
         left = global_pos.x() <= frame_rect.left() + margin
-        right = global_pos.x() >= frame_rect.right() - margin
+        right = global_pos.x() >= frame_rect.right() - margin and not in_menubar_area  # 菜单栏区域排除右边缘
         top = global_pos.y() <= frame_rect.top() + margin and not in_titlebar  # 标题栏内不触发上边缘
         bottom = global_pos.y() >= frame_rect.bottom() - margin
 
@@ -7222,7 +7254,13 @@ class MainWindow(QMainWindow):
                                   local_pos.x() >= 0 and 
                                   local_pos.x() <= self.width())
                     
-                    edge = self.detect_edge_global(global_pos) if not in_titlebar else None
+                    # 检查是否在窗口边界外（如菜单弹出到窗口外），如果是则不进行边缘检测
+                    in_window_bounds = (local_pos.x() >= 0 and 
+                                       local_pos.x() <= self.width() and
+                                       local_pos.y() >= 0 and 
+                                       local_pos.y() <= self.height())
+                    
+                    edge = self.detect_edge_global(global_pos) if (not in_titlebar and in_window_bounds) else None
 
                     if event.type() == QEvent.MouseMove:
                         if self.resizing and self.resize_direction:
