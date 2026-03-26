@@ -2709,10 +2709,16 @@ class FileExplorerTab(QWidget):
                                     hit_test_result = None
                             
                             # 1. 检查是否点击前有选中项
+                            # 注意：selected_before 可能是上一帧/上一操作遗留状态，
+                            # 若当前已无选中且 hit-test 明确为空白，不应据此阻止 go_up。
                             if selected_before is not None and int(selected_before) > 0:
-                                debug_print(f"[DoubleClick] Had selection before: {selected_before}, skip go_up")
-                                self._selected_before_click = None
-                                return
+                                if ((current_selection is not None and int(current_selection) > 0) or
+                                    hit_test_result is True):
+                                    debug_print(f"[DoubleClick] Had selection before: {selected_before}, and current confirms item interaction, skip go_up")
+                                    self._selected_before_click = None
+                                    return
+                                else:
+                                    debug_print(f"[DoubleClick] Had selection before: {selected_before}, but current_selection={current_selection}, hit_test={hit_test_result}; treat as stale and continue")
                             
                             # 2. 检查当前选中项数量
                             cnt = self._get_selected_count_safe()
