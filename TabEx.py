@@ -5632,7 +5632,6 @@ class MainWindow(QMainWindow):
             self.config["debug_mode"] = dlg.debug_mode_cb.isChecked()
             self.config["explorer_monitor_interval"] = new_interval
             self.config["enable_cache_tabs"] = dlg.cache_tabs_cb.isChecked()
-            self.config["enable_daily_restart"] = dlg.daily_restart_cb.isChecked()
 
             # 更新全局调试开关
             set_debug_mode(self.config["debug_mode"])
@@ -5653,7 +5652,6 @@ class MainWindow(QMainWindow):
             self.config["hotkeys"]["copy_filename"] = dlg.hotkey_copy_filename.isChecked()
             
             self.save_config()
-            self._setup_daily_restart_timer()
             
             # 重新设置快捷键
             # 清除旧的快捷键
@@ -5957,10 +5955,6 @@ class MainWindow(QMainWindow):
         # 性能优化：延迟加载非关键功能（100ms后加载）
         QTimer.singleShot(100, self._delayed_initialization)
 
-        # 每日凌晨自动重启（可在设置中开启）
-        self._daily_restart_timer = None
-        self._setup_daily_restart_timer()
-
         # 使用应用图标作为窗口图标
         try:
             from PyQt5.QtWidgets import QApplication
@@ -5978,7 +5972,6 @@ class MainWindow(QMainWindow):
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
             "enable_tortoisegit_buttons": False,  # 默认关闭TortoiseGit按钮
-            "enable_daily_restart": False,  # 每天凌晨自动重启释放内存
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -6024,74 +6017,6 @@ class MainWindow(QMainWindow):
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"Failed to save config: {e}")
-
-    def _setup_daily_restart_timer(self):
-        """根据设置启用每日凌晨自动重启"""
-        try:
-            if hasattr(self, '_daily_restart_timer') and self._daily_restart_timer:
-                self._daily_restart_timer.stop()
-                self._daily_restart_timer.deleteLater()
-                self._daily_restart_timer = None
-        except Exception:
-            self._daily_restart_timer = None
-
-        if not self.config.get("enable_daily_restart", False):
-            return
-
-        try:
-            from PyQt5.QtCore import QTimer
-            ms = self._ms_to_next_midnight()
-            self._daily_restart_timer = QTimer(self)
-            self._daily_restart_timer.setSingleShot(True)
-            self._daily_restart_timer.timeout.connect(self._on_daily_restart_timeout)
-            self._daily_restart_timer.start(ms)
-            debug_print(f"[DailyRestart] Scheduled in {ms}ms")
-        except Exception as e:
-            debug_print(f"[DailyRestart] Failed to schedule: {e}")
-
-    def _ms_to_next_midnight(self):
-        try:
-            from datetime import datetime, timedelta
-            now = datetime.now()
-            next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            delta = next_midnight - now
-            ms = int(delta.total_seconds() * 1000)
-            return ms if ms > 1000 else 1000
-        except Exception:
-            return 60 * 1000
-
-    def _on_daily_restart_timeout(self):
-        self._perform_daily_restart()
-
-    def _perform_daily_restart(self):
-        """立即重启应用（用于每日释放内存）"""
-        try:
-            import sys
-            import subprocess
-            import os
-            # 先关闭当前进程，再延迟启动新进程，避免端口/文件竞争
-            # 用 cmd /c ping 制造延迟，确保旧进程完全退出后再启动
-            args = [sys.executable] + sys.argv
-            cmd_args = args + []
-            # 构造延迟重启命令：等待 2 秒后启动（ping 127.0.0.1 -n 3 约 2 秒）
-            py_exe = sys.executable
-            script = sys.argv[0]
-            delay_cmd = (
-                f'cmd /c "ping 127.0.0.1 -n 3 >nul && start "" '
-                f'"{py_exe}" "{os.path.abspath(script)}""'
-            )
-            subprocess.Popen(delay_cmd, shell=True, cwd=os.getcwd())
-            debug_print(f"[DailyRestart] Scheduled delayed restart in ~2s")
-        except Exception as e:
-            debug_print(f"[DailyRestart] Failed to relaunch: {e}")
-            return
-
-        # 立即关闭当前进程，新进程将在约 2 秒后由 cmd 启动
-        try:
-            from PyQt5.QtWidgets import QApplication
-            QApplication.quit()
-        except Exception:
-            pass
 
     def ensure_default_bookmarks(self):
         bm = self.bookmark_manager
@@ -7422,7 +7347,8 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("设置")
         # 设置为不可调边框的对话框
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.setFixedSize(600, 750)
+        # 宽度固定，高度按内容自动计算
+        self.setFixedWidth(600)
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(12)
@@ -7534,21 +7460,6 @@ class SettingsDialog(QDialog):
             w = tabs_layout.itemAt(i).widget()
             if w: compact_widget(w)
         left_col.addWidget(tabs_group)
-
-        # 内存释放设置组
-        memory_group = QGroupBox("内存释放设置")
-        memory_layout = QVBoxLayout()
-        self.daily_restart_cb = QCheckBox("每天凌晨自动重启一次（释放内存）", self)
-        self.daily_restart_cb.setChecked(config.get("enable_daily_restart", False))
-        self.daily_restart_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        self.daily_restart_cb.setToolTip("每天凌晨自动重启一次，以释放长期占用的内存")
-        memory_layout.addWidget(self.daily_restart_cb)
-        memory_group.setLayout(memory_layout)
-        compact_groupbox(memory_group)
-        for i in range(memory_layout.count()):
-            w = memory_layout.itemAt(i).widget()
-            if w: compact_widget(w)
-        left_col.addWidget(memory_group)
 
         # 开机启动设置组
         startup_group = QGroupBox("开机启动设置")
@@ -7663,6 +7574,24 @@ class SettingsDialog(QDialog):
         
         # 主布局拼接
         main_layout.addLayout(main_vertical_layout)
+
+        # 高度根据内容自适应，并限制不超过屏幕可用高度
+        try:
+            from PyQt5.QtWidgets import QApplication
+            from PyQt5.QtCore import QTimer
+
+            def _apply_auto_height():
+                self.adjustSize()
+                target_h = self.sizeHint().height()
+                screen_geo = QApplication.primaryScreen().availableGeometry()
+                max_h = int(screen_geo.height() * 0.9)
+                self.setFixedHeight(min(target_h, max_h))
+
+            # 延迟到布局稳定后计算，避免初次 sizeHint 偏差
+            QTimer.singleShot(0, _apply_auto_height)
+        except Exception:
+            # 兜底：给一个较合理默认高度
+            self.resize(600, 620)
     
     def _is_auto_startup_enabled(self):
         """检查是否已启用开机启动"""
@@ -7752,7 +7681,6 @@ class SettingsDialog(QDialog):
             self.parent().config["explorer_monitor_debug"] = self.explorer_monitor_debug_cb.isChecked()
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
-            self.parent().config["enable_daily_restart"] = self.daily_restart_cb.isChecked()
             # 保存路径栏分隔符设置
             self.parent().config["breadcrumb_copy_separator"] = self.path_separator_combo.currentData()
             
@@ -7773,9 +7701,6 @@ class SettingsDialog(QDialog):
             
             # 保存到文件
             self.parent().save_config()
-            # 重新设置每日重启计时器
-            if hasattr(self.parent(), '_setup_daily_restart_timer'):
-                self.parent()._setup_daily_restart_timer()
             # 刷新所有tab的路径栏分隔符显示（立即生效）
             mainwin = self.parent()
             if hasattr(mainwin, 'tab_widget') and hasattr(mainwin, 'get_tab_widget'):
