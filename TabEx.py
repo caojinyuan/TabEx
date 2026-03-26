@@ -5153,7 +5153,7 @@ class MainWindow(QMainWindow):
     def nativeEvent(self, eventType, message):
         """处理 Windows 原生事件，实现任务栏点击切换"""
         try:
-            if eventType == b"windows_generic_MSG" or eventType == "windows_generic_MSG":
+            if eventType in (b"windows_generic_MSG", "windows_generic_MSG", b"windows_dispatcher_MSG", "windows_dispatcher_MSG"):
                 from ctypes import wintypes, cast, POINTER
                 import ctypes
                 
@@ -5224,15 +5224,29 @@ class MainWindow(QMainWindow):
                 # WM_SYSCOMMAND = 0x0112
                 if msg.message == 0x0112:  # WM_SYSCOMMAND
                     command = msg.wParam & 0xFFF0
+                    SC_MINIMIZE = 0xF020
+                    SC_RESTORE = 0xF120
+                    SC_MAXIMIZE = 0xF030
+
+                    if command in (SC_MINIMIZE, SC_RESTORE, SC_MAXIMIZE):
+                        print(f"[Taskbar] WM_SYSCOMMAND received: 0x{command:04X}, minimized={self.isMinimized()}, active={self.isActiveWindow()}")
                     
-                    # SC_RESTORE = 0xF120 - 通过任务栏点击时发送
-                    if command == 0xF120:  # SC_RESTORE
+                    # 任务栏点击切换：
+                    # - 最小化状态下：让系统默认恢复
+                    # - 非最小化状态下：点击任务栏按钮则最小化
+                    if command == SC_RESTORE:
                         # 如果窗口当前可见（包括正常、最大化状态），则最小化
                         # 只有在最小化时，才执行默认的恢复行为
                         if not self.isMinimized():
                             self.showMinimized()
                             return True, 0
                         # 如果已经最小化，返回 False 让系统执行默认恢复
+                    elif command == SC_MINIMIZE:
+                        # 某些系统/场景下，任务栏二次点击会发 SC_MINIMIZE
+                        # 主动处理以保证行为一致
+                        if not self.isMinimized():
+                            self.showMinimized()
+                            return True, 0
 
                 # WM_SETCURSOR - 在命中边缘时主动切换调整大小光标
                 if msg.message == 0x0020:  # WM_SETCURSOR
@@ -6055,21 +6069,29 @@ class MainWindow(QMainWindow):
             import sys
             import subprocess
             import os
+            # 先关闭当前进程，再延迟启动新进程，避免端口/文件竞争
+            # 用 cmd /c ping 制造延迟，确保旧进程完全退出后再启动
             args = [sys.executable] + sys.argv
-            subprocess.Popen(args, cwd=os.getcwd(), close_fds=True)
+            cmd_args = args + []
+            # 构造延迟重启命令：等待 2 秒后启动（ping 127.0.0.1 -n 3 约 2 秒）
+            py_exe = sys.executable
+            script = sys.argv[0]
+            delay_cmd = (
+                f'cmd /c "ping 127.0.0.1 -n 3 >nul && start "" '
+                f'"{py_exe}" "{os.path.abspath(script)}""'
+            )
+            subprocess.Popen(delay_cmd, shell=True, cwd=os.getcwd())
+            debug_print(f"[DailyRestart] Scheduled delayed restart in ~2s")
         except Exception as e:
             debug_print(f"[DailyRestart] Failed to relaunch: {e}")
             return
 
+        # 立即关闭当前进程，新进程将在约 2 秒后由 cmd 启动
         try:
-            from PyQt5.QtCore import QTimer
-            QTimer.singleShot(300, self.close)
+            from PyQt5.QtWidgets import QApplication
+            QApplication.quit()
         except Exception:
-            try:
-                from PyQt5.QtWidgets import QApplication
-                QApplication.quit()
-            except Exception:
-                pass
+            pass
 
     def ensure_default_bookmarks(self):
         bm = self.bookmark_manager
@@ -6210,8 +6232,13 @@ class MainWindow(QMainWindow):
         # 启用鼠标追踪，以便在边缘时显示调整大小光标
         self.setMouseTracking(True)
         
-        # 隐藏默认标题栏
-        self.setWindowFlags(Qt.FramelessWindowHint)
+        # 隐藏默认标题栏，但保留标准窗口能力（任务栏最小化切换依赖最小化样式）
+        self.setWindowFlags(
+            Qt.Window |
+            Qt.FramelessWindowHint |
+            Qt.WindowSystemMenuHint |
+            Qt.WindowMinMaxButtonsHint
+        )
 
         # 填充窗口背景，避免边框与内容之间出现半透明缝隙
         self.setAutoFillBackground(True)
@@ -6393,9 +6420,6 @@ class MainWindow(QMainWindow):
         self.splitter.setOrientation(Qt.Horizontal)
         # 设置分割条宽度（必须在设置样式之前）
         self.splitter.setHandleWidth(5)
-        # 允许左侧目录树折叠（往左拖动时隐藏）
-        self.splitter.setCollapsible(0, True)  # 索引0是左侧目录树，允许折叠
-        self.splitter.setCollapsible(1, False)  # 索引1是右侧标签页，不允许折叠
         # 设置分割条样式
         self.splitter.setStyleSheet("""
             QSplitter::handle {
@@ -6535,6 +6559,10 @@ class MainWindow(QMainWindow):
         
         self.splitter.addWidget(self.content_stack)
         
+        # 子控件添加完成后再设置 collapsible（必须在 addWidget 之后，否则 Qt 会报 index out of range）
+        self.splitter.setCollapsible(0, True)   # 索引0是左侧目录树，允许折叠
+        self.splitter.setCollapsible(1, False)  # 索引1是右侧标签页，不允许折叠
+
         # 设置左侧目录树和右侧内容的初始宽度比例（左:右 = 2:8，符合 Windows 11 风格）
         # 假设窗口总宽度1200px，左侧240px，右侧960px，根据DPI缩放
         left_width = int(240 * self.dpi_scale)
