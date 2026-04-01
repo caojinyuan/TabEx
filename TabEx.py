@@ -1953,6 +1953,14 @@ class FileExplorerTab(QWidget):
 
     def update_tab_title(self):
         if hasattr(self, 'current_path'):
+            # 兜底同步路径栏：有些导航路径变化来自 Explorer 内部事件，
+            # 可能只触发标题更新，不走 navigate_to()。
+            try:
+                if hasattr(self, 'path_bar') and self.path_bar:
+                    self.path_bar.set_path(self.current_path)
+            except Exception:
+                pass
+
             # shell: 路径中文映射
             shell_map = {
                 'shell:RecycleBinFolder': '回收站',
@@ -3064,6 +3072,13 @@ class FileExplorerTab(QWidget):
         old_path = getattr(self, 'current_path', None)
         url = QDir.toNativeSeparators(path)
         
+        # 立即更新路径栏（不等到最后，确保先更新 UI）
+        if hasattr(self, 'path_bar'):
+            self.path_bar.set_path(path)
+        
+        # 更新当前路径
+        self.current_path = path
+        
         # 停止目录轮询定时器，避免误触发刷新
         if hasattr(self, 'dir_poll_timer') and self.dir_poll_timer.isActive():
             self.dir_poll_timer.stop()
@@ -3081,7 +3096,6 @@ class FileExplorerTab(QWidget):
             # 回退到普通Navigate
             self.explorer.dynamicCall("Navigate(const QString&)", url)
         
-        self.current_path = path
         # 导航完成后清理标志并恢复路径同步
         if getattr(self, '_navigating_folder', False):
             self._navigating_folder = False
@@ -3107,8 +3121,6 @@ class FileExplorerTab(QWidget):
                     debug_print(f"[FileWatcher] Failed to watch: {path}")
                 debug_print(f"[FileWatcher] Now watching: {self.file_watcher.directories()}")
         
-        if hasattr(self, 'path_bar'):
-            self.path_bar.set_path(path)
         self.update_tab_title()
         # 添加到历史记录
         if add_to_history:
@@ -4008,6 +4020,686 @@ class CustomTabBar(QTabBar):
             self.moveTab(to_index, pinned_count)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AI 聊天面板：ChatWorker（异步 API 线程）+ ChatPanel（UI 面板）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ChatWorker(QThread):
+    """在后台线程中发起 OpenAI 兼容 API 请求，避免阻塞 UI。"""
+    response_received = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, messages, api_url, api_key, model, parent=None):
+        super().__init__(parent)
+        self.messages = messages
+        self.api_url = api_url.rstrip('/')
+        self.api_key = api_key
+        self.model = model
+
+    def run(self):
+        try:
+            import requests
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}" if self.api_key else "",
+            }
+            payload = {
+                "model": self.model,
+                "messages": self.messages,
+                "stream": False,
+            }
+            url = self.api_url + '/chat/completions'
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            resp = requests.post(url, headers=headers, json=payload, timeout=120, verify=False)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data['choices'][0]['message']['content']
+            self.response_received.emit(content)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+class ChatPanel(QWidget):
+    """右侧 AI 聊天侧边栏面板。"""
+
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.messages = []   # 对话历史（不含 system prompt）
+        self.worker = None
+        self.history_file = os.path.join(os.path.dirname(__file__), "chat_history.json")
+        # 给 ChatPanel 独立的 Win32 HWND，避免 QAxWidget(Shell Explorer) 抢占鼠标/键盘头
+        self.setAttribute(Qt.WA_NativeWindow, True)
+        self.setFocusPolicy(Qt.ClickFocus)
+        # 启用拖拽
+        self.setAcceptDrops(True)
+        self._setup_ui()
+        self._load_history()  # 启动时加载聊天记录
+
+    # ── UI 构建 ──────────────────────────────────────────────────────────────
+    def _setup_ui(self):
+        from PyQt5.QtWidgets import QTextBrowser, QPlainTextEdit
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        # 标题栏
+        header = QWidget()
+        header.setStyleSheet("background: #E3F2FD; border-radius: 4px;")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 4, 8, 4)
+        title_lbl = QLabel("🤖 AI 助手")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 10.5pt; background: transparent;")
+        header_layout.addWidget(title_lbl)
+        header_layout.addStretch()
+        clear_btn = QPushButton("清空")
+        clear_btn.setFixedHeight(22)
+        clear_btn.setStyleSheet(
+            "QPushButton{background:#fff;border:1px solid #90CAF9;border-radius:3px;font-size:9pt;padding:0 6px;}"
+            "QPushButton:hover{background:#BBDEFB;}"
+        )
+        clear_btn.clicked.connect(self.clear_chat)
+        header_layout.addWidget(clear_btn)
+        layout.addWidget(header)
+
+        # 当前目录提示条
+        self.context_label = QLabel("当前目录: —")
+        self.context_label.setStyleSheet(
+            "color:#555; font-size:8.5pt; padding:2px 6px;"
+            "background:#f0f4f8; border-radius:3px;"
+        )
+        self.context_label.setWordWrap(True)
+        layout.addWidget(self.context_label)
+
+        # 聊天历史显示区
+        self.chat_display = QTextBrowser()
+        self.chat_display.setOpenExternalLinks(False)
+        self.chat_display.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard | Qt.TextBrowserInteraction
+        )
+        self.chat_display.setStyleSheet(
+            "QTextBrowser{background:#fafafa;border:1px solid #e0e0e0;"
+            "border-radius:4px;font-family:'Microsoft YaHei UI','Segoe UI',Arial;"
+            "font-size:9.5pt;}"
+        )
+        self.chat_display.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.chat_display.customContextMenuRequested.connect(self._show_context_menu)
+        layout.addWidget(self.chat_display, 1)
+
+        # 输入框
+        self.input_box = QPlainTextEdit()
+        self.input_box.setPlaceholderText("输入问题… (Enter 发送，Shift+Enter 换行)")
+        self.input_box.setFixedHeight(72)
+        self.input_box.setStyleSheet(
+            "QPlainTextEdit{border:1px solid #d0d0d0;border-radius:4px;padding:4px;"
+            "font-family:'Microsoft YaHei UI','Segoe UI',Arial;font-size:9.5pt;}"
+            "QPlainTextEdit:focus{border:1px solid #42A5F5;}"
+        )
+        self.input_box.installEventFilter(self)
+        layout.addWidget(self.input_box)
+
+        # 发送按钮行
+        btn_row = QHBoxLayout()
+        self.send_btn = QPushButton("发 送")
+        self.send_btn.setFixedHeight(28)
+        self.send_btn.setStyleSheet(
+            "QPushButton{background:#1976D2;color:white;border:none;border-radius:4px;"
+            "font-size:9.5pt;font-weight:bold;padding:0 16px;}"
+            "QPushButton:hover{background:#1565C0;}"
+            "QPushButton:disabled{background:#BDBDBD;}"
+        )
+        self.send_btn.clicked.connect(self.send_message)
+        btn_row.addStretch()
+        btn_row.addWidget(self.send_btn)
+        layout.addLayout(btn_row)
+
+        # 状态提示
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet("color:#888;font-size:8.5pt;")
+        layout.addWidget(self.status_lbl)
+
+    # ── 鼠标点击：确保焦点转移到输入框 ──────────────────────────────────────
+    def mousePressEvent(self, event):
+        """点击面板空白区域时，强制 input_box 获取焦点（解决 QAxWidget 抢焦点问题）。"""
+        super().mousePressEvent(event)
+        self.main_window.activateWindow()
+        self.input_box.setFocus(Qt.MouseFocusReason)
+
+    # ── 事件过滤（Enter 发送 / 鼠标点击夺回焦点）────────────────────────────
+    def eventFilter(self, obj, event):
+        from PyQt5.QtCore import QEvent, QTimer
+        if obj is self.input_box:
+            if event.type() == QEvent.KeyPress:
+                if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                    if not (event.modifiers() & Qt.ShiftModifier):
+                        self.send_message()
+                        return True
+            elif event.type() == QEvent.MouseButtonPress:
+                # input_box 被点击时，确保主窗口重新激活并把焦点交给输入框
+                # 用 singleShot(0) 让 Qt 先处理完点击事件再设焦点
+                self.main_window.activateWindow()
+                QTimer.singleShot(0, lambda: self.input_box.setFocus(Qt.MouseFocusReason))
+        return super().eventFilter(obj, event)
+
+    # ── 公共方法 ─────────────────────────────────────────────────────────────
+    def update_context(self, path: str):
+        """更新当前目录提示。"""
+        if path:
+            display = path if len(path) <= 55 else '…' + path[-52:]
+            self.context_label.setText(f"当前目录: {display}")
+
+    def _show_context_menu(self, pos):
+        """显示右键菜单（复制、全选等）。"""
+        menu = QMenu(self)
+        
+        copy_action = menu.addAction("复制")
+        copy_action.triggered.connect(self.chat_display.copy)
+        
+        select_all_action = menu.addAction("全选")
+        select_all_action.triggered.connect(self.chat_display.selectAll)
+        
+        menu.addSeparator()
+        clear_action = menu.addAction("清空聊天")
+        clear_action.triggered.connect(self.clear_chat)
+        
+        menu.exec_(self.chat_display.mapToGlobal(pos))
+
+    def clear_chat(self):
+        self.messages.clear()
+        self.chat_display.clear()
+        self._delete_history()  # 清空时删除保存文件
+
+    def append_bubble(self, role: str, content: str):
+        """向聊天区追加一条消息气泡（HTML 格式）。"""
+        import html as _html
+        if role == "user":
+            color, prefix, bg = "#1976D2", "👤 你", "#E3F2FD"
+        elif role == "assistant":
+            color, prefix, bg = "#2E7D32", "🤖 AI", "#F1F8E9"
+        else:
+            color, prefix, bg = "#888", "ℹ 系统", "#F5F5F5"
+
+        escaped = _html.escape(content).replace('\n', '<br>')
+        bubble = (
+            f'<div style="margin:4px 0;padding:6px 10px;background:{bg};'
+            f'border-radius:6px;border-left:3px solid {color};">'
+            f'<b style="color:{color};">{prefix}</b><br>{escaped}</div>'
+        )
+        self.chat_display.append(bubble)
+        self.chat_display.verticalScrollBar().setValue(
+            self.chat_display.verticalScrollBar().maximum()
+        )
+        self._save_history()  # 每次追加气泡时保存历史
+
+    # ── 发送消息 ─────────────────────────────────────────────────────────────
+    def send_message(self):
+        text = self.input_box.toPlainText().strip()
+        if not text:
+            return
+
+        # 检查用户输入是否包含文件路径或链接，提前处理
+        self._handle_user_file_input(text)
+
+        cfg = self.main_window.config.get("ai_chat", {})
+        api_url = cfg.get("api_url", "").strip()
+        api_key = cfg.get("api_key", "").strip()
+        model   = cfg.get("model", "gpt-3.5-turbo").strip() or "gpt-3.5-turbo"
+
+        if not api_url:
+            self.append_bubble("system", "❌ 请先在 设置 → AI 助手 中填写 API 地址")
+            return
+
+        self.input_box.clear()
+        self.append_bubble("user", text)
+
+        # 获取当前路径作为上下文
+        current_path = ""
+        try:
+            tab = self.main_window.get_current_tab_widget()
+            if tab and hasattr(tab, 'current_path'):
+                current_path = tab.current_path or ""
+        except Exception:
+            pass
+
+        # 构建 system prompt
+        system_prompt = cfg.get("system_prompt", "").strip()
+        if not system_prompt:
+            system_prompt = (
+                "你是一个智能文件管理助手，帮助用户管理文件系统、打开目录和运行脚本。\n"
+                "⚠️ 只有当用户明确要求‘切换/打开目录’时，才在回复末尾添加：[OPEN_DIR: 目录完整路径]。"
+                "普通问答不要输出任何操作指令。\n"
+                "⚠️ 只有当用户明确要求运行脚本时，才添加：[RUN_SCRIPT: 脚本完整路径]。\n"
+                "⚠️ 仅当用户明确要求时，才可使用以下指令：\n"
+                "[READ_FILE: 文件路径] 读取文件（系统自动分段读取大文件，无需手动指定偏移）；\n"
+                "[WRITE_FILE: 文件路径|文件内容] 写入文件（覆盖）；\n"
+                "[LIST_DIR: 目录路径] 列出目录；\n"
+                "[MKDIR: 目录路径] 创建目录；\n"
+                "[DELETE: 路径] 删除文件或目录（需用户确认）。\n"
+                "路径使用 Windows 格式，例如 D:\\project\\src。\n"
+                "可以在同一回复中包含多个操作命令。"
+            )
+
+        ctx_prefix = f"[当前目录: {current_path}]\n" if current_path else ""
+        full_messages = [{"role": "system", "content": system_prompt}]
+        full_messages.extend(self.messages)
+        full_messages.append({"role": "user", "content": ctx_prefix + text})
+
+        # 保存对话历史（不含 system，不含 ctx_prefix）
+        self.messages.append({"role": "user", "content": text})
+
+        # 启动工作线程
+        self.send_btn.setEnabled(False)
+        self.status_lbl.setText("⏳ 正在请求 AI…")
+        self.worker = ChatWorker(full_messages, api_url, api_key, model)
+        self.worker.response_received.connect(self._on_response)
+        self.worker.error_occurred.connect(self._on_error)
+        self.worker.start()
+
+    def _handle_user_file_input(self, text):
+        """检查用户输入中是否包含文件链接，直接打开。仅处理显式的 file:// 链接，避免误触发。"""
+        import re
+        # 只匹配 file:/// 或 file:// 链接（显式指示）
+        file_links = re.findall(r'file:///?([^\s\]]+)', text)
+        for link in file_links:
+            path = link.replace('%20', ' ').replace('%5C', '\\')
+            if os.path.isfile(path):
+                # 打开文件所在目录
+                folder = os.path.dirname(path)
+                if os.path.isdir(folder):
+                    self.append_bubble("system", f"📂 打开目录: {folder}")
+                    self.main_window.add_new_tab(folder)
+            elif os.path.isdir(path):
+                # 直接打开目录
+                self.append_bubble("system", f"📂 打开目录: {path}")
+                self.main_window.add_new_tab(path)
+
+    def _on_response(self, content: str):
+        self.send_btn.setEnabled(True)
+        self.status_lbl.setText("")
+        self.messages.append({"role": "assistant", "content": content})
+        display_content = self._apply_actions(content)
+        self.append_bubble("assistant", display_content)
+
+    def _on_error(self, msg: str):
+        self.send_btn.setEnabled(True)
+        self.status_lbl.setText("")
+        self.append_bubble("system", f"❌ 请求失败: {msg}")
+
+    # ── 拖拽文件支持 ──────────────────────────────────────────────────────────
+    def dragEnterEvent(self, event):
+        """拖拽进入事件"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+    
+    def dragMoveEvent(self, event):
+        """拖拽移动事件"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+    
+    def dropEvent(self, event):
+        """拖拽释放事件 - 读取文件内容"""
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    file_path = url.toLocalFile()
+                    self._read_and_display_file(file_path)
+                else:
+                    # 尝试从 URL 字符串中提取本地路径
+                    url_str = url.toString()
+                    if url_str.startswith('file:///'):
+                        from urllib.parse import unquote
+                        file_path = unquote(url_str[8:])
+                        if os.name == 'nt' and file_path.startswith('/'):
+                            file_path = file_path[1:]
+                        self._read_and_display_file(file_path)
+            event.acceptProposedAction()
+    
+    def _read_and_display_file(self, file_path):
+        """读取文件并在聊天窗口中显示"""
+        if not os.path.isfile(file_path):
+            self.append_bubble("system", f"❌ 文件不存在: {file_path}")
+            return
+        
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        if file_size_mb > 10:  # 超过10MB不读取
+            self.append_bubble("system", f"⚠️ 文件太大（{file_size_mb:.1f}MB），无法读取")
+            return
+        
+        try:
+            # 尝试以 UTF-8 编码读取
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            try:
+                # 降级为 GBK/GB2312
+                with open(file_path, 'r', encoding='gbk') as f:
+                    content = f.read()
+            except Exception:
+                try:
+                    # 最后尝试二进制显示
+                    with open(file_path, 'rb') as f:
+                        raw = f.read(1000)
+                    content = f"[二进制文件，前 {len(raw)} 字节]\n{raw[:200]}"
+                except Exception as e:
+                    self.append_bubble("system", f"❌ 无法读取文件: {e}")
+                    return
+        
+        # 截断长内容（超过5000字符）
+        max_chars = 5000
+        if len(content) > max_chars:
+            content = content[:max_chars] + f"\n\n【省略 {len(content) - max_chars} 个字符】"
+        
+        # 获取文件名
+        file_name = os.path.basename(file_path)
+        
+        # 显示文件内容
+        display_text = f"📄 {file_name}\n" + "="*50 + "\n" + content
+        self.append_bubble("system", display_text)
+
+    # ── 聊天记录持久化 ──────────────────────────────────────────────────────────
+    def _save_history(self):
+        """保存聊天记录到 JSON 文件。"""
+        import json
+        try:
+            with open(self.history_file, 'w', encoding='utf-8') as f:
+                json.dump(self.messages, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"保存聊天记录失败: {e}")
+
+    def _load_history(self):
+        """从 JSON 文件加载聊天记录。"""
+        import json
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, 'r', encoding='utf-8') as f:
+                    self.messages = json.load(f)
+                # 重新显示所有消息
+                for msg in self.messages:
+                    role = msg.get("role", "system")
+                    content = msg.get("content", "")
+                    # 仅回显历史文本，不在启动时执行 [OPEN_DIR:] / [RUN_SCRIPT:] 指令
+                    self.append_bubble(role, content)
+            except Exception as e:
+                print(f"加载聊天记录失败: {e}")
+
+    def _delete_history(self):
+        """删除保存的聊天记录文件。"""
+        try:
+            if os.path.exists(self.history_file):
+                os.remove(self.history_file)
+        except Exception as e:
+            print(f"删除聊天记录文件失败: {e}")
+
+    def _get_action_base_dir(self):
+        """获取动作执行的基准目录（当前标签目录）。"""
+        try:
+            tab = self.main_window.get_current_tab_widget()
+            p = getattr(tab, 'current_path', '') if tab else ''
+            if p and os.path.isdir(p):
+                return os.path.normpath(p)
+        except Exception:
+            pass
+        return os.path.normpath(os.path.dirname(__file__))
+
+    def _resolve_action_path(self, raw_path: str):
+        """解析动作路径，限制在当前目录范围内。"""
+        p = (raw_path or '').strip().strip('"\'')
+        if not p:
+            return None, "空路径"
+
+        p = p.replace('/', '\\')
+        base_dir = self._get_action_base_dir()
+
+        # 相对路径按当前目录解析
+        if not os.path.isabs(p):
+            p = os.path.join(base_dir, p)
+
+        p = translate_common_path(os.path.normpath(p))
+
+        try:
+            base_norm = os.path.normcase(os.path.normpath(base_dir))
+            path_norm = os.path.normcase(os.path.normpath(p))
+            if not (path_norm == base_norm or path_norm.startswith(base_norm + os.sep)):
+                return None, f"超出当前目录范围: {p}"
+        except Exception:
+            return None, f"路径非法: {p}"
+
+        return p, None
+
+    def _confirm_danger_action(self, title: str, text: str) -> bool:
+        """危险操作二次确认。"""
+        try:
+            from PyQt5.QtWidgets import QMessageBox
+            ret = QMessageBox.question(
+                self,
+                title,
+                text,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            return ret == QMessageBox.Yes
+        except Exception:
+            # 任何异常都按拒绝处理，确保安全
+            return False
+
+    # ── 解析并执行 AI 操作命令 ────────────────────────────────────────────────
+    def _apply_actions(self, content: str) -> str:
+        """解析 AI 回复中的操作标记并按出现顺序执行。"""
+        import re, subprocess
+        notes = []
+
+        # ── 收集所有指令及其在文本中的位置，按顺序执行 ──────────────────────
+        actions = []  # list of (start_pos, action_type, match_obj)
+
+        patterns = {
+            'OPEN_DIR':   re.compile(r'\[OPEN_DIR:\s*([^\]]+)\]'),
+            'RUN_SCRIPT': re.compile(r'\[RUN_SCRIPT:\s*([^\]]+)\]'),
+            'LIST_DIR':   re.compile(r'\[LIST_DIR:\s*([^\]]+)\]'),
+            'READ_FILE':  re.compile(r'\[READ_FILE:\s*([^\]]+)\]'),
+            'MKDIR':      re.compile(r'\[MKDIR:\s*([^\]]+)\]'),
+            'WRITE_FILE': re.compile(r'\[WRITE_FILE:\s*([^\]]+)\]', re.DOTALL),
+            'DELETE':     re.compile(r'\[DELETE:\s*([^\]]+)\]'),
+        }
+        for atype, pat in patterns.items():
+            for m in pat.finditer(content):
+                actions.append((m.start(), atype, m))
+
+        # 按出现位置排序，保证 WRITE_FILE 在 RUN_SCRIPT 之前（若 AI 如此安排）
+        actions.sort(key=lambda x: x[0])
+
+        for _, atype, m in actions:
+
+            # ── OPEN_DIR ────────────────────────────────────────────────────
+            if atype == 'OPEN_DIR':
+                raw = m.group(1).strip().strip('"\'')
+                path = translate_common_path(os.path.normpath(raw))
+                if os.path.isdir(path):
+                    try:
+                        current_tab = self.main_window.get_current_tab_widget()
+                        if current_tab and hasattr(current_tab, 'navigate_to'):
+                            current_path = getattr(current_tab, 'current_path', '')
+                            same_path = False
+                            if hasattr(self.main_window, '_normalize_path_for_compare'):
+                                same_path = (
+                                    self.main_window._normalize_path_for_compare(current_path)
+                                    == self.main_window._normalize_path_for_compare(path)
+                                )
+                            if same_path:
+                                notes.append(f"ℹ 当前标签已在该目录: {path}")
+                            else:
+                                current_tab.navigate_to(path, skip_async_check=True)
+                                notes.append(f"✅ 已在当前标签切换到目录: {path}")
+                        else:
+                            self.main_window.add_new_tab(path)
+                            notes.append(f"✅ 已打开目录: {path}")
+                    except Exception as e:
+                        notes.append(f"❌ 打开目录失败: {path}（{e}）")
+                else:
+                    notes.append(f"⚠️ 目录不存在: {path}")
+
+            # ── RUN_SCRIPT ──────────────────────────────────────────────────
+            elif atype == 'RUN_SCRIPT':
+                raw = m.group(1).strip().strip('"\'')
+                script = os.path.normpath(raw)
+                if os.path.isfile(script):
+                    try:
+                        if not self._confirm_danger_action(
+                            "确认运行脚本",
+                            f"AI 请求运行脚本：\n{script}\n\n是否继续？"
+                        ):
+                            notes.append(f"⏸ 已取消运行脚本: {script}")
+                            continue
+                        subprocess.Popen(script, shell=True, cwd=os.path.dirname(script))
+                        notes.append(f"✅ 已启动脚本: {script}")
+                    except Exception as e:
+                        notes.append(f"❌ 运行脚本失败: {script}（{e}）")
+                else:
+                    notes.append(f"⚠️ 脚本不存在: {script}")
+
+            # ── LIST_DIR ────────────────────────────────────────────────────
+            elif atype == 'LIST_DIR':
+                raw = m.group(1)
+                path, err = self._resolve_action_path(raw)
+                if err:
+                    notes.append(f"❌ 列目录失败: {err}")
+                    continue
+                if not os.path.isdir(path):
+                    notes.append(f"❌ 目录不存在: {path}")
+                    continue
+                try:
+                    items = os.listdir(path)
+                    preview = "\n".join(items[:50]) if items else "(空目录)"
+                    if len(items) > 50:
+                        preview += f"\n... 其余 {len(items) - 50} 项省略"
+                    notes.append(f"📁 目录列表: {path}\n{preview}")
+                except Exception as e:
+                    notes.append(f"❌ 列目录失败: {path}（{e}）")
+
+            # ── READ_FILE ───────────────────────────────────────────────────
+            elif atype == 'READ_FILE':
+                raw = m.group(1)
+                parts = raw.split('|')
+                raw_path = parts[0].strip()
+                start_offset = 0
+                if len(parts) > 1:
+                    try:
+                        start_offset = int(parts[1].strip())
+                    except ValueError:
+                        pass
+                path, err = self._resolve_action_path(raw_path)
+                if err:
+                    notes.append(f"❌ 读取失败: {err}")
+                    continue
+                if not os.path.isfile(path):
+                    notes.append(f"❌ 文件不存在: {path}")
+                    continue
+                CHUNK = 5000
+                MAX_TOTAL = 50000
+                try:
+                    enc = 'utf-8'
+                    try:
+                        open(path, 'r', encoding='utf-8').read(1)
+                    except UnicodeDecodeError:
+                        enc = 'gbk'
+                    file_size = os.path.getsize(path)
+                    all_text = []
+                    offset = start_offset
+                    with open(path, 'r', encoding=enc, errors='replace') as f:
+                        f.seek(offset)
+                        while True:
+                            chunk = f.read(CHUNK)
+                            if not chunk:
+                                break
+                            all_text.append(chunk)
+                            offset += len(chunk.encode(enc, errors='replace'))
+                            if sum(len(t) for t in all_text) >= MAX_TOTAL:
+                                break
+                    full_text = ''.join(all_text)
+                    total_read = sum(len(t) for t in all_text)
+                    truncated = (start_offset + total_read) < file_size
+                    info = f"📄 文件内容（{start_offset}-{start_offset+total_read}/{file_size}字节，{enc}）: {path}"
+                    if truncated:
+                        info += f"\n⚠️ 文件过大，仅读取前 {MAX_TOTAL} 字符，剩余 {file_size - start_offset - total_read} 字节未读"
+                    notes.append(f"{info}\n{full_text}")
+                except Exception as e:
+                    notes.append(f"❌ 读取失败: {path}（{e}）")
+
+            # ── MKDIR ───────────────────────────────────────────────────────
+            elif atype == 'MKDIR':
+                raw = m.group(1)
+                path, err = self._resolve_action_path(raw)
+                if err:
+                    notes.append(f"❌ 创建目录失败: {err}")
+                    continue
+                try:
+                    os.makedirs(path, exist_ok=True)
+                    notes.append(f"✅ 已创建目录: {path}")
+                except Exception as e:
+                    notes.append(f"❌ 创建目录失败: {path}（{e}）")
+
+            # ── WRITE_FILE ──────────────────────────────────────────────────
+            elif atype == 'WRITE_FILE':
+                raw = m.group(1)
+                if '|' not in raw:
+                    notes.append("❌ 写入失败: 格式应为 [WRITE_FILE: 路径|内容]")
+                    continue
+                raw_path, file_content = raw.split('|', 1)
+                path, err = self._resolve_action_path(raw_path)
+                if err:
+                    notes.append(f"❌ 写入失败: {err}")
+                    continue
+                try:
+                    file_exists = os.path.exists(path)
+                    if file_exists:
+                        if not self._confirm_danger_action(
+                            "确认覆盖文件",
+                            f"AI 请求覆盖文件：\n{path}\n\n是否继续？"
+                        ):
+                            notes.append(f"⏸ 已取消覆盖文件: {path}")
+                            continue
+                    parent = os.path.dirname(path)
+                    if parent and not os.path.exists(parent):
+                        os.makedirs(parent, exist_ok=True)
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write(file_content)
+                    notes.append(f"✅ 已写入文件: {path}")
+                except Exception as e:
+                    notes.append(f"❌ 写入失败: {path}（{e}）")
+
+            # ── DELETE ──────────────────────────────────────────────────────
+            elif atype == 'DELETE':
+                raw = m.group(1).strip()
+                path, err = self._resolve_action_path(raw)
+                if err:
+                    notes.append(f"❌ 删除失败: {err}")
+                    continue
+                if not os.path.exists(path):
+                    notes.append(f"❌ 路径不存在: {path}")
+                    continue
+                is_dir = os.path.isdir(path)
+                type_label = "目录（及其所有内容）" if is_dir else "文件"
+                if not self._confirm_danger_action(
+                    "确认删除",
+                    f"AI 请求删除{type_label}：\n{path}\n\n⚠️ 此操作不可撤销！是否继续？"
+                ):
+                    notes.append(f"⏸ 已取消删除: {path}")
+                    continue
+                try:
+                    if is_dir:
+                        import shutil
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                    notes.append(f"✅ 已删除{type_label}: {path}")
+                except Exception as e:
+                    notes.append(f"❌ 删除失败: {path}（{e}）")
+
+        if notes:
+            content = content + "\n\n" + "\n".join(notes)
+        return content
+
+
 class MainWindow(QMainWindow):
     def _is_control_panel_path_for_monitor(self, path):
         """判断路径是否为控制面板或其子目录（供Explorer Monitor用）"""
@@ -4030,7 +4722,7 @@ class MainWindow(QMainWindow):
 
     # 定义信号用于从服务器线程通知主线程打开新标签
     open_path_signal = pyqtSignal(str)
-    
+
     def ensure_default_icons_on_bookmark_bar(self):
         """确保四个常用书签（带图标）始终在最左侧且不会被覆盖。"""
         bm = self.bookmark_manager
@@ -4038,13 +4730,10 @@ class MainWindow(QMainWindow):
         bar = tree.get('bookmark_bar')
         if not bar or 'children' not in bar:
             return
-        # 获取“下载”文件夹路径（跨平台，优先Win用户目录）
         import time
-        import os
         from PyQt5.QtCore import QStandardPaths
         downloads_path = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
         if not downloads_path or not os.path.exists(downloads_path):
-            # 兜底
             downloads_path = os.path.join(os.path.expanduser('~'), 'Downloads')
         icon_map = [
             ("🖥️", "此电脑", "shell:MyComputerFolder"),
@@ -4052,10 +4741,8 @@ class MainWindow(QMainWindow):
             ("🗑️", "回收站", "shell:RecycleBinFolder"),
             ("⬇️", "下载", downloads_path),
         ]
-        # 移除所有同名（无论有无emoji）
         names_set = set([n for _, n, _ in icon_map])
         bar['children'] = [c for c in bar['children'] if not (c.get('type') == 'url' and any(c.get('name', '').replace(icon, '').strip() == n for icon, n, _ in icon_map))]
-        # 插入标准五个项目到最前面
         now = int(time.time() * 1000000)
         def make_bm(icon, name, url):
             nonlocal now
@@ -4087,6 +4774,33 @@ class MainWindow(QMainWindow):
         """获取当前标签页的实际内容（从content_stack）"""
         current_index = self.tab_widget.currentIndex()
         return self.get_tab_widget(current_index)
+
+    def _normalize_path_for_compare(self, path):
+        """将路径标准化用于比较（Windows 不区分大小写）。"""
+        if not path:
+            return ""
+        try:
+            if path.startswith('shell:'):
+                return path.lower()
+            return os.path.normcase(os.path.normpath(path))
+        except Exception:
+            return str(path).lower()
+
+    def find_tab_index_by_path(self, path):
+        """查找已打开路径对应的标签索引，不存在返回 -1。"""
+        target = self._normalize_path_for_compare(path)
+        if not target:
+            return -1
+        for i in range(self.tab_widget.count()):
+            tab = self.get_tab_widget(i)
+            current_path = getattr(tab, 'current_path', '') if tab else ''
+            if self._normalize_path_for_compare(current_path) == target:
+                return i
+        return -1
+
+    def is_path_open(self, path):
+        """路径是否已在任一标签中打开。"""
+        return self.find_tab_index_by_path(path) >= 0
     
     def _on_splitter_moved(self, pos, index):
         """当splitter移动时，保存目录树宽度（节流）"""
@@ -4169,6 +4883,45 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'git_commit_button'):
             self.git_commit_button.setVisible(enable)
 
+    def toggle_chat_panel(self):
+        """切换 AI 聊天面板的显示/隐藏。"""
+        if not hasattr(self, 'chat_panel'):
+            return
+        visible = not self.chat_panel.isVisible()
+        self.chat_panel.setVisible(visible)
+        if hasattr(self, 'ai_chat_btn'):
+            self.ai_chat_btn.setChecked(visible)
+        # 保存AI面板的显示状态到配置
+        if "ai_chat" not in self.config:
+            self.config["ai_chat"] = {}
+        self.config["ai_chat"]["panel_visible"] = visible
+        self.save_config()
+        if visible:
+            # 保存面板宽度到 splitter
+            ai_panel_width = int(
+                self.config.get("ai_chat", {}).get("panel_width", 360) * self.dpi_scale
+            )
+            sizes = self.splitter.sizes()
+            if len(sizes) >= 3:
+                self.splitter.setSizes([sizes[0], sizes[1], ai_panel_width])
+            elif len(sizes) == 2:
+                total = sum(sizes)
+                self.splitter.setSizes([sizes[0], total - ai_panel_width, ai_panel_width])
+            # 更新当前目录提示
+            self.update_chat_context()
+            self.chat_panel.input_box.setFocus()
+
+    def update_chat_context(self):
+        """将当前标签页路径同步到 AI 聊天面板的上下文提示。"""
+        if not hasattr(self, 'chat_panel') or not self.chat_panel.isVisible():
+            return
+        try:
+            tab = self.get_current_tab_widget()
+            if tab and hasattr(tab, 'current_path'):
+                self.chat_panel.update_context(tab.current_path or "")
+        except Exception:
+            pass
+
     def _update_window_title(self, current_path: str = None):
         """根据当前状态更新窗口标题和自定义标题栏文本。
         当处于恢复状态时，在标题中附加“窗口恢复中”。
@@ -4227,8 +4980,13 @@ class MainWindow(QMainWindow):
             def restore_width():
                 current_sizes = self.splitter.sizes()
                 if len(current_sizes) >= 2:
-                    total_width = sum(current_sizes)
-                    self.splitter.setSizes([self._saved_dir_tree_width, total_width - self._saved_dir_tree_width])
+                    # 保留 AI 聊天面板宽度（第3个控件），避免新建标签时面板被挤压关闭
+                    chat_width = current_sizes[2] if len(current_sizes) >= 3 else 0
+                    content_width = sum(current_sizes) - self._saved_dir_tree_width - chat_width
+                    new_sizes = [self._saved_dir_tree_width, max(content_width, 100)]
+                    if len(current_sizes) >= 3:
+                        new_sizes.append(chat_width)
+                    self.splitter.setSizes(new_sizes)
                     debug_print(f"[Splitter] Restored dir tree width to {self._saved_dir_tree_width}px")
             QTimer.singleShot(0, restore_width)
         
@@ -4326,12 +5084,20 @@ class MainWindow(QMainWindow):
             # 从 content_stack 获取实际的标签页内容
             tab = self.content_stack.widget(index) if hasattr(self, 'content_stack') else self.tab_widget.widget(index)
             if hasattr(tab, 'current_path'):
+                # 切换标签时强制刷新该标签路径栏，避免显示上一个标签路径
+                try:
+                    if hasattr(tab, 'path_bar') and tab.path_bar:
+                        tab.path_bar.set_path(tab.current_path)
+                except Exception:
+                    pass
                 # 统一通过内部方法更新窗口标题（可带“窗口恢复中”标记）
                 self._update_window_title(tab.current_path)
                 # 展开并选中左侧目录树到当前目录
                 self.expand_dir_tree_to_path(tab.current_path)
             # 更新导航按钮状态
             self.update_navigation_buttons()
+            # 同步 AI 聊天面板的当前目录提示
+            self.update_chat_context()
         
         # 更新所有标签页的字体：选中的加粗，未选中的正常
         from PyQt5.QtGui import QFont
@@ -4748,7 +5514,42 @@ class MainWindow(QMainWindow):
         """)
         settings_btn.clicked.connect(self.show_settings_menu)
         titlebar_layout.addWidget(settings_btn)
-        
+
+        # AI 助手面板切换按钮
+        self.ai_chat_btn = QPushButton("🤖")
+        self.ai_chat_btn.setToolTip("AI 助手面板 (Ctrl+Shift+A)")
+        self.ai_chat_btn.setFixedSize(bookmark_btn_width, titlebar_height)
+        self.ai_chat_btn.setCheckable(True)
+        self.ai_chat_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: none;
+                border-radius: {btn_radius}px;
+                font-size: {btn_font_size}pt;
+                color: #202020;
+            }}
+            QPushButton:hover {{
+                background: #e5e5e5;
+                color: #000000;
+            }}
+            QPushButton:checked {{
+                background: #BBDEFB;
+                color: #1565C0;
+            }}
+            QPushButton:pressed {{
+                background: #d5d5d5;
+                color: #000000;
+            }}
+        """)
+        self.ai_chat_btn.clicked.connect(self.toggle_chat_panel)
+        # 初始化时同步按钮状态
+        chat_config = self.config.get("ai_chat", {})
+        panel_visible = chat_config.get("panel_visible", False)
+        ai_enabled = chat_config.get("enabled", True)
+        self.ai_chat_btn.setChecked(panel_visible)
+        self.ai_chat_btn.setVisible(ai_enabled)
+        titlebar_layout.addWidget(self.ai_chat_btn)
+    
         # 最小化按钮
         min_btn = QPushButton("─")
         win_btn_width = int(45 * getattr(self, 'dpi_scale', 1.0))
@@ -5505,6 +6306,17 @@ class MainWindow(QMainWindow):
                     return
                 else:
                     self._last_keys_state["Ctrl+Shift+T"] = False
+
+                    # Ctrl+Shift+A (0x41) - 切换 AI 聊天面板
+                    if is_key_pressed(VK_SHIFT) and is_key_pressed(0x41):
+                        key_combo = "Ctrl+Shift+A"
+                        if not self._last_keys_state.get(key_combo, False):
+                            debug_print("[Shortcut Poll] Detected Ctrl+Shift+A")
+                            self.toggle_chat_panel()
+                            self._last_keys_state[key_combo] = True
+                        return
+                    else:
+                        self._last_keys_state["Ctrl+Shift+A"] = False
                 
                 # Ctrl+T (0x54) - 新建标签页（不包含Shift）
                 if is_key_pressed(0x54) and not is_key_pressed(VK_SHIFT) and hotkeys.get("new_tab", True):
@@ -5993,6 +6805,15 @@ class MainWindow(QMainWindow):
                 "copy_filepath": True      # Alt+X - 复制文件路径\文件名
             }
         }
+        default_config["ai_chat"] = {
+            "enabled": False,
+            "api_url": "",       # OpenAI 兼容 API 基础地址，如 http://your-company/v1
+            "api_key": "",       # API 密钥（可留空）
+            "model": "gpt-3.5-turbo",
+            "system_prompt": "",  # 留空则使用内置默认提示词
+            "panel_width": 360,  # 面板宽度（像素）
+            "panel_visible": False,  # AI面板是否可见
+        }
         
         try:
             # 首先尝试加载主配置文件
@@ -6354,13 +7175,13 @@ class MainWindow(QMainWindow):
         # 设置分割条样式
         self.splitter.setStyleSheet("""
             QSplitter::handle {
-                background-color: transparent;
-            }
-            QSplitter::handle:hover {
                 background-color: #e0e0e0;
             }
+            QSplitter::handle:hover {
+                background-color: #b0b8c8;
+            }
             QSplitter::handle:pressed {
-                background-color: #d0d0d0;
+                background-color: #90a0b8;
             }
         """)
         # 设置子控件的拉伸因子（左侧0，右侧1，右侧会占据剩余空间）
@@ -6494,12 +7315,29 @@ class MainWindow(QMainWindow):
         self.splitter.setCollapsible(0, True)   # 索引0是左侧目录树，允许折叠
         self.splitter.setCollapsible(1, False)  # 索引1是右侧标签页，不允许折叠
 
+        # 右侧 AI 聊天面板（默认隐藏，点击 🤖 按钮后显示）
+        self.chat_panel = ChatPanel(self)
+        ai_panel_width = int(self.config.get("ai_chat", {}).get("panel_width", 360) * self.dpi_scale)
+        self.chat_panel.setMinimumWidth(260)
+        self.chat_panel.setFixedWidth(ai_panel_width)
+        # 根据保存的配置恢复AI面板的显示状态
+        chat_config = self.config.get("ai_chat", {})
+        panel_visible = chat_config.get("panel_visible", False)
+        self.chat_panel.setVisible(panel_visible)
+        self.splitter.addWidget(self.chat_panel)
+        self.splitter.setCollapsible(2, True)  # 索引2是AI面板，允许折叠
+
         # 设置左侧目录树和右侧内容的初始宽度比例（左:右 = 2:8，符合 Windows 11 风格）
         # 假设窗口总宽度1200px，左侧240px，右侧960px，根据DPI缩放
         left_width = int(240 * self.dpi_scale)
-        right_width = int(960 * self.dpi_scale)
-        self.splitter.setSizes([left_width, right_width])
-        
+        # 如果AI面板打开，需要为其分配宽度
+        if panel_visible:
+            right_width = int(960 * self.dpi_scale) - ai_panel_width
+            self.splitter.setSizes([left_width, right_width, ai_panel_width])
+        else:
+            right_width = int(960 * self.dpi_scale)
+            self.splitter.setSizes([left_width, right_width])
+    
         # 将分割器添加到主容器
         main_layout.addWidget(self.splitter)
         
@@ -6510,8 +7348,14 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(main_container)
 
         # 性能优化：延迟加载固定标签页（移到 _delayed_initialization）
-        # 先添加一个默认标签页，避免窗口空白
-        self.add_new_tab(QDir.homePath())
+        # 先检查是否有固定标签或缓存标签，如果没有才添加默认标签页
+        has_content = bool(
+            self.config.get("pinned_tabs", []) or 
+            self.config.get("cached_tabs", [])
+        )
+        if not has_content:
+            # 没有固定标签也没有缓存标签，才添加默认的主目录标签
+            self.add_new_tab(QDir.homePath())
         
         # 连接信号
         self.open_path_signal.connect(self.handle_open_path_from_instance)
@@ -6524,8 +7368,13 @@ class MainWindow(QMainWindow):
 
     def handle_open_path_from_instance(self, path):
         """处理从其他实例接收到的路径（在主线程中）"""
-        print(f"[MainWindow] Opening path in new tab: {path}")
-        self.add_new_tab(path)
+        existing_index = self.find_tab_index_by_path(path)
+        if existing_index >= 0:
+            print(f"[MainWindow] Path already open, focus tab: {path}")
+            self.tab_widget.setCurrentIndex(existing_index)
+        else:
+            print(f"[MainWindow] Opening path in new tab: {path}")
+            self.add_new_tab(path)
         # 激活并置顶窗口
         self.activateWindow()
         self.raise_()
@@ -6541,16 +7390,14 @@ class MainWindow(QMainWindow):
         # 初次更新标题（无路径）
         self._update_window_title()
         
+        debug_print(f"[App] 启动时标签页数: {self.tab_widget.count()}")
+        
         # 延迟加载固定标签页
         try:
             has_pinned = self.load_pinned_tabs()
-            # 如果有固定标签页，关闭默认的主目录标签
-            if has_pinned and self.tab_widget.count() > 0:
-                # 检查第一个标签是否是默认的主目录
-                first_tab = self.get_tab_widget(0)
-                if first_tab and hasattr(first_tab, 'current_path'):
-                    if first_tab.current_path == QDir.homePath():
-                        self.close_tab(0)
+            debug_print(f"[App] 加载固定标签后标签页数: {self.tab_widget.count()}")
+            if has_pinned:
+                debug_print("[App] 已加载固定标签页")
         except Exception as e:
             debug_print(f"[Performance] Failed to load pinned tabs: {e}")
         
@@ -6558,18 +7405,39 @@ class MainWindow(QMainWindow):
         try:
             if self.config.get("enable_cache_tabs", True):
                 cached_tabs = self.config.get("cached_tabs", [])
+                debug_print(f"[App] 待恢复的缓存标签页数: {len(cached_tabs)}")
                 if cached_tabs:
+                    pinned_norm = {
+                        self._normalize_path_for_compare(p)
+                        for p in self.config.get("pinned_tabs", []) if p
+                    }
                     debug_print(f"[App] 恢复 {len(cached_tabs)} 个缓存标签页")
                     for tab_info in cached_tabs:
                         path = tab_info.get('path', '')
                         if path:
+                            norm = self._normalize_path_for_compare(path)
+                            if norm in pinned_norm:
+                                debug_print(f"[App] 跳过缓存标签（已固定）: {path}")
+                                continue
+                            if self.is_path_open(path):
+                                debug_print(f"[App] 跳过缓存标签（已打开）: {path}")
+                                continue
                             self.add_new_tab(path)
+                    debug_print(f"[App] 恢复缓存标签后标签页数: {self.tab_widget.count()}")
                     # 恢复后清除缓存
                     self.config['cached_tabs'] = []
                     self.save_config()
                     debug_print("[App] 缓存标签页已恢复并清除")
+                else:
+                    # 没有缓存标签且没有固定标签，现在添加默认标签
+                    if self.tab_widget.count() == 0:
+                        debug_print("[App] 没有缓存和固定标签，添加默认主目录标签")
+                        self.add_new_tab(QDir.homePath())
         except Exception as e:
             debug_print(f"[Performance] Failed to restore cached tabs: {e}")
+            # 如果恢复失败且当前没有标签，添加默认标签
+            if self.tab_widget.count() == 0:
+                self.add_new_tab(QDir.homePath())
         
         # 延迟启动实例服务器
         try:
@@ -6953,14 +7821,30 @@ class MainWindow(QMainWindow):
         try:
             if self.config.get("enable_cache_tabs", True):
                 cached_tabs = []
+                seen_paths = set()
+                pinned_norm = {
+                    self._normalize_path_for_compare(p)
+                    for p in self.config.get("pinned_tabs", []) if p
+                }
                 for i in range(self.tab_widget.count()):
                     tab = self.get_tab_widget(i)
                     if tab and hasattr(tab, 'current_path'):
                         # 只缓存非固定标签
                         if not getattr(tab, 'is_pinned', False):
+                            current_path = tab.current_path
+                            norm = self._normalize_path_for_compare(current_path)
+                            if not current_path:
+                                continue
+                            # 不缓存已固定路径，避免下次启动重复
+                            if norm in pinned_norm:
+                                continue
+                            # 去重缓存，避免同路径多次恢复
+                            if norm in seen_paths:
+                                continue
+                            seen_paths.add(norm)
                             cached_tabs.append({
-                                'path': tab.current_path,
-                                'is_shell': tab.current_path.startswith('shell:') if tab.current_path else False
+                                'path': current_path,
+                                'is_shell': current_path.startswith('shell:') if current_path else False
                             })
                 
                 if cached_tabs:
@@ -7547,8 +8431,148 @@ class SettingsDialog(QDialog):
         right_col.addWidget(hotkey_group)
         # 右侧添加弹性空间，使快捷键组底部与左侧对齐
         right_col.addStretch(1)
-        
-        # 添加左右两列到内容布局
+
+            # AI 助手设置组
+        ai_group = QGroupBox("AI 助手设置")
+        ai_layout = QVBoxLayout()
+        ai_layout.setSpacing(6)
+        from PyQt5.QtWidgets import QLineEdit, QComboBox as _CB2
+        # 启用 AI 助手开关
+        self.ai_enabled_cb = QCheckBox("启用 AI 助手（显示标题栏机器人按钮🤖）")
+        self.ai_enabled_cb.setChecked(config.get("ai_chat", {}).get("enabled", True))
+        ai_layout.addWidget(self.ai_enabled_cb)
+
+        # ── 免费服务商预设 ──────────────────────────────────────────────────────
+        # 格式: (显示名称, api_url, 默认model, 获取Key说明)
+        _AI_PRESETS = [
+            ("── 请选择预设服务商 ──", "", "", ""),
+            ("Groq（免费·极速·推荐）",
+             "https://api.groq.com/openai/v1",
+             "llama-3.3-70b-versatile",
+             "免费注册获取Key: https://console.groq.com/keys"),
+            ("SiliconFlow 硅基流动（免费额度·国内快）",
+             "https://api.siliconflow.cn/v1",
+             "Qwen/Qwen2.5-7B-Instruct",
+             "免费注册获取Key: https://cloud.siliconflow.cn"),
+            ("DeepSeek（注册送额度·中文强）",
+             "https://api.deepseek.com/v1",
+             "deepseek-chat",
+             "注册获取Key: https://platform.deepseek.com/api_keys"),
+            ("Google Gemini（免费版）",
+             "https://generativelanguage.googleapis.com/v1beta/openai",
+             "gemini-2.0-flash",
+             "免费获取Key: https://aistudio.google.com/app/apikey"),
+            ("OpenRouter（含永久免费模型）",
+             "https://openrouter.ai/api/v1",
+             "meta-llama/llama-3.3-70b-instruct:free",
+             "注册获取Key: https://openrouter.ai/keys"),
+            ("本地 LM Studio（无需Key）",
+             "http://localhost:1234/v1",
+             "local-model",
+             "启动 LM Studio → Local Server 后使用"),
+            ("本地 Ollama（无需Key）",
+             "http://localhost:11434/v1",
+             "qwen2.5:7b",
+             "安装 Ollama 并运行模型后使用"),
+            ("── 自定义（手动填写下方） ──", "", "", ""),
+        ]
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("快速选择:"))
+        self.ai_preset_combo = _CB2()
+        for name, url, model, tip in _AI_PRESETS:
+            self.ai_preset_combo.addItem(name, (url, model, tip))
+        self.ai_preset_combo.setToolTip("选择预设后自动填充地址和模型名，然后只需粘贴对应的 API Key")
+        preset_row.addWidget(self.ai_preset_combo, 1)
+        ai_layout.addLayout(preset_row)
+
+        # 获取Key提示标签
+        self.ai_key_tip_label = QLabel("")
+        self.ai_key_tip_label.setStyleSheet(
+            "color:#1565C0; font-size:8.5pt; padding:2px 4px;"
+            "background:#E3F2FD; border-radius:3px;"
+        )
+        self.ai_key_tip_label.setWordWrap(True)
+        self.ai_key_tip_label.setVisible(False)
+        ai_layout.addWidget(self.ai_key_tip_label)
+
+        def _on_preset_changed(idx):
+            url, model, tip = self.ai_preset_combo.itemData(idx)
+            if url:
+                self.ai_api_url_edit.setText(url)
+                self.ai_model_edit.setText(model)
+            if tip:
+                self.ai_key_tip_label.setText(f"💡 {tip}")
+                self.ai_key_tip_label.setVisible(True)
+            else:
+                self.ai_key_tip_label.setVisible(False)
+
+        self.ai_preset_combo.currentIndexChanged.connect(_on_preset_changed)
+
+        # API 地址
+        api_url_row = QHBoxLayout()
+        api_url_row.addWidget(QLabel("API 地址:"))
+        self.ai_api_url_edit = QLineEdit()
+        self.ai_api_url_edit.setPlaceholderText("例: https://api.groq.com/openai/v1")
+        self.ai_api_url_edit.setText(config.get("ai_chat", {}).get("api_url", ""))
+        self.ai_api_url_edit.setToolTip("填写 OpenAI 兼容 API 的基础地址（不含 /chat/completions）")
+        api_url_row.addWidget(self.ai_api_url_edit, 1)
+        ai_layout.addLayout(api_url_row)
+        # API 密钥
+        api_key_row = QHBoxLayout()
+        api_key_row.addWidget(QLabel("API 密钥:"))
+        self.ai_api_key_edit = QLineEdit()
+        self.ai_api_key_edit.setPlaceholderText("粘贴从服务商网站获取的 Key（本地模型可留空）")
+        self.ai_api_key_edit.setEchoMode(QLineEdit.Password)
+        self.ai_api_key_edit.setText(config.get("ai_chat", {}).get("api_key", ""))
+        # 显示/隐藏密钥按钮
+        eye_btn = QPushButton("👁")
+        eye_btn.setFixedSize(26, 26)
+        eye_btn.setCheckable(True)
+        eye_btn.setStyleSheet(
+            "QPushButton{border:none;background:transparent;font-size:11pt;}"
+            "QPushButton:hover{background:#e5e5e5;border-radius:3px;}"
+        )
+        def _toggle_key_visibility(checked):
+            self.ai_api_key_edit.setEchoMode(
+                QLineEdit.Normal if checked else QLineEdit.Password
+            )
+        eye_btn.toggled.connect(_toggle_key_visibility)
+        api_key_row.addWidget(self.ai_api_key_edit, 1)
+        api_key_row.addWidget(eye_btn)
+        ai_layout.addLayout(api_key_row)
+        # 模型名称
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("模型名称:"))
+        self.ai_model_edit = QLineEdit()
+        self.ai_model_edit.setPlaceholderText("例: llama-3.3-70b-versatile")
+        self.ai_model_edit.setText(config.get("ai_chat", {}).get("model", ""))
+        model_row.addWidget(self.ai_model_edit, 1)
+        ai_layout.addLayout(model_row)
+        # 系统提示词
+        from PyQt5.QtWidgets import QPlainTextEdit as _PE
+        sp_label = QLabel("系统提示词（留空使用默认）:")
+        ai_layout.addWidget(sp_label)
+        self.ai_system_prompt_edit = _PE()
+        self.ai_system_prompt_edit.setFixedHeight(56)
+        self.ai_system_prompt_edit.setPlaceholderText("留空则使用内置提示词（支持 [OPEN_DIR:] 和 [RUN_SCRIPT:] 指令）")
+        self.ai_system_prompt_edit.setPlainText(config.get("ai_chat", {}).get("system_prompt", ""))
+        ai_layout.addWidget(self.ai_system_prompt_edit)
+        # 面板宽度
+        panel_w_row = QHBoxLayout()
+        panel_w_row.addWidget(QLabel("面板宽度 (px):"))
+        from PyQt5.QtWidgets import QSpinBox as _SB
+        self.ai_panel_width_spin = _SB()
+        self.ai_panel_width_spin.setRange(200, 800)
+        self.ai_panel_width_spin.setValue(config.get("ai_chat", {}).get("panel_width", 360))
+        panel_w_row.addWidget(self.ai_panel_width_spin)
+        panel_w_row.addStretch(1)
+        ai_layout.addLayout(panel_w_row)
+        ai_group.setLayout(ai_layout)
+        compact_groupbox(ai_group)
+        left_col.addWidget(ai_group)
+    
+    # 添加左右两列到内容布局
         content_layout.addLayout(left_col, 2)
         content_layout.addLayout(right_col, 1)
         
@@ -7721,6 +8745,22 @@ class SettingsDialog(QDialog):
             self.parent().apply_tortoisegit_buttons_config()
             # 重新设置快捷键
             self.parent().setup_shortcuts()
+            # 保存 AI 助手设置
+            ai_enabled = self.ai_enabled_cb.isChecked()
+            self.parent().config["ai_chat"] = {
+                "enabled": ai_enabled,
+                "api_url": self.ai_api_url_edit.text().strip(),
+                "api_key": self.ai_api_key_edit.text().strip(),
+                "model": self.ai_model_edit.text().strip() or "gpt-3.5-turbo",
+                "system_prompt": self.ai_system_prompt_edit.toPlainText().strip(),
+                "panel_width": self.ai_panel_width_spin.value(),
+            }
+            self.parent().save_config()
+            # 立即更新标题栏 AI 按钮显隐
+            if hasattr(self.parent(), 'ai_chat_btn'):
+                self.parent().ai_chat_btn.setVisible(ai_enabled)
+                if not ai_enabled and hasattr(self.parent(), 'chat_panel'):
+                    self.parent().chat_panel.setVisible(False)
         
         super().accept()
 
@@ -8392,10 +9432,16 @@ def main():
     window = MainWindow()
     
     # 如果有路径参数，在新窗口中打开
-    # 注意：MainWindow.__init__() 已经调用了 load_pinned_tabs()
+    # 注意：固定标签页在延迟初始化阶段加载，这里要避免和固定标签重复
     if path_to_open:
-        # 无论是否有固定标签页，都添加目标路径作为新标签
-        window.add_new_tab(path_to_open)
+        pinned_norm = {
+            window._normalize_path_for_compare(p)
+            for p in window.config.get("pinned_tabs", []) if p
+        }
+        if window._normalize_path_for_compare(path_to_open) in pinned_norm:
+            debug_print(f"[App] Skip argv path (already pinned): {path_to_open}")
+        else:
+            window.add_new_tab(path_to_open)
     
     # 启动时最大化显示
     window.showMaximized()
