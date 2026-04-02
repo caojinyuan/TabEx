@@ -1947,9 +1947,112 @@ class FileExplorerTab(QWidget):
             if path in self.file_watcher.directories():
                 self.file_watcher.removePath(path)
                 debug_print(f"[FileWatcher] Force removed: {path}")
+            if path in self.file_watcher.files():
+                self.file_watcher.removePath(path)
+                debug_print(f"[FileWatcher] Force removed file: {path}")
         except Exception as e:
             debug_print(f"[FileWatcher] Exception in force_remove_watcher: {e}")
-        debug_print(f"[FileWatcher] Now watching: {self.file_watcher.directories()}")
+        debug_print(f"[FileWatcher] Now watching dirs: {self.file_watcher.directories()}")
+        debug_print(f"[FileWatcher] Now watching files: {self.file_watcher.files()[:10]}")
+
+    def _build_dir_snapshot(self, path):
+        """构建当前目录的轻量元数据快照，用于检测文件修改时间/大小变化。"""
+        try:
+            if not path or not os.path.isdir(path):
+                return None
+            count = 0
+            latest_mtime_ns = 0
+            size_sum = 0
+            name_hash = 0
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    count += 1
+                    try:
+                        stat = entry.stat(follow_symlinks=False)
+                        latest_mtime_ns = max(latest_mtime_ns, getattr(stat, 'st_mtime_ns', int(stat.st_mtime * 1_000_000_000)))
+                        if not entry.is_dir(follow_symlinks=False):
+                            size_sum += getattr(stat, 'st_size', 0)
+                        name_hash ^= hash((entry.name, entry.is_dir(follow_symlinks=False)))
+                    except Exception:
+                        continue
+            return (count, latest_mtime_ns, size_sum, name_hash)
+        except Exception:
+            return None
+
+    def _refresh_file_watch_paths(self, path):
+        """同步当前目录下的文件 watcher，提升对文件内容修改的检测能力。"""
+        if not hasattr(self, 'file_watcher'):
+            return
+        try:
+            # 清理旧文件监听
+            old_files = getattr(self, '_watched_files', set())
+            for file_path in list(old_files):
+                self._force_remove_watcher(file_path)
+            self._watched_files = set()
+
+            if not path or not os.path.isdir(path):
+                return
+
+            max_watch_files = 200
+            watched = set()
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    if len(watched) >= max_watch_files:
+                        break
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            file_path = os.path.normpath(entry.path)
+                            if self.file_watcher.addPath(file_path):
+                                watched.add(file_path)
+                    except Exception:
+                        continue
+            self._watched_files = watched
+            debug_print(f"[FileWatcher] Watching {len(watched)} files in current dir")
+        except Exception as e:
+            debug_print(f"[FileWatcher] Failed to refresh file watch paths: {e}")
+
+    def set_refresh_active(self, active: bool):
+        """设置当前标签的刷新活跃态：仅当前可见标签执行高频刷新。"""
+        self._refresh_active = bool(active)
+        current_path = getattr(self, 'current_path', '')
+
+        if self._refresh_active:
+            if current_path and os.path.isdir(current_path):
+                self._refresh_file_watch_paths(current_path)
+                self._last_dir_snapshot = self._build_dir_snapshot(current_path)
+                if hasattr(self, 'dir_poll_timer') and self.dir_poll_timer and not self.dir_poll_timer.isActive():
+                    self.dir_poll_timer.start()
+                    debug_print(f"[DirPoll] Activated polling for visible tab: {current_path}")
+                if getattr(self, '_pending_external_refresh', False):
+                    self._pending_external_refresh = False
+                    self._schedule_refresh(reason="activate_tab")
+        else:
+            self._refresh_file_watch_paths(None)
+            if hasattr(self, 'dir_poll_timer') and self.dir_poll_timer and self.dir_poll_timer.isActive():
+                self.dir_poll_timer.stop()
+                debug_print(f"[DirPoll] Suspended polling for background tab: {current_path}")
+
+    def on_file_changed(self, path):
+        """文件内容或元数据变化时，主动刷新当前视图。"""
+        try:
+            debug_print(f"[FileWatcher] File changed: {path}")
+            current_dir = getattr(self, 'current_path', '')
+            if current_dir and os.path.normcase(os.path.dirname(path)) == os.path.normcase(current_dir):
+                if not getattr(self, '_refresh_active', True):
+                    self._pending_external_refresh = True
+                    debug_print(f"[FileWatcher] Background tab file changed, marked dirty: {path}")
+                    return
+                # 某些编辑器会以重命名替换文件，变化后需重新添加 watcher
+                if os.path.isfile(path):
+                    try:
+                        if path not in self.file_watcher.files():
+                            self.file_watcher.addPath(path)
+                    except Exception:
+                        pass
+                self._last_dir_snapshot = self._build_dir_snapshot(current_dir)
+                self._schedule_refresh(reason="file_changed")
+        except Exception as e:
+            debug_print(f"[FileWatcher] on_file_changed error: {e}")
 
     def update_tab_title(self):
         if hasattr(self, 'current_path'):
@@ -2906,6 +3009,7 @@ class FileExplorerTab(QWidget):
         # 文件系统监控（监控当前路径的变化）
         self.file_watcher = QFileSystemWatcher()
         self.file_watcher.directoryChanged.connect(self.on_directory_changed)
+        self.file_watcher.fileChanged.connect(self.on_file_changed)
         # 延迟刷新定时器（避免频繁刷新）
         self.refresh_timer = QTimer()
         self.refresh_timer.setSingleShot(True)
@@ -2914,12 +3018,16 @@ class FileExplorerTab(QWidget):
         # 防抖机制：记录最近处理的路径和时间，避免事件风暴
         self._last_watcher_event = {}  # {path: timestamp}
         self._watcher_debounce_ms = 1200  # 1.2s 内的重复事件会被忽略，进一步抑制风暴
+        self._watched_files = set()
+        self._last_dir_snapshot = None
+        self._refresh_active = False
+        self._pending_external_refresh = False
 
-        # 目录轮询刷新（已禁用，QFileSystemWatcher已足够，轮询会造成不必要的刷新）
-        # self.dir_mtime = None
-        # self.dir_poll_timer = QTimer()
-        # self.dir_poll_timer.setInterval(2000)  # 2s 低频轮询，开销很小
-        # self.dir_poll_timer.timeout.connect(self._poll_directory_changes)
+        # 目录轮询刷新兜底：处理部分编辑器改文件但目录 watcher 不触发的情况
+        self.dir_mtime = None
+        self.dir_poll_timer = QTimer()
+        self.dir_poll_timer.setInterval(3000)  # 3s 低频轮询，尽量降低开销
+        self.dir_poll_timer.timeout.connect(self._poll_directory_changes)
         
         self.setup_ui()
         
@@ -3119,7 +3227,12 @@ class FileExplorerTab(QWidget):
                     debug_print(f"[FileWatcher] Now watching: {path}")
                 else:
                     debug_print(f"[FileWatcher] Failed to watch: {path}")
+                self._refresh_file_watch_paths(path)
+                self._last_dir_snapshot = self._build_dir_snapshot(path)
                 debug_print(f"[FileWatcher] Now watching: {self.file_watcher.directories()}")
+
+        # 启用低频轮询兜底，处理 watcher 未报告的文件修改时间变化
+        self._update_dir_polling(path)
         
         self.update_tab_title()
         # 添加到历史记录
@@ -3231,6 +3344,10 @@ class FileExplorerTab(QWidget):
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
             return
+        if not getattr(self, '_refresh_active', True):
+            self._pending_external_refresh = True
+            debug_print(f"[FileWatcher] Background tab marked dirty: {path}")
+            return
         if path == self.current_path:
             self._schedule_refresh(reason="watcher")
 
@@ -3255,17 +3372,21 @@ class FileExplorerTab(QWidget):
         debug_print(f"[FileWatcher] Auto-refreshing: {self.current_path}")
         if hasattr(self, 'explorer') and self.current_path:
             try:
-                # 重新导航到当前路径以刷新
-                is_shell = self.current_path.startswith('shell:')
-                if is_shell:
-                    self.explorer.dynamicCall('Navigate(const QString&)', self.current_path)
-                else:
-                    url = 'file:///' + self.current_path.replace('\\', '/')
-                    self.explorer.dynamicCall('Navigate2(const QVariant&)', url)
+                # 优先原地刷新，失败时再回退到重新导航当前路径
+                try:
+                    self.explorer.dynamicCall('Refresh()')
+                except Exception:
+                    is_shell = self.current_path.startswith('shell:')
+                    if is_shell:
+                        self.explorer.dynamicCall('Navigate(const QString&)', self.current_path)
+                    else:
+                        url = 'file:///' + self.current_path.replace('\\', '/')
+                        self.explorer.dynamicCall('Navigate2(const QVariant&)', url)
                 debug_print(f"[FileWatcher] Refresh completed")
             except Exception as e:
                 debug_print(f"[FileWatcher] Refresh error: {e}")
         # 刷新后更新状态栏
+        self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
         self.update_explorer_status()
 
     def on_dir_model_directory_loaded(self, path):
@@ -3282,24 +3403,26 @@ class FileExplorerTab(QWidget):
             debug_print(f"[DirModel] directoryLoaded handler error: {e}")
 
     def _poll_directory_changes(self):
-        """兜底轮询目录修改时间，解决部分环境下 watcher 不触发的问题"""
+        """兜底轮询目录元数据，解决文件编辑后目录 watcher 不触发的问题"""
         # 如果设置了抑制标志，不触发刷新
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[DirPoll] Auto-refresh suppressed during navigation")
+            return
+        if not getattr(self, '_refresh_active', True):
             return
             
         path = self.current_path
         if not path or not os.path.isdir(path):
             return
-        current_mtime = self._get_dir_mtime(path)
-        if current_mtime is None:
+        current_snapshot = self._build_dir_snapshot(path)
+        if current_snapshot is None:
             return
-        if self.dir_mtime is None:
-            self.dir_mtime = current_mtime
+        if self._last_dir_snapshot is None:
+            self._last_dir_snapshot = current_snapshot
             return
-        if current_mtime != self.dir_mtime:
-            debug_print(f"[DirPoll] Detected mtime change for {path}, scheduling refresh")
-            self.dir_mtime = current_mtime
+        if current_snapshot != self._last_dir_snapshot:
+            debug_print(f"[DirPoll] Detected snapshot change for {path}, scheduling refresh")
+            self._last_dir_snapshot = current_snapshot
             self._schedule_refresh(reason="poll")
 
     def _update_dir_polling(self, path):
@@ -3307,10 +3430,11 @@ class FileExplorerTab(QWidget):
         if not hasattr(self, 'dir_poll_timer'):
             return
         if path and os.path.isdir(path):
-            # 立即更新mtime，避免误判为变化（特别是刚导航到新目录时）
+            # 立即更新快照，避免刚导航时误判为变化
             self.dir_mtime = self._get_dir_mtime(path)
+            self._last_dir_snapshot = self._build_dir_snapshot(path)
             debug_print(f"[DirPoll] Updated mtime for {path}: {self.dir_mtime}")
-            if not self.dir_poll_timer.isActive():
+            if getattr(self, '_refresh_active', False) and not self.dir_poll_timer.isActive():
                 self.dir_poll_timer.start()
                 debug_print(f"[DirPoll] Started polling {path}")
         else:
@@ -3318,6 +3442,7 @@ class FileExplorerTab(QWidget):
                 self.dir_poll_timer.stop()
                 debug_print(f"[DirPoll] Stopped polling")
             self.dir_mtime = None
+            self._last_dir_snapshot = None
 
     def _get_dir_mtime(self, path):
         """安全获取目录修改时间"""
@@ -4131,12 +4256,17 @@ class ChatPanel(QWidget):
         self.input_box = QPlainTextEdit()
         self.input_box.setPlaceholderText("输入问题… (Enter 发送，Shift+Enter 换行)")
         self.input_box.setFixedHeight(72)
+        self.input_box.setReadOnly(False)
+        self.input_box.setFocusPolicy(Qt.StrongFocus)
+        self.input_box.setAttribute(Qt.WA_InputMethodEnabled, True)
         self.input_box.setStyleSheet(
             "QPlainTextEdit{border:1px solid #d0d0d0;border-radius:4px;padding:4px;"
             "font-family:'Microsoft YaHei UI','Segoe UI',Arial;font-size:9.5pt;}"
             "QPlainTextEdit:focus{border:1px solid #42A5F5;}"
         )
         self.input_box.installEventFilter(self)
+        # QPlainTextEdit 的鼠标事件实际落在 viewport 上，这里一并监听
+        self.input_box.viewport().installEventFilter(self)
         layout.addWidget(self.input_box)
 
         # 发送按钮行
@@ -4169,7 +4299,7 @@ class ChatPanel(QWidget):
     # ── 事件过滤（Enter 发送 / 鼠标点击夺回焦点）────────────────────────────
     def eventFilter(self, obj, event):
         from PyQt5.QtCore import QEvent, QTimer
-        if obj is self.input_box:
+        if obj is self.input_box or obj is self.input_box.viewport():
             if event.type() == QEvent.KeyPress:
                 if event.key() in (Qt.Key_Return, Qt.Key_Enter):
                     if not (event.modifiers() & Qt.ShiftModifier):
@@ -4180,6 +4310,7 @@ class ChatPanel(QWidget):
                 # 用 singleShot(0) 让 Qt 先处理完点击事件再设焦点
                 self.main_window.activateWindow()
                 QTimer.singleShot(0, lambda: self.input_box.setFocus(Qt.MouseFocusReason))
+                QTimer.singleShot(20, lambda: self.input_box.setFocus(Qt.MouseFocusReason))
         return super().eventFilter(obj, event)
 
     # ── 公共方法 ─────────────────────────────────────────────────────────────
@@ -5002,6 +5133,11 @@ class MainWindow(QMainWindow):
 
     def close_tab(self, index):
         tab = self.get_tab_widget(index)
+        if tab and hasattr(tab, 'set_refresh_active'):
+            try:
+                tab.set_refresh_active(False)
+            except Exception:
+                pass
         
         # 调试：打印标签页信息
         debug_print(f"[ClosedTabs] Closing tab at index {index}")
@@ -5069,6 +5205,15 @@ class MainWindow(QMainWindow):
 
     def on_tab_changed(self, index):
         if index >= 0:
+            # 仅当前可见标签保持高频刷新；后台标签暂停轮询并仅记录脏状态
+            for i in range(self.tab_widget.count()):
+                tab_item = self.get_tab_widget(i)
+                if tab_item and hasattr(tab_item, 'set_refresh_active'):
+                    try:
+                        tab_item.set_refresh_active(i == index)
+                    except Exception:
+                        pass
+
             # 调试信息：检查同步状态
             print(f"[TabSwitch] Tab changed to index {index}")
             if hasattr(self, 'content_stack'):
@@ -6236,6 +6381,13 @@ class MainWindow(QMainWindow):
     def _check_shortcuts(self):
         """定时检查快捷键状态（用于检测被QAxWidget拦截的快捷键）"""
         try:
+            # 当焦点在文本输入控件时，避免全局快捷键轮询干扰输入
+            from PyQt5.QtWidgets import QApplication, QLineEdit, QTextEdit, QPlainTextEdit
+            fw = QApplication.focusWidget()
+            if isinstance(fw, (QLineEdit, QTextEdit, QPlainTextEdit)):
+                self._last_keys_state.clear()
+                return
+
             # 严格检查窗口是否激活 - 使用多重检查确保只在TabEx激活时响应
             # 1. 检查Qt窗口是否激活
             if not self.isActiveWindow():
@@ -6243,7 +6395,6 @@ class MainWindow(QMainWindow):
                 return
             
             # 2. 检查应用程序焦点窗口
-            from PyQt5.QtWidgets import QApplication
             if QApplication.activeWindow() != self:
                 self._last_keys_state.clear()
                 return
