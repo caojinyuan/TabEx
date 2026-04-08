@@ -1960,6 +1960,9 @@ class FileExplorerTab(QWidget):
         try:
             if not path or not os.path.isdir(path):
                 return None
+            # OneDrive/网络路径的os.scandir()会阻塞UI线程（云同步），直接跳过
+            if self._is_slow_path(path):
+                return None
             count = 0
             latest_mtime_ns = 0
             size_sum = 0
@@ -1992,6 +1995,10 @@ class FileExplorerTab(QWidget):
 
             if not path or not os.path.isdir(path):
                 return
+            # OneDrive/网络路径的os.scandir()会阻塞UI线程，跳过文件监视
+            if self._is_slow_path(path):
+                debug_print(f"[FileWatcher] Skipping file watch for slow path: {path}")
+                return
 
             max_watch_files = 200
             watched = set()
@@ -2018,11 +2025,17 @@ class FileExplorerTab(QWidget):
 
         if self._refresh_active:
             if current_path and os.path.isdir(current_path):
-                self._refresh_file_watch_paths(current_path)
-                self._last_dir_snapshot = self._build_dir_snapshot(current_path)
+                is_slow = self._is_slow_path(current_path)
+                # OneDrive/网络路径：跳过os.scandir操作，避免阻塞UI线程和COM消息泵
+                if not is_slow:
+                    self._refresh_file_watch_paths(current_path)
+                    self._last_dir_snapshot = self._build_dir_snapshot(current_path)
                 if hasattr(self, 'dir_poll_timer') and self.dir_poll_timer and not self.dir_poll_timer.isActive():
-                    self.dir_poll_timer.start()
-                    debug_print(f"[DirPoll] Activated polling for visible tab: {current_path}")
+                    if not is_slow:
+                        self.dir_poll_timer.start()
+                        debug_print(f"[DirPoll] Activated polling for visible tab: {current_path}")
+                    else:
+                        debug_print(f"[DirPoll] Skipped polling for slow path: {current_path}")
                 if getattr(self, '_pending_external_refresh', False):
                     self._pending_external_refresh = False
                     self._schedule_refresh(reason="activate_tab")
@@ -2790,7 +2803,7 @@ class FileExplorerTab(QWidget):
                         # 导航后兜底恢复路径同步（防止计时器永久停止）
                         try:
                             from PyQt5.QtCore import QTimer
-                            QTimer.singleShot(1200, self._resume_path_sync_after_navigation)
+                            QTimer.singleShot(350, self._resume_path_sync_after_navigation)
                         except Exception:
                             pass
 
@@ -2920,7 +2933,7 @@ class FileExplorerTab(QWidget):
                                             self._navigating_folder = False
                                         # 重启路径同步定时器
                                         if hasattr(self, '_path_sync_timer') and self._path_sync_timer and not self._path_sync_timer.isActive():
-                                            self._path_sync_timer.start(1000)
+                                            self._path_sync_timer.start(200)
                                             debug_print(f"[Navigation] Path sync timer restarted after navigation complete")
                                 t2 = QTimer()
                                 t2.setSingleShot(True)
@@ -3114,13 +3127,30 @@ class FileExplorerTab(QWidget):
             self.update_explorer_status()
         elif os.path.exists(path):
             # 如果skip_async_check=True或禁用异步，直接导航
-            if skip_async_check or not ASYNC_LOAD_ENABLED or not os.path.isdir(path):
+            # OneDrive/网络路径的os.scandir()可能永久阻塞，直接跳过异步检查
+            is_slow = self._is_slow_path(path)
+            if is_slow:
+                debug_print(f"[navigate_to] OneDrive/network path detected, skipping async check: {path}")
+            if skip_async_check or not ASYNC_LOAD_ENABLED or not os.path.isdir(path) or is_slow:
                 self._perform_navigation(path, add_to_history)
             else:
                 # 异步检查文件夹大小
                 self._check_folder_size_async(path, add_to_history)
         else:
             debug_print(f"[navigate_to] Path does not exist: {path}")
+
+    def _is_slow_path(self, path):
+        """检测OneDrive/网络路径——这类路径上os.scandir()可能永久阻塞"""
+        if not path:
+            return False
+        # 网络UNC路径
+        if path.startswith('\\\\') or path.startswith('//'):
+            return True
+        # OneDrive同步文件夹（路径中含OneDrive关键字）
+        path_lower = path.replace('\\', '/').lower()
+        if 'onedrive' in path_lower:
+            return True
+        return False
 
     def _is_control_panel_path(self, path):
         """判断路径是否为控制面板或其子目录"""
@@ -3151,13 +3181,32 @@ class FileExplorerTab(QWidget):
         """异步检查文件夹大小并决定是否显示加载指示器"""
         # 显示加载指示器
         self._show_loading_indicator()
-        
+        self._folder_checker_done = False
+
         # 创建并启动检查线程
         self.folder_checker = FolderSizeChecker(path, self)
-        self.folder_checker.finished.connect(
-            lambda p, count, is_large: self._on_folder_size_checked(p, count, is_large, add_to_history)
-        )
+
+        def _on_checker_finished(p, count, is_large):
+            if getattr(self, '_folder_checker_done', False):
+                return  # 已由超时保护处理
+            self._folder_checker_done = True
+            self._on_folder_size_checked(p, count, is_large, add_to_history)
+
+        self.folder_checker.finished.connect(_on_checker_finished)
         self.folder_checker.start()
+
+        # 超时保护：若线程在 FOLDER_CHECK_TIMEOUT+500ms 内未完成则强制导航
+        # 防止云存储/网络路径的os.scandir()永久阻塞
+        def _checker_timeout():
+            if getattr(self, '_folder_checker_done', True):
+                return  # 线程已正常结束
+            debug_print(f"[AsyncLoad] FolderSizeChecker timeout, forcing navigation: {path}")
+            if hasattr(self, 'folder_checker') and self.folder_checker:
+                self.folder_checker.stop()
+            self._folder_checker_done = True
+            self._on_folder_size_checked(path, 0, False, add_to_history)
+
+        QTimer.singleShot(FOLDER_CHECK_TIMEOUT + 500, _checker_timeout)
         debug_print(f"[AsyncLoad] Started checking folder: {path}")
     
     def _on_folder_size_checked(self, path, file_count, is_large, add_to_history):
@@ -3414,6 +3463,9 @@ class FileExplorerTab(QWidget):
         path = self.current_path
         if not path or not os.path.isdir(path):
             return
+        # OneDrive/网络路径的os.scandir()会阻塞UI线程，不做轮询
+        if self._is_slow_path(path):
+            return
         current_snapshot = self._build_dir_snapshot(path)
         if current_snapshot is None:
             return
@@ -3428,6 +3480,12 @@ class FileExplorerTab(QWidget):
     def _update_dir_polling(self, path):
         """根据当前路径启动或停止兜底轮询"""
         if not hasattr(self, 'dir_poll_timer'):
+            return
+        # OneDrive/网络路径不做轮询，避免os.scandir()阻塞UI线程
+        if path and self._is_slow_path(path):
+            if self.dir_poll_timer.isActive():
+                self.dir_poll_timer.stop()
+                debug_print(f"[DirPoll] Stopped polling for slow path: {path}")
             return
         if path and os.path.isdir(path):
             # 立即更新快照，避免刚导航时误判为变化
