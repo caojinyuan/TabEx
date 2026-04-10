@@ -8445,8 +8445,8 @@ class MainWindow(QMainWindow):
         """窗口关闭时停止服务器和监听"""
         # 缓存非固定标签（如果启用）
         try:
+            cached_tabs = []
             if self.config.get("enable_cache_tabs", True):
-                cached_tabs = []
                 seen_paths = set()
                 pinned_norm = {
                     self._normalize_path_for_compare(p)
@@ -8472,11 +8472,12 @@ class MainWindow(QMainWindow):
                                 'path': current_path,
                                 'is_shell': current_path.startswith('shell:') if current_path else False
                             })
-                
-                if cached_tabs:
-                    self.config['cached_tabs'] = cached_tabs
-                    self.save_config()
-                    debug_print(f"[App] 缓存了 {len(cached_tabs)} 个非固定标签页")
+
+            # 无论是否启用缓存，都覆盖写入 cached_tabs，避免残留旧会话数据
+            self.config['cached_tabs'] = cached_tabs
+            # 关闭流程必须立即落盘，避免防抖定时器来不及触发
+            self.save_config(immediate=True)
+            debug_print(f"[App] 关闭时写入缓存标签页: {len(cached_tabs)}")
         except Exception as e:
             print(f"Error caching tabs: {e}")
         
