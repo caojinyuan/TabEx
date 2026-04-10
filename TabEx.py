@@ -83,7 +83,7 @@ LARGE_FOLDER_THRESHOLD = 1000  # 超过此数量文件视为大文件夹
 FOLDER_CHECK_TIMEOUT = 500  # 文件夹检查超时时间(ms)
 ASYNC_LOAD_ENABLED = True  # 是否启用异步加载
 # 状态栏目录计数缓存（避免高频 os.scandir）
-DIR_ENTRY_COUNT_CACHE_TTL_MS = 1500
+DIR_ENTRY_COUNT_CACHE_TTL_MS = 5000  # 状态栏目录计数缓存时间（提升到5秒，减少频繁os.scandir）
 
 
 def apply_runtime_performance_config(perf_cfg=None):
@@ -1100,13 +1100,6 @@ class SearchDialog(QDialog):
                     file_path = os.path.join(root, filename)
                     matched = False
                     match_type = ""
-                    is_debug_file = 'TstMgr_RtnSound.c' in filename or 'Rtcsub_rtc_Cfg.h' in filename
-                    
-                    # 调试：显示正在搜索的特定文件
-                    if is_debug_file:
-                        print(f"[Search DEBUG] 正在搜索文件: {file_path}")
-                        print(f"[Search DEBUG] 搜索文件名: {search_filename}, 搜索内容: {search_content}")
-                        print(f"[Search DEBUG] 关键词: {keyword}, ASCII: {keyword_is_ascii}")
                     
                     # 搜索文件名（Python内置优化）
                     if search_filename and keyword_lower in filename_lower:
@@ -1118,21 +1111,12 @@ class SearchDialog(QDialog):
                         # 1. 首先检查黑名单（明确的二进制文件）
                         if file_ext in binary_file_extensions:
                             skipped_binary_files += 1
-                            if is_debug_file:
-                                print(f"[Search DEBUG] 文件被黑名单过滤: {file_ext}")
                             continue
 
                         # 2. 文本白名单直接通过；其余文件走探测
                         if file_ext not in text_file_extensions and not is_text_file(file_path):
                             skipped_binary_files += 1
-                            if is_debug_file:
-                                print(f"[Search DEBUG] 文件被认定为二进制: {file_ext}")
                             continue
-                        
-                        # 调试信息
-                        if is_debug_file:
-                            file_size = os.path.getsize(file_path)
-                            print(f"[Search DEBUG] 开始搜索文件内容，文件大小: {file_size} bytes")
                         
                         try:
                             # 获取文件大小
@@ -1145,8 +1129,6 @@ class SearchDialog(QDialog):
 
                             # ASCII关键词快速路径：直接按字节匹配，跳过多编码解码
                             if keyword_is_ascii and keyword_bytes:
-                                if is_debug_file:
-                                    print(f"[Search DEBUG] 进入ASCII快速路径, keyword_bytes={keyword_bytes}")
                                 read_limit = min(file_size, max_scan_bytes)
                                 if read_limit <= in_memory_threshold:
                                     with open(file_path, 'rb') as bf:
@@ -1155,9 +1137,6 @@ class SearchDialog(QDialog):
                                     # 兼容 UTF-16(无BOM) 等含 NULL 字节文本：移除 NULL 后再匹配一次
                                     raw_no_null = raw_content.replace(b'\x00', b'')
                                     raw_no_null_lower = raw_no_null.lower()
-                                    if is_debug_file:
-                                        null_count = raw_content.count(b'\x00')
-                                        print(f"[Search DEBUG] ASCII路径小文件: {len(raw_content)} bytes, NULL字节数: {null_count}")
                                     if (
                                         keyword_bytes in raw_content
                                         or keyword_bytes_lower in raw_lower
@@ -1166,14 +1145,7 @@ class SearchDialog(QDialog):
                                     ):
                                         matched = True
                                         match_type = "📄"
-                                        if is_debug_file:
-                                            print(f"[Search DEBUG] ✓ ASCII快速路径匹配成功!")
-                                        # 不再continue，让代码继续执行到结果处理
-                                    elif is_debug_file:
-                                        print(f"[Search DEBUG] ✗ ASCII快速路径未匹配")
                                 else:
-                                    if is_debug_file:
-                                        print(f"[Search DEBUG] ASCII路径大文件，分块读取")
                                     overlap_bytes = max(1, len(keyword_bytes) * 2)
                                     scanned_bytes = 0
                                     with open(file_path, 'rb') as bf:
@@ -1195,15 +1167,9 @@ class SearchDialog(QDialog):
                                             ):
                                                 matched = True
                                                 match_type = "📄"
-                                                if is_debug_file:
-                                                    print(f"[Search DEBUG] ✓ ASCII路径大文件分块匹配成功!")
                                                 break
                                             if len(chunk) == chunk_size:
                                                 bf.seek(bf.tell() - overlap_bytes)
-                                    if matched:
-                                        if is_debug_file:
-                                            print(f"[Search DEBUG] ASCII路径完成, 匹配={matched}")
-                                        # 不再continue，让代码继续执行到结果处理
 
                             # 编码顺序：优先使用该扩展名最近成功编码
                             if not matched:  # 跳过编码尝试如果已匹配
@@ -1214,13 +1180,8 @@ class SearchDialog(QDialog):
                                     encodings = list(CONTENT_SEARCH_ENCODINGS)
                                 content_matched = False
                                 
-                                if is_debug_file:
-                                    print(f"[Search DEBUG] 进入编码路径，试用编码: {encodings}")
-                                
                                 for encoding in encodings:
                                     try:
-                                        if is_debug_file:
-                                            print(f"[Search DEBUG] 尝试编码: {encoding}")
                                         read_limit = min(file_size, max_scan_bytes)
                                         if read_limit <= in_memory_threshold:
                                             # 小文件优化：只读一次二进制，再在内存中尝试不同编码，避免重复磁盘I/O
@@ -1234,11 +1195,7 @@ class SearchDialog(QDialog):
                                                 content_matched = True
                                                 if file_ext:
                                                     ext_encoding_cache[file_ext] = encoding
-                                                if is_debug_file:
-                                                    print(f"[Search DEBUG] ✓ 编码 {encoding} 匹配成功!")
                                                 break
-                                            elif is_debug_file:
-                                                print(f"[Search DEBUG] ✗ 编码 {encoding} 未匹配")
                                         else:
                                             with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
                                                 # 大文件分块读取（有总扫描上限）
@@ -1263,16 +1220,11 @@ class SearchDialog(QDialog):
                                                         f.seek(f.tell() - overlap)
                                                 if content_matched:
                                                     break
-                                    except UnicodeError as e:
-                                        # 尝试下一个编码
-                                        if is_debug_file:
-                                            print(f"[Search DEBUG] 编码 {encoding} UnicodeError: {e}")
+                                    except UnicodeError:
                                         continue
                                     except Exception as e:
                                         # 其他错误，记录日志并尝试下一个编码
                                         print(f"[Search] 读取文件失败 {file_path} (编码 {encoding}): {e}")
-                                        if is_debug_file:
-                                            print(f"[Search DEBUG] 编码 {encoding} 异常: {e}")
                                         continue
                         except Exception as e:
                             # 如果无法以文本方式读取，记录日志并跳过该文件
@@ -1404,7 +1356,7 @@ from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor, QDrag
 # from PyQt5.QtGui import QIcon  # unused
 
 # 全局调试开关
-_DEBUG_MODE = True
+_DEBUG_MODE = False  # 生产环境关闭，避免性能损耗
 _EXPLORER_MONITOR_DEBUG = False  # Explorer Monitor 单独的日志开关
 
 def debug_print(*args, **kwargs):
@@ -2220,12 +2172,18 @@ class BookmarkManager:
     def save_bookmarks(self, immediate=False):
         # 优化：延迟保存，避免频繁操作时多次写入
         if immediate:
+            tmp_path = self.config_file + ".tmp"
             try:
-                with open(self.config_file, 'w', encoding='utf-8') as f:
+                with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump({"roots": self.bookmark_tree}, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, self.config_file)  # 原子替换，防止断电损坏
                 self._pending_save = False
             except Exception as e:
                 print(f"Failed to save bookmarks: {e}")
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
         else:
             self._pending_save = True
             if self._save_timer is None:
@@ -7419,9 +7377,10 @@ class MainWindow(QMainWindow):
         }
         
         try:
-            # 首先尝试加载主配置文件
-            if os.path.exists("config.json"):
-                with open("config.json", "r", encoding="utf-8") as f:
+            # 首先尝试加载主配置文件（使用程序所在目录的绝对路径）
+            config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
                     # 合并默认配置
                     for key, value in default_config.items():
@@ -7462,13 +7421,32 @@ class MainWindow(QMainWindow):
             apply_runtime_performance_config(default_config.get("performance"))
             return default_config
     
-    def save_config(self):
-        """保存配置文件"""
+    def save_config(self, immediate=False):
+        """保存配置文件（带防抖：500ms无操作后写盘，避免高频config更改频繁I/O）"""
+        if immediate:
+            self._flush_config_to_disk()
+        else:
+            if not hasattr(self, '_config_save_timer') or self._config_save_timer is None:
+                from PyQt5.QtCore import QTimer
+                self._config_save_timer = QTimer(self)
+                self._config_save_timer.setSingleShot(True)
+                self._config_save_timer.timeout.connect(self._flush_config_to_disk)
+            self._config_save_timer.start(500)
+
+    def _flush_config_to_disk(self):
+        """实际写入config.json（原子写入：先写临时文件再重命名）"""
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        tmp_path = config_path + ".tmp"
         try:
-            with open("config.json", "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, config_path)
         except Exception as e:
             print(f"Failed to save config: {e}")
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
     def ensure_default_bookmarks(self):
         bm = self.bookmark_manager
@@ -8201,13 +8179,6 @@ class MainWindow(QMainWindow):
                 def check_windows_callback(hwnd, _):
                     try:
                         class_name = win32gui.GetClassName(hwnd)
-                        # 调试：记录所有可见窗口的类名（仅在检测到新窗口时）
-                        if win32gui.IsWindowVisible(hwnd):
-                            title = win32gui.GetWindowText(hwnd)
-                            # 记录可能相关的窗口信息
-                            if title and len(title) > 0 and (':\\' in title or title.startswith('C:') or title.startswith('D:')):
-                                debug_print(f"[Explorer Monitor] Debug: Found window - Class: '{class_name}', Title: '{title}'")
-                        
                         # CabinetWClass: 标准Explorer窗口
                         # ExploreWClass: 另一种Explorer窗口类型
                         if class_name in ("CabinetWClass", "ExploreWClass"):
@@ -9873,7 +9844,8 @@ class BookmarkManagerDialog(QDialog):
         if file_path:
             try:
                 # 复制当前的bookmarks.json到目标位置
-                shutil.copy2("bookmarks.json", file_path)
+                bookmarks_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bookmarks.json")
+                shutil.copy2(bookmarks_path, file_path)
                 show_toast(self, "导出成功", f"书签已成功导出到:\n{file_path}", level="success")
                 print(f"[Bookmark Export] Successfully exported to: {file_path}")
             except Exception as e:
