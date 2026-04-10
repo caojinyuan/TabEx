@@ -63,6 +63,17 @@ def translate_common_path(path):
 # 性能优化配置常量
 MAX_SEARCH_CACHE_SIZE = 50  # 搜索缓存最大数量
 MAX_SEARCH_RESULTS = 1000000  # 单次搜索最大结果数
+MAX_CACHED_RESULTS_PER_QUERY = 5000  # 单次搜索最多缓存结果数（控制内存占用）
+CONTENT_SEARCH_CHUNK_SIZE = 10 * 1024 * 1024  # 内容搜索分块大小（10MB）
+CONTENT_SEARCH_MAX_BYTES_PER_FILE = 64 * 1024 * 1024  # 单文件最多扫描64MB，避免超大文件拖慢整体
+CONTENT_SEARCH_IN_MEMORY_THRESHOLD = 2 * 1024 * 1024  # 小文件（<=2MB）一次性读入内存后多编码匹配
+CONTENT_SEARCH_ENCODINGS = ['utf-8', 'utf-8-sig', 'utf-16', 'utf-16-le', 'utf-16-be', 'gbk', 'gb2312', 'latin-1']
+SEARCH_RESULT_QUEUE_MAXSIZE = 3000  # 搜索结果队列容量（降低高吞吐时溢出概率）
+SEARCH_RESULT_BATCH_BASE = 100  # 搜索线程默认批量发送大小
+SEARCH_RESULT_BATCH_MIN = 50  # 低积压时最小批量发送大小
+SEARCH_RESULT_BATCH_MAX = 400  # 高积压时最大批量发送大小
+SEARCH_METADATA_DEGRADE_ENABLED = True  # 队列高压时降级元数据(stat)获取
+SEARCH_METADATA_DEGRADE_QUEUE_RATIO = 0.75  # 触发降级的队列占用比例
 MAX_CLOSED_TABS_HISTORY = 20  # 关闭标签页历史最大数量（从10增加到20）
 MAX_SEARCH_HISTORY = 30  # 搜索历史最大数量（从20增加到30）
 MAX_NAVIGATION_HISTORY = 50  # 导航历史最大数量
@@ -71,6 +82,135 @@ MAX_NAVIGATION_HISTORY = 50  # 导航历史最大数量
 LARGE_FOLDER_THRESHOLD = 1000  # 超过此数量文件视为大文件夹
 FOLDER_CHECK_TIMEOUT = 500  # 文件夹检查超时时间(ms)
 ASYNC_LOAD_ENABLED = True  # 是否启用异步加载
+# 状态栏目录计数缓存（避免高频 os.scandir）
+DIR_ENTRY_COUNT_CACHE_TTL_MS = 1500
+
+
+def apply_runtime_performance_config(perf_cfg=None):
+    """将配置中的性能参数应用到运行时常量（带边界校验）。"""
+    global CONTENT_SEARCH_CHUNK_SIZE
+    global CONTENT_SEARCH_MAX_BYTES_PER_FILE
+    global CONTENT_SEARCH_IN_MEMORY_THRESHOLD
+    global SEARCH_RESULT_QUEUE_MAXSIZE
+    global SEARCH_RESULT_BATCH_BASE
+    global SEARCH_RESULT_BATCH_MIN
+    global SEARCH_RESULT_BATCH_MAX
+    global SEARCH_METADATA_DEGRADE_ENABLED
+    global SEARCH_METADATA_DEGRADE_QUEUE_RATIO
+
+    if not isinstance(perf_cfg, dict):
+        return
+
+    def _clamp_int(val, default_val, min_val, max_val):
+        try:
+            iv = int(val)
+        except Exception:
+            return default_val
+        if iv < min_val:
+            return min_val
+        if iv > max_val:
+            return max_val
+        return iv
+
+    def _clamp_float(val, default_val, min_val, max_val):
+        try:
+            fv = float(val)
+        except Exception:
+            return default_val
+        if fv < min_val:
+            return min_val
+        if fv > max_val:
+            return max_val
+        return fv
+
+    def _to_bool(val, default_val):
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            v = val.strip().lower()
+            if v in ('1', 'true', 'yes', 'on'):
+                return True
+            if v in ('0', 'false', 'no', 'off'):
+                return False
+        return default_val
+
+    CONTENT_SEARCH_CHUNK_SIZE = _clamp_int(
+        perf_cfg.get("content_search_chunk_size", CONTENT_SEARCH_CHUNK_SIZE),
+        CONTENT_SEARCH_CHUNK_SIZE,
+        256 * 1024,
+        64 * 1024 * 1024,
+    )
+    CONTENT_SEARCH_MAX_BYTES_PER_FILE = _clamp_int(
+        perf_cfg.get("content_search_max_bytes_per_file", CONTENT_SEARCH_MAX_BYTES_PER_FILE),
+        CONTENT_SEARCH_MAX_BYTES_PER_FILE,
+        1 * 1024 * 1024,
+        1024 * 1024 * 1024,
+    )
+    CONTENT_SEARCH_IN_MEMORY_THRESHOLD = _clamp_int(
+        perf_cfg.get("content_search_in_memory_threshold", CONTENT_SEARCH_IN_MEMORY_THRESHOLD),
+        CONTENT_SEARCH_IN_MEMORY_THRESHOLD,
+        64 * 1024,
+        16 * 1024 * 1024,
+    )
+    SEARCH_RESULT_QUEUE_MAXSIZE = _clamp_int(
+        perf_cfg.get("search_result_queue_maxsize", SEARCH_RESULT_QUEUE_MAXSIZE),
+        SEARCH_RESULT_QUEUE_MAXSIZE,
+        200,
+        100000,
+    )
+    SEARCH_RESULT_BATCH_BASE = _clamp_int(
+        perf_cfg.get("search_result_batch_base", SEARCH_RESULT_BATCH_BASE),
+        SEARCH_RESULT_BATCH_BASE,
+        20,
+        2000,
+    )
+    SEARCH_RESULT_BATCH_MIN = _clamp_int(
+        perf_cfg.get("search_result_batch_min", SEARCH_RESULT_BATCH_MIN),
+        SEARCH_RESULT_BATCH_MIN,
+        10,
+        1000,
+    )
+    SEARCH_RESULT_BATCH_MAX = _clamp_int(
+        perf_cfg.get("search_result_batch_max", SEARCH_RESULT_BATCH_MAX),
+        SEARCH_RESULT_BATCH_MAX,
+        20,
+        5000,
+    )
+    SEARCH_METADATA_DEGRADE_ENABLED = _to_bool(
+        perf_cfg.get("search_metadata_degrade_enabled", SEARCH_METADATA_DEGRADE_ENABLED),
+        SEARCH_METADATA_DEGRADE_ENABLED,
+    )
+    SEARCH_METADATA_DEGRADE_QUEUE_RATIO = _clamp_float(
+        perf_cfg.get("search_metadata_degrade_queue_ratio", SEARCH_METADATA_DEGRADE_QUEUE_RATIO),
+        SEARCH_METADATA_DEGRADE_QUEUE_RATIO,
+        0.1,
+        0.98,
+    )
+
+    # 保证内存阈值不大于单文件扫描上限
+    if CONTENT_SEARCH_IN_MEMORY_THRESHOLD > CONTENT_SEARCH_MAX_BYTES_PER_FILE:
+        CONTENT_SEARCH_IN_MEMORY_THRESHOLD = CONTENT_SEARCH_MAX_BYTES_PER_FILE
+    if SEARCH_RESULT_BATCH_MIN > SEARCH_RESULT_BATCH_MAX:
+        SEARCH_RESULT_BATCH_MIN = SEARCH_RESULT_BATCH_MAX
+    if SEARCH_RESULT_BATCH_BASE < SEARCH_RESULT_BATCH_MIN:
+        SEARCH_RESULT_BATCH_BASE = SEARCH_RESULT_BATCH_MIN
+    elif SEARCH_RESULT_BATCH_BASE > SEARCH_RESULT_BATCH_MAX:
+        SEARCH_RESULT_BATCH_BASE = SEARCH_RESULT_BATCH_MAX
+
+    debug_print(
+        "[Config] Performance applied:",
+        f"chunk={CONTENT_SEARCH_CHUNK_SIZE}",
+        f"max_file={CONTENT_SEARCH_MAX_BYTES_PER_FILE}",
+        f"in_memory={CONTENT_SEARCH_IN_MEMORY_THRESHOLD}",
+        f"queue={SEARCH_RESULT_QUEUE_MAXSIZE}",
+        f"batch_base={SEARCH_RESULT_BATCH_BASE}",
+        f"batch_min={SEARCH_RESULT_BATCH_MIN}",
+        f"batch_max={SEARCH_RESULT_BATCH_MAX}",
+        f"meta_degrade={SEARCH_METADATA_DEGRADE_ENABLED}",
+        f"meta_ratio={SEARCH_METADATA_DEGRADE_QUEUE_RATIO}",
+    )
 
 class SearchCache:
     """搜索结果缓存，使用LRU策略"""
@@ -78,9 +218,9 @@ class SearchCache:
         self.cache = OrderedDict()
         self.max_size = max_size
     
-    def get_key(self, search_path, keyword, search_filename, search_content, file_types):
+    def get_key(self, search_path, keyword, search_filename, search_content, file_types, force_metadata_degrade=False):
         """生成缓存键"""
-        key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}"
+        key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}|{force_metadata_degrade}"
         return hashlib.md5(key_str.encode()).hexdigest()
     
     def get(self, key):
@@ -213,9 +353,9 @@ class SearchDialog(QDialog):
     def __init__(self, search_path, parent=None, search_history=None):
         super().__init__(parent)
         self.setWindowTitle(f"搜索 - {search_path}")
-        # 设置为不可调边框的对话框
+        # 设置为可调整大小的对话框
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.setFixedSize(800, 500)
+        self.resize(800, 500)  # 初始大小，但允许调整
         self.search_path = search_path
         self.main_window = parent
         self.search_thread = None
@@ -228,7 +368,7 @@ class SearchDialog(QDialog):
         
         # 线程安全的结果队列（限制大小防止内存溢出）
         import queue
-        self.result_queue = queue.Queue(maxsize=1000)  # 最多缓存1000个待显示的结果
+        self.result_queue = queue.Queue(maxsize=SEARCH_RESULT_QUEUE_MAXSIZE)  # 结果队列容量
         self.ui_update_timer = None
         self.queue_overflow_count = 0  # 队列溢出计数
         
@@ -301,6 +441,12 @@ class SearchDialog(QDialog):
             self.use_everything_cb.setToolTip("未检测到Everything，请从 https://www.voidtools.com/ 下载安装")
         self.use_everything_cb.stateChanged.connect(self.on_everything_toggled)
         type_options.addWidget(self.use_everything_cb)
+
+        # 手动轻量模式：强制降级元数据以提升吞吐
+        self.force_lightweight_cb = QCheckBox("轻量模式(更快)")
+        self.force_lightweight_cb.setChecked(False)
+        self.force_lightweight_cb.setToolTip("勾选后搜索结果将优先显示核心路径信息，可能省略修改时间/大小")
+        type_options.addWidget(self.force_lightweight_cb)
         
         type_options.addStretch(1)
         layout.addLayout(type_options)
@@ -362,7 +508,16 @@ class SearchDialog(QDialog):
             # 批量处理结果（一次处理最多200个，加快队列消费）
             batch_results = []
             batch_count = 0
-            max_batch = 200  # 从50增加到20
+            # 根据队列积压动态调整消费批次，减少结果爆发时的UI延迟
+            max_batch = 200
+            try:
+                pending = self.result_queue.qsize()
+                if pending > 800:
+                    max_batch = 500
+                elif pending > 300:
+                    max_batch = 350
+            except Exception:
+                pass
             
             while batch_count < max_batch:
                 try:
@@ -371,6 +526,11 @@ class SearchDialog(QDialog):
                     if item['type'] == 'result':
                         batch_results.append(item)
                         batch_count += 1
+                    elif item['type'] == 'result_batch':
+                        items = item.get('items') or []
+                        if items:
+                            batch_results.extend(items)
+                            batch_count += len(items)
                     elif item['type'] == 'status':
                         self.status_label.setText(item['text'])
                     elif item['type'] == 'button':
@@ -386,40 +546,52 @@ class SearchDialog(QDialog):
             
             # 批量添加结果到表格（性能优化）
             if batch_results:
-                from PyQt5.QtCore import Qt
-                
-                # 禁用更新以提高性能
-                self.result_list.setUpdatesEnabled(False)
-                
-                for item in batch_results:
-                    # 检查是否超过最大结果数
-                    if self.current_result_count >= self.max_results:
-                        break
-                    
-                    row = self.result_list.rowCount()
-                    self.result_list.insertRow(row)
-                    
-                    # 文件名项
-                    name_item = QTableWidgetItem(item['name'])
-                    name_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                    name_item.setToolTip(item['full_path'])
-                    self.result_list.setItem(row, 0, name_item)
-                    self.result_list.setItem(row, 1, QTableWidgetItem(item['file_type']))
-                    self.result_list.setItem(row, 2, QTableWidgetItem(item['date']))
-                    self.result_list.setItem(row, 3, QTableWidgetItem(item['size']))
-                    self.result_list.item(row, 0).setData(256, item['path'])
-                    
-                    self.current_result_count += 1
-                
-                # 重新启用更新
-                self.result_list.setUpdatesEnabled(True)
+                self._append_results_to_table(batch_results)
                 
         except Exception as e:
             print(f"[Search] UI update error: {e}")
+
+    def _append_results_to_table(self, results):
+        """批量渲染搜索结果到表格。"""
+        from PyQt5.QtCore import Qt
+
+        if not results:
+            return
+
+        remaining_capacity = self.max_results - self.current_result_count
+        if remaining_capacity <= 0:
+            return
+        rows_to_add = results[:remaining_capacity]
+
+        self.result_list.setUpdatesEnabled(False)
+        start_row = self.result_list.rowCount()
+        self.result_list.setRowCount(start_row + len(rows_to_add))
+
+        for offset, item in enumerate(rows_to_add):
+            row = start_row + offset
+
+            name_item = QTableWidgetItem(item['name'])
+            name_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            name_item.setToolTip(item['full_path'])
+            self.result_list.setItem(row, 0, name_item)
+            self.result_list.setItem(row, 1, QTableWidgetItem(item['file_type']))
+            self.result_list.setItem(row, 2, QTableWidgetItem(item['date']))
+            self.result_list.setItem(row, 3, QTableWidgetItem(item['size']))
+            self.result_list.item(row, 0).setData(Qt.UserRole, item['path'])
+
+            self.current_result_count += 1
+
+        self.result_list.setUpdatesEnabled(True)
     
-    def add_search_result(self, text):
-        """添加搜索结果项（通过队列，线程安全）"""
-        self.result_queue.put({'type': 'result', 'text': text})
+    def add_search_result(self, item):
+        """添加单条搜索结果（通过队列，线程安全）。"""
+        self.result_queue.put({'type': 'result', **item})
+
+    def add_search_results_batch(self, items, timeout=0.5):
+        """批量添加搜索结果到队列，减少高并发下的队列争用。"""
+        if not items:
+            return
+        self.result_queue.put({'type': 'result_batch', 'items': items}, timeout=timeout)
     
     def on_everything_toggled(self, state):
         """当Everything选项切换时"""
@@ -486,11 +658,13 @@ class SearchDialog(QDialog):
         
         # 检查缓存
         global _search_cache
+        force_metadata_degrade = self.force_lightweight_cb.isChecked()
         cache_key = _search_cache.get_key(
             search_path, keyword, 
             self.search_filename_cb.isChecked(), 
             self.search_content_cb.isChecked(), 
-            file_types
+            file_types,
+            force_metadata_degrade
         )
         cached_results = _search_cache.get(cache_key)
         
@@ -498,17 +672,18 @@ class SearchDialog(QDialog):
             # 使用缓存结果
             print(f"[Search] 使用缓存结果，共 {len(cached_results)} 个")
             self.result_list.setRowCount(0)
+            self.current_result_count = 0
             self.status_label.setText("正在加载缓存结果...")
             
             # 批量添加缓存结果
             sorting_enabled = self.result_list.isSortingEnabled()
             self.result_list.setSortingEnabled(False)
-            
-            for item in cached_results:
-                self.result_queue.put({'type': 'result', **item})
+
+            self._append_results_to_table(cached_results)
             
             self.result_list.setSortingEnabled(sorting_enabled)
-            self.status_label.setText(f"搜索完成（缓存），共找到 {len(cached_results)} 个结果")
+            shown_count = min(len(cached_results), self.max_results)
+            self.status_label.setText(f"搜索完成（缓存），共显示 {shown_count} 个结果")
             return
         
         # 清空之前的结果
@@ -528,7 +703,7 @@ class SearchDialog(QDialog):
         use_everything = self.use_everything_cb.isChecked() if self.everything_path else False
         self.search_thread = threading.Thread(
             target=self.do_search,
-            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked(), file_types, cache_key, use_everything)
+            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked(), file_types, cache_key, use_everything, force_metadata_degrade)
         )
         self.search_thread.daemon = True
         self.search_thread.start()
@@ -584,7 +759,8 @@ class SearchDialog(QDialog):
                 results = []
                 for line in lines:
                     line = line.strip()
-                    if line and os.path.exists(line):
+                    # es.exe 输出本身来自索引，避免逐条 exists 造成大量额外 I/O
+                    if line:
                         results.append(line)
                 
                 debug_print(f"[Everything] Found {len(results)} results")
@@ -600,7 +776,21 @@ class SearchDialog(QDialog):
             debug_print(f"[Everything] Error: {e}")
             return []
     
-    def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None, use_everything=False):
+    def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None, use_everything=False, force_metadata_degrade=False):
+        metadata_degrade_count = 0
+
+        def _should_degrade_metadata():
+            if force_metadata_degrade:
+                return True
+            if not SEARCH_METADATA_DEGRADE_ENABLED:
+                return False
+            try:
+                pending = self.result_queue.qsize()
+                queue_max = max(1, self.result_queue.maxsize)
+                return (pending / queue_max) >= SEARCH_METADATA_DEGRADE_QUEUE_RATIO
+            except Exception:
+                return False
+
         # 如果使用Everything搜索
         if use_everything and self.everything_path:
             self.result_queue.put({'type': 'status', 'text': 'Using Everything搜索引擎...'})
@@ -612,23 +802,62 @@ class SearchDialog(QDialog):
                     return
                 
                 # 将Everything结果添加到显示队列
+                batch_size = 200
+                batch_items = []
                 for file_path in results:
                     if not self.is_searching:
                         break
                     
                     try:
-                        self.add_search_result(file_path)
+                        basename = os.path.basename(file_path)
+                        name_without_ext, file_ext = os.path.splitext(basename)
+                        path_without_ext = os.path.join(os.path.dirname(file_path), name_without_ext)
+                        file_type = file_ext[1:].upper() if file_ext else "无"
+                        if _should_degrade_metadata():
+                            metadata_degrade_count += 1
+                            mtime = "-"
+                            size_str = "-"
+                        else:
+                            try:
+                                stat_info = os.stat(file_path)
+                                mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
+                                size_bytes = stat_info.st_size
+                                if size_bytes < 1024:
+                                    size_str = f"{size_bytes} B"
+                                elif size_bytes < 1024 * 1024:
+                                    size_str = f"{size_bytes / 1024:.1f} KB"
+                                elif size_bytes < 1024 * 1024 * 1024:
+                                    size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
+                                else:
+                                    size_str = f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+                            except Exception:
+                                mtime = "-"
+                                size_str = "-"
+
+                        batch_items.append({
+                            'path': file_path,
+                            'name': f"📄 {path_without_ext}",
+                            'full_path': f"📄 {file_path}",
+                            'file_type': file_type,
+                            'date': mtime,
+                            'size': size_str,
+                        })
+                        if len(batch_items) >= batch_size:
+                            self.add_search_results_batch(batch_items, timeout=0.5)
+                            batch_items = []
                     except:
+                        pass
+
+                if batch_items:
+                    try:
+                        self.add_search_results_batch(batch_items, timeout=0.5)
+                    except Exception:
                         pass
                 
                 # 搜索完成
                 final_count = len(results)
-                self.result_queue.put({
-                    'type': 'complete',
-                    'count': final_count,
-                    'cache_key': cache_key,
-                    'results': results[:1000] if cache_key else None  # 限制缓存大小
-                })
+                degrade_note = f"，元数据降级 {metadata_degrade_count} 条" if metadata_degrade_count > 0 else ""
+                self.result_queue.put({'type': 'status', 'text': f'Everything搜索完成，共找到 {final_count} 个结果{degrade_note}'})
                 
             except Exception as e:
                 self.result_queue.put({'type': 'error', 'text': f'Everything搜索错误: {str(e)}'})
@@ -638,10 +867,45 @@ class SearchDialog(QDialog):
         # 原有的搜索逻辑
         found_count = 0
         keyword_lower = keyword.lower()
+        keyword_is_ascii = keyword.isascii()
+        keyword_bytes = keyword.encode('ascii', errors='ignore') if keyword_is_ascii else b''
+        keyword_bytes_lower = keyword_lower.encode('ascii', errors='ignore') if keyword_is_ascii else b''
         results_buffer = []  # 结果缓冲区
-        buffer_size = 100  # 每100个结果批量更新一次（优化：从20增加到100）
-        all_results = []  # 存储所有结果用于缓存（限制大小）
-        
+        base_buffer_size = SEARCH_RESULT_BATCH_BASE
+        max_cached_results = MAX_CACHED_RESULTS_PER_QUERY
+        all_results = [] if cache_key else None  # 仅在需要缓存时保存结果
+        ext_encoding_cache = {}  # 扩展名 -> 最近成功编码（减少重复试错）
+
+        def _adaptive_buffer_size():
+            """根据结果队列积压动态调整发送批次，降低高压场景争用。"""
+            try:
+                pending = self.result_queue.qsize()
+                queue_max = max(1, self.result_queue.maxsize)
+                ratio = pending / queue_max
+                if ratio >= 0.75:
+                    return min(SEARCH_RESULT_BATCH_MAX, base_buffer_size * 3)
+                if ratio >= 0.4:
+                    return min(SEARCH_RESULT_BATCH_MAX, base_buffer_size * 2)
+                if ratio <= 0.1:
+                    return max(SEARCH_RESULT_BATCH_MIN, base_buffer_size // 2)
+            except Exception:
+                pass
+            return base_buffer_size
+
+        def _flush_results_buffer(force=False):
+            nonlocal results_buffer
+            if not results_buffer:
+                return
+            if not force:
+                threshold = _adaptive_buffer_size()
+                if len(results_buffer) < threshold:
+                    return
+            try:
+                self.add_search_results_batch(results_buffer, timeout=0.5)
+            except Exception:
+                self.queue_overflow_count += len(results_buffer)
+            results_buffer = []
+
         # 结果限制（防止内存溢出和UI卡死）
         max_results = self.max_results
         results_limited = False
@@ -665,6 +929,14 @@ class SearchDialog(QDialog):
             # 其他二进制
             'obj', 'o', 'a', 'lib', 'pyc', 'pyo', 'class', 'jar', 'war',
         }
+
+        # 文本扩展名白名单：命中时跳过二进制探测，减少一次额外文件读取
+        text_file_extensions = {
+            'txt', 'md', 'rst', 'log', 'ini', 'cfg', 'conf', 'toml', 'yaml', 'yml', 'json', 'xml',
+            'csv', 'tsv', 'sql', 'bat', 'ps1', 'sh', 'c', 'h', 'cpp', 'hpp', 'cc', 'cs', 'java',
+            'py', 'js', 'ts', 'jsx', 'tsx', 'html', 'htm', 'css', 'scss', 'less', 'go', 'rs', 'php',
+            'rb', 'swift', 'kt', 'm', 'mm', 'vue', 'svelte', 'dockerfile', 'gitignore', 'arxml', 'xdm'
+        }
         
         def is_text_file(file_path, sample_size=1024):
             """智能检测文件是否为文本文件（读取前N字节检测）"""
@@ -673,26 +945,25 @@ class SearchDialog(QDialog):
                     sample = f.read(sample_size)
                     if not sample:
                         return True  # 空文件视为文本文件
-                    
-                    # 检测二进制字符的比例
-                    # 文本文件中NULL字节和其他控制字符应该很少
-                    null_count = sample.count(b'\x00')
-                    
-                    # 如果包含NULL字节，很可能是二进制文件
-                    if null_count > 0:
+
+                    # UTF-16/UTF-32 BOM 视为文本，避免被 NULL 字节规则误判
+                    if sample.startswith((b'\xff\xfe', b'\xfe\xff', b'\xff\xfe\x00\x00', b'\x00\x00\xfe\xff')):
+                        return True
+
+                    # NULL 字节几乎总是二进制特征
+                    if b'\x00' in sample:
                         return False
-                    
-                    # 统计非打印字符（排除常见的\r\n\t）
-                    non_printable = 0
+
+                    # 仅统计 ASCII 控制字符（排除 \t\n\r），避免把 UTF-8 非 ASCII 文本误判为二进制
+                    control_count = 0
                     for byte in sample:
-                        # ASCII可打印字符范围：32-126，加上\r(13)\n(10)\t(9)
-                        if byte < 9 or (byte > 13 and byte < 32) or byte > 126:
-                            non_printable += 1
-                    
-                    # 如果超过10%是非打印字符，可能是二进制文件
-                    if non_printable / len(sample) > 0.1:
+                        if byte < 9 or (13 < byte < 32):
+                            control_count += 1
+
+                    # 控制字符占比过高，判定为二进制
+                    if control_count / len(sample) > 0.1:
                         return False
-                    
+
                     return True
             except:
                 return False  # 无法读取则视为二进制
@@ -701,16 +972,16 @@ class SearchDialog(QDialog):
         # 但Python的内置字符串搜索已经很快，这里保持简单
         
         # 解析文件类型过滤（支持*.ext格式，逗号分隔）
-        file_extensions = []
+        file_extensions = set()
         if file_types:
             for ft in file_types.split(','):
                 ft = ft.strip()
                 if ft.startswith('*.'):
-                    file_extensions.append(ft[2:].lower())  # 去掉*.，只保留扩展名
+                    file_extensions.add(ft[2:].lower())  # 去掉*.，只保留扩展名
                 elif ft.startswith('.'):
-                    file_extensions.append(ft[1:].lower())  # 去掉.，只保留扩展名
+                    file_extensions.add(ft[1:].lower())  # 去掉.，只保留扩展名
                 elif ft:
-                    file_extensions.append(ft.lower())  # 直接使用输入的扩展名
+                    file_extensions.add(ft.lower())  # 直接使用输入的扩展名
         
         # 调试信息：输出搜索路径
         print(f"[Search] 开始搜索路径: {self.search_path}")
@@ -718,21 +989,11 @@ class SearchDialog(QDialog):
         print(f"[Search] 搜索文件名: {search_filename}, 搜索内容: {search_content}")
         print(f"[Search] 文件类型过滤: {file_extensions if file_extensions else '所有类型'}")
         
-        def matches_file_type(filename):
-            """检查文件是否匹配文件类型过滤"""
-            if not file_extensions:  # 如果没有设置过滤，匹配所有文件
-                return True
-            # 获取文件扩展名（不含点）
-            _, ext = os.path.splitext(filename)
-            if ext:
-                ext = ext[1:].lower()  # 去掉点号并转为小写
-                return ext in file_extensions
-            return False
-        
         try:
             scanned_files = 0
             folder_count = 0
             skipped_binary_files = 0  # 跳过的二进制文件数
+            last_status_update_ms = int(time.time() * 1000)
             for root, dirs, files in os.walk(self.search_path):
                 if not self.is_searching:
                     print("[Search] 搜索被中断")
@@ -757,13 +1018,18 @@ class SearchDialog(QDialog):
                             dir_path = os.path.join(root, dirname)
                             
                             # 获取文件夹信息
-                            try:
-                                stat_info = os.stat(dir_path)
-                                mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
-                                size_str = "-"  # 文件夹不显示大小
-                            except:
+                            if _should_degrade_metadata():
+                                metadata_degrade_count += 1
                                 mtime = "-"
                                 size_str = "-"
+                            else:
+                                try:
+                                    stat_info = os.stat(dir_path)
+                                    mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
+                                    size_str = "-"  # 文件夹不显示大小
+                                except:
+                                    mtime = "-"
+                                    size_str = "-"
                             
                             result_item = {
                                 'path': dir_path,
@@ -774,18 +1040,11 @@ class SearchDialog(QDialog):
                                 'size': size_str
                             }
                             results_buffer.append(result_item)
-                            all_results.append(result_item)  # 保存到缓存列表
+                            if all_results is not None and len(all_results) < max_cached_results:
+                                all_results.append(result_item)  # 保存到缓存列表
                             
                             # 批量更新UI（队列满时等待）
-                            if len(results_buffer) >= buffer_size:
-                                for item in results_buffer:
-                                    # 使用带超时的put，队列满时等待最多0.5秒
-                                    try:
-                                        self.result_queue.put({'type': 'result', **item}, timeout=0.5)
-                                    except:
-                                        # 超时后跳过该结果
-                                        self.queue_overflow_count += 1
-                                results_buffer.clear()
+                            _flush_results_buffer()
                 
                 # 检查是否达到结果限制
                 if found_count >= max_results:
@@ -797,6 +1056,10 @@ class SearchDialog(QDialog):
                     if not self.is_searching:
                         print("[Search] 搜索被中断（文件循环）")
                         break
+
+                    filename_lower = filename.lower()
+                    name_without_ext, ext = os.path.splitext(filename)
+                    file_ext = ext[1:].lower() if ext else ''
                     
                     # 检查是否达到结果限制
                     if found_count >= max_results:
@@ -805,11 +1068,11 @@ class SearchDialog(QDialog):
                     
                     # 优化：如果只搜索文件名，快速过滤不匹配的文件
                     if search_filename and not search_content:
-                        if keyword_lower not in filename.lower():
+                        if keyword_lower not in filename_lower:
                             continue  # 文件名不匹配，跳过
                     
                     # 检查文件类型过滤
-                    if not matches_file_type(filename):
+                    if file_extensions and file_ext not in file_extensions:
                         # 调试：显示被过滤的文件（仅对特定文件名）
                         if 'TstMgr' in filename or scanned_files < 5:
                             print(f"[Search] 文件被类型过滤跳过: {filename}")
@@ -817,98 +1080,200 @@ class SearchDialog(QDialog):
                     
                     scanned_files += 1
                     
-                    # 每扫描100个文件更新一次状态（减少队列压力）
-                    if scanned_files % 100 == 0:
-                        # 使用带超时的put，确保状态能更新
+                    # 状态更新节流：每300个文件必更新；否则每32个文件检查一次时间阈值
+                    should_update_status = False
+                    if scanned_files % 300 == 0:
+                        should_update_status = True
+                    elif scanned_files % 32 == 0:
+                        now_ms = int(time.time() * 1000)
+                        if (now_ms - last_status_update_ms) >= 500:
+                            should_update_status = True
+
+                    if should_update_status:
                         status_text = f"搜索中... 已扫描 {scanned_files} 个文件，找到 {found_count} 个结果"
                         try:
                             self.result_queue.put({'type': 'status', 'text': status_text}, timeout=0.1)
+                            last_status_update_ms = int(time.time() * 1000)
                         except:
                             pass  # 超时后继续搜索
                     
                     file_path = os.path.join(root, filename)
                     matched = False
                     match_type = ""
+                    is_debug_file = 'TstMgr_RtnSound.c' in filename or 'Rtcsub_rtc_Cfg.h' in filename
                     
                     # 调试：显示正在搜索的特定文件
-                    if 'TstMgr_RtnSound.c' in filename:
-                        print(f"[Search] 正在搜索文件: {file_path}")
-                        print(f"[Search] 搜索文件名: {search_filename}, 搜索内容: {search_content}")
+                    if is_debug_file:
+                        print(f"[Search DEBUG] 正在搜索文件: {file_path}")
+                        print(f"[Search DEBUG] 搜索文件名: {search_filename}, 搜索内容: {search_content}")
+                        print(f"[Search DEBUG] 关键词: {keyword}, ASCII: {keyword_is_ascii}")
                     
                     # 搜索文件名（Python内置优化）
-                    if search_filename and keyword_lower in filename.lower():
+                    if search_filename and keyword_lower in filename_lower:
                         matched = True
                         match_type = "📄"
                     
                     # 搜索文件内容（智能检测文本文件）
                     if search_content and not matched:
-                        # 获取文件扩展名
-                        _, ext = os.path.splitext(filename)
-                        file_ext = ext[1:].lower() if ext else ''  # 去掉点号并转小写
-                        
                         # 1. 首先检查黑名单（明确的二进制文件）
                         if file_ext in binary_file_extensions:
                             skipped_binary_files += 1
+                            if is_debug_file:
+                                print(f"[Search DEBUG] 文件被黑名单过滤: {file_ext}")
                             continue
-                        
-                        # 2. 对于其他文件，智能检测是否为文本文件
-                        if not is_text_file(file_path):
+
+                        # 2. 文本白名单直接通过；其余文件走探测
+                        if file_ext not in text_file_extensions and not is_text_file(file_path):
                             skipped_binary_files += 1
+                            if is_debug_file:
+                                print(f"[Search DEBUG] 文件被认定为二进制: {file_ext}")
                             continue
                         
                         # 调试信息
-                        if 'TstMgr_RtnSound.c' in filename:
-                            print(f"[Search] 开始搜索文件内容: {file_path}")
+                        if is_debug_file:
+                            file_size = os.path.getsize(file_path)
+                            print(f"[Search DEBUG] 开始搜索文件内容，文件大小: {file_size} bytes")
                         
                         try:
                             # 获取文件大小
                             file_size = os.path.getsize(file_path)
-                            
-                            # 分块读取大文件，每次读取10MB
-                            chunk_size = 10 * 1024 * 1024  # 10MB
-                            
-                            # 尝试多种编码方式读取文件内容
-                            encodings = ['utf-8', 'gbk', 'gb2312', 'latin-1']
-                            content_matched = False
-                            
-                            for encoding in encodings:
-                                try:
-                                    with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
-                                        if file_size <= chunk_size:
-                                            # 小文件直接全部读取（Python内置字符串搜索已优化）
-                                            content = f.read()
-                                            if keyword_lower in content.lower():
+
+                            # 分块读取与单文件扫描上限
+                            chunk_size = CONTENT_SEARCH_CHUNK_SIZE
+                            max_scan_bytes = CONTENT_SEARCH_MAX_BYTES_PER_FILE
+                            in_memory_threshold = CONTENT_SEARCH_IN_MEMORY_THRESHOLD
+
+                            # ASCII关键词快速路径：直接按字节匹配，跳过多编码解码
+                            if keyword_is_ascii and keyword_bytes:
+                                if is_debug_file:
+                                    print(f"[Search DEBUG] 进入ASCII快速路径, keyword_bytes={keyword_bytes}")
+                                read_limit = min(file_size, max_scan_bytes)
+                                if read_limit <= in_memory_threshold:
+                                    with open(file_path, 'rb') as bf:
+                                        raw_content = bf.read(read_limit)
+                                    raw_lower = raw_content.lower()
+                                    # 兼容 UTF-16(无BOM) 等含 NULL 字节文本：移除 NULL 后再匹配一次
+                                    raw_no_null = raw_content.replace(b'\x00', b'')
+                                    raw_no_null_lower = raw_no_null.lower()
+                                    if is_debug_file:
+                                        null_count = raw_content.count(b'\x00')
+                                        print(f"[Search DEBUG] ASCII路径小文件: {len(raw_content)} bytes, NULL字节数: {null_count}")
+                                    if (
+                                        keyword_bytes in raw_content
+                                        or keyword_bytes_lower in raw_lower
+                                        or keyword_bytes in raw_no_null
+                                        or keyword_bytes_lower in raw_no_null_lower
+                                    ):
+                                        matched = True
+                                        match_type = "📄"
+                                        if is_debug_file:
+                                            print(f"[Search DEBUG] ✓ ASCII快速路径匹配成功!")
+                                        # 不再continue，让代码继续执行到结果处理
+                                    elif is_debug_file:
+                                        print(f"[Search DEBUG] ✗ ASCII快速路径未匹配")
+                                else:
+                                    if is_debug_file:
+                                        print(f"[Search DEBUG] ASCII路径大文件，分块读取")
+                                    overlap_bytes = max(1, len(keyword_bytes) * 2)
+                                    scanned_bytes = 0
+                                    with open(file_path, 'rb') as bf:
+                                        while True:
+                                            if scanned_bytes >= max_scan_bytes:
+                                                break
+                                            chunk = bf.read(chunk_size)
+                                            if not chunk:
+                                                break
+                                            scanned_bytes += len(chunk)
+                                            chunk_lower = chunk.lower()
+                                            chunk_no_null = chunk.replace(b'\x00', b'')
+                                            chunk_no_null_lower = chunk_no_null.lower()
+                                            if (
+                                                keyword_bytes in chunk
+                                                or keyword_bytes_lower in chunk_lower
+                                                or keyword_bytes in chunk_no_null
+                                                or keyword_bytes_lower in chunk_no_null_lower
+                                            ):
+                                                matched = True
+                                                match_type = "📄"
+                                                if is_debug_file:
+                                                    print(f"[Search DEBUG] ✓ ASCII路径大文件分块匹配成功!")
+                                                break
+                                            if len(chunk) == chunk_size:
+                                                bf.seek(bf.tell() - overlap_bytes)
+                                    if matched:
+                                        if is_debug_file:
+                                            print(f"[Search DEBUG] ASCII路径完成, 匹配={matched}")
+                                        # 不再continue，让代码继续执行到结果处理
+
+                            # 编码顺序：优先使用该扩展名最近成功编码
+                            if not matched:  # 跳过编码尝试如果已匹配
+                                preferred_encoding = ext_encoding_cache.get(file_ext)
+                                if preferred_encoding and preferred_encoding in CONTENT_SEARCH_ENCODINGS:
+                                    encodings = [preferred_encoding] + [enc for enc in CONTENT_SEARCH_ENCODINGS if enc != preferred_encoding]
+                                else:
+                                    encodings = list(CONTENT_SEARCH_ENCODINGS)
+                                content_matched = False
+                                
+                                if is_debug_file:
+                                    print(f"[Search DEBUG] 进入编码路径，试用编码: {encodings}")
+                                
+                                for encoding in encodings:
+                                    try:
+                                        if is_debug_file:
+                                            print(f"[Search DEBUG] 尝试编码: {encoding}")
+                                        read_limit = min(file_size, max_scan_bytes)
+                                        if read_limit <= in_memory_threshold:
+                                            # 小文件优化：只读一次二进制，再在内存中尝试不同编码，避免重复磁盘I/O
+                                            if encoding == encodings[0]:
+                                                with open(file_path, 'rb') as bf:
+                                                    raw_content = bf.read(read_limit)
+                                            content = raw_content.decode(encoding, errors='ignore')
+                                            if keyword in content or keyword_lower in content.lower():
                                                 matched = True
                                                 match_type = "📄"
                                                 content_matched = True
-                                                # 调试信息
-                                                if 'TstMgr_RtnSound.c' in filename:
-                                                    print(f"[Search] ✓ 在文件内容中找到关键词 (编码: {encoding})")
+                                                if file_ext:
+                                                    ext_encoding_cache[file_ext] = encoding
+                                                if is_debug_file:
+                                                    print(f"[Search DEBUG] ✓ 编码 {encoding} 匹配成功!")
                                                 break
+                                            elif is_debug_file:
+                                                print(f"[Search DEBUG] ✗ 编码 {encoding} 未匹配")
                                         else:
-                                            # 大文件分块读取（优化：使用内存映射）
-                                            overlap = len(keyword) * 2  # 重叠区域，防止关键词被分割
-                                            while True:
-                                                chunk = f.read(chunk_size)
-                                                if not chunk:
+                                            with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
+                                                # 大文件分块读取（有总扫描上限）
+                                                overlap = len(keyword) * 2  # 重叠区域，防止关键词被分割
+                                                scanned_bytes = 0
+                                                while True:
+                                                    if scanned_bytes >= max_scan_bytes:
+                                                        break
+                                                    chunk = f.read(chunk_size)
+                                                    if not chunk:
+                                                        break
+                                                    scanned_bytes += len(chunk)
+                                                    if keyword in chunk or keyword_lower in chunk.lower():
+                                                        matched = True
+                                                        match_type = "📄"
+                                                        content_matched = True
+                                                        if file_ext:
+                                                            ext_encoding_cache[file_ext] = encoding
+                                                        break
+                                                    # 回退overlap字节，避免关键词跨块
+                                                    if len(chunk) == chunk_size:
+                                                        f.seek(f.tell() - overlap)
+                                                if content_matched:
                                                     break
-                                                if keyword_lower in chunk.lower():
-                                                    matched = True
-                                                    match_type = "📄"
-                                                    content_matched = True
-                                                    break
-                                                # 回退overlap字节，避免关键词跨块
-                                                if len(chunk) == chunk_size:
-                                                    f.seek(f.tell() - overlap)
-                                            if content_matched:
-                                                break
-                                except UnicodeDecodeError:
-                                    # 尝试下一个编码
-                                    continue
-                                except Exception as e:
-                                    # 其他错误，记录日志并尝试下一个编码
-                                    print(f"[Search] 读取文件失败 {file_path} (编码 {encoding}): {e}")
-                                    continue
+                                    except UnicodeError as e:
+                                        # 尝试下一个编码
+                                        if is_debug_file:
+                                            print(f"[Search DEBUG] 编码 {encoding} UnicodeError: {e}")
+                                        continue
+                                    except Exception as e:
+                                        # 其他错误，记录日志并尝试下一个编码
+                                        print(f"[Search] 读取文件失败 {file_path} (编码 {encoding}): {e}")
+                                        if is_debug_file:
+                                            print(f"[Search DEBUG] 编码 {encoding} 异常: {e}")
+                                        continue
                         except Exception as e:
                             # 如果无法以文本方式读取，记录日志并跳过该文件
                             print(f"[Search] 无法读取文件 {file_path}: {e}")
@@ -918,31 +1283,31 @@ class SearchDialog(QDialog):
                         found_count += 1
                         
                         # 获取文件信息
-                        try:
-                            stat_info = os.stat(file_path)
-                            mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
-                            size_bytes = stat_info.st_size
-                            # 格式化大小
-                            if size_bytes < 1024:
-                                size_str = f"{size_bytes} B"
-                            elif size_bytes < 1024 * 1024:
-                                size_str = f"{size_bytes / 1024:.1f} KB"
-                            elif size_bytes < 1024 * 1024 * 1024:
-                                size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
-                            else:
-                                size_str = f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
-                        except:
+                        if _should_degrade_metadata():
+                            metadata_degrade_count += 1
                             mtime = "-"
                             size_str = "-"
+                        else:
+                            try:
+                                stat_info = os.stat(file_path)
+                                mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
+                                size_bytes = stat_info.st_size
+                                # 格式化大小
+                                if size_bytes < 1024:
+                                    size_str = f"{size_bytes} B"
+                                elif size_bytes < 1024 * 1024:
+                                    size_str = f"{size_bytes / 1024:.1f} KB"
+                                elif size_bytes < 1024 * 1024 * 1024:
+                                    size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
+                                else:
+                                    size_str = f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+                            except:
+                                mtime = "-"
+                                size_str = "-"
                         
-                        # 获取文件名和扩展名
-                        name_without_ext, file_ext = os.path.splitext(filename)
                         # 获取不带扩展名的完整路径
                         path_without_ext = os.path.join(root, name_without_ext)
-                        if file_ext:
-                            file_type = file_ext[1:].upper()  # 去掉点并转大写
-                        else:
-                            file_type = "无"
+                        file_type = file_ext.upper() if file_ext else "无"
                         
                         result_item = {
                             'path': file_path,
@@ -953,29 +1318,17 @@ class SearchDialog(QDialog):
                             'size': size_str
                         }
                         results_buffer.append(result_item)
-                        all_results.append(result_item)  # 保存到缓存列表
+                        if all_results is not None and len(all_results) < max_cached_results:
+                            all_results.append(result_item)  # 保存到缓存列表
                         
                         # 批量更新UI（每20个结果更新一次）
-                        if len(results_buffer) >= buffer_size:
-                            # 将结果放入队列（队列满时等待）
-                            for item in results_buffer:
-                                try:
-                                    # 使用带超时的put，队列满时等待最多0.5秒
-                                    self.result_queue.put({'type': 'result', **item}, timeout=0.5)
-                                except:
-                                    # 超时后跳过该结果
-                                    self.queue_overflow_count += 1
-                            results_buffer.clear()
+                        _flush_results_buffer()
         except Exception as e:
             print(f"Search error: {e}")
         
         # 添加剩余的结果（队列满时等待）
         if results_buffer:
-            for item in results_buffer:
-                try:
-                    self.result_queue.put({'type': 'result', **item}, timeout=0.5)
-                except:
-                    self.queue_overflow_count += 1
+            _flush_results_buffer(force=True)
         
         # 调试信息
         print(f"[Search] 搜索完成，共扫描 {scanned_files} 个文件，找到 {found_count} 个结果")
@@ -987,8 +1340,7 @@ class SearchDialog(QDialog):
         # 将结果存入缓存（限制缓存大小，防止内存溢出）
         if cache_key and all_results:
             global _search_cache
-            # 只缓存前max_results个结果
-            cached_results = all_results[:max_results]
+            cached_results = all_results
             _search_cache.put(cache_key, cached_results)
             print(f"[Search] 已将 {len(cached_results)} 个结果存入缓存")
         
@@ -1001,6 +1353,8 @@ class SearchDialog(QDialog):
             final_status = f"搜索完成（已限制），显示前 {found_count} 个结果（扫描了 {scanned_files} 个文件）⚠️"
         else:
             final_status = f"搜索完成，共找到 {found_count} 个结果（扫描了 {scanned_files} 个文件）"
+        if metadata_degrade_count > 0:
+            final_status += f"，元数据降级 {metadata_degrade_count} 条"
         
         # 使用超时put，防止队列满时卡死
         try:
@@ -1016,10 +1370,11 @@ class SearchDialog(QDialog):
     
     def on_result_double_clicked(self, row, column):
         """双击搜索结果，打开文件所在文件夹或文件夹本身，并选中文件"""
+        from PyQt5.QtCore import Qt
         # 从第一列获取存储的完整路径
         path_item = self.result_list.item(row, 0)
         if path_item:
-            file_path = path_item.data(256)  # 获取存储的完整路径
+            file_path = path_item.data(Qt.UserRole)  # 获取存储的完整路径
             
             if os.path.exists(file_path):
                 # 如果是文件夹，直接打开文件夹；如果是文件，打开文件所在文件夹并选中文件
@@ -1982,6 +2337,12 @@ class FileExplorerTab(QWidget):
         except Exception:
             return None
 
+    def _invalidate_entry_count_cache(self, path=None):
+        """失效目录总项目数缓存。"""
+        cache_path = self._entry_count_cache.get('path')
+        if path is None or (cache_path and os.path.normcase(cache_path) == os.path.normcase(path)):
+            self._entry_count_cache = {'path': None, 'count': None, 'ts_ms': 0}
+
     def _refresh_file_watch_paths(self, path):
         """同步当前目录下的文件 watcher，提升对文件内容修改的检测能力。"""
         if not hasattr(self, 'file_watcher'):
@@ -2051,6 +2412,7 @@ class FileExplorerTab(QWidget):
             debug_print(f"[FileWatcher] File changed: {path}")
             current_dir = getattr(self, 'current_path', '')
             if current_dir and os.path.normcase(os.path.dirname(path)) == os.path.normcase(current_dir):
+                self._invalidate_entry_count_cache(current_dir)
                 if not getattr(self, '_refresh_active', True):
                     self._pending_external_refresh = True
                     debug_print(f"[FileWatcher] Background tab file changed, marked dirty: {path}")
@@ -3035,6 +3397,7 @@ class FileExplorerTab(QWidget):
         self._last_dir_snapshot = None
         self._refresh_active = False
         self._pending_external_refresh = False
+        self._entry_count_cache = {'path': None, 'count': None, 'ts_ms': 0}
 
         # 目录轮询刷新兜底：处理部分编辑器改文件但目录 watcher 不触发的情况
         self.dir_mtime = None
@@ -3370,6 +3733,7 @@ class FileExplorerTab(QWidget):
         """文件系统监控：目录内容发生变化（带防抖）"""
         import time, os
         current_time = time.time() * 1000  # 转为毫秒
+        self._invalidate_entry_count_cache(path)
         # 目录已不存在，强制移除watcher，防止事件风暴
         if not os.path.exists(path):
             debug_print(f"[FileWatcher] Directory not exist, remove watcher: {path}")
@@ -3596,8 +3960,27 @@ class FileExplorerTab(QWidget):
     def _count_dir_entries(self, path):
         """计算目录下的项目数"""
         try:
+            now_ms = int(time.time() * 1000)
+            cache_path = self._entry_count_cache.get('path')
+            cache_count = self._entry_count_cache.get('count')
+            cache_ts = self._entry_count_cache.get('ts_ms', 0)
+            if (
+                cache_count is not None
+                and cache_path
+                and os.path.normcase(cache_path) == os.path.normcase(path)
+                and now_ms - cache_ts < DIR_ENTRY_COUNT_CACHE_TTL_MS
+            ):
+                return cache_count
+
             with os.scandir(path) as it:
-                return sum(1 for _ in it)
+                count = sum(1 for _ in it)
+
+            self._entry_count_cache = {
+                'path': path,
+                'count': count,
+                'ts_ms': now_ms,
+            }
+            return count
         except Exception:
             return None
 
@@ -7023,6 +7406,17 @@ class MainWindow(QMainWindow):
             "panel_width": 360,  # 面板宽度（像素）
             "panel_visible": False,  # AI面板是否可见
         }
+        default_config["performance"] = {
+            "content_search_chunk_size": CONTENT_SEARCH_CHUNK_SIZE,
+            "content_search_max_bytes_per_file": CONTENT_SEARCH_MAX_BYTES_PER_FILE,
+            "content_search_in_memory_threshold": CONTENT_SEARCH_IN_MEMORY_THRESHOLD,
+            "search_result_queue_maxsize": SEARCH_RESULT_QUEUE_MAXSIZE,
+            "search_result_batch_base": SEARCH_RESULT_BATCH_BASE,
+            "search_result_batch_min": SEARCH_RESULT_BATCH_MIN,
+            "search_result_batch_max": SEARCH_RESULT_BATCH_MAX,
+            "search_metadata_degrade_enabled": SEARCH_METADATA_DEGRADE_ENABLED,
+            "search_metadata_degrade_queue_ratio": SEARCH_METADATA_DEGRADE_QUEUE_RATIO,
+        }
         
         try:
             # 首先尝试加载主配置文件
@@ -7038,12 +7432,34 @@ class MainWindow(QMainWindow):
                         for key, value in default_config["hotkeys"].items():
                             if key not in config["hotkeys"]:
                                 config["hotkeys"][key] = value
+                    else:
+                        config["hotkeys"] = default_config["hotkeys"]
+
+                    # 确保 ai_chat 存在所有键
+                    if "ai_chat" in config and isinstance(config["ai_chat"], dict):
+                        for key, value in default_config["ai_chat"].items():
+                            if key not in config["ai_chat"]:
+                                config["ai_chat"][key] = value
+                    else:
+                        config["ai_chat"] = default_config["ai_chat"]
+
+                    # 确保 performance 存在所有键
+                    if "performance" in config and isinstance(config["performance"], dict):
+                        for key, value in default_config["performance"].items():
+                            if key not in config["performance"]:
+                                config["performance"][key] = value
+                    else:
+                        config["performance"] = default_config["performance"]
+
+                    apply_runtime_performance_config(config.get("performance"))
                     return config
             else:
                 print("No config file found, starting with default config")
+                apply_runtime_performance_config(default_config.get("performance"))
                 return default_config
         except Exception as e:
             print(f"Failed to load config: {e}")
+            apply_runtime_performance_config(default_config.get("performance"))
             return default_config
     
     def save_config(self):
