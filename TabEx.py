@@ -2397,15 +2397,15 @@ class FileExplorerTab(QWidget):
             except Exception:
                 pass
 
-            # shell: 路径中文映射
-            shell_map = {
+            # shell: 路径中文映射（字典 O(1) 查找）
+            _SHELL_PATH_MAP = {
                 'shell:RecycleBinFolder': '回收站',
                 'shell:MyComputerFolder': '此电脑',
                 'shell:Desktop': '桌面',
                 'shell:NetworkPlacesFolder': '网络',
             }
             path = self.current_path
-            display = shell_map.get(path, None)
+            display = _SHELL_PATH_MAP.get(path, None)
             
             if not display and path.startswith('shell:'):
                 display = path  # 兜底显示原始shell:路径
@@ -2459,12 +2459,25 @@ class FileExplorerTab(QWidget):
                     self.main_window.tab_widget.setTabText(idx, title)
                     debug_print(f"DEBUG: Set tab {idx} text to '{title}'")
 
-    def start_path_sync_timer(self):
+    def start_path_sync_timer(self, duration_ms=2000):
+        """启动路径同步定时器，duration_ms 后自动停止（按需触发，减少持续COM调用）"""
         from PyQt5.QtCore import QTimer
-        self._path_sync_timer = QTimer(self)
-        self._path_sync_timer.timeout.connect(self.sync_path_bar_with_explorer)
-        # 改为200ms，确保路径栏实时更新
-        self._path_sync_timer.start(200)
+        if not hasattr(self, '_path_sync_timer') or self._path_sync_timer is None:
+            self._path_sync_timer = QTimer(self)
+            self._path_sync_timer.timeout.connect(self.sync_path_bar_with_explorer)
+        # 设置自动停止定时器：导航期间轮询，稳定后停止
+        if not hasattr(self, '_path_sync_stop_timer') or self._path_sync_stop_timer is None:
+            self._path_sync_stop_timer = QTimer(self)
+            self._path_sync_stop_timer.setSingleShot(True)
+            self._path_sync_stop_timer.timeout.connect(self._stop_path_sync_timer)
+        self._path_sync_stop_timer.start(duration_ms)
+        if not self._path_sync_timer.isActive():
+            self._path_sync_timer.start(200)
+
+    def _stop_path_sync_timer(self):
+        """停止路径同步轮询（稳定后调用，避免持续COM跨进程调用）"""
+        if hasattr(self, '_path_sync_timer') and self._path_sync_timer and self._path_sync_timer.isActive():
+            self._path_sync_timer.stop()
 
     def sync_path_bar_with_explorer(self):
         # 通过QAxWidget的LocationURL属性获取当前路径
@@ -2505,11 +2518,9 @@ class FileExplorerTab(QWidget):
             pass
 
     def _resume_path_sync_after_navigation(self):
-        """恢复路径同步定时器并清理导航标志"""
+        """导航后重启路径同步定时器（短窗口轮询，自动停止）"""
         try:
-            if hasattr(self, '_path_sync_timer') and self._path_sync_timer and not self._path_sync_timer.isActive():
-                self._path_sync_timer.start(200)
-                debug_print(f"[Navigation] Path sync timer resumed")
+            self.start_path_sync_timer(duration_ms=2000)
         except Exception:
             pass
 
@@ -3251,10 +3262,8 @@ class FileExplorerTab(QWidget):
                                         # 最终确认完成，清除导航标志（双保险）
                                         if hasattr(self, '_navigating_folder'):
                                             self._navigating_folder = False
-                                        # 重启路径同步定时器
-                                        if hasattr(self, '_path_sync_timer') and self._path_sync_timer and not self._path_sync_timer.isActive():
-                                            self._path_sync_timer.start(200)
-                                            debug_print(f"[Navigation] Path sync timer restarted after navigation complete")
+                                        # 重启路径同步定时器（短窗口按需轮询）
+                                        self.start_path_sync_timer(duration_ms=2000)
                                 t2 = QTimer()
                                 t2.setSingleShot(True)
                                 t2.timeout.connect(final_confirm_and_go_up)
@@ -3360,7 +3369,7 @@ class FileExplorerTab(QWidget):
         # 目录轮询刷新兜底：处理部分编辑器改文件但目录 watcher 不触发的情况
         self.dir_mtime = None
         self.dir_poll_timer = QTimer()
-        self.dir_poll_timer.setInterval(3000)  # 3s 低频轮询，尽量降低开销
+        self.dir_poll_timer.setInterval(8000)  # 8s 低频轮询，后台标签降低I/O开销
         self.dir_poll_timer.timeout.connect(self._poll_directory_changes)
         
         self.setup_ui()
@@ -7074,13 +7083,32 @@ class MainWindow(QMainWindow):
         
         # 创建非模态对话框，传入搜索历史
         dlg = SearchDialog(search_path, self, self.search_history)
+        # 恢复上次的大小和位置
+        dlg_geo = self.config.get("search_dialog_geometry")
+        if dlg_geo and isinstance(dlg_geo, dict):
+            try:
+                dlg.resize(dlg_geo.get("w", 800), dlg_geo.get("h", 500))
+                x, y = dlg_geo.get("x"), dlg_geo.get("y")
+                if x is not None and y is not None:
+                    dlg.move(x, y)
+            except Exception:
+                pass
+        # 关闭时保存大小和位置
+        def _save_geo():
+            geo = dlg.geometry()
+            self.config["search_dialog_geometry"] = {
+                "x": geo.x(), "y": geo.y(),
+                "w": geo.width(), "h": geo.height()
+            }
+            self.save_config()
+        dlg.finished.connect(lambda _: _save_geo())
         # 保存对话框引用，防止被垃圾回收
         if not hasattr(self, 'search_dialogs'):
             self.search_dialogs = []
         self.search_dialogs.append(dlg)
         
-        # 对话框关闭时从列表中移除
-        dlg.finished.connect(lambda: self.search_dialogs.remove(dlg) if dlg in self.search_dialogs else None)
+        # 对话框关闭时从列表中移除（注意: finished信号带int参数，需要兼容lambada）
+        dlg.finished.connect(lambda result: self.search_dialogs.remove(dlg) if dlg in self.search_dialogs else None)
         
         # 非模态显示，不阻塞主窗口
         dlg.show()
@@ -7103,7 +7131,9 @@ class MainWindow(QMainWindow):
         if len(self.search_history) > self.max_search_history:
             self.search_history = self.search_history[:self.max_search_history]
         
-        debug_print(f"[Search History] Added '{keyword}', total: {len(self.search_history)}")
+        # 持久化搜索历史到 config.json
+        self.config["search_history"] = self.search_history
+        self.save_config()
 
     def tab_context_menu(self, pos):
         tab_index = self.tab_widget.tabBar().tabAt(pos)
@@ -7288,8 +7318,8 @@ class MainWindow(QMainWindow):
         self.resize_margin = 15  # 边缘检测范围（像素），与阴影边距一致以便更容易触发
         self.cursor_overridden = False  # 通过QApplication是否已覆盖光标
         
-        # 搜索历史（内存中，软件关闭后自动清除）- 使用常量限制大小
-        self.search_history = []
+        # 搜索历史（持久化到config.json）- 使用常量限制大小
+        self.search_history = list(self.config.get("search_history", []))[:MAX_SEARCH_HISTORY]
         self.max_search_history = MAX_SEARCH_HISTORY
         
         # 关闭标签页历史 - 使用常量限制大小
