@@ -2462,6 +2462,7 @@ class FileExplorerTab(QWidget):
     def start_path_sync_timer(self, duration_ms=2000):
         """启动路径同步定时器，duration_ms 后自动停止（按需触发，减少持续COM调用）"""
         from PyQt5.QtCore import QTimer
+        debug_print(f"[PathSync] Starting timer: duration={duration_ms}ms, current_path={self.current_path}")
         if not hasattr(self, '_path_sync_timer') or self._path_sync_timer is None:
             self._path_sync_timer = QTimer(self)
             self._path_sync_timer.timeout.connect(self.sync_path_bar_with_explorer)
@@ -2473,11 +2474,13 @@ class FileExplorerTab(QWidget):
         self._path_sync_stop_timer.start(duration_ms)
         if not self._path_sync_timer.isActive():
             self._path_sync_timer.start(200)
+            debug_print(f"[PathSync] Timer started, will poll every 200ms for {duration_ms}ms")
 
     def _stop_path_sync_timer(self):
         """停止路径同步轮询（稳定后调用，避免持续COM跨进程调用）"""
         if hasattr(self, '_path_sync_timer') and self._path_sync_timer and self._path_sync_timer.isActive():
             self._path_sync_timer.stop()
+            debug_print(f"[PathSync] Timer stopped after duration")
 
     def sync_path_bar_with_explorer(self):
         # 通过QAxWidget的LocationURL属性获取当前路径
@@ -2497,12 +2500,15 @@ class FileExplorerTab(QWidget):
                 elif url_str.startswith('shell:') or '::' in url_str:
                     # Shell特殊文件夹，通常以 shell: 或包含 CLSID (::)
                     # 这些路径我们已经在 current_path 中维护，无需更新
+                    debug_print(f"[PathSync] Shell path detected: {url_str[:50]}...")
                     return
                 
                 if local_path and local_path != self.current_path:
+                    debug_print(f"[PathSync] Path detected change: {self.current_path} → {local_path}")
                     self.current_path = local_path
                     if hasattr(self, 'path_bar'):
                         self.path_bar.set_path(local_path)
+                        debug_print(f"[PathSync] Updated path_bar to {local_path}")
                     self.update_tab_title()
                     # 只在非程序化导航时添加到历史记录
                     if not self._navigating_programmatically and hasattr(self, '_add_to_history'):
@@ -2514,15 +2520,20 @@ class FileExplorerTab(QWidget):
                     if getattr(self, '_navigating_folder', False):
                         self._navigating_folder = False
                     self._resume_path_sync_after_navigation()
-        except Exception:
-            pass
+                else:
+                    debug_print(f"[PathSync] No change: LocationURL={local_path}, current={self.current_path}")
+            else:
+                debug_print(f"[PathSync] LocationURL is empty or None")
+        except Exception as e:
+            debug_print(f"[PathSync] ERROR: {e}")
 
     def _resume_path_sync_after_navigation(self):
         """导航后重启路径同步定时器（短窗口轮询，自动停止）"""
+        debug_print(f"[PathSync] Resuming path sync after navigation")
         try:
             self.start_path_sync_timer(duration_ms=2000)
-        except Exception:
-            pass
+        except Exception as e:
+            debug_print(f"[PathSync] ERROR resuming timer: {e}")
 
     def setup_ui(self):
         from PyQt5.QtWidgets import QLabel
