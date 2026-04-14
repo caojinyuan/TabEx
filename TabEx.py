@@ -84,6 +84,9 @@ FOLDER_CHECK_TIMEOUT = 500  # 文件夹检查超时时间(ms)
 ASYNC_LOAD_ENABLED = True  # 是否启用异步加载
 # 状态栏目录计数缓存（避免高频 os.scandir）
 DIR_ENTRY_COUNT_CACHE_TTL_MS = 5000  # 状态栏目录计数缓存时间（提升到5秒，减少频繁os.scandir）
+STATUS_SELECTION_CACHE_TTL_MS = 400  # 选中项状态缓存，降低频繁 COM/文件属性查询
+SHORTCUT_POLL_ACTIVE_MS = 160  # 主窗口激活时快捷键轮询频率
+SHORTCUT_POLL_INACTIVE_MS = 500  # 主窗口非激活时快捷键轮询频率
 
 
 def apply_runtime_performance_config(perf_cfg=None):
@@ -371,6 +374,7 @@ class SearchDialog(QDialog):
         self.result_queue = queue.Queue(maxsize=SEARCH_RESULT_QUEUE_MAXSIZE)  # 结果队列容量
         self.ui_update_timer = None
         self.queue_overflow_count = 0  # 队列溢出计数
+        self._queue_idle_ticks = 0
         
         # 结果限制配置（使用虚拟滚动优化，支持更多结果）
         self.max_results = 1000000  # 最多显示100万个结果（虚拟滚动优化）
@@ -500,18 +504,37 @@ class SearchDialog(QDialog):
         from PyQt5.QtCore import QTimer
         self.ui_update_timer = QTimer(self)
         self.ui_update_timer.timeout.connect(self.update_ui_from_queue)
-        self.ui_update_timer.start(50)  # 每50ms检查一次队列（加快消费速度）
+        self.ui_update_timer.start(80)  # 搜索时动态提速，空闲时降频
     
     def update_ui_from_queue(self):
         """从队列中取出结果并更新UI（在主线程中调用，批量优化）"""
         try:
+            pending = 0
+            try:
+                pending = self.result_queue.qsize()
+            except Exception:
+                pending = 0
+
+            # 自适应轮询：有积压时提速，空闲时降频，减少空转开销
+            target_interval = 80
+            if self.is_searching:
+                if pending > 600:
+                    target_interval = 20
+                elif pending > 120:
+                    target_interval = 35
+                else:
+                    target_interval = 60
+            else:
+                target_interval = 220 if pending == 0 else 80
+            if self.ui_update_timer.interval() != target_interval:
+                self.ui_update_timer.setInterval(target_interval)
+
             # 批量处理结果（一次处理最多200个，加快队列消费）
             batch_results = []
             batch_count = 0
             # 根据队列积压动态调整消费批次，减少结果爆发时的UI延迟
             max_batch = 200
             try:
-                pending = self.result_queue.qsize()
                 if pending > 800:
                     max_batch = 500
                 elif pending > 300:
@@ -547,9 +570,14 @@ class SearchDialog(QDialog):
             # 批量添加结果到表格（性能优化）
             if batch_results:
                 self._append_results_to_table(batch_results)
+                self._queue_idle_ticks = 0
+            elif not self.is_searching:
+                self._queue_idle_ticks += 1
+                if self._queue_idle_ticks > 3 and self.ui_update_timer.interval() != 250:
+                    self.ui_update_timer.setInterval(250)
                 
         except Exception as e:
-            print(f"[Search] UI update error: {e}")
+            debug_print(f"[Search] UI update error: {e}")
 
     def _append_results_to_table(self, results):
         """批量渲染搜索结果到表格。"""
@@ -670,7 +698,7 @@ class SearchDialog(QDialog):
         
         if cached_results is not None:
             # 使用缓存结果
-            print(f"[Search] 使用缓存结果，共 {len(cached_results)} 个")
+            debug_print(f"[Search] 使用缓存结果，共 {len(cached_results)} 个")
             self.result_list.setRowCount(0)
             self.current_result_count = 0
             self.status_label.setText("正在加载缓存结果...")
@@ -697,6 +725,8 @@ class SearchDialog(QDialog):
         self.search_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_label.setText(f"搜索中... (最多显示{self.max_results}个结果)")
+        if self.ui_update_timer and self.ui_update_timer.interval() != 20:
+            self.ui_update_timer.setInterval(20)
         
         # 在后台线程执行搜索
         import threading
@@ -713,6 +743,8 @@ class SearchDialog(QDialog):
         self.search_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status_label.setText("已停止")
+        if self.ui_update_timer and self.ui_update_timer.interval() != 220:
+            self.ui_update_timer.setInterval(220)
     
     def search_with_everything(self, keyword, search_path, file_types=""):
         """使用Everything进行搜索"""
@@ -984,10 +1016,10 @@ class SearchDialog(QDialog):
                     file_extensions.add(ft.lower())  # 直接使用输入的扩展名
         
         # 调试信息：输出搜索路径
-        print(f"[Search] 开始搜索路径: {self.search_path}")
-        print(f"[Search] 搜索关键词: {keyword}")
-        print(f"[Search] 搜索文件名: {search_filename}, 搜索内容: {search_content}")
-        print(f"[Search] 文件类型过滤: {file_extensions if file_extensions else '所有类型'}")
+        debug_print(f"[Search] 开始搜索路径: {self.search_path}")
+        debug_print(f"[Search] 搜索关键词: {keyword}")
+        debug_print(f"[Search] 搜索文件名: {search_filename}, 搜索内容: {search_content}")
+        debug_print(f"[Search] 文件类型过滤: {file_extensions if file_extensions else '所有类型'}")
         
         try:
             scanned_files = 0
@@ -996,7 +1028,7 @@ class SearchDialog(QDialog):
             last_status_update_ms = int(time.time() * 1000)
             for root, dirs, files in os.walk(self.search_path):
                 if not self.is_searching:
-                    print("[Search] 搜索被中断")
+                    debug_print("[Search] 搜索被中断")
                     break
                 
                 folder_count += 1
@@ -1054,7 +1086,7 @@ class SearchDialog(QDialog):
                 # 搜索文件名和文件内容
                 for filename in files:
                     if not self.is_searching:
-                        print("[Search] 搜索被中断（文件循环）")
+                        debug_print("[Search] 搜索被中断（文件循环）")
                         break
 
                     filename_lower = filename.lower()
@@ -1075,7 +1107,7 @@ class SearchDialog(QDialog):
                     if file_extensions and file_ext not in file_extensions:
                         # 调试：显示被过滤的文件（仅对特定文件名）
                         if 'TstMgr' in filename or scanned_files < 5:
-                            print(f"[Search] 文件被类型过滤跳过: {filename}")
+                            debug_print(f"[Search] 文件被类型过滤跳过: {filename}")
                         continue  # 跳过不匹配的文件类型
                     
                     scanned_files += 1
@@ -1224,11 +1256,11 @@ class SearchDialog(QDialog):
                                         continue
                                     except Exception as e:
                                         # 其他错误，记录日志并尝试下一个编码
-                                        print(f"[Search] 读取文件失败 {file_path} (编码 {encoding}): {e}")
+                                        debug_print(f"[Search] 读取文件失败 {file_path} (编码 {encoding}): {e}")
                                         continue
                         except Exception as e:
                             # 如果无法以文本方式读取，记录日志并跳过该文件
-                            print(f"[Search] 无法读取文件 {file_path}: {e}")
+                            debug_print(f"[Search] 无法读取文件 {file_path}: {e}")
                             pass
                     
                     if matched:
@@ -1276,25 +1308,25 @@ class SearchDialog(QDialog):
                         # 批量更新UI（每20个结果更新一次）
                         _flush_results_buffer()
         except Exception as e:
-            print(f"Search error: {e}")
+            debug_print(f"[Search] error: {e}")
         
         # 添加剩余的结果（队列满时等待）
         if results_buffer:
             _flush_results_buffer(force=True)
         
         # 调试信息
-        print(f"[Search] 搜索完成，共扫描 {scanned_files} 个文件，找到 {found_count} 个结果")
+        debug_print(f"[Search] 搜索完成，共扫描 {scanned_files} 个文件，找到 {found_count} 个结果")
         if search_content and skipped_binary_files > 0:
-            print(f"[Search] 跳过 {skipped_binary_files} 个二进制文件（不搜索内容）")
+            debug_print(f"[Search] 跳过 {skipped_binary_files} 个二进制文件（不搜索内容）")
         if self.queue_overflow_count > 0:
-            print(f"[Search] ⚠️ 队列溢出 {self.queue_overflow_count} 次（部分结果未显示）")
+            debug_print(f"[Search] ⚠️ 队列溢出 {self.queue_overflow_count} 次（部分结果未显示）")
         
         # 将结果存入缓存（限制缓存大小，防止内存溢出）
         if cache_key and all_results:
             global _search_cache
             cached_results = all_results
             _search_cache.put(cache_key, cached_results)
-            print(f"[Search] 已将 {len(cached_results)} 个结果存入缓存")
+            debug_print(f"[Search] 已将 {len(cached_results)} 个结果存入缓存")
         
         # 重置搜索状态（先重置，避免后续更新被跳过）
         self.is_searching = False
@@ -1316,9 +1348,9 @@ class SearchDialog(QDialog):
             # 搜索完成后启用排序
             self.result_queue.put({'type': 'enable_sorting'}, timeout=1)
         except:
-            print(f"[Search] ⚠️ 队列满，最终状态更新失败")
+            debug_print(f"[Search] ⚠️ 队列满，最终状态更新失败")
         
-        print(f"[Search] UI更新已调度（使用队列）")
+        debug_print(f"[Search] UI更新已调度（使用队列）")
     
     def on_result_double_clicked(self, row, column):
         """双击搜索结果，打开文件所在文件夹或文件夹本身，并选中文件"""
@@ -2462,7 +2494,7 @@ class FileExplorerTab(QWidget):
     def start_path_sync_timer(self, duration_ms=2000):
         """启动路径同步定时器，duration_ms 后自动停止（按需触发，减少持续COM调用）"""
         from PyQt5.QtCore import QTimer
-        debug_print(f"[PathSync] Starting timer: duration={duration_ms}ms, current_path={self.current_path}")
+        self._path_sync_stable_hits = 0
         if not hasattr(self, '_path_sync_timer') or self._path_sync_timer is None:
             self._path_sync_timer = QTimer(self)
             self._path_sync_timer.timeout.connect(self.sync_path_bar_with_explorer)
@@ -2474,13 +2506,12 @@ class FileExplorerTab(QWidget):
         self._path_sync_stop_timer.start(duration_ms)
         if not self._path_sync_timer.isActive():
             self._path_sync_timer.start(200)
-            debug_print(f"[PathSync] Timer started, will poll every 200ms for {duration_ms}ms")
 
     def _stop_path_sync_timer(self):
         """停止路径同步轮询（稳定后调用，避免持续COM跨进程调用）"""
         if hasattr(self, '_path_sync_timer') and self._path_sync_timer and self._path_sync_timer.isActive():
             self._path_sync_timer.stop()
-            debug_print(f"[PathSync] Timer stopped after duration")
+        self._path_sync_stable_hits = 0
 
     def sync_path_bar_with_explorer(self):
         # 通过QAxWidget的LocationURL属性获取当前路径
@@ -2500,15 +2531,13 @@ class FileExplorerTab(QWidget):
                 elif url_str.startswith('shell:') or '::' in url_str:
                     # Shell特殊文件夹，通常以 shell: 或包含 CLSID (::)
                     # 这些路径我们已经在 current_path 中维护，无需更新
-                    debug_print(f"[PathSync] Shell path detected: {url_str[:50]}...")
                     return
                 
                 if local_path and local_path != self.current_path:
-                    debug_print(f"[PathSync] Path detected change: {self.current_path} → {local_path}")
+                    self._path_sync_stable_hits = 0
                     self.current_path = local_path
                     if hasattr(self, 'path_bar'):
                         self.path_bar.set_path(local_path)
-                        debug_print(f"[PathSync] Updated path_bar to {local_path}")
                     self.update_tab_title()
                     # 只在非程序化导航时添加到历史记录
                     if not self._navigating_programmatically and hasattr(self, '_add_to_history'):
@@ -2520,16 +2549,15 @@ class FileExplorerTab(QWidget):
                     if getattr(self, '_navigating_folder', False):
                         self._navigating_folder = False
                     self._resume_path_sync_after_navigation()
-                else:
-                    debug_print(f"[PathSync] No change: LocationURL={local_path}, current={self.current_path}")
-            else:
-                debug_print(f"[PathSync] LocationURL is empty or None")
+                elif local_path and local_path == self.current_path:
+                    self._path_sync_stable_hits = int(getattr(self, '_path_sync_stable_hits', 0)) + 1
+                    if self._path_sync_stable_hits >= 2:
+                        self._stop_path_sync_timer()
         except Exception as e:
             debug_print(f"[PathSync] ERROR: {e}")
 
     def _resume_path_sync_after_navigation(self):
         """导航后重启路径同步定时器（短窗口轮询，自动停止）"""
-        debug_print(f"[PathSync] Resuming path sync after navigation")
         try:
             self.start_path_sync_timer(duration_ms=2000)
         except Exception as e:
@@ -2603,12 +2631,10 @@ class FileExplorerTab(QWidget):
         self.folder_checker = None  # 文件夹大小检查线程
         self.pending_navigation = None  # 待处理的导航请求
         
-        # 绑定导航完成信号，自动更新路径栏
-        self.explorer.dynamicCall('NavigateComplete2(QVariant,QVariant)', None, None)  # 预绑定，防止信号未注册
+        # Explorer 基础配置：保留必要项，避免重复 COM 调用拖慢初始化
         self.explorer.dynamicCall('Visible', True)
         self.explorer.dynamicCall('RegisterAsBrowser', True)
         self.explorer.dynamicCall('RegisterAsDropTarget', True)
-        
         self.explorer.dynamicCall('TheaterMode', False)
         self.explorer.dynamicCall('ToolBar', False)
         self.explorer.dynamicCall('StatusBar', False)
@@ -2618,43 +2644,10 @@ class FileExplorerTab(QWidget):
         self.explorer.dynamicCall('FullScreen', False)
         self.explorer.dynamicCall('Offline', False)
         self.explorer.dynamicCall('Silent', True)
-        self.explorer.dynamicCall('NavigateComplete2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('NavigateError(QVariant,QVariant,QVariant,QVariant)', None, None, None, None)
-        self.explorer.dynamicCall('DocumentComplete(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('BeforeNavigate2(QVariant,QVariant,QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None, None, None)
-        self.explorer.dynamicCall('NewWindow2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('NewWindow3(QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None)
-        self.explorer.dynamicCall('OnQuit()', )
-        self.explorer.dynamicCall('OnVisible()', )
-        self.explorer.dynamicCall('OnToolBar()', )
-        self.explorer.dynamicCall('OnMenuBar()', )
-        self.explorer.dynamicCall('OnStatusBar()', )
-        self.explorer.dynamicCall('OnFullScreen()', )
-        self.explorer.dynamicCall('OnTheaterMode()', )
-        self.explorer.dynamicCall('OnAddressBar()', )
-        self.explorer.dynamicCall('OnResizable()', )
-        self.explorer.dynamicCall('OnOffline()', )
-        self.explorer.dynamicCall('OnSilent()', )
-        self.explorer.dynamicCall('OnRegisterAsBrowser()', )
-        self.explorer.dynamicCall('OnRegisterAsDropTarget()', )
-        self.explorer.dynamicCall('OnNavigateComplete2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnNavigateError(QVariant,QVariant,QVariant,QVariant)', None, None, None, None)
-        self.explorer.dynamicCall('OnDocumentComplete(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnBeforeNavigate2(QVariant,QVariant,QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None, None, None)
-        self.explorer.dynamicCall('OnNewWindow2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnNewWindow3(QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None)
-        self.explorer.dynamicCall('OnQuit()', )
-        # 连接信号
+        # 预绑定关键导航事件签名，避免首次导航时事件分发延迟
         self.explorer.dynamicCall('NavigateComplete2(QVariant,QVariant)', None, None)
         self.explorer.dynamicCall('DocumentComplete(QVariant,QVariant)', None, None)
         self.explorer.dynamicCall('BeforeNavigate2(QVariant,QVariant,QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None, None, None)
-        self.explorer.dynamicCall('NewWindow2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('NewWindow3(QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None)
-        self.explorer.dynamicCall('OnNavigateComplete2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnDocumentComplete(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnBeforeNavigate2(QVariant,QVariant,QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None, None, None)
-        self.explorer.dynamicCall('OnNewWindow2(QVariant,QVariant)', None, None)
-        self.explorer.dynamicCall('OnNewWindow3(QVariant,QVariant,QVariant,QVariant,QVariant)', None, None, None, None, None)
 
 
         # 兼容原有空白双击（保留控件但不占用空间，避免底部留白）
@@ -3376,6 +3369,7 @@ class FileExplorerTab(QWidget):
         self._refresh_active = False
         self._pending_external_refresh = False
         self._entry_count_cache = {'path': None, 'count': None, 'ts_ms': 0}
+        self._selection_cache = {'path': None, 'entries': None, 'ts_ms': 0}
 
         # 目录轮询刷新兜底：处理部分编辑器改文件但目录 watcher 不触发的情况
         self.dir_mtime = None
@@ -3870,7 +3864,7 @@ class FileExplorerTab(QWidget):
         total_text = f"（共 {total} 项）" if total is not None else ""
 
         # 统计选中项
-        selection = self._get_selection_entries()
+        selection = self._get_selection_entries_cached()
         if selection is None:
             text = f"{total} 项" if total is not None else "就绪"
             self.status_bar.setText(text)
@@ -3934,6 +3928,31 @@ class FileExplorerTab(QWidget):
             return entries
         except Exception:
             return None
+
+    def _get_selection_entries_cached(self):
+        """短TTL缓存选中项，减少状态栏高频轮询时的 COM 与磁盘查询。"""
+        try:
+            now_ms = int(time.time() * 1000)
+            path = getattr(self, 'current_path', None)
+            cache = getattr(self, '_selection_cache', None)
+            if cache and cache.get('entries') is not None:
+                if (
+                    cache.get('path')
+                    and path
+                    and os.path.normcase(cache.get('path')) == os.path.normcase(path)
+                    and now_ms - int(cache.get('ts_ms', 0)) < STATUS_SELECTION_CACHE_TTL_MS
+                ):
+                    return cache.get('entries')
+
+            entries = self._get_selection_entries()
+            self._selection_cache = {
+                'path': path,
+                'entries': entries,
+                'ts_ms': now_ms,
+            }
+            return entries
+        except Exception:
+            return self._get_selection_entries()
 
     def _count_dir_entries(self, path):
         """计算目录下的项目数"""
@@ -6805,22 +6824,29 @@ class MainWindow(QMainWindow):
             fw = QApplication.focusWidget()
             if isinstance(fw, (QLineEdit, QTextEdit, QPlainTextEdit)):
                 self._last_keys_state.clear()
+                if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
+                    self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
                 return
 
             # 严格检查窗口是否激活 - 使用多重检查确保只在TabEx激活时响应
             # 1. 检查Qt窗口是否激活
             if not self.isActiveWindow():
                 self._last_keys_state.clear()
+                if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
+                    self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
                 return
             
             # 2. 检查应用程序焦点窗口
             if QApplication.activeWindow() != self:
                 self._last_keys_state.clear()
+                if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
+                    self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
                 return
             
             # 3. 使用Windows API检查前台窗口是否是当前窗口
             import ctypes
-            from ctypes import wintypes
+            if self._shortcut_timer.interval() != SHORTCUT_POLL_ACTIVE_MS:
+                self._shortcut_timer.setInterval(SHORTCUT_POLL_ACTIVE_MS)
             
             foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
             current_hwnd = int(self.winId())
@@ -6828,6 +6854,8 @@ class MainWindow(QMainWindow):
             # 如果前台窗口不是TabEx，则不响应快捷键
             if foreground_hwnd != current_hwnd:
                 self._last_keys_state.clear()
+                if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
+                    self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
                 return
             
             # Windows虚拟键码
@@ -6870,7 +6898,7 @@ class MainWindow(QMainWindow):
                 if is_key_pressed(VK_SHIFT) and is_key_pressed(0x54) and hotkeys.get("reopen_tab", True):
                     key_combo = "Ctrl+Shift+T"
                     if not self._last_keys_state.get(key_combo, False):
-                        print("[Shortcut Poll] Detected Ctrl+Shift+T")
+                        debug_print("[Shortcut Poll] Detected Ctrl+Shift+T")
                         self.reopen_closed_tab()
                         self._last_keys_state[key_combo] = True
                     return
@@ -6892,7 +6920,7 @@ class MainWindow(QMainWindow):
                 if is_key_pressed(0x54) and not is_key_pressed(VK_SHIFT) and hotkeys.get("new_tab", True):
                     key_combo = "Ctrl+T"
                     if not self._last_keys_state.get(key_combo, False):
-                        print("[Shortcut Poll] Detected Ctrl+T")
+                        debug_print("[Shortcut Poll] Detected Ctrl+T")
                         self.add_new_tab()
                         self._last_keys_state[key_combo] = True
                     return
@@ -6903,7 +6931,7 @@ class MainWindow(QMainWindow):
                 if is_key_pressed(0x57) and hotkeys.get("close_tab", True):
                     key_combo = "Ctrl+W"
                     if not self._last_keys_state.get(key_combo, False):
-                        print("[Shortcut Poll] Detected Ctrl+W")
+                        debug_print("[Shortcut Poll] Detected Ctrl+W")
                         self.close_current_tab()
                         self._last_keys_state[key_combo] = True
                     return
@@ -6914,7 +6942,7 @@ class MainWindow(QMainWindow):
                 if is_key_pressed(0x46) and hotkeys.get("search", True):
                     key_combo = "Ctrl+F"
                     if not self._last_keys_state.get(key_combo, False):
-                        print("[Shortcut Poll] Detected Ctrl+F")
+                        debug_print("[Shortcut Poll] Detected Ctrl+F")
                         self.show_search_dialog()
                         self._last_keys_state[key_combo] = True
                     return
@@ -6925,7 +6953,7 @@ class MainWindow(QMainWindow):
                 if is_key_pressed(0x44) and hotkeys.get("add_bookmark", True):
                     key_combo = "Ctrl+D"
                     if not self._last_keys_state.get(key_combo, False):
-                        print("[Shortcut Poll] Detected Ctrl+D")
+                        debug_print("[Shortcut Poll] Detected Ctrl+D")
                         self.add_current_tab_bookmark()
                         self._last_keys_state[key_combo] = True
                     return
@@ -6938,7 +6966,7 @@ class MainWindow(QMainWindow):
                         # Ctrl+Shift+Tab
                         key_combo = "Ctrl+Shift+Tab"
                         if not self._last_keys_state.get(key_combo, False):
-                            print("[Shortcut Poll] Detected Ctrl+Shift+Tab")
+                            debug_print("[Shortcut Poll] Detected Ctrl+Shift+Tab")
                             self.tab_widget.setCurrentIndex(
                                 (self.tab_widget.currentIndex() - 1) % self.tab_widget.count())
                             self._last_keys_state[key_combo] = True
@@ -6947,7 +6975,7 @@ class MainWindow(QMainWindow):
                         # Ctrl+Tab
                         key_combo = "Ctrl+Tab"
                         if not self._last_keys_state.get(key_combo, False):
-                            print("[Shortcut Poll] Detected Ctrl+Tab")
+                            debug_print("[Shortcut Poll] Detected Ctrl+Tab")
                             self.tab_widget.setCurrentIndex(
                                 (self.tab_widget.currentIndex() + 1) % self.tab_widget.count())
                             self._last_keys_state[key_combo] = True
@@ -7359,7 +7387,7 @@ class MainWindow(QMainWindow):
         self._last_keys_state = {}
         self._shortcut_timer = QTimer(self)
         self._shortcut_timer.timeout.connect(self._check_shortcuts)
-        self._shortcut_timer.start(100)  # 每100ms检查一次
+        self._shortcut_timer.start(SHORTCUT_POLL_ACTIVE_MS)
         
         # 性能优化：延迟加载非关键功能（100ms后加载）
         QTimer.singleShot(100, self._delayed_initialization)
