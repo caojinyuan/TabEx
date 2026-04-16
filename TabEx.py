@@ -1772,6 +1772,14 @@ class BreadcrumbPathBar(QWidget):
             }
         """)
         
+        # 节流定时器：避免每次按键都触发 setRootPath（会扫目录，拖慢输入体验）
+        self._completer_timer = QTimer(self)
+        self._completer_timer.setSingleShot(True)
+        self._completer_timer.setInterval(300)
+        self._completer_timer.timeout.connect(self._do_update_completer_prefix)
+        self._completer_pending_text = ""
+        self._completer_last_parent = ""
+
         # 连接信号以动态更新补全
         self.path_edit.textChanged.connect(self.update_completer_prefix)
         
@@ -1781,28 +1789,34 @@ class BreadcrumbPathBar(QWidget):
         debug_print("[PathCompleter] Path auto-completion initialized")
     
     def update_completer_prefix(self, text):
-        """动态更新补全前缀"""
+        """动态更新补全前缀（节流版，避免每次按键都扫目录）"""
+        self._completer_pending_text = text
+        if hasattr(self, '_completer_timer'):
+            self._completer_timer.start()  # 重置300ms计时
+
+    def _do_update_completer_prefix(self):
+        """节流后实际执行补全根路径更新"""
+        text = getattr(self, '_completer_pending_text', '')
         if not text:
             return
-        
-        # 处理不同的路径格式
+        # 特殊命令不需要补全
         if text.startswith('shell:') or text in ['cmd', '回收站', '此电脑', '我的电脑', '桌面', '网络']:
-            # 特殊命令不需要补全
             return
-        
         # 标准化路径分隔符
         normalized_path = text.replace('/', '\\') if os.name == 'nt' else text
-        
-        # 获取父目录路径
         parent_dir = os.path.dirname(normalized_path)
-        
-        # 如果有父目录，设置为补全的根路径
-        if parent_dir and os.path.exists(parent_dir):
+        # 与上次相同则跳过，避免重复扫目录
+        if not parent_dir or parent_dir == getattr(self, '_completer_last_parent', ''):
+            return
+        if os.path.exists(parent_dir):
+            self._completer_last_parent = parent_dir
             self.completer_model.setRootPath(parent_dir)
             debug_print(f"[PathCompleter] Updated root path to: {parent_dir}")
     
     def set_path(self, path):
         """设置并显示路径，始终按全局设置分隔符存储和显示"""
+        if not path:
+            return
         # 优先从主窗口(MainWindow)获取config
         separator = "/"
         mainwin = None
@@ -1825,7 +1839,29 @@ class BreadcrumbPathBar(QWidget):
             norm_path = path.replace("\\", "/").replace("/", "/")
         else:
             norm_path = path.replace("/", "\\").replace("\\", "\\")
+        old_path = self.current_path
         self.current_path = norm_path
+        path_changed = (norm_path != old_path)
+        # 用户正在地址栏输入时（且路径未变化），不要被后台同步打断。
+        if (self.edit_mode and
+            hasattr(self, 'path_edit') and
+            self.path_edit.isVisible() and
+            self.path_edit.hasFocus() and
+            not path_changed):
+            return
+        # 无论当前状态如何，都同步编辑框文本并恢复显示模式，避免地址栏偶发空白。
+        if hasattr(self, 'path_edit'):
+            try:
+                self.path_edit.blockSignals(True)
+                self.path_edit.setText(norm_path)
+            finally:
+                self.path_edit.blockSignals(False)
+        if self.edit_mode or (hasattr(self, 'path_edit') and self.path_edit.isVisible()):
+            self.edit_mode = False
+        if hasattr(self, 'path_edit'):
+            self.path_edit.hide()
+        if hasattr(self, 'breadcrumb_widget'):
+            self.breadcrumb_widget.show()
         # 标记这是来自导航的更新（需要立即刷新，不节流）
         self._is_navigation_update = True
         # 总是更新面包屑，无论是否处于编辑模式
@@ -2297,8 +2333,6 @@ class FileExplorerTab(QWidget):
                 debug_print(f"[FileWatcher] Force removed file: {path}")
         except Exception as e:
             debug_print(f"[FileWatcher] Exception in force_remove_watcher: {e}")
-        debug_print(f"[FileWatcher] Now watching dirs: {self.file_watcher.directories()}")
-        debug_print(f"[FileWatcher] Now watching files: {self.file_watcher.files()[:10]}")
 
     def _build_dir_snapshot(self, path):
         """构建当前目录的轻量元数据快照，用于检测文件修改时间/大小变化。"""
@@ -2399,6 +2433,19 @@ class FileExplorerTab(QWidget):
     def on_file_changed(self, path):
         """文件内容或元数据变化时，主动刷新当前视图。"""
         try:
+            import time
+            now_ms = time.time() * 1000
+            norm_file = os.path.normcase(os.path.normpath(path))
+            # 文件级去抖：同一路径短时间内重复事件只处理一次
+            last_ms = self._last_file_event.get(norm_file, 0)
+            if now_ms - last_ms < getattr(self, '_file_event_debounce_ms', 400):
+                return
+            self._last_file_event[norm_file] = now_ms
+            if len(self._last_file_event) > 200:
+                # 仅保留最近触发的100条，避免字典无限增长
+                items = sorted(self._last_file_event.items(), key=lambda x: x[1], reverse=True)
+                self._last_file_event = dict(items[:100])
+
             debug_print(f"[FileWatcher] File changed: {path}")
             current_dir = getattr(self, 'current_path', '')
             if current_dir and os.path.normcase(os.path.dirname(path)) == os.path.normcase(current_dir):
@@ -2414,7 +2461,6 @@ class FileExplorerTab(QWidget):
                             self.file_watcher.addPath(path)
                     except Exception:
                         pass
-                self._last_dir_snapshot = self._build_dir_snapshot(current_dir)
                 self._schedule_refresh(reason="file_changed")
         except Exception as e:
             debug_print(f"[FileWatcher] on_file_changed error: {e}")
@@ -2551,6 +2597,9 @@ class FileExplorerTab(QWidget):
                     self._resume_path_sync_after_navigation()
                 elif local_path and local_path == self.current_path:
                     self._path_sync_stable_hits = int(getattr(self, '_path_sync_stable_hits', 0)) + 1
+                    # 即使路径未变化，也做一次轻量UI回写，修复偶发地址栏未重绘。
+                    if hasattr(self, 'path_bar'):
+                        self.path_bar.set_path(local_path)
                     if self._path_sync_stable_hits >= 2:
                         self._stop_path_sync_timer()
         except Exception as e:
@@ -3361,9 +3410,13 @@ class FileExplorerTab(QWidget):
         self.refresh_timer.setSingleShot(True)
         self.refresh_timer.timeout.connect(self.delayed_refresh)
         self.refresh_delay_ms = 500  # 500ms延迟
+        self._refresh_min_interval_ms = 1200  # 连续刷新最小间隔，避免COM刷新风暴卡界面
+        self._last_refresh_ts_ms = 0
         # 防抖机制：记录最近处理的路径和时间，避免事件风暴
         self._last_watcher_event = {}  # {path: timestamp}
         self._watcher_debounce_ms = 1200  # 1.2s 内的重复事件会被忽略，进一步抑制风暴
+        self._last_file_event = {}  # {file_path: timestamp_ms}
+        self._file_event_debounce_ms = 400
         self._watched_files = set()
         self._last_dir_snapshot = None
         self._refresh_active = False
@@ -3738,22 +3791,38 @@ class FileExplorerTab(QWidget):
 
     def _schedule_refresh(self, reason="manual"):
         """统一的刷新调度，避免重复代码"""
+        import time
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[AutoRefresh] Suppressed during navigation (reason={reason})")
             return
-        if not self.refresh_timer.isActive():
-            debug_print(f"[AutoRefresh] Scheduling refresh in {self.refresh_delay_ms}ms (reason={reason})")
-            self.refresh_timer.start(self.refresh_delay_ms)
-        else:
+
+        delay_ms = int(getattr(self, 'refresh_delay_ms', 500))
+        min_interval_ms = int(getattr(self, '_refresh_min_interval_ms', 0))
+        last_refresh_ms = float(getattr(self, '_last_refresh_ts_ms', 0) or 0)
+        if min_interval_ms > 0 and last_refresh_ms > 0:
+            elapsed_ms = (time.time() * 1000) - last_refresh_ms
+            if elapsed_ms < min_interval_ms:
+                delay_ms = max(delay_ms, int(min_interval_ms - elapsed_ms))
+
+        if self.refresh_timer.isActive():
+            remaining = self.refresh_timer.remainingTime()
+            # 已有更早的刷新计划时不延后，避免连续事件导致“永远不刷新”
+            if remaining > 0 and remaining <= delay_ms:
+                return
             self.refresh_timer.stop()
-            self.refresh_timer.start(self.refresh_delay_ms)
-            debug_print(f"[AutoRefresh] Refresh timer restarted (reason={reason})")
+            self.refresh_timer.start(delay_ms)
+            debug_print(f"[AutoRefresh] Refresh timer adjusted to {delay_ms}ms (reason={reason})")
+        else:
+            debug_print(f"[AutoRefresh] Scheduling refresh in {delay_ms}ms (reason={reason})")
+            self.refresh_timer.start(delay_ms)
     
     def delayed_refresh(self):
         """延迟刷新：避免频繁刷新"""
+        import time
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
             return
+        self._last_refresh_ts_ms = time.time() * 1000
         debug_print(f"[FileWatcher] Auto-refreshing: {self.current_path}")
         if hasattr(self, 'explorer') and self.current_path:
             try:
@@ -5670,6 +5739,10 @@ class MainWindow(QMainWindow):
                 # 切换标签时强制刷新该标签路径栏，避免显示上一个标签路径
                 try:
                     if hasattr(tab, 'path_bar') and tab.path_bar:
+                        try:
+                            tab.path_bar.exit_edit_mode()
+                        except Exception:
+                            pass
                         tab.path_bar.set_path(tab.current_path)
                 except Exception:
                     pass
@@ -6865,13 +6938,20 @@ class MainWindow(QMainWindow):
             VK_F5 = 0x74
             
             # 获取键盘状态
-            def is_key_pressed(vk_code):
-                return ctypes.windll.user32.GetAsyncKeyState(vk_code) & 0x8000 != 0
+            # require_down=True: 必须当前按住（用于 Ctrl/Shift/Alt 等修饰键）
+            # require_down=False: 支持“当前按住”或“自上次轮询以来被按下过一次”（修复短按漏检）
+            def is_key_pressed(vk_code, require_down=False):
+                state = ctypes.windll.user32.GetAsyncKeyState(vk_code)
+                is_down = (state & 0x8000) != 0
+                if require_down:
+                    return is_down
+                was_pressed_since_last = (state & 0x0001) != 0
+                return is_down or was_pressed_since_last
             
             hotkeys = self.config.get("hotkeys", {})
             
             # Alt+Z - 拷贝文件名
-            if is_key_pressed(VK_MENU) and is_key_pressed(0x5A) and hotkeys.get("copy_filename", True):
+            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x5A) and hotkeys.get("copy_filename", True):
                 key_combo = "Alt+Z"
                 if not self._last_keys_state.get(key_combo, False):
                     debug_print("[Shortcut Poll] Detected Alt+Z")
@@ -6882,7 +6962,7 @@ class MainWindow(QMainWindow):
                 self._last_keys_state["Alt+Z"] = False
             
             # Alt+X - 拷贝路径+文件名
-            if is_key_pressed(VK_MENU) and is_key_pressed(0x58) and hotkeys.get("copy_filepath", True):
+            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x58) and hotkeys.get("copy_filepath", True):
                 key_combo = "Alt+X"
                 if not self._last_keys_state.get(key_combo, False):
                     debug_print("[Shortcut Poll] Detected Alt+X")
@@ -6893,9 +6973,22 @@ class MainWindow(QMainWindow):
                 self._last_keys_state["Alt+X"] = False
             
             # 检查Ctrl组合键
-            if is_key_pressed(VK_CONTROL):
+            if is_key_pressed(VK_CONTROL, require_down=True):
+                # Ctrl+L (0x4C) - 聚焦并全选路径栏，便于直接输入地址
+                if is_key_pressed(0x4C):
+                    key_combo = "Ctrl+L"
+                    if not self._last_keys_state.get(key_combo, False):
+                        debug_print("[Shortcut Poll] Detected Ctrl+L")
+                        current_tab = self.get_current_tab_widget()
+                        if current_tab and hasattr(current_tab, 'path_bar') and current_tab.path_bar:
+                            current_tab.path_bar.enter_edit_mode()
+                        self._last_keys_state[key_combo] = True
+                    return
+                else:
+                    self._last_keys_state["Ctrl+L"] = False
+
                 # Ctrl+Shift+T (0x54) - 恢复关闭的标签页（必须在Ctrl+T之前检测）
-                if is_key_pressed(VK_SHIFT) and is_key_pressed(0x54) and hotkeys.get("reopen_tab", True):
+                if is_key_pressed(VK_SHIFT, require_down=True) and is_key_pressed(0x54) and hotkeys.get("reopen_tab", True):
                     key_combo = "Ctrl+Shift+T"
                     if not self._last_keys_state.get(key_combo, False):
                         debug_print("[Shortcut Poll] Detected Ctrl+Shift+T")
@@ -6906,7 +6999,7 @@ class MainWindow(QMainWindow):
                     self._last_keys_state["Ctrl+Shift+T"] = False
 
                     # Ctrl+Shift+A (0x41) - 切换 AI 聊天面板
-                    if is_key_pressed(VK_SHIFT) and is_key_pressed(0x41):
+                    if is_key_pressed(VK_SHIFT, require_down=True) and is_key_pressed(0x41):
                         key_combo = "Ctrl+Shift+A"
                         if not self._last_keys_state.get(key_combo, False):
                             debug_print("[Shortcut Poll] Detected Ctrl+Shift+A")
@@ -6917,7 +7010,7 @@ class MainWindow(QMainWindow):
                         self._last_keys_state["Ctrl+Shift+A"] = False
                 
                 # Ctrl+T (0x54) - 新建标签页（不包含Shift）
-                if is_key_pressed(0x54) and not is_key_pressed(VK_SHIFT) and hotkeys.get("new_tab", True):
+                if is_key_pressed(0x54) and not is_key_pressed(VK_SHIFT, require_down=True) and hotkeys.get("new_tab", True):
                     key_combo = "Ctrl+T"
                     if not self._last_keys_state.get(key_combo, False):
                         debug_print("[Shortcut Poll] Detected Ctrl+T")
@@ -6962,7 +7055,7 @@ class MainWindow(QMainWindow):
                 
                 # Ctrl+Tab (0x09)
                 if is_key_pressed(0x09) and hotkeys.get("switch_tab", True):
-                    if is_key_pressed(VK_SHIFT):
+                    if is_key_pressed(VK_SHIFT, require_down=True):
                         # Ctrl+Shift+Tab
                         key_combo = "Ctrl+Shift+Tab"
                         if not self._last_keys_state.get(key_combo, False):
@@ -6985,7 +7078,7 @@ class MainWindow(QMainWindow):
                     self._last_keys_state["Ctrl+Shift+Tab"] = False
             
             # 检查Alt组合键
-            if is_key_pressed(VK_MENU):
+            if is_key_pressed(VK_MENU, require_down=True):
                 # Alt+Left (0x25)
                 if is_key_pressed(0x25) and hotkeys.get("navigate", True):
                     key_combo = "Alt+Left"
