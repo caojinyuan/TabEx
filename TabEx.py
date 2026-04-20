@@ -4528,94 +4528,63 @@ class CustomTabBar(QTabBar):
     def mouseMoveEvent(self, event):
         """追踪鼠标位置，更新悬停的标签页"""
         tab_index = self.tabAt(event.pos())
-        if tab_index != self.hovered_tab:
-            # 移除旧的关闭按钮
-            if self.hovered_tab >= 0:
-                self.setTabButton(self.hovered_tab, QTabBar.RightSide, None)
-            
-            # 添加新的关闭按钮
-            self.hovered_tab = tab_index
-            if self.hovered_tab >= 0:
-                close_btn = QToolButton(self)
-                close_btn.setText("×")
-                tab_close_btn_size = int(16 * getattr(self, 'parent_window', self).dpi_scale if hasattr(getattr(self, 'parent_window', self), 'dpi_scale') else 16)
-                close_btn.setFixedSize(tab_close_btn_size, tab_close_btn_size)
-                close_btn.setStyleSheet("""
-                    QToolButton {
-                        border: none;
-                        background: transparent;
-                        color: #666;
-                        font-size: 18px;
-                        font-weight: bold;
-                        padding: 0px;
-                        margin: 0px;
-                    }
-                    QToolButton:hover {
-                        background: #ff6b6b;
-                        color: white;
-                        border-radius: 8px;
-                    }
-                """)
-                close_btn.clicked.connect(lambda: self.close_tab_at_index(self.hovered_tab))
-                self.setTabButton(self.hovered_tab, QTabBar.RightSide, close_btn)
-        
+        self.hovered_tab = tab_index
         super().mouseMoveEvent(event)
     
     def leaveEvent(self, event):
-        """鼠标离开标签栏时移除关闭按钮"""
-        if self.hovered_tab >= 0:
-            self.setTabButton(self.hovered_tab, QTabBar.RightSide, None)
-            self.hovered_tab = -1
+        """鼠标离开标签栏"""
+        self.hovered_tab = -1
         super().leaveEvent(event)
     
+    def _make_close_btn(self, index):
+        """创建关闭按钮，始终可见，hover 时变灰"""
+        close_btn = QToolButton(self)
+        close_btn.setText("×")
+        tab_close_btn_size = int(16 * getattr(self, 'parent_window', self).dpi_scale if hasattr(getattr(self, 'parent_window', self), 'dpi_scale') else 16)
+        close_btn.setFixedSize(tab_close_btn_size, tab_close_btn_size)
+        close_btn.setStyleSheet("""
+            QToolButton {
+                border: none;
+                background: transparent;
+                color: #999;
+                font-size: 18px;
+                font-weight: bold;
+                padding: 0px;
+                margin: 0px;
+            }
+            QToolButton:hover {
+                background: #cccccc;
+                color: #333;
+                border-radius: 4px;
+            }
+        """)
+        def _on_click(_checked=False, btn=close_btn, tabbar=self):
+            # 通过按钮在 TabBar 中的位置反查标签索引，避免 PyQt 对象包装导致的身份比较失效
+            tab_index = tabbar.tabAt(btn.mapToParent(QPoint(1, 1)))
+            if tab_index < 0:
+                tab_index = tabbar.tabAt(btn.pos())
+            if tab_index >= 0 and tabbar.main_window and hasattr(tabbar.main_window, 'close_tab'):
+                tabbar.main_window.close_tab(tab_index)
+        close_btn.clicked.connect(_on_click)
+        return close_btn
+
+    def tabInserted(self, index):
+        """标签添加时自动附加关闭按钮"""
+        super().tabInserted(index)
+        close_btn = self._make_close_btn(index)
+        self.setTabButton(index, QTabBar.RightSide, close_btn)
+
     def close_tab_at_index(self, index):
-        """关闭指定索引的标签页，并刷新关闭按钮显示"""
+        """关闭指定索引的标签页"""
         if self.main_window and hasattr(self.main_window, 'close_tab'):
             self.main_window.close_tab(index)
-            self.show_close_button_under_cursor()
 
     def show_close_button_under_cursor(self):
-        """在鼠标当前位置自动显示关闭按钮（用于标签切换/关闭/移动后）"""
-        from PyQt5.QtGui import QCursor
-        pos = self.mapFromGlobal(QCursor.pos())
-        tab_index = self.tabAt(pos)
-        if tab_index != self.hovered_tab:
-            if self.hovered_tab >= 0:
-                self.setTabButton(self.hovered_tab, QTabBar.RightSide, None)
-            self.hovered_tab = tab_index
-        if self.hovered_tab >= 0:
-            close_btn = QToolButton(self)
-            close_btn.setText("×")
-            tab_close_btn_size = int(16 * getattr(self, 'parent_window', self).dpi_scale if hasattr(getattr(self, 'parent_window', self), 'dpi_scale') else 16)
-            close_btn.setFixedSize(tab_close_btn_size, tab_close_btn_size)
-            close_btn.setStyleSheet("""
-                QToolButton {
-                    border: none;
-                    background: transparent;
-                    color: #666;
-                    font-size: 18px;
-                    font-weight: bold;
-                    padding: 0px;
-                    margin: 0px;
-                }
-                QToolButton:hover, QToolButton:pressed, QToolButton[forceHover="true"] {
-                    background: #ff6b6b;
-                    color: white;
-                    border-radius: 8px;
-                }
-            """)
-            close_btn.clicked.connect(lambda: self.close_tab_at_index(self.hovered_tab))
-            self.setTabButton(self.hovered_tab, QTabBar.RightSide, close_btn)
-            # 检查鼠标是否在按钮rect内，若在则强制高亮
-            from PyQt5.QtGui import QCursor
-            btn_rect = close_btn.rect()
-            btn_pos = close_btn.mapFromGlobal(QCursor.pos())
-            if btn_rect.contains(btn_pos):
-                close_btn.setProperty("forceHover", True)
-                close_btn.setStyle(close_btn.style())
-            else:
-                close_btn.setProperty("forceHover", False)
-                close_btn.setStyle(close_btn.style())
+        """关闭标签后重建所有按钮（索引已变化）"""
+        for i in range(self.count()):
+            if self.tabButton(i, QTabBar.RightSide) is None:
+                close_btn = self._make_close_btn(i)
+                self.setTabButton(i, QTabBar.RightSide, close_btn)
     
     def on_tab_moved(self, from_index, to_index):
         """标签页移动后的处理，确保固定标签页始终在左侧，并同步content_stack，并刷新关闭按钮显示"""
