@@ -7500,28 +7500,30 @@ class MainWindow(QMainWindow):
             from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QIcon
             
             te_icon = QIcon()
-            # 18px 为基准，按这个比例执行所有尺寸
+            # 按 256px 基准等比例生成各尺寸图标
             for size in [256, 128, 96, 64, 48, 32, 24, 18, 16]:
                 pix = QPixmap(size, size)
                 pix.fill(Qt.transparent)
                 p = QPainter(pix)
                 p.setRenderHint(QPainter.Antialiasing)
-                blue = QColor(33, 150, 243)
-                white = QColor(255, 255, 255)
-                # 外层蓝色方形（无圆角）
+                blue = QColor("#2196F3")
+                white = QColor("white")
+                # 外层蓝色圆角背景
+                outer_radius = max(2, size * 40 // 256)
                 p.setBrush(blue)
                 p.setPen(Qt.NoPen)
-                p.drawRect(0, 0, size, size)
-                # 内层白色区域（边框占 11%）
-                margin = max(2, size * 11 // 100)
-                inner_radius = 1
+                p.drawRoundedRect(0, 0, size, size, outer_radius, outer_radius)
+                # 内层白色圆角容器（形成蓝色边框效果）
+                margin = max(2, size * 28 // 256)
+                inner_radius = max(2, size * 24 // 256)
                 p.setBrush(white)
                 p.drawRoundedRect(margin, margin, size - 2*margin, size - 2*margin, inner_radius, inner_radius)
                 # 中央蓝色 TE 文字
                 p.setPen(blue)
                 f = QFont()
                 f.setBold(True)
-                f.setPointSize(max(5, int(size * 0.65)))
+                f.setPointSize(max(5, size * 130 // 256))
+                f.setStretch(70)  # 压窄字体，使其看起来更高
                 p.setFont(f)
                 p.drawText(pix.rect(), Qt.AlignCenter, "TE")
                 p.end()

@@ -9,50 +9,62 @@ import os
 
 def create_te_icon(filename='TabExplorer.ico', size=256):
     """
-    创建一个带有 TE 字母的图标
-    以 18px 为基准，按这个比例执行所有尺寸
+    创建蓝白圆角主题的 TE 图标
+    按 256px 基准等比例生成各尺寸
     """
     from PIL import Image, ImageDraw, ImageFont
     
     blue = (33, 150, 243)  # #2196F3
     white = (255, 255, 255)
 
-    # 蓝色方形背景（无圆角）
     img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    draw.rectangle([(0, 0), (size - 1, size - 1)], fill=blue)
-
-    # 内层白色区域（边框占 11%）
-    margin = max(2, size * 11 // 100)
-    inner_radius = 1
+    
+    # 外层蓝色圆角背景
+    outer_radius = max(2, size * 40 // 256)
+    draw.rounded_rectangle(
+        [(0, 0), (size - 1, size - 1)],
+        radius=outer_radius,
+        fill=blue
+    )
+    
+    # 内层白色圆角容器（形成蓝色边框效果）
+    margin = max(2, size * 28 // 256)
+    inner_radius = max(2, size * 24 // 256)
     draw.rounded_rectangle(
         [(margin, margin), (size - margin - 1, size - margin - 1)],
         radius=inner_radius,
         fill=white
     )
 
-    # 蓝色 TE 文字
+    # 蓝色 TE 文字（精确填充内框高度，压窄宽度使其瘦高）
     text = "TE"
-    font_size = max(5, int(size * 0.65))
     font = None
     for font_path in ["arialbd.ttf", "arial.ttf",
                       "C:\\Windows\\Fonts\\arialbd.ttf",
                       "C:\\Windows\\Fonts\\arial.ttf"]:
         try:
-            font = ImageFont.truetype(font_path, font_size)
+            font = ImageFont.truetype(font_path, 512)
             break
         except:
             continue
     if font is None:
         font = ImageFont.load_default()
 
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
-    x = (size - text_width) // 2
-    y = (size - text_height) // 2
-
-    draw.text((x, y), text, font=font, fill=blue)
+    # 在大画布上渲染，裁剪实际文字像素边界
+    big = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
+    big_draw = ImageDraw.Draw(big)
+    big_draw.text((256, 256), text, font=font, fill=blue)
+    bbox = big.getbbox()
+    if bbox:
+        text_crop = big.crop(bbox)
+        inner = size - 2 * max(2, size * 28 // 256)
+        target_h = int(inner * 0.82)   # 高度：内框的 82%
+        target_w = int(target_h * 0.90)  # 宽度：高度的 90%，使 TE 瘦高
+        text_resized = text_crop.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        px = (size - target_w) // 2
+        py = (size - target_h) // 2
+        img.paste(text_resized, (px, py), text_resized)
     
     # 保存为 ICO 文件
     icon_sizes = [(256, 256), (128, 128), (96, 96), (64, 64), (48, 48), (32, 32), (24, 24), (18, 18), (16, 16)]
