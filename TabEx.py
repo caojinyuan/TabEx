@@ -5899,10 +5899,20 @@ class MainWindow(QMainWindow):
         title_layout.setContentsMargins(0, 0, 0, 0)
         title_layout.setSpacing(6)
         
-        # 应用图标
-        icon_label = QLabel("📂")
-        icon_label.setStyleSheet("font-size: 14pt; padding: 0; margin: 0;")
+        # 应用图标 - 使用 QLabel 显示 QPixmap
+        icon_label = QLabel()
+        icon_label.setFixedSize(18, 18)
+        icon_label.setStyleSheet("padding: 0; margin: 0;")
+        try:
+            from PyQt5.QtWidgets import QApplication
+            app_icon = QApplication.instance().windowIcon()
+            if not app_icon.isNull():
+                icon_label.setPixmap(app_icon.pixmap(18, 18))
+        except Exception:
+            icon_label.setText("🗂")
+            icon_label.setStyleSheet("font-size: 14pt; padding: 0; margin: 0;")
         title_layout.addWidget(icon_label)
+        self._title_icon_label = icon_label  # 保存引用供后续更新
         
         # 应用名称
         self.title_label = QLabel("Tab Explorer")
@@ -7485,12 +7495,48 @@ class MainWindow(QMainWindow):
         # 性能优化：延迟加载非关键功能（100ms后加载）
         QTimer.singleShot(100, self._delayed_initialization)
 
-        # 使用应用图标作为窗口图标
+        # 生成并设置 TE 窗口图标
         try:
+            from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QIcon
+            
+            te_icon = QIcon()
+            # 18px 为基准，按这个比例执行所有尺寸
+            for size in [256, 128, 96, 64, 48, 32, 24, 18, 16]:
+                pix = QPixmap(size, size)
+                pix.fill(Qt.transparent)
+                p = QPainter(pix)
+                p.setRenderHint(QPainter.Antialiasing)
+                blue = QColor(33, 150, 243)
+                white = QColor(255, 255, 255)
+                # 外层蓝色方形（无圆角）
+                p.setBrush(blue)
+                p.setPen(Qt.NoPen)
+                p.drawRect(0, 0, size, size)
+                # 内层白色区域（边框占 11%）
+                margin = max(2, size * 11 // 100)
+                inner_radius = 1
+                p.setBrush(white)
+                p.drawRoundedRect(margin, margin, size - 2*margin, size - 2*margin, inner_radius, inner_radius)
+                # 中央蓝色 TE 文字
+                p.setPen(blue)
+                f = QFont()
+                f.setBold(True)
+                f.setPointSize(max(5, int(size * 0.65)))
+                p.setFont(f)
+                p.drawText(pix.rect(), Qt.AlignCenter, "TE")
+                p.end()
+                te_icon.addPixmap(pix, QIcon.Normal)
+            
+            self.setWindowIcon(te_icon)
+            # 同时设置到 QApplication，使任务栏也生效
             from PyQt5.QtWidgets import QApplication
-            self.setWindowIcon(QApplication.windowIcon())
-        except Exception:
-            pass
+            QApplication.instance().setWindowIcon(te_icon)
+            # 更新自定义标题栏中的图标 Label
+            if hasattr(self, '_title_icon_label'):
+                self._title_icon_label.setPixmap(te_icon.pixmap(18, 18))
+            print("[Icon] ✓ TE icon set on window and application")
+        except Exception as e:
+            print(f"[Icon] ✗ Failed to set TE icon: {e}")
     
     def load_config(self):
         """加载配置文件"""
@@ -10111,6 +10157,9 @@ def try_send_to_existing_instance(path):
 
 def main():
     # 支持命令行参数：打开指定路径
+    import sys
+    import os
+    
     path_to_open = None
     if len(sys.argv) > 1:
         path = sys.argv[1]
@@ -10128,7 +10177,6 @@ def main():
                 sys.exit(0)  # 退出程序，不启动新实例
     
     # 禁用 Qt 的警告输出（在创建 QApplication 之前设置）
-    import os
     os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
     
     # 启用高DPI支持（在创建QApplication之前）
@@ -10159,37 +10207,11 @@ def main():
     from PyQt5.QtCore import qInstallMessageHandler
     qInstallMessageHandler(qt_message_handler)
     
-    # 创建并设置应用图标（用于任务栏与窗口）
-    try:
-        from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QIcon
-        # 生成简单的蓝白主题图标，呼应应用配色
-        pix = QPixmap(256, 256)
-        pix.fill(Qt.transparent)
-        painter = QPainter(pix)
-        painter.setRenderHint(QPainter.Antialiasing)
-        blue = QColor("#2196F3")
-        white = QColor("white")
-        # 外层蓝色圆角背景
-        painter.setBrush(blue)
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(0, 0, 256, 256, 40, 40)
-        # 内层白色圆角容器，形成蓝色边框效果
-        margin = 28
-        painter.setBrush(white)
-        painter.drawRoundedRect(margin, margin, 256 - 2*margin, 256 - 2*margin, 24, 24)
-        # 中央绘制 "TE" 字样（TabExplorer缩写）
-        painter.setPen(blue)
-        font = QFont()
-        font.setBold(True)
-        font.setPointSize(96)
-        painter.setFont(font)
-        painter.drawText(pix.rect(), Qt.AlignCenter, "TE")
-        painter.end()
-        icon = QIcon(pix)
-        app.setWindowIcon(icon)
-    except Exception as e:
-        debug_print(f"[Icon] Failed to create app icon: {e}")
+    # 图标将在 MainWindow.__init__ 中生成并设置，确保 Qt 完全初始化后执行
+    
+    # 创建窗口（图标在 MainWindow.__init__ 内部生成）
     window = MainWindow()
+    
     
     # 如果有路径参数，在新窗口中打开
     # 注意：固定标签页在延迟初始化阶段加载，这里要避免和固定标签重复

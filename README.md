@@ -158,6 +158,53 @@
 
 如遇问题，请在 [Issues](../../issues) 页面反馈，建议开启调试模式（`设置` → `启用调试输出`）以获取详细日志。
 
+---
+
+## 🎨 图标维护
+
+### 图标文件
+- `TabExplorer.ico` - 应用图标，支持多分辨率（256, 128, 96, 64, 48, 32, 24, 18, 16 px）
+- `generate_icon.py` - 图标生成脚本，基于 Pillow
+
+### 修改图标设计
+1. 编辑 `generate_icon.py` 中的 `create_te_icon()` 函数，修改色彩、边框、文字等参数
+2. 运行脚本生成新图标：
+   ```bash
+   python generate_icon.py
+   ```
+3. 图标将自动保存为 `TabExplorer.ico`
+4. 如需打包 exe，运行 `2_build_exe.bat` 即可
+
+### 图标设计原则
+- **所有尺寸统一比例**：基于 18px 标准，边框占 11%，字体大小占 65%
+- **外形**：方形，无圆角（仅内部白框有 1px 圆角）
+- **配色**：蓝色背景（#2196F3）+ 白色内框 + 蓝色 TE 文字
+- **多尺寸**：使用 LANCZOS 重采样确保缩小后清晰
+
+---
+
+## 💻 开发与贡献
+
+### 构建可执行文件
+```bash
+# 1. 清空旧输出
+Remove-Item build, dist -Recurse -Force -ErrorAction SilentlyContinue
+
+# 2. 运行打包脚本
+.\2_build_exe.bat
+```
+
+### 项目文件说明
+- `TabEx.py` - 主程序入口
+- `requirements.txt` - Python 依赖列表
+- `config.json` / `config - 副本.json` - 应用配置示例
+- `bookmarks.json` - 书签数据
+- `0_install_requirements.bat` - 依赖安装脚本
+- `1_TabEx.bat` - 源码运行脚本
+- `2_build_exe.bat` - PyInstaller 打包脚本
+- `generate_icon.py` - 图标生成脚本
+- `clear_icon_cache.bat` - Windows 图标缓存清理脚本（仅 Windows）
+
 
 
 

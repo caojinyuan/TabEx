@@ -56,8 +56,19 @@ echo [步骤 3/4] 正在打包程序...
 echo 这可能需要几分钟时间，请耐心等待...
 echo.
 
+REM 检查是否存在图标文件
+if exist TabExplorer.ico (
+    echo 检测到自定义图标文件
+    set ICON_PARAM=--icon=TabExplorer.ico
+    set DATA_PARAM=--add-data "TabExplorer.ico;."
+) else (
+    echo 未找到 TabExplorer.ico，将使用默认图标
+    set ICON_PARAM=
+    set DATA_PARAM=
+)
+
 REM 打包成单个exe文件，直接输出到当前目录
-pyinstaller --onefile --windowed --name TabExplorer --distpath . TabEx.py
+pyinstaller --onefile --windowed --name TabExplorer %ICON_PARAM% %DATA_PARAM% --distpath . TabEx.py
 
 if errorlevel 1 (
     echo.
@@ -70,6 +81,18 @@ echo.
 echo [步骤 4/4] 清理临时文件...
 if exist build rmdir /s /q build
 if exist TabExplorer.spec del /q TabExplorer.spec
+
+REM 复制 ico 文件到 exe 同目录（确保程序能找到）
+if exist TabExplorer.ico (
+    echo 复制图标文件到 exe 目录...
+    copy /y TabExplorer.ico .
+    if exist TabExplorer.exe (
+        REM 验证 ico 文件已复制
+        if exist TabExplorer.ico (
+            echo ✓ 图标文件已准备好
+        )
+    )
+)
 
 echo.
 echo ======================================
