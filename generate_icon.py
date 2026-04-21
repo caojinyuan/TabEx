@@ -75,15 +75,10 @@ def create_te_icon(filename='TabExplorer.ico', size=256):
             icons_img = img
         else:
             icons_img = img.resize(icon_size, Image.Resampling.LANCZOS)
-        # 转为 RGB（ICO 格式需要）
-        bg = Image.new('RGB', icons_img.size, (255, 255, 255))
-        if icons_img.mode == 'RGBA':
-            bg.paste(icons_img, mask=icons_img.split()[3])
-        else:
-            bg.paste(icons_img)
-        images.append(bg)
+        # 保持 RGBA 模式以支持透明度
+        images.append(icons_img)
     
-    # 保存 ICO 文件
+    # 保存 ICO 文件（RGBA 格式支持透明）
     images[0].save(
         filename,
         format='ICO',
