@@ -1381,9 +1381,9 @@ import time
 import socket
 import threading
 import queue
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QTreeView, QFileSystemModel, QSplitter, QProgressBar, QCompleter, QFrame)  # 添加QFrame
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QTreeView, QFileSystemModel, QSplitter, QProgressBar, QCompleter, QFrame, QToolButton, QFileIconProvider)  # 添加QFrame
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer, QThread, QMutex, QMimeData
+from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer, QThread, QMutex, QMimeData, QFileInfo, QEvent
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor, QDrag
 # from PyQt5.QtGui import QIcon  # unused
 
@@ -5307,6 +5307,288 @@ class ChatPanel(QWidget):
         return content
 
 
+class TitleShortcutBar(QWidget):
+    """标题栏快捷方式区域：支持拖拽 .lnk 并点击运行。"""
+
+    shortcutDropped = pyqtSignal(str)
+    shortcutClicked = pyqtSignal(str)
+    shortcutsChanged = pyqtSignal(list)
+
+    def __init__(self, parent=None, icon_size=18, button_size=28):
+        super().__init__(parent)
+        self._icon_size = icon_size
+        self._button_size = button_size
+        self._paths = []
+        self._icon_provider = QFileIconProvider()
+        self._drag_start_pos = None
+        self._drag_source_index = -1
+        self.setAcceptDrops(True)
+
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(2)
+
+        self._hint_label = QLabel("拖入快捷方式")
+        self._hint_label.setStyleSheet("QLabel { color: #666; font-size: 9pt; padding: 0 4px; }")
+        self._hint_label.setAcceptDrops(True)
+        self._hint_label.installEventFilter(self)
+        self._layout.addWidget(self._hint_label)
+
+    def set_shortcuts(self, paths):
+        cleaned = []
+        for path in paths or []:
+            if isinstance(path, str) and path and path not in cleaned:
+                cleaned.append(path)
+        self._paths = cleaned[:20]
+        self._rebuild_buttons()
+
+    def get_shortcuts(self):
+        return list(self._paths)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat("application/x-tabex-shortcut-index"):
+            event.acceptProposedAction()
+            return
+        if self._collect_shortcuts_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat("application/x-tabex-shortcut-index"):
+            event.acceptProposedAction()
+            return
+        if self._collect_shortcuts_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasFormat("application/x-tabex-shortcut-index"):
+            try:
+                source_index = int(bytes(event.mimeData().data("application/x-tabex-shortcut-index")).decode("utf-8"))
+            except Exception:
+                event.ignore()
+                return
+            target_index = self._get_insert_index(event.pos().x())
+            self._reorder_shortcut(source_index, target_index)
+            event.acceptProposedAction()
+            return
+
+        paths = self._collect_shortcuts_from_mime(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        for path in paths:
+            self.shortcutDropped.emit(path)
+        event.acceptProposedAction()
+
+    def eventFilter(self, obj, event):
+        if isinstance(obj, QToolButton) and obj.parent() is self:
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                path = obj.property("shortcut_path")
+                if path in self._paths:
+                    self._drag_start_pos = event.globalPos()
+                    self._drag_source_index = self._paths.index(path)
+                return False
+            if event.type() == QEvent.MouseMove and (event.buttons() & Qt.LeftButton):
+                if self._drag_start_pos is not None and self._drag_source_index >= 0:
+                    if (event.globalPos() - self._drag_start_pos).manhattanLength() >= QApplication.startDragDistance():
+                        source_index = self._drag_source_index
+                        self._drag_start_pos = None
+                        self._drag_source_index = -1
+                        self._start_drag_from_index(source_index)
+                        return True
+                return False
+            if event.type() == QEvent.MouseButtonRelease:
+                self._drag_start_pos = None
+                self._drag_source_index = -1
+                return False
+
+        if event.type() in (QEvent.DragEnter, QEvent.DragMove):
+            mime_data = event.mimeData() if hasattr(event, 'mimeData') else None
+            if mime_data and (mime_data.hasFormat("application/x-tabex-shortcut-index") or self._collect_shortcuts_from_mime(mime_data)):
+                event.acceptProposedAction()
+                return True
+        elif event.type() == QEvent.Drop:
+            mime_data = event.mimeData() if hasattr(event, 'mimeData') else None
+            if not mime_data:
+                return super().eventFilter(obj, event)
+
+            if mime_data.hasFormat("application/x-tabex-shortcut-index"):
+                try:
+                    source_index = int(bytes(mime_data.data("application/x-tabex-shortcut-index")).decode("utf-8"))
+                except Exception:
+                    event.ignore()
+                    return True
+                local_pos = obj.mapTo(self, event.pos()) if isinstance(obj, QWidget) else event.pos()
+                target_index = self._get_insert_index(local_pos.x())
+                self._reorder_shortcut(source_index, target_index)
+                event.acceptProposedAction()
+                return True
+
+            paths = self._collect_shortcuts_from_mime(mime_data)
+            if paths:
+                for path in paths:
+                    self.shortcutDropped.emit(path)
+                event.acceptProposedAction()
+                return True
+
+        return super().eventFilter(obj, event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start_pos = event.pos()
+            self._drag_source_index = self._button_index_at(event.pos())
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not (event.buttons() & Qt.LeftButton):
+            super().mouseMoveEvent(event)
+            return
+        if self._drag_start_pos is None or self._drag_source_index < 0:
+            super().mouseMoveEvent(event)
+            return
+        if (event.pos() - self._drag_start_pos).manhattanLength() < QApplication.startDragDistance():
+            super().mouseMoveEvent(event)
+            return
+
+        source_index = self._drag_source_index
+        self._drag_start_pos = None
+        self._drag_source_index = -1
+        self._start_drag_from_index(source_index)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start_pos = None
+        self._drag_source_index = -1
+        super().mouseReleaseEvent(event)
+
+    def _collect_shortcuts_from_mime(self, mime_data):
+        if not mime_data or not mime_data.hasUrls():
+            return []
+        paths = []
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            path = url.toLocalFile()
+            if not path:
+                continue
+            lower_path = path.lower()
+            if lower_path.endswith('.lnk') and os.path.isfile(path):
+                paths.append(path)
+        return paths
+
+    def _rebuild_buttons(self):
+        while self._layout.count() > 0:
+            item = self._layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        # 提示文字固定在最左侧
+        self._hint_label = QLabel("+ 拖入快捷方式")
+        self._hint_label.setStyleSheet("QLabel { color: #888; font-size: 9pt; padding: 0 4px; }")
+        self._hint_label.setAcceptDrops(True)
+        self._hint_label.installEventFilter(self)
+        self._layout.addWidget(self._hint_label)
+
+        if not self._paths:
+            return
+
+        for path in self._paths:
+            btn = QToolButton(self)
+            btn.setAutoRaise(True)
+            btn.setFixedSize(self._button_size, self._button_size)
+            icon_px = max(12, min(self._icon_size, self._button_size - 8))
+            btn.setIconSize(QSize(icon_px, icon_px))
+            btn.setToolTip(f"{os.path.basename(path)}\n{path}\n左键启动，右键移除，拖拽可排序")
+            icon = self._icon_provider.icon(QFileInfo(path))
+            if not icon.isNull():
+                btn.setIcon(icon)
+            else:
+                btn.setText("↗")
+            btn.setStyleSheet(
+                "QToolButton { background: transparent; border: none; border-radius: 4px; padding: 0px; margin: 0px; }"
+                "QToolButton:hover { background: #e0e0e0; }"
+                "QToolButton:pressed { background: #d0d0d0; }"
+            )
+            btn.setAcceptDrops(True)
+            btn.installEventFilter(self)
+            btn.setProperty("shortcut_path", path)
+            btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn.customContextMenuRequested.connect(lambda pos, b=btn: self._show_context_menu_for_button(b, pos))
+            btn.clicked.connect(lambda _checked=False, p=path: self.shortcutClicked.emit(p))
+            self._layout.addWidget(btn)
+
+    def _show_context_menu_for_button(self, btn, pos):
+        path = btn.property("shortcut_path")
+        if not path:
+            return
+        menu = QMenu(self)
+        remove_action = menu.addAction("移除该快捷方式")
+        action = menu.exec_(btn.mapToGlobal(pos))
+        if action == remove_action:
+            self._remove_shortcut(path)
+
+    def _remove_shortcut(self, path):
+        if path not in self._paths:
+            return
+        self._paths = [p for p in self._paths if p != path]
+        self._rebuild_buttons()
+        self.shortcutsChanged.emit(list(self._paths))
+
+    def _button_index_at(self, pos):
+        widget = self.childAt(pos)
+        while widget and widget is not self:
+            if isinstance(widget, QToolButton):
+                path = widget.property("shortcut_path")
+                if path in self._paths:
+                    return self._paths.index(path)
+            widget = widget.parentWidget()
+        return -1
+
+    def _get_insert_index(self, x_pos):
+        button_centers = []
+        for i in range(self._layout.count()):
+            item = self._layout.itemAt(i)
+            widget = item.widget()
+            if isinstance(widget, QToolButton):
+                g = widget.geometry()
+                button_centers.append((g.left() + g.right()) // 2)
+        if not button_centers:
+            return 0
+        for idx, center in enumerate(button_centers):
+            if x_pos < center:
+                return idx
+        return len(button_centers)
+
+    def _reorder_shortcut(self, source_index, target_index):
+        if source_index < 0 or source_index >= len(self._paths):
+            return
+        if target_index > source_index:
+            target_index -= 1
+        if target_index < 0:
+            target_index = 0
+        if target_index >= len(self._paths):
+            target_index = len(self._paths) - 1
+        if target_index == source_index:
+            return
+        moving = self._paths.pop(source_index)
+        self._paths.insert(target_index, moving)
+        self._rebuild_buttons()
+        self.shortcutsChanged.emit(list(self._paths))
+
+    def _start_drag_from_index(self, source_index):
+        if source_index < 0 or source_index >= len(self._paths):
+            return
+        drag = QDrag(self)
+        mime_data = QMimeData()
+        mime_data.setData("application/x-tabex-shortcut-index", str(source_index).encode("utf-8"))
+        drag.setMimeData(mime_data)
+        drag.exec_(Qt.MoveAction)
+
+
 class MainWindow(QMainWindow):
     def _is_control_panel_path_for_monitor(self, path):
         """判断路径是否为控制面板或其子目录（供Explorer Monitor用）"""
@@ -5489,6 +5771,71 @@ class MainWindow(QMainWindow):
             self.git_log_button.setVisible(enable)
         if hasattr(self, 'git_commit_button'):
             self.git_commit_button.setVisible(enable)
+
+    def apply_title_shortcuts_config(self):
+        """根据配置显示/隐藏标题栏快捷方式区域。"""
+        enable = self.config.get("enable_title_shortcuts", True)
+        if hasattr(self, 'title_shortcut_bar'):
+            self.title_shortcut_bar.setVisible(enable)
+        if hasattr(self, 'shortcut_git_separator'):
+            self.shortcut_git_separator.setVisible(enable)
+
+    def refresh_title_shortcuts_ui(self):
+        """刷新标题栏快捷方式按钮。"""
+        if not hasattr(self, 'title_shortcut_bar'):
+            return
+        shortcuts = self.config.get("title_shortcuts", [])
+        if not isinstance(shortcuts, list):
+            shortcuts = []
+        cleaned = []
+        for path in shortcuts:
+            if isinstance(path, str) and path and os.path.exists(path) and path not in cleaned:
+                cleaned.append(path)
+        if cleaned != shortcuts:
+            self.config["title_shortcuts"] = cleaned
+            self.save_config()
+        self.title_shortcut_bar.set_shortcuts(cleaned)
+
+    def on_title_shortcut_dropped(self, path):
+        """处理拖入标题栏快捷方式区域的 .lnk 文件。"""
+        if not isinstance(path, str) or not path.lower().endswith('.lnk'):
+            return
+        shortcuts = self.config.get("title_shortcuts", [])
+        if not isinstance(shortcuts, list):
+            shortcuts = []
+        if path in shortcuts:
+            return
+        # 新拖入的快捷方式优先放在左侧
+        shortcuts.insert(0, path)
+        self.config["title_shortcuts"] = shortcuts[:20]
+        self.refresh_title_shortcuts_ui()
+        self.save_config()
+
+    def on_title_shortcuts_changed(self, paths):
+        """处理标题栏快捷方式顺序/删除变更。"""
+        self.config["title_shortcuts"] = list(paths or [])[:20]
+        self.save_config()
+
+    def open_title_shortcut(self, path):
+        """点击标题栏快捷方式后启动对应程序。"""
+        if not path or not os.path.exists(path):
+            show_toast(self, "提示", "快捷方式不存在，已从列表移除", level="warning")
+            shortcuts = self.config.get("title_shortcuts", [])
+            if path in shortcuts:
+                shortcuts = [p for p in shortcuts if p != path]
+                self.config["title_shortcuts"] = shortcuts
+                self.refresh_title_shortcuts_ui()
+                self.save_config()
+            return
+        try:
+            display_name = os.path.splitext(os.path.basename(path))[0] or os.path.basename(path)
+            if os.name == 'nt':
+                os.startfile(path)
+            else:
+                launch_detached([path])
+            show_toast(self, "已启动", f"运行: {display_name}", level="info")
+        except Exception as e:
+            show_toast(self, "错误", f"无法启动快捷方式: {e}", level="error")
 
     def toggle_chat_panel(self):
         """切换 AI 聊天面板的显示/隐藏。"""
@@ -5910,6 +6257,24 @@ class MainWindow(QMainWindow):
         btn_size = int(32 * getattr(self, 'dpi_scale', 1.0))
         btn_font_size = int(14 * getattr(self, 'dpi_scale', 1.0))
         btn_radius = int(4 * getattr(self, 'dpi_scale', 1.0))
+
+        # 标题栏快捷方式区域（位于 Git 按钮左侧）
+        shortcut_btn_size = max(int(24 * getattr(self, 'dpi_scale', 1.0)), btn_size - int(6 * getattr(self, 'dpi_scale', 1.0)))
+        icon_size = max(14, int(shortcut_btn_size * 0.62))
+        self.title_shortcut_bar = TitleShortcutBar(self, icon_size=icon_size, button_size=shortcut_btn_size)
+        self.title_shortcut_bar.shortcutDropped.connect(self.on_title_shortcut_dropped)
+        self.title_shortcut_bar.shortcutClicked.connect(self.open_title_shortcut)
+        self.title_shortcut_bar.shortcutsChanged.connect(self.on_title_shortcuts_changed)
+        self.refresh_title_shortcuts_ui()
+        titlebar_layout.addWidget(self.title_shortcut_bar)
+
+        # 快捷方式区域与 Git 区域分隔线
+        self.shortcut_git_separator = QFrame()
+        self.shortcut_git_separator.setFrameShape(QFrame.VLine)
+        self.shortcut_git_separator.setFrameShadow(QFrame.Plain)
+        self.shortcut_git_separator.setStyleSheet("background-color: #d0d0d0; max-width: 1px;")
+        self.shortcut_git_separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
+        titlebar_layout.addWidget(self.shortcut_git_separator)
         
         git_btn_style = f"""
             QPushButton {{
@@ -7120,6 +7485,8 @@ class MainWindow(QMainWindow):
             self.config["debug_mode"] = dlg.debug_mode_cb.isChecked()
             self.config["explorer_monitor_interval"] = new_interval
             self.config["enable_cache_tabs"] = dlg.cache_tabs_cb.isChecked()
+            self.config["enable_tortoisegit_buttons"] = dlg.tortoisegit_buttons_cb.isChecked()
+            self.config["enable_title_shortcuts"] = dlg.title_shortcuts_cb.isChecked()
 
             # 更新全局调试开关
             set_debug_mode(self.config["debug_mode"])
@@ -7140,6 +7507,10 @@ class MainWindow(QMainWindow):
             self.config["hotkeys"]["copy_filename"] = dlg.hotkey_copy_filename.isChecked()
             
             self.save_config()
+
+            # 同步标题栏按钮可见性
+            self.apply_tortoisegit_buttons_config()
+            self.apply_title_shortcuts_config()
             
             # 重新设置快捷键
             # 清除旧的快捷键
@@ -7446,6 +7817,8 @@ class MainWindow(QMainWindow):
         
         # 根据配置显示/隐藏 TortoiseGit 按钮
         self.apply_tortoisegit_buttons_config()
+        # 根据配置显示/隐藏标题栏快捷方式区域
+        self.apply_title_shortcuts_config()
         
         # 设置快捷键（在init_ui之后，确保所有组件已创建）
         self.setup_shortcuts()
@@ -7519,6 +7892,8 @@ class MainWindow(QMainWindow):
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
             "enable_tortoisegit_buttons": False,  # 默认关闭TortoiseGit按钮
+            "enable_title_shortcuts": True,  # 默认启用标题栏快捷方式区域
+            "title_shortcuts": [],  # 标题栏快捷方式（.lnk 路径）
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -9014,7 +9389,7 @@ class SettingsDialog(QDialog):
         # 设置为不可调边框的对话框
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         # 宽度固定，高度按内容自动计算
-        self.setFixedWidth(600)
+        self.setFixedWidth(820)
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(12)
@@ -9156,6 +9531,21 @@ class SettingsDialog(QDialog):
             w = git_layout.itemAt(i).widget()
             if w: compact_widget(w)
         left_col.addWidget(git_group)
+
+        # 快捷方式设置组（右侧独立分组）
+        shortcuts_group = QGroupBox("快捷方式设置")
+        shortcuts_layout = QVBoxLayout()
+        self.title_shortcuts_cb = QCheckBox("启用标题栏快捷方式区域（可拖拽 .lnk 并点击启动）", self)
+        self.title_shortcuts_cb.setChecked(config.get("enable_title_shortcuts", True))
+        self.title_shortcuts_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.title_shortcuts_cb.setToolTip("拖拽应用快捷方式到标题栏 Git 左侧区域，后续可一键启动")
+        shortcuts_layout.addWidget(self.title_shortcuts_cb)
+        shortcuts_group.setLayout(shortcuts_layout)
+        compact_groupbox(shortcuts_group)
+        for i in range(shortcuts_layout.count()):
+            w = shortcuts_layout.itemAt(i).widget()
+            if w: compact_widget(w)
+        right_col.addWidget(shortcuts_group)
 
         # 快捷键设置组
         hotkey_group = QGroupBox("快捷键设置")
@@ -9349,8 +9739,8 @@ class SettingsDialog(QDialog):
         left_col.addWidget(ai_group)
     
     # 添加左右两列到内容布局
-        content_layout.addLayout(left_col, 2)
-        content_layout.addLayout(right_col, 1)
+        content_layout.addLayout(left_col, 3)
+        content_layout.addLayout(right_col, 2)
         
         # 创建主垂直布局，放置内容和底部区域
         main_vertical_layout = QVBoxLayout()
