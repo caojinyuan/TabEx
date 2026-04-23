@@ -96,8 +96,18 @@ ASYNC_LOAD_ENABLED = True  # 是否启用异步加载
 # 状态栏目录计数缓存（避免高频 os.scandir）
 DIR_ENTRY_COUNT_CACHE_TTL_MS = 5000  # 状态栏目录计数缓存时间（提升到5秒，减少频繁os.scandir）
 STATUS_SELECTION_CACHE_TTL_MS = 400  # 选中项状态缓存，降低频繁 COM/文件属性查询
+STATUS_SELECTION_METADATA_LIMIT = 20  # 多选超过阈值时跳过逐项大小统计
 SHORTCUT_POLL_ACTIVE_MS = 160  # 主窗口激活时快捷键轮询频率
 SHORTCUT_POLL_INACTIVE_MS = 500  # 主窗口非激活时快捷键轮询频率
+SEARCH_RESULT_TYPE_COL_WIDTH = 90
+SEARCH_RESULT_DATE_COL_WIDTH = 155
+SEARCH_RESULT_SIZE_COL_WIDTH = 100
+DIR_TREE_COLUMN_WIDTH = 260
+STATUS_UPDATE_DEFER_MS = 80
+STATUS_TRACKING_INTERVAL_MS = 220
+STATUS_TRACKING_WINDOW_MS = 1400
+TITLE_SHORTCUT_EXTENSIONS = ('.lnk', '.exe', '.bat', '.cmd', '.ps1')
+SUPPORTED_TERMINAL_TOOLS = ('cmd', 'powershell', 'git-bash')
 
 
 def apply_runtime_performance_config(perf_cfg=None):
@@ -232,9 +242,9 @@ class SearchCache:
         self.cache = OrderedDict()
         self.max_size = max_size
     
-    def get_key(self, search_path, keyword, search_filename, search_content, file_types, force_metadata_degrade=False):
+    def get_key(self, search_path, keyword, search_filename, search_content, file_types, force_metadata_degrade=False, match_case=False, match_whole_word=False):
         """生成缓存键"""
-        key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}|{force_metadata_degrade}"
+        key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}|{force_metadata_degrade}|{match_case}|{match_whole_word}"
         return hashlib.md5(key_str.encode()).hexdigest()
     
     def get(self, key):
@@ -392,8 +402,8 @@ class SearchResultsTableModel(QAbstractTableModel):
         key_map = {
             0: lambda row: str(row.get('name', '')).lower(),
             1: lambda row: str(row.get('file_type', '')).lower(),
-            2: lambda row: str(row.get('date', '')),
-            3: lambda row: str(row.get('size', '')),
+            2: lambda row: (row.get('sort_date_ts') is None, row.get('sort_date_ts') if row.get('sort_date_ts') is not None else 0, str(row.get('date', ''))),
+            3: lambda row: (row.get('sort_size_bytes') is None, row.get('sort_size_bytes') if row.get('sort_size_bytes') is not None else -1, str(row.get('size', ''))),
         }
         key_fn = key_map.get(column)
         if key_fn is None or len(self._rows) <= 1:
@@ -413,9 +423,17 @@ class SearchResultsTableModel(QAbstractTableModel):
         start_row = len(self._rows)
         end_row = start_row + len(rows) - 1
         self.beginInsertRows(QModelIndex(), start_row, end_row)
-        self._rows.extend(rows)
+        normalized_rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_copy = dict(row)
+            row_copy.setdefault('sort_date_ts', None)
+            row_copy.setdefault('sort_size_bytes', None)
+            normalized_rows.append(row_copy)
+        self._rows.extend(normalized_rows)
         self.endInsertRows()
-        return len(rows)
+        return len(normalized_rows)
 
     def path_for_row(self, row):
         if 0 <= row < len(self._rows):
@@ -445,6 +463,27 @@ def detect_everything():
     
     return None
 
+
+def detect_notepad_plus_plus():
+    """检测系统中是否安装了 Notepad++。"""
+    import shutil
+
+    exe_path = shutil.which('notepad++.exe')
+    if exe_path:
+        return exe_path
+
+    common_paths = [
+        r'C:\Program Files\Notepad++\notepad++.exe',
+        r'C:\Program Files (x86)\Notepad++\notepad++.exe',
+        os.path.expandvars(r'%PROGRAMFILES%\Notepad++\notepad++.exe'),
+        os.path.expandvars(r'%PROGRAMFILES(X86)%\Notepad++\notepad++.exe'),
+        os.path.expandvars(r'%LOCALAPPDATA%\Programs\Notepad++\notepad++.exe'),
+    ]
+    for path in common_paths:
+        if os.path.exists(path):
+            return path
+    return None
+
 # 搜索对话框
 from PyQt5.QtCore import pyqtSignal as _pyqtSignal
 class SearchDialog(QDialog):    
@@ -462,6 +501,7 @@ class SearchDialog(QDialog):
         
         # 检测Everything
         self.everything_path = detect_everything()
+        self.notepad_plus_plus_path = detect_notepad_plus_plus()
         debug_print(f"[Search] Everything detected: {self.everything_path}")
         
         # 线程安全的结果队列（限制大小防止内存溢出）
@@ -529,6 +569,14 @@ class SearchDialog(QDialog):
         self.search_content_cb = QCheckBox("搜索文件内容")
         self.search_content_cb.setChecked(True)  # 默认也选中
         type_options.addWidget(self.search_content_cb)
+
+        self.match_case_cb = QCheckBox("区分大小写")
+        self.match_case_cb.setToolTip("区分大小写匹配文件名和文件内容")
+        type_options.addWidget(self.match_case_cb)
+
+        self.match_whole_word_cb = QCheckBox("全词匹配")
+        self.match_whole_word_cb.setToolTip("仅匹配完整单词，避免命中更长字符串的一部分")
+        type_options.addWidget(self.match_whole_word_cb)
         
         # Everything搜索选项
         self.use_everything_cb = QCheckBox("使用 Everything (极速)")
@@ -570,13 +618,19 @@ class SearchDialog(QDialog):
         self.result_list.setModel(self.result_model)
         self.result_list.horizontalHeader().setStretchLastSection(False)
         self.result_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.result_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.result_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.result_list.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.result_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.result_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self.result_list.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)
+        self.result_list.setColumnWidth(1, SEARCH_RESULT_TYPE_COL_WIDTH)
+        self.result_list.setColumnWidth(2, SEARCH_RESULT_DATE_COL_WIDTH)
+        self.result_list.setColumnWidth(3, SEARCH_RESULT_SIZE_COL_WIDTH)
         self.result_list.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.result_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.result_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.result_list.setWordWrap(False)
         self.result_list.doubleClicked.connect(self.on_result_double_clicked)
+        self.result_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.result_list.customContextMenuRequested.connect(self.show_result_context_menu)
         # 启用排序功能
         self.result_list.setSortingEnabled(True)
         # 设置自定义委托，让文件名列的省略号显示在开头
@@ -783,7 +837,9 @@ class SearchDialog(QDialog):
             self.search_filename_cb.isChecked(), 
             self.search_content_cb.isChecked(), 
             file_types,
-            force_metadata_degrade
+            force_metadata_degrade,
+            self.match_case_cb.isChecked(),
+            self.match_whole_word_cb.isChecked(),
         )
         cached_results = _search_cache.get(cache_key)
         
@@ -825,9 +881,11 @@ class SearchDialog(QDialog):
         # 在后台线程执行搜索
         import threading
         use_everything = self.use_everything_cb.isChecked() if self.everything_path else False
+        match_case = self.match_case_cb.isChecked()
+        match_whole_word = self.match_whole_word_cb.isChecked()
         self.search_thread = threading.Thread(
             target=self.do_search,
-            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked(), file_types, cache_key, use_everything, force_metadata_degrade)
+            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked(), file_types, cache_key, use_everything, force_metadata_degrade, match_case, match_whole_word)
         )
         self.search_thread.daemon = True
         self.search_thread.start()
@@ -841,9 +899,18 @@ class SearchDialog(QDialog):
             self._queue_idle_ticks = 0
             self._ensure_ui_update_timer(220)
     
-    def search_with_everything(self, keyword, search_path, file_types=""):
+    def search_with_everything(self, keyword, search_path, file_types="", match_case=False, match_whole_word=False):
         """使用Everything进行搜索"""
         import subprocess
+        import re
+
+        def _matches_filename(name):
+            if match_whole_word:
+                flags = 0 if match_case else re.IGNORECASE
+                return bool(re.search(rf'\b{re.escape(keyword)}\b', name, flags))
+            if match_case:
+                return keyword in name
+            return keyword.lower() in name.lower()
         
         try:
             # 构建Everything命令
@@ -887,7 +954,7 @@ class SearchDialog(QDialog):
                 for line in lines:
                     line = line.strip()
                     # es.exe 输出本身来自索引，避免逐条 exists 造成大量额外 I/O
-                    if line:
+                    if line and _matches_filename(os.path.basename(line)):
                         results.append(line)
                 
                 debug_print(f"[Everything] Found {len(results)} results")
@@ -903,8 +970,36 @@ class SearchDialog(QDialog):
             debug_print(f"[Everything] Error: {e}")
             return []
     
-    def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None, use_everything=False, force_metadata_degrade=False):
+    def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None, use_everything=False, force_metadata_degrade=False, match_case=False, match_whole_word=False):
+        import re
+
         metadata_degrade_count = 0
+        whole_word_pattern = None
+        whole_word_pattern_bytes = None
+        if match_whole_word:
+            whole_word_flags = 0 if match_case else re.IGNORECASE
+            whole_word_pattern = re.compile(rf'\b{re.escape(keyword)}\b', whole_word_flags)
+            if keyword.isascii():
+                byte_flags = 0 if match_case else re.IGNORECASE
+                whole_word_pattern_bytes = re.compile(rb'\b' + re.escape(keyword.encode('ascii', errors='ignore')) + rb'\b', byte_flags)
+
+        def _matches_text(value):
+            if not isinstance(value, str) or not value:
+                return False
+            if whole_word_pattern is not None:
+                return bool(whole_word_pattern.search(value))
+            if match_case:
+                return keyword in value
+            return keyword.lower() in value.lower()
+
+        def _matches_bytes(value):
+            if not value:
+                return False
+            if whole_word_pattern_bytes is not None:
+                return bool(whole_word_pattern_bytes.search(value))
+            if match_case:
+                return keyword_bytes in value
+            return keyword_bytes_lower in value.lower()
 
         def _should_degrade_metadata():
             if force_metadata_degrade:
@@ -923,7 +1018,7 @@ class SearchDialog(QDialog):
             self.result_queue.put({'type': 'status', 'text': 'Using Everything搜索引擎...'})
             
             try:
-                results = self.search_with_everything(keyword, self.search_path, file_types)
+                results = self.search_with_everything(keyword, self.search_path, file_types, match_case=match_case, match_whole_word=match_whole_word)
                 
                 if not self.is_searching:
                     return
@@ -940,6 +1035,8 @@ class SearchDialog(QDialog):
                         name_without_ext, file_ext = os.path.splitext(basename)
                         path_without_ext = os.path.join(os.path.dirname(file_path), name_without_ext)
                         file_type = file_ext[1:].upper() if file_ext else "无"
+                        sort_date_ts = None
+                        sort_size_bytes = None
                         if _should_degrade_metadata():
                             metadata_degrade_count += 1
                             mtime = "-"
@@ -949,6 +1046,8 @@ class SearchDialog(QDialog):
                                 stat_info = os.stat(file_path)
                                 mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
                                 size_bytes = stat_info.st_size
+                                sort_date_ts = stat_info.st_mtime
+                                sort_size_bytes = size_bytes
                                 if size_bytes < 1024:
                                     size_str = f"{size_bytes} B"
                                 elif size_bytes < 1024 * 1024:
@@ -968,6 +1067,8 @@ class SearchDialog(QDialog):
                             'file_type': file_type,
                             'date': mtime,
                             'size': size_str,
+                            'sort_date_ts': sort_date_ts,
+                            'sort_size_bytes': sort_size_bytes,
                         })
                         if len(batch_items) >= batch_size:
                             self.add_search_results_batch(batch_items, timeout=0.5)
@@ -1140,7 +1241,7 @@ class SearchDialog(QDialog):
                             break
                         
                         # 使用Python内置的字符串搜索（已优化）
-                        if keyword_lower in dirname.lower():
+                        if _matches_text(dirname):
                             found_count += 1
                             dir_path = os.path.join(root, dirname)
                             
@@ -1149,14 +1250,17 @@ class SearchDialog(QDialog):
                                 metadata_degrade_count += 1
                                 mtime = "-"
                                 size_str = "-"
+                                sort_date_ts = None
                             else:
                                 try:
                                     stat_info = os.stat(dir_path)
                                     mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
                                     size_str = "-"  # 文件夹不显示大小
+                                    sort_date_ts = stat_info.st_mtime
                                 except:
                                     mtime = "-"
                                     size_str = "-"
+                                    sort_date_ts = None
                             
                             result_item = {
                                 'path': dir_path,
@@ -1164,7 +1268,9 @@ class SearchDialog(QDialog):
                                 'full_path': f"📁 {dir_path}",
                                 'file_type': '文件夹',
                                 'date': mtime,
-                                'size': size_str
+                                'size': size_str,
+                                'sort_date_ts': sort_date_ts,
+                                'sort_size_bytes': None,
                             }
                             results_buffer.append(result_item)
                             if all_results is not None and len(all_results) < max_cached_results:
@@ -1195,7 +1301,7 @@ class SearchDialog(QDialog):
                     
                     # 优化：如果只搜索文件名，快速过滤不匹配的文件
                     if search_filename and not search_content:
-                        if keyword_lower not in filename_lower:
+                        if not _matches_text(filename):
                             continue  # 文件名不匹配，跳过
                     
                     # 检查文件类型过滤
@@ -1229,7 +1335,7 @@ class SearchDialog(QDialog):
                     match_type = ""
                     
                     # 搜索文件名（Python内置优化）
-                    if search_filename and keyword_lower in filename_lower:
+                    if search_filename and _matches_text(filename):
                         matched = True
                         match_type = "📄"
                     
@@ -1260,15 +1366,11 @@ class SearchDialog(QDialog):
                                 if read_limit <= in_memory_threshold:
                                     with open(file_path, 'rb') as bf:
                                         raw_content = bf.read(read_limit)
-                                    raw_lower = raw_content.lower()
                                     # 兼容 UTF-16(无BOM) 等含 NULL 字节文本：移除 NULL 后再匹配一次
                                     raw_no_null = raw_content.replace(b'\x00', b'')
-                                    raw_no_null_lower = raw_no_null.lower()
                                     if (
-                                        keyword_bytes in raw_content
-                                        or keyword_bytes_lower in raw_lower
-                                        or keyword_bytes in raw_no_null
-                                        or keyword_bytes_lower in raw_no_null_lower
+                                        _matches_bytes(raw_content)
+                                        or _matches_bytes(raw_no_null)
                                     ):
                                         matched = True
                                         match_type = "📄"
@@ -1283,14 +1385,10 @@ class SearchDialog(QDialog):
                                             if not chunk:
                                                 break
                                             scanned_bytes += len(chunk)
-                                            chunk_lower = chunk.lower()
                                             chunk_no_null = chunk.replace(b'\x00', b'')
-                                            chunk_no_null_lower = chunk_no_null.lower()
                                             if (
-                                                keyword_bytes in chunk
-                                                or keyword_bytes_lower in chunk_lower
-                                                or keyword_bytes in chunk_no_null
-                                                or keyword_bytes_lower in chunk_no_null_lower
+                                                _matches_bytes(chunk)
+                                                or _matches_bytes(chunk_no_null)
                                             ):
                                                 matched = True
                                                 match_type = "📄"
@@ -1316,7 +1414,7 @@ class SearchDialog(QDialog):
                                                 with open(file_path, 'rb') as bf:
                                                     raw_content = bf.read(read_limit)
                                             content = raw_content.decode(encoding, errors='ignore')
-                                            if keyword in content or keyword_lower in content.lower():
+                                            if _matches_text(content):
                                                 matched = True
                                                 match_type = "📄"
                                                 content_matched = True
@@ -1335,7 +1433,7 @@ class SearchDialog(QDialog):
                                                     if not chunk:
                                                         break
                                                     scanned_bytes += len(chunk)
-                                                    if keyword in chunk or keyword_lower in chunk.lower():
+                                                    if _matches_text(chunk):
                                                         matched = True
                                                         match_type = "📄"
                                                         content_matched = True
@@ -1362,6 +1460,8 @@ class SearchDialog(QDialog):
                         found_count += 1
                         
                         # 获取文件信息
+                        sort_date_ts = None
+                        sort_size_bytes = None
                         if _should_degrade_metadata():
                             metadata_degrade_count += 1
                             mtime = "-"
@@ -1371,6 +1471,8 @@ class SearchDialog(QDialog):
                                 stat_info = os.stat(file_path)
                                 mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
                                 size_bytes = stat_info.st_size
+                                sort_date_ts = stat_info.st_mtime
+                                sort_size_bytes = size_bytes
                                 # 格式化大小
                                 if size_bytes < 1024:
                                     size_str = f"{size_bytes} B"
@@ -1394,7 +1496,9 @@ class SearchDialog(QDialog):
                             'full_path': f"{match_type} {file_path}",
                             'file_type': file_type,
                             'date': mtime,
-                            'size': size_str
+                            'size': size_str,
+                            'sort_date_ts': sort_date_ts,
+                            'sort_size_bytes': sort_size_bytes,
                         }
                         results_buffer.append(result_item)
                         if all_results is not None and len(all_results) < max_cached_results:
@@ -1463,6 +1567,108 @@ class SearchDialog(QDialog):
             # 不关闭搜索对话框，保持独立
             if self.main_window and hasattr(self.main_window, 'add_new_tab'):
                 self.main_window.add_new_tab(folder_path, select_file=select_file)
+
+    def _launch_file_with_program(self, file_path, program_path, display_name):
+        if not file_path or not os.path.isfile(file_path):
+            show_toast(self, "提示", "该搜索结果不是可打开的文件", level="warning")
+            return False
+        if not program_path:
+            show_toast(self, "提示", f"未找到 {display_name}", level="warning")
+            return False
+        try:
+            launch_detached([program_path, file_path], cwd=os.path.dirname(file_path) or None)
+            return True
+        except Exception as e:
+            show_toast(self, "错误", f"无法使用 {display_name} 打开文件: {e}", level="error")
+            return False
+
+    def open_result_with_notepad(self, file_path):
+        self._launch_file_with_program(file_path, 'notepad.exe', '记事本')
+
+    def open_result_with_notepad_plus_plus(self, file_path):
+        self._launch_file_with_program(file_path, self.notepad_plus_plus_path, 'Notepad++')
+
+    def open_result_with_default_app(self, file_path):
+        if not file_path or not os.path.isfile(file_path):
+            show_toast(self, "提示", "该搜索结果不是可打开的文件", level="warning")
+            return False
+        try:
+            if os.name == 'nt':
+                os.startfile(file_path)
+            else:
+                launch_detached([file_path], cwd=os.path.dirname(file_path) or None)
+            return True
+        except Exception as e:
+            show_toast(self, "错误", f"无法使用系统默认程序打开文件: {e}", level="error")
+            return False
+
+    def open_result_with_system_dialog(self, file_path):
+        if not file_path or not os.path.isfile(file_path):
+            show_toast(self, "提示", "该搜索结果不是可打开的文件", level="warning")
+            return False
+        if os.name != 'nt':
+            show_toast(self, "提示", "当前系统不支持打开“选择其他应用”对话框", level="warning")
+            return False
+        try:
+            launch_detached(['rundll32.exe', 'shell32.dll,OpenAs_RunDLL', file_path], cwd=os.path.dirname(file_path) or None)
+            return True
+        except Exception as e:
+            show_toast(self, "错误", f"无法打开“选择其他应用”对话框: {e}", level="error")
+            return False
+
+    def show_result_context_menu(self, pos):
+        index = self.result_list.indexAt(pos)
+        if not index.isValid():
+            return
+
+        row = index.row()
+        file_path = self.result_model.path_for_row(row)
+        if not file_path or not os.path.exists(file_path):
+            return
+
+        self.result_list.selectRow(row)
+        menu = QMenu(self)
+
+        open_action = menu.addAction("打开")
+        open_action.triggered.connect(lambda: self.on_result_double_clicked(index))
+
+        open_folder_action = menu.addAction("打开所在目录")
+        open_folder_action.triggered.connect(lambda: self._open_result_parent_folder(file_path))
+
+        if os.path.isfile(file_path):
+            open_with_menu = menu.addMenu("打开方式")
+
+            default_action = open_with_menu.addAction("系统默认程序")
+            default_action.triggered.connect(lambda: self.open_result_with_default_app(file_path))
+
+            open_with_menu.addSeparator()
+
+            notepad_action = open_with_menu.addAction("记事本")
+            notepad_action.triggered.connect(lambda: self.open_result_with_notepad(file_path))
+
+            notepadpp_action = open_with_menu.addAction("Notepad++")
+            notepadpp_action.setEnabled(bool(self.notepad_plus_plus_path))
+            if not self.notepad_plus_plus_path:
+                notepadpp_action.setToolTip("未检测到 Notepad++")
+            notepadpp_action.triggered.connect(lambda: self.open_result_with_notepad_plus_plus(file_path))
+
+            open_with_menu.addSeparator()
+            system_dialog_action = open_with_menu.addAction("选择其他应用...")
+            system_dialog_action.triggered.connect(lambda: self.open_result_with_system_dialog(file_path))
+
+        menu.exec_(self.result_list.viewport().mapToGlobal(pos))
+
+    def _open_result_parent_folder(self, file_path):
+        if not file_path or not os.path.exists(file_path):
+            return
+        if os.path.isdir(file_path):
+            folder_path = file_path
+            select_file = None
+        else:
+            folder_path = os.path.dirname(file_path)
+            select_file = os.path.basename(file_path)
+        if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+            self.main_window.add_new_tab(folder_path, select_file=select_file)
 
 import sys
 import os
@@ -1582,6 +1788,28 @@ def launch_shell_tool(tool_name, cwd=None):
         return subprocess.Popen(['calc.exe'])
 
     raise ValueError(f"Unsupported tool: {tool_name}")
+
+
+def is_supported_title_shortcut_path(path):
+    return isinstance(path, str) and bool(path) and os.path.isfile(path) and path.lower().endswith(TITLE_SHORTCUT_EXTENSIONS)
+
+
+def normalize_terminal_tool_name(tool_name, default='cmd'):
+    if not isinstance(tool_name, str):
+        return default
+    value = tool_name.strip().lower()
+    alias_map = {
+        'cmd': 'cmd',
+        'command prompt': 'cmd',
+        'powershell': 'powershell',
+        'ps': 'powershell',
+        'pwsh': 'powershell',
+        'git bash': 'git-bash',
+        'git-bash': 'git-bash',
+        'bash': 'git-bash',
+    }
+    normalized = alias_map.get(value, value)
+    return normalized if normalized in SUPPORTED_TERMINAL_TOOLS else default
 
 
 # 全局轻量提示气泡，用于替换阻塞式消息框
@@ -2588,6 +2816,17 @@ class FileExplorerTab(QWidget):
                 self.dir_poll_timer.stop()
                 debug_print(f"[DirPoll] Suspended polling for background tab: {current_path}")
 
+    def is_auto_refresh_frozen(self):
+        return bool(getattr(self, '_manual_refresh_frozen', False))
+
+    def set_auto_refresh_frozen(self, frozen):
+        self._manual_refresh_frozen = bool(frozen)
+        if self._manual_refresh_frozen and hasattr(self, 'refresh_timer') and self.refresh_timer.isActive():
+            self.refresh_timer.stop()
+        if not self._manual_refresh_frozen:
+            self._consume_pending_refresh(fallback_reason="manual_unfreeze")
+        return self._manual_refresh_frozen
+
     def _request_refresh(self, reason="manual"):
         """统一记录刷新请求，当前标签可见时立即调度，不可见时延后到激活后消费。"""
         self._refresh_pending = True
@@ -2595,6 +2834,9 @@ class FileExplorerTab(QWidget):
 
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[AutoRefresh] Suppressed during navigation (reason={reason})")
+            return False
+        if getattr(self, '_manual_refresh_frozen', False):
+            debug_print(f"[AutoRefresh] Manually frozen (reason={reason})")
             return False
         if not getattr(self, '_refresh_active', True):
             debug_print(f"[AutoRefresh] Deferred while tab inactive (reason={reason})")
@@ -2605,6 +2847,8 @@ class FileExplorerTab(QWidget):
 
     def _consume_pending_refresh(self, fallback_reason="manual"):
         if not getattr(self, '_refresh_pending', False):
+            return False
+        if getattr(self, '_manual_refresh_frozen', False):
             return False
         reason = getattr(self, '_refresh_pending_reason', None) or fallback_reason
         self._schedule_refresh(reason=reason)
@@ -2721,6 +2965,7 @@ class FileExplorerTab(QWidget):
         """启动路径同步定时器，duration_ms 后自动停止（按需触发，减少持续COM调用）"""
         from PyQt5.QtCore import QTimer
         self._path_sync_stable_hits = 0
+        self._path_sync_interval_ms = 120
         if not hasattr(self, '_path_sync_timer') or self._path_sync_timer is None:
             self._path_sync_timer = QTimer(self)
             self._path_sync_timer.timeout.connect(self.sync_path_bar_with_explorer)
@@ -2731,13 +2976,16 @@ class FileExplorerTab(QWidget):
             self._path_sync_stop_timer.timeout.connect(self._stop_path_sync_timer)
         self._path_sync_stop_timer.start(duration_ms)
         if not self._path_sync_timer.isActive():
-            self._path_sync_timer.start(200)
+            self._path_sync_timer.start(self._path_sync_interval_ms)
+        elif self._path_sync_timer.interval() != self._path_sync_interval_ms:
+            self._path_sync_timer.setInterval(self._path_sync_interval_ms)
 
     def _stop_path_sync_timer(self):
         """停止路径同步轮询（稳定后调用，避免持续COM跨进程调用）"""
         if hasattr(self, '_path_sync_timer') and self._path_sync_timer and self._path_sync_timer.isActive():
             self._path_sync_timer.stop()
         self._path_sync_stable_hits = 0
+        self._path_sync_interval_ms = 120
 
     def sync_path_bar_with_explorer(self):
         # 通过QAxWidget的LocationURL属性获取当前路径
@@ -2761,10 +3009,14 @@ class FileExplorerTab(QWidget):
                 
                 if local_path and local_path != self.current_path:
                     self._path_sync_stable_hits = 0
+                    self._path_sync_interval_ms = 120
+                    if hasattr(self, '_path_sync_timer') and self._path_sync_timer and self._path_sync_timer.interval() != self._path_sync_interval_ms:
+                        self._path_sync_timer.setInterval(self._path_sync_interval_ms)
                     self.current_path = local_path
                     if hasattr(self, 'path_bar'):
                         self.path_bar.set_path(local_path)
                     self.update_tab_title()
+                    self._schedule_status_update(track_selection=True)
                     # 只在非程序化导航时添加到历史记录
                     if not self._navigating_programmatically and hasattr(self, '_add_to_history'):
                         self._add_to_history(local_path)
@@ -2780,6 +3032,10 @@ class FileExplorerTab(QWidget):
                     # 即使路径未变化，也做一次轻量UI回写，修复偶发地址栏未重绘。
                     if hasattr(self, 'path_bar'):
                         self.path_bar.set_path(local_path)
+                    if hasattr(self, '_path_sync_timer') and self._path_sync_timer:
+                        target_interval = 220 if self._path_sync_stable_hits == 1 else 360
+                        if self._path_sync_timer.interval() != target_interval:
+                            self._path_sync_timer.setInterval(target_interval)
                     if self._path_sync_stable_hits >= 2:
                         self._stop_path_sync_timer()
         except Exception as e:
@@ -2791,6 +3047,39 @@ class FileExplorerTab(QWidget):
             self.start_path_sync_timer(duration_ms=2000)
         except Exception as e:
             debug_print(f"[PathSync] ERROR resuming timer: {e}")
+
+    def _invalidate_selection_cache(self):
+        self._selection_cache = {'path': None, 'entries': None, 'ts_ms': 0}
+
+    def _schedule_status_update(self, delay_ms=STATUS_UPDATE_DEFER_MS, track_selection=False):
+        if track_selection:
+            self._invalidate_selection_cache()
+            self._start_status_tracking()
+        if delay_ms <= 0:
+            if self.status_update_timer.isActive():
+                self.status_update_timer.stop()
+            self.update_explorer_status()
+            return
+        if self.status_update_timer.isActive() and self.status_update_timer.remainingTime() <= delay_ms:
+            return
+        self.status_update_timer.start(delay_ms)
+
+    def _start_status_tracking(self, duration_ms=STATUS_TRACKING_WINDOW_MS):
+        self._status_tracking_deadline_ms = int(time.time() * 1000) + int(duration_ms)
+        if not self.status_tracking_timer.isActive():
+            self.status_tracking_timer.start()
+
+    def _stop_status_tracking(self):
+        self._status_tracking_deadline_ms = 0
+        if self.status_tracking_timer.isActive():
+            self.status_tracking_timer.stop()
+
+    def _poll_status_during_interaction(self):
+        self._invalidate_selection_cache()
+        self.update_explorer_status()
+        now_ms = int(time.time() * 1000)
+        if now_ms >= int(getattr(self, '_status_tracking_deadline_ms', 0) or 0):
+            self._stop_status_tracking()
 
     def setup_ui(self):
         from PyQt5.QtWidgets import QLabel
@@ -2901,11 +3190,6 @@ class FileExplorerTab(QWidget):
         # 启动路径同步定时器
         self.start_path_sync_timer()
 
-        # 启动状态栏定时更新（轮询选中状态与目录计数）
-        self.status_timer = QTimer(self)
-        self.status_timer.setInterval(800)  # 低频轮询，避免性能影响
-        self.status_timer.timeout.connect(self.update_explorer_status)
-        self.status_timer.start()
         self.update_explorer_status()
         
         # 初始导航到当前路径（在setup_ui最后调用，确保所有设置已应用）
@@ -2939,6 +3223,7 @@ class FileExplorerTab(QWidget):
                         self.current_path = local_path
                         if hasattr(self, 'path_bar'):
                             self.path_bar.set_path(local_path)
+                        self._schedule_status_update(track_selection=True)
                         # 导航完成，延迟清除导航标志（等待双击检查完成，避免时序问题）
                         if hasattr(self, '_navigating_folder') and self._navigating_folder:
                             from PyQt5.QtCore import QTimer
@@ -3113,8 +3398,25 @@ class FileExplorerTab(QWidget):
         """处理面包屑路径栏的路径变化，支持特殊shell路径自动跳转"""
         import os
         path = path.strip()
+        lower_path = path.lower()
+
+        if lower_path in ('terminal', 'term'):
+            try:
+                current_dir = self.current_path
+                if current_dir and os.path.exists(current_dir):
+                    preferred_tool = 'cmd'
+                    if self.main_window and hasattr(self.main_window, 'get_preferred_terminal_tool'):
+                        preferred_tool = self.main_window.get_preferred_terminal_tool()
+                    launch_shell_tool(preferred_tool, current_dir)
+                    self.path_bar.set_path(current_dir)
+                else:
+                    show_toast(self, "错误", "当前路径无效，无法打开默认终端", level="error")
+            except Exception as e:
+                show_toast(self, "错误", f"无法打开默认终端: {e}", level="error")
+            return
+
         # 处理cmd命令
-        if path.lower() == 'cmd':
+        if lower_path == 'cmd':
             try:
                 current_dir = self.current_path
                 if current_dir and os.path.exists(current_dir):
@@ -3124,6 +3426,32 @@ class FileExplorerTab(QWidget):
                     show_toast(self, "错误", "当前路径无效，无法打开命令行", level="error")
             except Exception as e:
                 show_toast(self, "错误", f"无法打开命令行: {e}", level="error")
+            return
+
+        if lower_path in ('powershell', 'ps', 'pwsh'):
+            try:
+                current_dir = self.current_path
+                if current_dir and os.path.exists(current_dir):
+                    launch_shell_tool('powershell', current_dir)
+                    self.path_bar.set_path(current_dir)
+                else:
+                    show_toast(self, "错误", "当前路径无效，无法打开 PowerShell", level="error")
+            except Exception as e:
+                show_toast(self, "错误", f"无法打开 PowerShell: {e}", level="error")
+            return
+
+        if lower_path in ('gitbash', 'git-bash', 'bash'):
+            try:
+                current_dir = self.current_path
+                if current_dir and os.path.exists(current_dir):
+                    launch_shell_tool('git-bash', current_dir)
+                    self.path_bar.set_path(current_dir)
+                else:
+                    show_toast(self, "错误", "当前路径无效，无法打开 Git Bash", level="error")
+            except FileNotFoundError as e:
+                show_toast(self, "提示", str(e), level="warning")
+            except Exception as e:
+                show_toast(self, "错误", f"无法打开 Git Bash: {e}", level="error")
             return
 
         # 支持特殊shell路径映射
@@ -3329,7 +3657,16 @@ class FileExplorerTab(QWidget):
                         self._selected_before_click = int(cnt) if cnt is not None else None
                     except Exception:
                         self._selected_before_click = None
+                    self._schedule_status_update(track_selection=True)
+                elif event.type() == QEvent.ContextMenu:
+                    self._schedule_status_update(track_selection=True)
+                    global_pos = event.globalPos() if hasattr(event, 'globalPos') else QCursor.pos()
+                    if self.show_selected_item_context_menu(global_pos):
+                        return True
+                elif event.type() == QEvent.MouseButtonRelease:
+                    self._schedule_status_update(track_selection=True)
                 elif event.type() == QEvent.MouseButtonDblClick:
+                    self._schedule_status_update(track_selection=True)
                     # 取消所有之前待处理的双击检查
                     try:
                         for timer in getattr(self, '_pending_double_click_timers', []):
@@ -3516,6 +3853,8 @@ class FileExplorerTab(QWidget):
                     if not hasattr(self, '_pending_double_click_timers'):
                         self._pending_double_click_timers = []
                     self._pending_double_click_timers.append(timer)
+                elif event.type() in (QEvent.KeyRelease, QEvent.FocusIn, QEvent.Wheel):
+                    self._schedule_status_update(track_selection=True)
         except Exception:
             pass
         return super().eventFilter(obj, event)
@@ -3567,6 +3906,7 @@ class FileExplorerTab(QWidget):
         self.main_window = parent
         self.current_path = path if path else QDir.homePath()
         self.select_file = select_file  # 要选中的文件名
+        self.notepad_plus_plus_path = detect_notepad_plus_plus()
         # 浏览历史记录
         self.history = []
         self.history_index = -1
@@ -3600,8 +3940,16 @@ class FileExplorerTab(QWidget):
         self._refresh_active = False
         self._refresh_pending = False
         self._refresh_pending_reason = None
+        self._manual_refresh_frozen = False
         self._entry_count_cache = {'path': None, 'count': None, 'ts_ms': 0}
         self._selection_cache = {'path': None, 'entries': None, 'ts_ms': 0}
+        self._status_tracking_deadline_ms = 0
+        self.status_update_timer = QTimer(self)
+        self.status_update_timer.setSingleShot(True)
+        self.status_update_timer.timeout.connect(self.update_explorer_status)
+        self.status_tracking_timer = QTimer(self)
+        self.status_tracking_timer.setInterval(STATUS_TRACKING_INTERVAL_MS)
+        self.status_tracking_timer.timeout.connect(self._poll_status_during_interaction)
 
         # 目录轮询刷新兜底：处理部分编辑器改文件但目录 watcher 不触发的情况
         self.dir_mtime = None
@@ -4015,6 +4363,9 @@ class FileExplorerTab(QWidget):
             self._refresh_burst_suppressed_until = now_ms + 5000
             debug_print(f"[AutoRefresh] Refresh burst detected ({len(burst_times)} in 5s), suppressing for 5s")
             return
+        if getattr(self, '_manual_refresh_frozen', False):
+            debug_print(f"[AutoRefresh] Manually frozen, skipping refresh execution")
+            return
         self._last_refresh_ts_ms = now_ms
         self._refresh_pending = False
         self._refresh_pending_reason = None
@@ -4142,9 +4493,12 @@ class FileExplorerTab(QWidget):
 
         # 选中状态
         text = f"已选 {sel_count} 项{total_text}"
-        if all(entry['is_file'] for entry in selection):
+        metadata_limited = sel_count > STATUS_SELECTION_METADATA_LIMIT
+        if not metadata_limited and all(entry['is_file'] for entry in selection):
             size_sum = sum(entry['size'] for entry in selection if entry['size'] is not None)
             text += f"，总大小 {self._format_size(size_sum)}"
+        elif metadata_limited:
+            text += "，已省略大小统计"
         if sel_count == 1:
             entry = selection[0]
             mtime = self._get_mtime(entry['path'])
@@ -4164,8 +4518,10 @@ class FileExplorerTab(QWidget):
             count = selected.dynamicCall('Count()')
             if not count or count <= 0:
                 return []
+            count_int = int(count)
+            collect_file_sizes = count_int <= STATUS_SELECTION_METADATA_LIMIT
             entries = []
-            for i in range(int(count)):
+            for i in range(count_int):
                 item = selected.querySubObject('Item(int)', i)
                 if not item:
                     continue
@@ -4179,7 +4535,7 @@ class FileExplorerTab(QWidget):
                 path_str = str(path)
                 is_file = os.path.isfile(path_str)
                 size = None
-                if is_file:
+                if is_file and collect_file_sizes:
                     try:
                         size = os.path.getsize(path_str)
                     except Exception:
@@ -4192,6 +4548,120 @@ class FileExplorerTab(QWidget):
             return entries
         except Exception:
             return None
+
+    def _get_selected_paths(self):
+        entries = self._get_selection_entries()
+        if not entries:
+            return []
+        return [entry.get('path') for entry in entries if entry and entry.get('path')]
+
+    def _get_single_selected_path(self):
+        paths = self._get_selected_paths()
+        if len(paths) == 1:
+            return paths[0]
+        return None
+
+    def _launch_selected_file_with_program(self, file_path, program_path, display_name):
+        if not file_path or not os.path.isfile(file_path):
+            show_toast(self, "提示", "当前选中项不是可打开的文件", level="warning")
+            return False
+        if not program_path:
+            show_toast(self, "提示", f"未找到 {display_name}", level="warning")
+            return False
+        try:
+            launch_detached([program_path, file_path], cwd=os.path.dirname(file_path) or None)
+            return True
+        except Exception as e:
+            show_toast(self, "错误", f"无法使用 {display_name} 打开文件: {e}", level="error")
+            return False
+
+    def open_selected_with_default_app(self, file_path):
+        if not file_path or not os.path.exists(file_path):
+            show_toast(self, "提示", "当前选中项不可打开", level="warning")
+            return False
+        try:
+            if os.path.isdir(file_path):
+                if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+                    self.main_window.add_new_tab(file_path)
+            elif os.name == 'nt':
+                os.startfile(file_path)
+            else:
+                launch_detached([file_path], cwd=os.path.dirname(file_path) or None)
+            return True
+        except Exception as e:
+            show_toast(self, "错误", f"无法打开选中项: {e}", level="error")
+            return False
+
+    def open_selected_with_notepad(self, file_path):
+        return self._launch_selected_file_with_program(file_path, 'notepad.exe', '记事本')
+
+    def open_selected_with_notepad_plus_plus(self, file_path):
+        return self._launch_selected_file_with_program(file_path, getattr(self, 'notepad_plus_plus_path', None), 'Notepad++')
+
+    def open_selected_with_system_dialog(self, file_path):
+        if not file_path or not os.path.isfile(file_path):
+            show_toast(self, "提示", "当前选中项不是可打开的文件", level="warning")
+            return False
+        if os.name != 'nt':
+            show_toast(self, "提示", "当前系统不支持打开“选择其他应用”对话框", level="warning")
+            return False
+        try:
+            launch_detached(['rundll32.exe', 'shell32.dll,OpenAs_RunDLL', file_path], cwd=os.path.dirname(file_path) or None)
+            return True
+        except Exception as e:
+            show_toast(self, "错误", f"无法打开“选择其他应用”对话框: {e}", level="error")
+            return False
+
+    def open_selected_parent_folder(self, file_path):
+        if not file_path or not os.path.exists(file_path):
+            return False
+        if os.path.isdir(file_path):
+            folder_path = file_path
+            select_file = None
+        else:
+            folder_path = os.path.dirname(file_path)
+            select_file = os.path.basename(file_path)
+        if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+            self.main_window.add_new_tab(folder_path, select_file=select_file)
+            return True
+        return False
+
+    def show_selected_item_context_menu(self, global_pos):
+        file_path = self._get_single_selected_path()
+        if not file_path or not os.path.exists(file_path):
+            return False
+
+        menu = QMenu(self)
+        open_action = menu.addAction("打开")
+        open_action.triggered.connect(lambda: self.open_selected_with_default_app(file_path))
+
+        open_folder_action = menu.addAction("打开所在目录")
+        open_folder_action.triggered.connect(lambda: self.open_selected_parent_folder(file_path))
+
+        if os.path.isfile(file_path):
+            open_with_menu = menu.addMenu("打开方式")
+
+            default_action = open_with_menu.addAction("系统默认程序")
+            default_action.triggered.connect(lambda: self.open_selected_with_default_app(file_path))
+
+            open_with_menu.addSeparator()
+
+            notepad_action = open_with_menu.addAction("记事本")
+            notepad_action.triggered.connect(lambda: self.open_selected_with_notepad(file_path))
+
+            notepadpp_action = open_with_menu.addAction("Notepad++")
+            notepadpp_action.setEnabled(bool(getattr(self, 'notepad_plus_plus_path', None)))
+            if not getattr(self, 'notepad_plus_plus_path', None):
+                notepadpp_action.setToolTip("未检测到 Notepad++")
+            notepadpp_action.triggered.connect(lambda: self.open_selected_with_notepad_plus_plus(file_path))
+
+            open_with_menu.addSeparator()
+
+            system_dialog_action = open_with_menu.addAction("选择其他应用...")
+            system_dialog_action.triggered.connect(lambda: self.open_selected_with_system_dialog(file_path))
+
+        menu.exec_(global_pos)
+        return True
 
     def _get_selection_entries_cached(self):
         """短TTL缓存选中项，减少状态栏高频轮询时的 COM 与磁盘查询。"""
@@ -5503,7 +5973,7 @@ class ChatPanel(QWidget):
 
 
 class TitleShortcutBar(QWidget):
-    """标题栏快捷方式区域：支持拖拽 .lnk 并点击运行。"""
+    """标题栏快捷方式区域：支持拖拽常用启动文件并点击运行。"""
 
     shortcutDropped = pyqtSignal(str)
     shortcutClicked = pyqtSignal(str)
@@ -5523,7 +5993,7 @@ class TitleShortcutBar(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(8)
 
-        self._hint_label = QLabel("拖入快捷方式")
+        self._hint_label = QLabel("拖入应用或快捷方式")
         self._hint_label.setStyleSheet("QLabel { color: #666; font-size: 9pt; padding: 0 4px; }")
         self._hint_label.setAcceptDrops(True)
         self._hint_label.installEventFilter(self)
@@ -5669,8 +6139,7 @@ class TitleShortcutBar(QWidget):
             path = url.toLocalFile()
             if not path:
                 continue
-            lower_path = path.lower()
-            if lower_path.endswith('.lnk') and os.path.isfile(path):
+            if is_supported_title_shortcut_path(path):
                 paths.append(path)
         return paths
 
@@ -5714,7 +6183,7 @@ class TitleShortcutBar(QWidget):
                 widget.deleteLater()
 
         # 提示文字固定在最左侧
-        self._hint_label = QLabel("+ 拖入快捷方式")
+            self._hint_label = QLabel("+ 拖入应用或快捷方式")
         self._hint_label.setStyleSheet("QLabel { color: #888; font-size: 9pt; padding: 0 4px; }")
         self._hint_label.setAcceptDrops(True)
         self._hint_label.installEventFilter(self)
@@ -5731,7 +6200,7 @@ class TitleShortcutBar(QWidget):
             btn.setFixedSize(self._button_size, self._button_size)
             icon_px = max(12, min(self._icon_size + 1, self._button_size - 4))
             btn.setIconSize(QSize(icon_px, icon_px))
-            btn.setToolTip(f"{os.path.basename(path)}\n{path}\n左键启动，右键移除，拖拽可排序")
+            btn.setToolTip(f"{os.path.basename(path)}\n{path}\n左键启动应用/快捷方式，右键移除，拖拽可排序")
             icon = self._resolve_shortcut_icon(path)
             if not icon.isNull():
                 btn.setIcon(icon)
@@ -6011,6 +6480,20 @@ class MainWindow(QMainWindow):
         show_toast(self, "提示", "当前标签页路径无效", level="warning")
         return None
 
+    def get_preferred_terminal_tool(self):
+        return normalize_terminal_tool_name(self.config.get('preferred_terminal_tool', 'cmd'))
+
+    def open_preferred_terminal_current_tab(self):
+        current_dir = self._get_current_tab_launch_dir()
+        if not current_dir:
+            return
+        try:
+            launch_shell_tool(self.get_preferred_terminal_tool(), current_dir)
+        except FileNotFoundError as e:
+            show_toast(self, "提示", str(e), level="warning")
+        except Exception as e:
+            show_toast(self, "错误", f"无法打开默认终端: {e}", level="error")
+
     def open_cmd_current_tab(self):
         """在当前标签页目录打开 cmd。"""
         current_dir = self._get_current_tab_launch_dir()
@@ -6089,8 +6572,8 @@ class MainWindow(QMainWindow):
         self.title_shortcut_bar.set_shortcuts(cleaned)
 
     def on_title_shortcut_dropped(self, path):
-        """处理拖入标题栏快捷方式区域的 .lnk 文件。"""
-        if not isinstance(path, str) or not path.lower().endswith('.lnk'):
+        """处理拖入标题栏快捷方式区域的启动文件。"""
+        if not is_supported_title_shortcut_path(path):
             return
         shortcuts = self.config.get("title_shortcuts", [])
         if not isinstance(shortcuts, list):
@@ -6121,7 +6604,18 @@ class MainWindow(QMainWindow):
             return
         try:
             display_name = os.path.splitext(os.path.basename(path))[0] or os.path.basename(path)
-            if os.name == 'nt':
+            lower_path = path.lower()
+            if os.name == 'nt' and lower_path.endswith('.ps1'):
+                subprocess.Popen([
+                    'powershell.exe',
+                    '-ExecutionPolicy',
+                    'Bypass',
+                    '-File',
+                    path,
+                ], cwd=os.path.dirname(path) or None)
+            elif os.name == 'nt' and lower_path.endswith(('.bat', '.cmd')):
+                subprocess.Popen(['cmd.exe', '/c', 'start', '', path], cwd=os.path.dirname(path) or None)
+            elif os.name == 'nt':
                 os.startfile(path)
             else:
                 launch_detached([path])
@@ -7816,6 +8310,7 @@ class MainWindow(QMainWindow):
             self.config["explorer_monitor_interval"] = new_interval
             self.config["enable_cache_tabs"] = dlg.cache_tabs_cb.isChecked()
             self.config["enable_tortoisegit_buttons"] = dlg.tortoisegit_buttons_cb.isChecked()
+            self.config["preferred_terminal_tool"] = normalize_terminal_tool_name(dlg.preferred_terminal_combo.currentData())
             self.config["enable_title_shortcuts"] = dlg.title_shortcuts_cb.isChecked()
 
             # 更新全局调试开关
@@ -7969,7 +8464,29 @@ class MainWindow(QMainWindow):
         add_bm_action.triggered.connect(lambda: self.add_tab_bookmark(tab))
         menu.addAction(add_bm_action)
 
+        if hasattr(tab, 'set_auto_refresh_frozen'):
+            if tab.is_auto_refresh_frozen():
+                refresh_action = QAction("▶ 恢复自动刷新", self)
+                refresh_action.triggered.connect(lambda: self.toggle_tab_auto_refresh(tab_index, False))
+            else:
+                refresh_action = QAction("⏸ 冻结自动刷新", self)
+                refresh_action.triggered.connect(lambda: self.toggle_tab_auto_refresh(tab_index, True))
+            menu.addAction(refresh_action)
+
         menu.exec_(self.tab_widget.tabBar().mapToGlobal(pos))
+
+    def toggle_tab_auto_refresh(self, tab_index, frozen):
+        tab = self.get_tab_widget(tab_index)
+        if not tab or not hasattr(tab, 'set_auto_refresh_frozen'):
+            return
+        is_frozen = tab.set_auto_refresh_frozen(frozen)
+        show_toast(
+            self,
+            "自动刷新",
+            "当前标签自动刷新已冻结" if is_frozen else "当前标签自动刷新已恢复",
+            level="info",
+            duration=1800,
+        )
 
     def add_tab_bookmark(self, tab):
         # 选择父文件夹
@@ -8222,8 +8739,9 @@ class MainWindow(QMainWindow):
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
             "enable_tortoisegit_buttons": False,  # 默认关闭TortoiseGit按钮
+            "preferred_terminal_tool": "cmd",  # 默认终端类型
             "enable_title_shortcuts": True,  # 默认启用标题栏快捷方式区域
-            "title_shortcuts": [],  # 标题栏快捷方式（.lnk 路径）
+            "title_shortcuts": [],  # 标题栏快捷方式（.lnk/.exe/.bat/.cmd/.ps1 路径）
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -8696,12 +9214,9 @@ class MainWindow(QMainWindow):
         self.dir_tree.setModel(self.dir_model)
         # 修复横向滚动条不显示问题：始终根据内容自动调整列宽
         self.dir_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.dir_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        # 展开目录时自动调整列宽，确保横轴弹出逻辑正确
-        def auto_resize_on_expand(index):
-            self.dir_tree.resizeColumnToContents(0)
-        self.dir_tree.expanded.connect(auto_resize_on_expand)
-        self.dir_tree.collapsed.connect(auto_resize_on_expand)
+        self.dir_tree.header().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.dir_tree.setColumnWidth(0, DIR_TREE_COLUMN_WIDTH)
+        self.dir_tree.setUniformRowHeights(True)
         # 如果有多列，隐藏的不用管，显示的都设置为 ResizeToContents
         # self.dir_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         # 性能优化：统一排序，减少渲染开销
@@ -9855,20 +10370,39 @@ class SettingsDialog(QDialog):
         self.tortoisegit_buttons_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.tortoisegit_buttons_cb.setToolTip("在标题栏显示 Git Log 和 Git Commit 快捷按钮")
         git_layout.addWidget(self.tortoisegit_buttons_cb)
+
+        terminal_pref_layout = QHBoxLayout()
+        terminal_pref_layout.addWidget(QLabel("默认终端:"))
+        self.preferred_terminal_combo = QComboBox(self)
+        self.preferred_terminal_combo.addItem("CMD", "cmd")
+        self.preferred_terminal_combo.addItem("PowerShell", "powershell")
+        self.preferred_terminal_combo.addItem("Git Bash", "git-bash")
+        preferred_terminal = normalize_terminal_tool_name(config.get("preferred_terminal_tool", "cmd"))
+        terminal_idx = max(0, self.preferred_terminal_combo.findData(preferred_terminal))
+        self.preferred_terminal_combo.setCurrentIndex(terminal_idx)
+        self.preferred_terminal_combo.setToolTip("路径栏输入 terminal 或 term 时使用的默认终端")
+        terminal_pref_layout.addWidget(self.preferred_terminal_combo)
+        terminal_pref_layout.addStretch(1)
+        git_layout.addLayout(terminal_pref_layout)
         git_group.setLayout(git_layout)
         compact_groupbox(git_group)
         for i in range(git_layout.count()):
-            w = git_layout.itemAt(i).widget()
-            if w: compact_widget(w)
+            item = git_layout.itemAt(i)
+            if item.layout():
+                for j in range(item.layout().count()):
+                    w = item.layout().itemAt(j).widget()
+                    if w: compact_widget(w)
+            elif item.widget():
+                compact_widget(item.widget())
         left_col.addWidget(git_group)
 
         # 快捷方式设置组（右侧独立分组）
         shortcuts_group = QGroupBox("快捷方式设置")
         shortcuts_layout = QVBoxLayout()
-        self.title_shortcuts_cb = QCheckBox("启用标题栏快捷方式区域（可拖拽 .lnk 并点击启动）", self)
+        self.title_shortcuts_cb = QCheckBox("启用标题栏启动区（可拖拽应用、快捷方式或脚本并点击启动）", self)
         self.title_shortcuts_cb.setChecked(config.get("enable_title_shortcuts", True))
         self.title_shortcuts_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        self.title_shortcuts_cb.setToolTip("拖拽应用快捷方式到标题栏 Git 左侧区域，后续可一键启动")
+        self.title_shortcuts_cb.setToolTip("拖拽应用、快捷方式或脚本到标题栏 Git 左侧区域，后续可一键启动")
         shortcuts_layout.addWidget(self.title_shortcuts_cb)
         shortcuts_group.setLayout(shortcuts_layout)
         compact_groupbox(shortcuts_group)
@@ -10207,6 +10741,7 @@ class SettingsDialog(QDialog):
             self.parent().config["explorer_monitor_debug"] = self.explorer_monitor_debug_cb.isChecked()
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
+            self.parent().config["preferred_terminal_tool"] = normalize_terminal_tool_name(self.preferred_terminal_combo.currentData())
             # 保存路径栏分隔符设置
             self.parent().config["breadcrumb_copy_separator"] = self.path_separator_combo.currentData()
             
