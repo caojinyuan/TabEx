@@ -5358,7 +5358,7 @@ class TitleShortcutBar(QWidget):
 
         self._layout = QHBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(2)
+        self._layout.setSpacing(8)
 
         self._hint_label = QLabel("拖入快捷方式")
         self._hint_label.setStyleSheet("QLabel { color: #666; font-size: 9pt; padding: 0 4px; }")
@@ -5511,6 +5511,38 @@ class TitleShortcutBar(QWidget):
                 paths.append(path)
         return paths
 
+    def _resolve_shortcut_icon(self, path):
+        if not isinstance(path, str) or not path:
+            return QIcon()
+
+        lower_path = path.lower()
+        if lower_path.endswith('.lnk') and os.name == 'nt':
+            try:
+                from win32com.client import Dispatch
+
+                shell = Dispatch('WScript.Shell')
+                shortcut = shell.CreateShortCut(path)
+
+                icon_location = getattr(shortcut, 'IconLocation', '') or ''
+                if icon_location:
+                    icon_path = icon_location.split(',', 1)[0].strip().strip('"')
+                    icon_path = os.path.expandvars(icon_path)
+                    if os.path.exists(icon_path):
+                        icon = self._icon_provider.icon(QFileInfo(icon_path))
+                        if not icon.isNull():
+                            return icon
+
+                target_path = getattr(shortcut, 'Targetpath', '') or getattr(shortcut, 'TargetPath', '') or ''
+                target_path = os.path.expandvars(str(target_path).strip().strip('"'))
+                if target_path and os.path.exists(target_path):
+                    icon = self._icon_provider.icon(QFileInfo(target_path))
+                    if not icon.isNull():
+                        return icon
+            except Exception:
+                pass
+
+        return self._icon_provider.icon(QFileInfo(path))
+
     def _rebuild_buttons(self):
         while self._layout.count() > 0:
             item = self._layout.takeAt(0)
@@ -5528,14 +5560,16 @@ class TitleShortcutBar(QWidget):
         if not self._paths:
             return
 
+        self._layout.addSpacing(6)
+
         for path in self._paths:
             btn = QToolButton(self)
             btn.setAutoRaise(True)
             btn.setFixedSize(self._button_size, self._button_size)
-            icon_px = max(12, min(self._icon_size, self._button_size - 8))
+            icon_px = max(12, min(self._icon_size + 1, self._button_size - 4))
             btn.setIconSize(QSize(icon_px, icon_px))
             btn.setToolTip(f"{os.path.basename(path)}\n{path}\n左键启动，右键移除，拖拽可排序")
-            icon = self._icon_provider.icon(QFileInfo(path))
+            icon = self._resolve_shortcut_icon(path)
             if not icon.isNull():
                 btn.setIcon(icon)
             else:
@@ -5795,6 +5829,100 @@ class MainWindow(QMainWindow):
         current_tab = self.get_current_tab_widget()
         if current_tab and hasattr(current_tab, 'open_tortoisegit_commit'):
             current_tab.open_tortoisegit_commit()
+
+    def _get_current_tab_launch_dir(self):
+        """获取适合外部终端启动的当前标签页目录。"""
+        current_tab = self.get_current_tab_widget()
+        current_path = getattr(current_tab, 'current_path', '') if current_tab else ''
+
+        def normalize_launch_path(path):
+            return os.path.normpath(path) if os.name == 'nt' else path
+
+        if not current_path:
+            show_toast(self, "提示", "当前没有可用的标签页路径", level="warning")
+            return None
+        if isinstance(current_path, str) and current_path.startswith('shell:'):
+            show_toast(self, "提示", "当前为特殊路径，无法定位到 cmd 或 PowerShell", level="warning")
+            return None
+        if os.path.isdir(current_path):
+            return normalize_launch_path(current_path)
+        if os.path.exists(current_path):
+            return normalize_launch_path(os.path.dirname(current_path))
+        show_toast(self, "提示", "当前标签页路径无效", level="warning")
+        return None
+
+    def open_cmd_current_tab(self):
+        """在当前标签页目录打开 cmd。"""
+        current_dir = self._get_current_tab_launch_dir()
+        if not current_dir:
+            return
+        try:
+            subprocess.Popen(
+                ['cmd.exe', '/K', 'cd', '/d', current_dir],
+                creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
+                cwd=current_dir,
+            )
+        except Exception as e:
+            show_toast(self, "错误", f"无法打开 cmd: {e}", level="error")
+
+    def open_powershell_current_tab(self):
+        """在当前标签页目录打开 PowerShell。"""
+        current_dir = self._get_current_tab_launch_dir()
+        if not current_dir:
+            return
+        try:
+            escaped_dir = current_dir.replace("'", "''")
+            subprocess.Popen(
+                ['powershell.exe', '-NoExit', '-Command', f"Set-Location -LiteralPath '{escaped_dir}'"],
+                creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
+                cwd=current_dir,
+            )
+        except Exception as e:
+            show_toast(self, "错误", f"无法打开 PowerShell: {e}", level="error")
+
+    def open_git_bash_current_tab(self):
+        """在当前标签页目录打开 Git Bash。"""
+        current_dir = self._get_current_tab_launch_dir()
+        if not current_dir:
+            return
+        git_root_candidates = [
+            r"C:\Program Files\Git",
+            r"C:\Program Files (x86)\Git",
+            os.path.expandvars(r"%PROGRAMFILES%\Git"),
+            os.path.expandvars(r"%PROGRAMFILES(X86)%\Git"),
+        ]
+        git_root = next((path for path in git_root_candidates if os.path.isdir(path)), None)
+        if not git_root:
+            show_toast(self, "提示", "未找到 Git Bash，请确认已安装 Git for Windows", level="warning")
+            return
+
+        git_bash_exe = os.path.join(git_root, "git-bash.exe")
+        try:
+            if os.path.exists(git_bash_exe) and os.name == 'nt':
+                subprocess.Popen([
+                    'cmd.exe',
+                    '/c',
+                    'start',
+                    '',
+                    '/D',
+                    current_dir,
+                    git_bash_exe,
+                ])
+                return
+
+            show_toast(self, "提示", "未找到可用的 Git Bash 可执行文件", level="warning")
+        except Exception as e:
+            show_toast(self, "错误", f"无法打开 Git Bash: {e}", level="error")
+
+    def open_calculator(self):
+        """打开系统计算器。"""
+        try:
+            if os.name == 'nt':
+                subprocess.Popen(['calc.exe'])
+            else:
+                show_toast(self, "提示", "当前系统不支持打开计算器", level="warning")
+        except Exception as e:
+            show_toast(self, "错误", f"无法打开计算器: {e}", level="error")
     
     def apply_tortoisegit_buttons_config(self):
         """根据配置显示/隐藏 TortoiseGit 按钮"""
@@ -5803,6 +5931,10 @@ class MainWindow(QMainWindow):
             self.git_log_button.setVisible(enable)
         if hasattr(self, 'git_commit_button'):
             self.git_commit_button.setVisible(enable)
+        if hasattr(self, 'git_bash_button'):
+            self.git_bash_button.setVisible(enable)
+        if hasattr(self, 'git_tools_separator'):
+            self.git_tools_separator.setVisible(enable)
 
     def apply_title_shortcuts_config(self):
         """根据配置显示/隐藏标题栏快捷方式区域。"""
@@ -6300,14 +6432,6 @@ class MainWindow(QMainWindow):
         self.refresh_title_shortcuts_ui()
         titlebar_layout.addWidget(self.title_shortcut_bar)
 
-        # 快捷方式区域与 Git 区域分隔线
-        self.shortcut_git_separator = QFrame()
-        self.shortcut_git_separator.setFrameShape(QFrame.VLine)
-        self.shortcut_git_separator.setFrameShadow(QFrame.Plain)
-        self.shortcut_git_separator.setStyleSheet("background-color: #d0d0d0; max-width: 1px;")
-        self.shortcut_git_separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
-        titlebar_layout.addWidget(self.shortcut_git_separator)
-        
         git_btn_style = f"""
             QPushButton {{
                 background: transparent;
@@ -6324,6 +6448,14 @@ class MainWindow(QMainWindow):
                 background: #d0d0d0;
             }}
         """
+
+        # 快捷方式区域与 Git 区域分隔线
+        self.shortcut_git_separator = QFrame()
+        self.shortcut_git_separator.setFrameShape(QFrame.VLine)
+        self.shortcut_git_separator.setFrameShadow(QFrame.Plain)
+        self.shortcut_git_separator.setStyleSheet("background-color: #d0d0d0; max-width: 1px;")
+        self.shortcut_git_separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
+        titlebar_layout.addWidget(self.shortcut_git_separator)
         
         # Git Log 按钮
         self.git_log_button = QPushButton("🐢")
@@ -6340,6 +6472,44 @@ class MainWindow(QMainWindow):
         self.git_commit_button.setStyleSheet(git_btn_style)
         self.git_commit_button.clicked.connect(self.open_tortoisegit_commit_current_tab)
         titlebar_layout.addWidget(self.git_commit_button)
+
+        # Git Bash 按钮
+        self.git_bash_button = QPushButton("🐚")
+        self.git_bash_button.setToolTip("在当前标签页路径打开 Git Bash")
+        self.git_bash_button.setFixedSize(btn_size, btn_size)
+        self.git_bash_button.setStyleSheet(git_btn_style)
+        self.git_bash_button.clicked.connect(self.open_git_bash_current_tab)
+        titlebar_layout.addWidget(self.git_bash_button)
+
+        # Git 与终端/工具按钮组之间的分隔线
+        self.git_tools_separator = QFrame()
+        self.git_tools_separator.setFrameShape(QFrame.VLine)
+        self.git_tools_separator.setFrameShadow(QFrame.Plain)
+        self.git_tools_separator.setStyleSheet("background-color: #d0d0d0; max-width: 1px;")
+        self.git_tools_separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
+        titlebar_layout.addWidget(self.git_tools_separator)
+
+        # 终端/工具按钮组（位于 Git 按钮右侧）
+        self.cmd_button = QPushButton("🪟")
+        self.cmd_button.setToolTip("在当前标签页路径打开 cmd")
+        self.cmd_button.setFixedSize(btn_size, btn_size)
+        self.cmd_button.setStyleSheet(git_btn_style)
+        self.cmd_button.clicked.connect(self.open_cmd_current_tab)
+        titlebar_layout.addWidget(self.cmd_button)
+
+        self.powershell_button = QPushButton("⚡")
+        self.powershell_button.setToolTip("在当前标签页路径打开 PowerShell")
+        self.powershell_button.setFixedSize(btn_size, btn_size)
+        self.powershell_button.setStyleSheet(git_btn_style)
+        self.powershell_button.clicked.connect(self.open_powershell_current_tab)
+        titlebar_layout.addWidget(self.powershell_button)
+
+        self.calculator_button = QPushButton("🧮")
+        self.calculator_button.setToolTip("打开计算器")
+        self.calculator_button.setFixedSize(btn_size, btn_size)
+        self.calculator_button.setStyleSheet(git_btn_style)
+        self.calculator_button.clicked.connect(self.open_calculator)
+        titlebar_layout.addWidget(self.calculator_button)
         
         # 分隔线（可选）
         separator = QFrame()
