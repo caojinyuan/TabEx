@@ -4,7 +4,6 @@ from collections import OrderedDict
 import hashlib
 import os
 
-<<<<<<< HEAD
 
 def get_app_base_dir():
     """Return a stable base directory for persistent app data."""
@@ -16,8 +15,6 @@ def get_app_base_dir():
 def get_app_data_path(*parts):
     return os.path.join(get_app_base_dir(), *parts)
 
-=======
->>>>>>> 631c7efca42f1b2d50d6bc03408c2daf9805000c
 # 常用中英文目录名对照表
 _COMMON_PATH_PAIRS = [
     ("Users", "用户"),
@@ -2386,11 +2383,8 @@ class FileExplorerTab(QWidget):
 
     def _refresh_file_watch_paths(self, path):
         """同步当前目录下的文件 watcher，提升对文件内容修改的检测能力。"""
-<<<<<<< HEAD
         # 文件级 Watcher 已关闭（节省系统句柄资源），目录 Watcher + DirPoll 兜底仍生效
         return
-=======
->>>>>>> 631c7efca42f1b2d50d6bc03408c2daf9805000c
         if not hasattr(self, 'file_watcher'):
             return
         try:
@@ -3432,7 +3426,6 @@ class FileExplorerTab(QWidget):
         self.refresh_timer.setSingleShot(True)
         self.refresh_timer.timeout.connect(self.delayed_refresh)
         self.refresh_delay_ms = 500  # 500ms延迟
-<<<<<<< HEAD
         self._refresh_min_interval_ms = 3000  # 连续刷新最小间隔，避免COM刷新风暴卡界面
         self._last_refresh_ts_ms = 0
         # 防抖机制：记录最近处理的路径和时间，避免事件风暴
@@ -3440,13 +3433,6 @@ class FileExplorerTab(QWidget):
         self._watcher_debounce_ms = 3000  # 3s 内的重复事件会被忽略，进一步抑制风暴
         self._refresh_burst_times = []  # 刷新时间戳列表，用于检测风暴
         self._refresh_burst_suppressed_until = 0  # 风暴期间暂停刷新的截止时间戳(ms)
-=======
-        self._refresh_min_interval_ms = 1200  # 连续刷新最小间隔，避免COM刷新风暴卡界面
-        self._last_refresh_ts_ms = 0
-        # 防抖机制：记录最近处理的路径和时间，避免事件风暴
-        self._last_watcher_event = {}  # {path: timestamp}
-        self._watcher_debounce_ms = 1200  # 1.2s 内的重复事件会被忽略，进一步抑制风暴
->>>>>>> 631c7efca42f1b2d50d6bc03408c2daf9805000c
         self._last_file_event = {}  # {file_path: timestamp_ms}
         self._file_event_debounce_ms = 400
         self._watched_files = set()
@@ -3854,7 +3840,6 @@ class FileExplorerTab(QWidget):
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
             return
-<<<<<<< HEAD
         now_ms = time.time() * 1000
         # 风暴检测：5s 内超过 3 次刷新，暂停 5s
         burst_suppressed_until = getattr(self, '_refresh_burst_suppressed_until', 0)
@@ -3870,9 +3855,6 @@ class FileExplorerTab(QWidget):
             debug_print(f"[AutoRefresh] Refresh burst detected ({len(burst_times)} in 5s), suppressing for 5s")
             return
         self._last_refresh_ts_ms = now_ms
-=======
-        self._last_refresh_ts_ms = time.time() * 1000
->>>>>>> 631c7efca42f1b2d50d6bc03408c2daf9805000c
         debug_print(f"[FileWatcher] Auto-refreshing: {self.current_path}")
         if hasattr(self, 'explorer') and self.current_path:
             try:
@@ -4719,11 +4701,7 @@ class ChatPanel(QWidget):
         self.main_window = main_window
         self.messages = []   # 对话历史（不含 system prompt）
         self.worker = None
-<<<<<<< HEAD
         self.history_file = get_app_data_path("chat_history.json")
-=======
-        self.history_file = os.path.join(os.path.dirname(__file__), "chat_history.json")
->>>>>>> 631c7efca42f1b2d50d6bc03408c2daf9805000c
         # 给 ChatPanel 独立的 Win32 HWND，避免 QAxWidget(Shell Explorer) 抢占鼠标/键盘头
         self.setAttribute(Qt.WA_NativeWindow, True)
         self.setFocusPolicy(Qt.ClickFocus)
@@ -5101,11 +5079,7 @@ class ChatPanel(QWidget):
                 return os.path.normpath(p)
         except Exception:
             pass
-<<<<<<< HEAD
         return os.path.normpath(get_app_base_dir())
-=======
-        return os.path.normpath(os.path.dirname(__file__))
->>>>>>> 631c7efca42f1b2d50d6bc03408c2daf9805000c
 
     def _resolve_action_path(self, raw_path: str):
         """解析动作路径，限制在当前目录范围内。"""
@@ -7990,11 +7964,7 @@ class MainWindow(QMainWindow):
         
         try:
             # 首先尝试加载主配置文件（使用程序所在目录的绝对路径）
-<<<<<<< HEAD
             config_path = get_app_data_path("config.json")
-=======
-            config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
->>>>>>> 631c7efca42f1b2d50d6bc03408c2daf9805000c
             if os.path.exists(config_path):
                 with open(config_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
@@ -8051,11 +8021,7 @@ class MainWindow(QMainWindow):
 
     def _flush_config_to_disk(self):
         """实际写入config.json（原子写入：先写临时文件再重命名）"""
-<<<<<<< HEAD
         config_path = get_app_data_path("config.json")
-=======
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
->>>>>>> 631c7efca42f1b2d50d6bc03408c2daf9805000c
         tmp_path = config_path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -9914,11 +9880,7 @@ class SettingsDialog(QDialog):
             return sys.executable
         
         # 如果是开发环境，尝试查找同目录下的 TabExplorer.exe
-<<<<<<< HEAD
         script_dir = get_app_base_dir()
-=======
-        script_dir = os.path.dirname(os.path.abspath(__file__))
->>>>>>> 631c7efca42f1b2d50d6bc03408c2daf9805000c
         exe_path = os.path.join(script_dir, "TabExplorer.exe")
         if os.path.exists(exe_path):
             return exe_path
@@ -10484,11 +10446,7 @@ class BookmarkManagerDialog(QDialog):
         if file_path:
             try:
                 # 复制当前的bookmarks.json到目标位置
-<<<<<<< HEAD
                 bookmarks_path = get_app_data_path("bookmarks.json")
-=======
-                bookmarks_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bookmarks.json")
->>>>>>> 631c7efca42f1b2d50d6bc03408c2daf9805000c
                 shutil.copy2(bookmarks_path, file_path)
                 show_toast(self, "导出成功", f"书签已成功导出到:\n{file_path}", level="success")
                 print(f"[Bookmark Export] Successfully exported to: {file_path}")
