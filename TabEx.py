@@ -318,8 +318,8 @@ class BookmarkDialog(QDialog):
                 show_toast(self, "路径错误", f"路径不存在: {local_path2}", level="warning")
 
 # 自定义委托：在文件名列实现省略号在开头
-from PyQt5.QtWidgets import QStyledItemDelegate
-from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QStyledItemDelegate, QTableView, QAbstractItemView
+from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex
 from PyQt5.QtGui import QPainter
 
 class ElideLeftDelegate(QStyledItemDelegate):
@@ -337,6 +337,90 @@ class ElideLeftDelegate(QStyledItemDelegate):
             painter.restore()
         else:
             super().paint(painter, option, index)
+
+
+class SearchResultsTableModel(QAbstractTableModel):
+    HEADERS = ["文件名", "类型", "修改日期", "大小"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows = []
+
+    def rowCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return len(self.HEADERS)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        row = self._rows[index.row()]
+        column = index.column()
+
+        if role == Qt.DisplayRole:
+            if column == 0:
+                return row.get('name', '')
+            if column == 1:
+                return row.get('file_type', '')
+            if column == 2:
+                return row.get('date', '')
+            if column == 3:
+                return row.get('size', '')
+        elif role == Qt.ToolTipRole:
+            if column == 0:
+                return row.get('full_path') or row.get('path', '')
+            return row.get('path', '')
+        elif role == Qt.UserRole:
+            return row.get('path', '')
+        elif role == Qt.TextAlignmentRole and column == 0:
+            return int(Qt.AlignLeft | Qt.AlignVCenter)
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal and 0 <= section < len(self.HEADERS):
+            return self.HEADERS[section]
+        return super().headerData(section, orientation, role)
+
+    def sort(self, column, order=Qt.AscendingOrder):
+        key_map = {
+            0: lambda row: str(row.get('name', '')).lower(),
+            1: lambda row: str(row.get('file_type', '')).lower(),
+            2: lambda row: str(row.get('date', '')),
+            3: lambda row: str(row.get('size', '')),
+        }
+        key_fn = key_map.get(column)
+        if key_fn is None or len(self._rows) <= 1:
+            return
+        self.layoutAboutToBeChanged.emit()
+        self._rows.sort(key=key_fn, reverse=(order == Qt.DescendingOrder))
+        self.layoutChanged.emit()
+
+    def clear(self):
+        self.beginResetModel()
+        self._rows = []
+        self.endResetModel()
+
+    def append_results(self, rows):
+        if not rows:
+            return 0
+        start_row = len(self._rows)
+        end_row = start_row + len(rows) - 1
+        self.beginInsertRows(QModelIndex(), start_row, end_row)
+        self._rows.extend(rows)
+        self.endInsertRows()
+        return len(rows)
+
+    def path_for_row(self, row):
+        if 0 <= row < len(self._rows):
+            return self._rows[row].get('path', '')
+        return ''
 
 # Everything 搜索引擎集成
 def detect_everything():
@@ -481,17 +565,18 @@ class SearchDialog(QDialog):
         layout.addWidget(self.status_label)
         
         # 结果表格
-        self.result_list = QTableWidget()
-        self.result_list.setColumnCount(4)
-        self.result_list.setHorizontalHeaderLabels(["文件名", "类型", "修改日期", "大小"])
+        self.result_model = SearchResultsTableModel(self)
+        self.result_list = QTableView()
+        self.result_list.setModel(self.result_model)
         self.result_list.horizontalHeader().setStretchLastSection(False)
         self.result_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.result_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.result_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.result_list.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.result_list.setSelectionBehavior(QTableWidget.SelectRows)
-        self.result_list.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.result_list.cellDoubleClicked.connect(self.on_result_double_clicked)
+        self.result_list.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.result_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.result_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.result_list.doubleClicked.connect(self.on_result_double_clicked)
         # 启用排序功能
         self.result_list.setSortingEnabled(True)
         # 设置自定义委托，让文件名列的省略号显示在开头
@@ -516,6 +601,14 @@ class SearchDialog(QDialog):
         self.ui_update_timer = QTimer(self)
         self.ui_update_timer.timeout.connect(self.update_ui_from_queue)
         self.ui_update_timer.start(80)  # 搜索时动态提速，空闲时降频
+
+    def _ensure_ui_update_timer(self, interval=None):
+        if not self.ui_update_timer:
+            return
+        if interval is not None and self.ui_update_timer.interval() != interval:
+            self.ui_update_timer.setInterval(interval)
+        if not self.ui_update_timer.isActive():
+            self.ui_update_timer.start()
     
     def update_ui_from_queue(self):
         """从队列中取出结果并更新UI（在主线程中调用，批量优化）"""
@@ -584,7 +677,9 @@ class SearchDialog(QDialog):
                 self._queue_idle_ticks = 0
             elif not self.is_searching:
                 self._queue_idle_ticks += 1
-                if self._queue_idle_ticks > 3 and self.ui_update_timer.interval() != 250:
+                if self._queue_idle_ticks > 3 and pending == 0 and self.ui_update_timer.isActive():
+                    self.ui_update_timer.stop()
+                elif self._queue_idle_ticks > 1 and self.ui_update_timer.interval() != 250:
                     self.ui_update_timer.setInterval(250)
                 
         except Exception as e:
@@ -603,23 +698,8 @@ class SearchDialog(QDialog):
         rows_to_add = results[:remaining_capacity]
 
         self.result_list.setUpdatesEnabled(False)
-        start_row = self.result_list.rowCount()
-        self.result_list.setRowCount(start_row + len(rows_to_add))
-
-        for offset, item in enumerate(rows_to_add):
-            row = start_row + offset
-
-            name_item = QTableWidgetItem(item['name'])
-            name_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            name_item.setToolTip(item['full_path'])
-            self.result_list.setItem(row, 0, name_item)
-            self.result_list.setItem(row, 1, QTableWidgetItem(item['file_type']))
-            self.result_list.setItem(row, 2, QTableWidgetItem(item['date']))
-            self.result_list.setItem(row, 3, QTableWidgetItem(item['size']))
-            self.result_list.item(row, 0).setData(Qt.UserRole, item['path'])
-
-            self.current_result_count += 1
-
+        added_count = self.result_model.append_results(rows_to_add)
+        self.current_result_count += added_count
         self.result_list.setUpdatesEnabled(True)
     
     def add_search_result(self, item):
@@ -710,7 +790,7 @@ class SearchDialog(QDialog):
         if cached_results is not None:
             # 使用缓存结果
             debug_print(f"[Search] 使用缓存结果，共 {len(cached_results)} 个")
-            self.result_list.setRowCount(0)
+            self.result_model.clear()
             self.current_result_count = 0
             self.status_label.setText("正在加载缓存结果...")
             
@@ -723,10 +803,12 @@ class SearchDialog(QDialog):
             self.result_list.setSortingEnabled(sorting_enabled)
             shown_count = min(len(cached_results), self.max_results)
             self.status_label.setText(f"搜索完成（缓存），共显示 {shown_count} 个结果")
+            if self.ui_update_timer and self.ui_update_timer.isActive():
+                self.ui_update_timer.stop()
             return
         
         # 清空之前的结果
-        self.result_list.setRowCount(0)
+        self.result_model.clear()
         self.current_result_count = 0  # 重置计数器
         
         # 搜索期间完全禁用排序（性能优化）
@@ -736,8 +818,9 @@ class SearchDialog(QDialog):
         self.search_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_label.setText(f"搜索中... (最多显示{self.max_results}个结果)")
-        if self.ui_update_timer and self.ui_update_timer.interval() != 20:
-            self.ui_update_timer.setInterval(20)
+        if self.ui_update_timer:
+            self._queue_idle_ticks = 0
+            self._ensure_ui_update_timer(20)
         
         # 在后台线程执行搜索
         import threading
@@ -754,8 +837,9 @@ class SearchDialog(QDialog):
         self.search_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status_label.setText("已停止")
-        if self.ui_update_timer and self.ui_update_timer.interval() != 220:
-            self.ui_update_timer.setInterval(220)
+        if self.ui_update_timer:
+            self._queue_idle_ticks = 0
+            self._ensure_ui_update_timer(220)
     
     def search_with_everything(self, keyword, search_path, file_types=""):
         """使用Everything进行搜索"""
@@ -1363,25 +1447,22 @@ class SearchDialog(QDialog):
         
         debug_print(f"[Search] UI更新已调度（使用队列）")
     
-    def on_result_double_clicked(self, row, column):
+    def on_result_double_clicked(self, index):
         """双击搜索结果，打开文件所在文件夹或文件夹本身，并选中文件"""
-        from PyQt5.QtCore import Qt
-        # 从第一列获取存储的完整路径
-        path_item = self.result_list.item(row, 0)
-        if path_item:
-            file_path = path_item.data(Qt.UserRole)  # 获取存储的完整路径
-            
-            if os.path.exists(file_path):
-                # 如果是文件夹，直接打开文件夹；如果是文件，打开文件所在文件夹并选中文件
-                if os.path.isdir(file_path):
-                    folder_path = file_path
-                    select_file = None
-                else:
-                    folder_path = os.path.dirname(file_path)
-                    select_file = os.path.basename(file_path)  # 要选中的文件名
-                # 不关闭搜索对话框，保持独立
-                if self.main_window and hasattr(self.main_window, 'add_new_tab'):
-                    self.main_window.add_new_tab(folder_path, select_file=select_file)
+        if not index.isValid():
+            return
+        file_path = self.result_model.path_for_row(index.row())
+        if file_path and os.path.exists(file_path):
+            # 如果是文件夹，直接打开文件夹；如果是文件，打开文件所在文件夹并选中文件
+            if os.path.isdir(file_path):
+                folder_path = file_path
+                select_file = None
+            else:
+                folder_path = os.path.dirname(file_path)
+                select_file = os.path.basename(file_path)  # 要选中的文件名
+            # 不关闭搜索对话框，保持独立
+            if self.main_window and hasattr(self.main_window, 'add_new_tab'):
+                self.main_window.add_new_tab(folder_path, select_file=select_file)
 
 import sys
 import os
@@ -1438,6 +1519,69 @@ def launch_detached(cmd, cwd=None, extra_creationflags=0):
         return subprocess.Popen(cmd, cwd=cwd, creationflags=flags, close_fds=True)
     # 非 Windows 环境使用新 session，避免收到父进程信号
     return subprocess.Popen(cmd, cwd=cwd, start_new_session=True, close_fds=True)
+
+
+def normalize_external_launch_dir(path):
+    if not path:
+        return None
+    return os.path.normpath(path) if os.name == 'nt' else path
+
+
+def find_git_install_root():
+    git_root_candidates = [
+        r"C:\Program Files\Git",
+        r"C:\Program Files (x86)\Git",
+        os.path.expandvars(r"%PROGRAMFILES%\Git"),
+        os.path.expandvars(r"%PROGRAMFILES(X86)%\Git"),
+    ]
+    return next((path for path in git_root_candidates if os.path.isdir(path)), None)
+
+
+def launch_shell_tool(tool_name, cwd=None):
+    cwd = normalize_external_launch_dir(cwd)
+
+    if tool_name in ('cmd', 'powershell', 'git-bash'):
+        if not cwd or not os.path.isdir(cwd):
+            raise FileNotFoundError("当前路径无效，无法启动终端")
+
+    if tool_name == 'cmd':
+        return subprocess.Popen(
+            ['cmd.exe', '/K', 'cd', '/d', cwd],
+            creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
+            cwd=cwd,
+        )
+
+    if tool_name == 'powershell':
+        escaped_dir = cwd.replace("'", "''")
+        return subprocess.Popen(
+            ['powershell.exe', '-NoExit', '-Command', f"Set-Location -LiteralPath '{escaped_dir}'"],
+            creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
+            cwd=cwd,
+        )
+
+    if tool_name == 'git-bash':
+        git_root = find_git_install_root()
+        if not git_root:
+            raise FileNotFoundError("未找到 Git Bash，请确认已安装 Git for Windows")
+        git_bash_exe = os.path.join(git_root, 'git-bash.exe')
+        if not os.path.exists(git_bash_exe):
+            raise FileNotFoundError("未找到可用的 Git Bash 可执行文件")
+        return subprocess.Popen([
+            'cmd.exe',
+            '/c',
+            'start',
+            '',
+            '/D',
+            cwd,
+            git_bash_exe,
+        ])
+
+    if tool_name == 'calculator':
+        if os.name != 'nt':
+            raise OSError("当前系统不支持打开计算器")
+        return subprocess.Popen(['calc.exe'])
+
+    raise ValueError(f"Unsupported tool: {tool_name}")
 
 
 # 全局轻量提示气泡，用于替换阻塞式消息框
@@ -2437,14 +2581,34 @@ class FileExplorerTab(QWidget):
                         debug_print(f"[DirPoll] Activated polling for visible tab: {current_path}")
                     else:
                         debug_print(f"[DirPoll] Skipped polling for slow path: {current_path}")
-                if getattr(self, '_pending_external_refresh', False):
-                    self._pending_external_refresh = False
-                    self._schedule_refresh(reason="activate_tab")
+                self._consume_pending_refresh(fallback_reason="activate_tab")
         else:
             self._refresh_file_watch_paths(None)
             if hasattr(self, 'dir_poll_timer') and self.dir_poll_timer and self.dir_poll_timer.isActive():
                 self.dir_poll_timer.stop()
                 debug_print(f"[DirPoll] Suspended polling for background tab: {current_path}")
+
+    def _request_refresh(self, reason="manual"):
+        """统一记录刷新请求，当前标签可见时立即调度，不可见时延后到激活后消费。"""
+        self._refresh_pending = True
+        self._refresh_pending_reason = reason
+
+        if getattr(self, '_suppress_auto_refresh', False):
+            debug_print(f"[AutoRefresh] Suppressed during navigation (reason={reason})")
+            return False
+        if not getattr(self, '_refresh_active', True):
+            debug_print(f"[AutoRefresh] Deferred while tab inactive (reason={reason})")
+            return False
+
+        self._schedule_refresh(reason=reason)
+        return True
+
+    def _consume_pending_refresh(self, fallback_reason="manual"):
+        if not getattr(self, '_refresh_pending', False):
+            return False
+        reason = getattr(self, '_refresh_pending_reason', None) or fallback_reason
+        self._schedule_refresh(reason=reason)
+        return True
 
     def on_file_changed(self, path):
         """文件内容或元数据变化时，主动刷新当前视图。"""
@@ -2467,7 +2631,7 @@ class FileExplorerTab(QWidget):
             if current_dir and os.path.normcase(os.path.dirname(path)) == os.path.normcase(current_dir):
                 self._invalidate_entry_count_cache(current_dir)
                 if not getattr(self, '_refresh_active', True):
-                    self._pending_external_refresh = True
+                    self._request_refresh(reason="file_changed")
                     debug_print(f"[FileWatcher] Background tab file changed, marked dirty: {path}")
                     return
                 # 某些编辑器会以重命名替换文件，变化后需重新添加 watcher
@@ -2477,7 +2641,7 @@ class FileExplorerTab(QWidget):
                             self.file_watcher.addPath(path)
                     except Exception:
                         pass
-                self._schedule_refresh(reason="file_changed")
+                self._request_refresh(reason="file_changed")
         except Exception as e:
             debug_print(f"[FileWatcher] on_file_changed error: {e}")
 
@@ -2948,17 +3112,13 @@ class FileExplorerTab(QWidget):
     def on_path_bar_changed(self, path):
         """处理面包屑路径栏的路径变化，支持特殊shell路径自动跳转"""
         import os
-        import subprocess
         path = path.strip()
         # 处理cmd命令
         if path.lower() == 'cmd':
             try:
                 current_dir = self.current_path
                 if current_dir and os.path.exists(current_dir):
-                    # 直接使用subprocess.Popen，CREATE_NEW_CONSOLE不能与DETACHED_PROCESS同时使用
-                    subprocess.Popen(['cmd', '/K', 'cd', '/d', current_dir], 
-                                   creationflags=subprocess.CREATE_NEW_CONSOLE,
-                                   cwd=current_dir)
+                    launch_shell_tool('cmd', current_dir)
                     self.path_bar.set_path(current_dir)
                 else:
                     show_toast(self, "错误", "当前路径无效，无法打开命令行", level="error")
@@ -3438,7 +3598,8 @@ class FileExplorerTab(QWidget):
         self._watched_files = set()
         self._last_dir_snapshot = None
         self._refresh_active = False
-        self._pending_external_refresh = False
+        self._refresh_pending = False
+        self._refresh_pending_reason = None
         self._entry_count_cache = {'path': None, 'count': None, 'ts_ms': 0}
         self._selection_cache = {'path': None, 'entries': None, 'ts_ms': 0}
 
@@ -3801,11 +3962,11 @@ class FileExplorerTab(QWidget):
             debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
             return
         if not getattr(self, '_refresh_active', True):
-            self._pending_external_refresh = True
+            self._request_refresh(reason="watcher")
             debug_print(f"[FileWatcher] Background tab marked dirty: {path}")
             return
         if path == self.current_path:
-            self._schedule_refresh(reason="watcher")
+            self._request_refresh(reason="watcher")
 
     def _schedule_refresh(self, reason="manual"):
         """统一的刷新调度，避免重复代码"""
@@ -3855,6 +4016,8 @@ class FileExplorerTab(QWidget):
             debug_print(f"[AutoRefresh] Refresh burst detected ({len(burst_times)} in 5s), suppressing for 5s")
             return
         self._last_refresh_ts_ms = now_ms
+        self._refresh_pending = False
+        self._refresh_pending_reason = None
         debug_print(f"[FileWatcher] Auto-refreshing: {self.current_path}")
         if hasattr(self, 'explorer') and self.current_path:
             try:
@@ -3884,7 +4047,7 @@ class FileExplorerTab(QWidget):
             norm_loaded = os.path.abspath(path)
             norm_current = os.path.abspath(self.current_path)
             if norm_loaded == norm_current:
-                self._schedule_refresh(reason="dir_tree_loaded")
+                self._request_refresh(reason="dir_tree_loaded")
         except Exception as e:
             debug_print(f"[DirModel] directoryLoaded handler error: {e}")
 
@@ -3912,7 +4075,7 @@ class FileExplorerTab(QWidget):
         if current_snapshot != self._last_dir_snapshot:
             debug_print(f"[DirPoll] Detected snapshot change for {path}, scheduling refresh")
             self._last_dir_snapshot = current_snapshot
-            self._schedule_refresh(reason="poll")
+            self._request_refresh(reason="poll")
 
     def _update_dir_polling(self, path):
         """根据当前路径启动或停止兜底轮询"""
@@ -5835,9 +5998,6 @@ class MainWindow(QMainWindow):
         current_tab = self.get_current_tab_widget()
         current_path = getattr(current_tab, 'current_path', '') if current_tab else ''
 
-        def normalize_launch_path(path):
-            return os.path.normpath(path) if os.name == 'nt' else path
-
         if not current_path:
             show_toast(self, "提示", "当前没有可用的标签页路径", level="warning")
             return None
@@ -5845,9 +6005,9 @@ class MainWindow(QMainWindow):
             show_toast(self, "提示", "当前为特殊路径，无法定位到 cmd 或 PowerShell", level="warning")
             return None
         if os.path.isdir(current_path):
-            return normalize_launch_path(current_path)
+            return normalize_external_launch_dir(current_path)
         if os.path.exists(current_path):
-            return normalize_launch_path(os.path.dirname(current_path))
+            return normalize_external_launch_dir(os.path.dirname(current_path))
         show_toast(self, "提示", "当前标签页路径无效", level="warning")
         return None
 
@@ -5857,11 +6017,7 @@ class MainWindow(QMainWindow):
         if not current_dir:
             return
         try:
-            subprocess.Popen(
-                ['cmd.exe', '/K', 'cd', '/d', current_dir],
-                creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
-                cwd=current_dir,
-            )
+            launch_shell_tool('cmd', current_dir)
         except Exception as e:
             show_toast(self, "错误", f"无法打开 cmd: {e}", level="error")
 
@@ -5871,12 +6027,7 @@ class MainWindow(QMainWindow):
         if not current_dir:
             return
         try:
-            escaped_dir = current_dir.replace("'", "''")
-            subprocess.Popen(
-                ['powershell.exe', '-NoExit', '-Command', f"Set-Location -LiteralPath '{escaped_dir}'"],
-                creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
-                cwd=current_dir,
-            )
+            launch_shell_tool('powershell', current_dir)
         except Exception as e:
             show_toast(self, "错误", f"无法打开 PowerShell: {e}", level="error")
 
@@ -5885,42 +6036,19 @@ class MainWindow(QMainWindow):
         current_dir = self._get_current_tab_launch_dir()
         if not current_dir:
             return
-        git_root_candidates = [
-            r"C:\Program Files\Git",
-            r"C:\Program Files (x86)\Git",
-            os.path.expandvars(r"%PROGRAMFILES%\Git"),
-            os.path.expandvars(r"%PROGRAMFILES(X86)%\Git"),
-        ]
-        git_root = next((path for path in git_root_candidates if os.path.isdir(path)), None)
-        if not git_root:
-            show_toast(self, "提示", "未找到 Git Bash，请确认已安装 Git for Windows", level="warning")
-            return
-
-        git_bash_exe = os.path.join(git_root, "git-bash.exe")
         try:
-            if os.path.exists(git_bash_exe) and os.name == 'nt':
-                subprocess.Popen([
-                    'cmd.exe',
-                    '/c',
-                    'start',
-                    '',
-                    '/D',
-                    current_dir,
-                    git_bash_exe,
-                ])
-                return
-
-            show_toast(self, "提示", "未找到可用的 Git Bash 可执行文件", level="warning")
+            launch_shell_tool('git-bash', current_dir)
+        except FileNotFoundError as e:
+            show_toast(self, "提示", str(e), level="warning")
         except Exception as e:
             show_toast(self, "错误", f"无法打开 Git Bash: {e}", level="error")
 
     def open_calculator(self):
         """打开系统计算器。"""
         try:
-            if os.name == 'nt':
-                subprocess.Popen(['calc.exe'])
-            else:
-                show_toast(self, "提示", "当前系统不支持打开计算器", level="warning")
+            launch_shell_tool('calculator')
+        except OSError as e:
+            show_toast(self, "提示", str(e), level="warning")
         except Exception as e:
             show_toast(self, "错误", f"无法打开计算器: {e}", level="error")
     
