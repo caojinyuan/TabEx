@@ -11,6 +11,12 @@ TabExplorer.exe
 # Configuration
 *.json
 
+# Backup files
+*.bak
+
+# vscode
+*.code-workspace
+
 # C extensions
 *.so
 
