@@ -88,6 +88,8 @@ SEARCH_METADATA_DEGRADE_QUEUE_RATIO = 0.75  # 触发降级的队列占用比例
 MAX_CLOSED_TABS_HISTORY = 20  # 关闭标签页历史最大数量（从10增加到20）
 MAX_SEARCH_HISTORY = 30  # 搜索历史最大数量（从20增加到30）
 MAX_NAVIGATION_HISTORY = 50  # 导航历史最大数量
+SESSION_SNAPSHOT_INTERVAL_MS = 15000  # 崩溃恢复兜底：定期写入当前会话快照
+SESSION_SNAPSHOT_DEBOUNCE_MS = 1200  # 标签/路径变化后的会话快照防抖时间
 
 # 大文件夹异步加载配置
 LARGE_FOLDER_THRESHOLD = 1000  # 超过此数量文件视为大文件夹
@@ -326,6 +328,66 @@ class BookmarkDialog(QDialog):
                     self.parent().add_new_tab(local_path2)
             else:
                 show_toast(self, "路径错误", f"路径不存在: {local_path2}", level="warning")
+
+
+class QuickFindResultsDialog(QDialog):
+    def __init__(self, matched_paths, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择匹配项")
+        self.resize(680, 420)
+        self.selected_path = None
+
+        layout = QVBoxLayout(self)
+
+        self.table = QTableWidget(self)
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["名称", "类型", "完整路径"])
+        self.table.setRowCount(len(matched_paths))
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSortingEnabled(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.itemDoubleClicked.connect(self._accept_current_selection)
+
+        for row, path in enumerate(matched_paths):
+            name_item = QTableWidgetItem(os.path.basename(path))
+            type_item = QTableWidgetItem("文件夹" if os.path.isdir(path) else "文件")
+            path_item = QTableWidgetItem(path)
+            name_item.setData(Qt.UserRole, path)
+            self.table.setItem(row, 0, name_item)
+            self.table.setItem(row, 1, type_item)
+            self.table.setItem(row, 2, path_item)
+
+        if matched_paths:
+            self.table.selectRow(0)
+
+        layout.addWidget(self.table)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        ok_btn = QPushButton("确定", self)
+        cancel_btn = QPushButton("取消", self)
+        ok_btn.clicked.connect(self._accept_current_selection)
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(ok_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+
+    def _accept_current_selection(self):
+        current_row = self.table.currentRow()
+        if current_row < 0:
+            return
+        current_item = self.table.item(current_row, 0)
+        if current_item is None:
+            return
+        self.selected_path = current_item.data(Qt.UserRole)
+        if self.selected_path:
+            self.accept()
 
 # 自定义委托：在文件名列实现省略号在开头
 from PyQt5.QtWidgets import QStyledItemDelegate, QTableView, QAbstractItemView
@@ -2960,6 +3022,8 @@ class FileExplorerTab(QWidget):
                 if idx != -1:
                     self.main_window.tab_widget.setTabText(idx, title)
                     debug_print(f"DEBUG: Set tab {idx} text to '{title}'")
+                    if hasattr(self.main_window, '_schedule_session_snapshot'):
+                        self.main_window._schedule_session_snapshot()
 
     def start_path_sync_timer(self, duration_ms=2000):
         """启动路径同步定时器，duration_ms 后自动停止（按需触发，减少持续COM调用）"""
@@ -3001,13 +3065,16 @@ class FileExplorerTab(QWidget):
                     local_path = unquote(url_str[8:])
                     if os.name == 'nt' and local_path.startswith('/'):
                         local_path = local_path[1:]
+                    local_path = self._normalize_local_path(local_path)
                 # 处理 shell: 特殊路径
                 elif url_str.startswith('shell:') or '::' in url_str:
                     # Shell特殊文件夹，通常以 shell: 或包含 CLSID (::)
                     # 这些路径我们已经在 current_path 中维护，无需更新
                     return
                 
-                if local_path and local_path != self.current_path:
+                current_path = self._normalize_local_path(self.current_path)
+
+                if local_path and local_path != current_path:
                     self._path_sync_stable_hits = 0
                     self._path_sync_interval_ms = 120
                     if hasattr(self, '_path_sync_timer') and self._path_sync_timer and self._path_sync_timer.interval() != self._path_sync_interval_ms:
@@ -3027,7 +3094,7 @@ class FileExplorerTab(QWidget):
                     if getattr(self, '_navigating_folder', False):
                         self._navigating_folder = False
                     self._resume_path_sync_after_navigation()
-                elif local_path and local_path == self.current_path:
+                elif local_path and local_path == current_path:
                     self._path_sync_stable_hits = int(getattr(self, '_path_sync_stable_hits', 0)) + 1
                     # 即使路径未变化，也做一次轻量UI回写，修复偶发地址栏未重绘。
                     if hasattr(self, 'path_bar'):
@@ -3901,10 +3968,21 @@ class FileExplorerTab(QWidget):
         else:
             debug_print(f"[go_up] Invalid parent path")
 
+    def _normalize_local_path(self, path):
+        if not isinstance(path, str) or not path:
+            return path
+        if path.startswith('shell:') or '::' in path:
+            return path
+        try:
+            return os.path.normpath(path)
+        except Exception:
+            return path
+
     def __init__(self, parent=None, path="", is_shell=False, select_file=None):
         super().__init__(parent)
         self.main_window = parent
-        self.current_path = path if path else QDir.homePath()
+        initial_path = path if path else QDir.homePath()
+        self.current_path = self._normalize_local_path(initial_path)
         self.select_file = select_file  # 要选中的文件名
         self.notepad_plus_plus_path = detect_notepad_plus_plus()
         # 浏览历史记录
@@ -3998,6 +4076,8 @@ class FileExplorerTab(QWidget):
         return filenames
 
     def navigate_to(self, path, is_shell=False, add_to_history=True, skip_async_check=False):
+        if not is_shell:
+            path = self._normalize_local_path(path)
         debug_print(f"[navigate_to] To '{path}' (is_shell={is_shell}, skip_async={skip_async_check})")
 
         # 控制面板及其子目录用原生窗口打开，不嵌入
@@ -4141,6 +4221,7 @@ class FileExplorerTab(QWidget):
     
     def _perform_navigation(self, path, add_to_history):
         """执行实际的导航操作"""
+        path = self._normalize_local_path(path)
         old_path = getattr(self, 'current_path', None)
         url = QDir.toNativeSeparators(path)
         
@@ -4746,8 +4827,8 @@ class FileExplorerTab(QWidget):
         except Exception:
             return None
     
-    def select_file_in_explorer(self, filename):
-        """在Explorer控件中选中指定的文件"""
+    def select_file_in_explorer(self, filename, retries=6, delay_ms=250):
+        """在Explorer控件中选中当前目录下指定的文件或文件夹。"""
         try:
             debug_print(f"[SelectFile] Attempting to select file: {filename}")
             
@@ -4755,7 +4836,7 @@ class FileExplorerTab(QWidget):
             full_path = os.path.join(self.current_path, filename)
             if not os.path.exists(full_path):
                 debug_print(f"[SelectFile] File not found: {full_path}")
-                return
+                return False
             
             # 使用Windows API选中文件（通过查找ListView控件并发送消息）
             try:
@@ -4801,11 +4882,18 @@ class FileExplorerTab(QWidget):
                 
                 if not listview_hwnd:
                     debug_print(f"[SelectFile] ListView control not found")
-                    return
+                    if retries > 0:
+                        QTimer.singleShot(delay_ms, lambda: self.select_file_in_explorer(filename, retries - 1, delay_ms))
+                    return False
                 
                 # 获取ListView中的项目数
                 item_count = user32.SendMessageW(listview_hwnd, LVM_GETITEMCOUNT, 0, 0)
                 debug_print(f"[SelectFile] ListView has {item_count} items")
+                if item_count <= 0:
+                    if retries > 0:
+                        debug_print(f"[SelectFile] ListView not ready, retrying... remaining={retries}")
+                        QTimer.singleShot(delay_ms, lambda: self.select_file_in_explorer(filename, retries - 1, delay_ms))
+                    return False
                 
                 # 遍历所有项目，查找匹配的文件名
                 for i in range(item_count):
@@ -4858,25 +4946,35 @@ class FileExplorerTab(QWidget):
                                             user32.SendMessageW(listview_hwnd, LVM_ENSUREVISIBLE, i, 0)
                                             
                                             # 设置焦点到ListView
+                                            self.activateWindow()
+                                            self.raise_()
+                                            if hasattr(self, 'explorer') and self.explorer:
+                                                self.explorer.setFocus(Qt.OtherFocusReason)
                                             user32.SetFocus(listview_hwnd)
                                             
                                             debug_print(f"[SelectFile] Successfully selected file via API: {filename}")
-                                            return
+                                            return True
                     except Exception as e:
                         debug_print(f"[SelectFile] Error matching item {i}: {e}")
                         continue
                 
                 debug_print(f"[SelectFile] File not found in ListView: {filename}")
+                if retries > 0:
+                    debug_print(f"[SelectFile] Target not visible yet, retrying... remaining={retries}")
+                    QTimer.singleShot(delay_ms, lambda: self.select_file_in_explorer(filename, retries - 1, delay_ms))
+                return False
                 
             except Exception as e:
                 debug_print(f"[SelectFile] Windows API method failed: {e}")
                 import traceback
                 traceback.print_exc()
+                return False
         
         except Exception as e:
             debug_print(f"[SelectFile] Error: {e}")
             import traceback
             traceback.print_exc()
+            return False
 
 
 class DragDropTabWidget(QTabWidget):
@@ -6736,6 +6834,8 @@ class MainWindow(QMainWindow):
         # 激活窗口（当从其他实例接收到路径时）
         self.activateWindow()
         self.raise_()
+
+        self._schedule_session_snapshot()
         
         return tab_index
 
@@ -6787,6 +6887,7 @@ class MainWindow(QMainWindow):
                 self.content_stack.removeWidget(widget)
                 if widget:
                     widget.deleteLater()
+            self._schedule_session_snapshot()
         else:
             self.close()
 
@@ -6824,16 +6925,16 @@ class MainWindow(QMainWindow):
                         pass
 
             # 调试信息：检查同步状态
-            print(f"[TabSwitch] Tab changed to index {index}")
+            debug_print(f"[TabSwitch] Tab changed to index {index}")
             if hasattr(self, 'content_stack'):
-                print(f"[TabSwitch] content_stack has {self.content_stack.count()} widgets, tab_widget has {self.tab_widget.count()} tabs")
+                debug_print(f"[TabSwitch] content_stack has {self.content_stack.count()} widgets, tab_widget has {self.tab_widget.count()} tabs")
             
             # 同步 content_stack 的显示
             if hasattr(self, 'content_stack') and index < self.content_stack.count():
                 self.content_stack.setCurrentIndex(index)
-                print(f"[TabSwitch] Set content_stack to index {index}")
+                debug_print(f"[TabSwitch] Set content_stack to index {index}")
             else:
-                print(f"[TabSwitch] WARNING: Cannot sync - content_stack count is {self.content_stack.count() if hasattr(self, 'content_stack') else 'N/A'}")
+                debug_print(f"[TabSwitch] WARNING: Cannot sync - content_stack count is {self.content_stack.count() if hasattr(self, 'content_stack') else 'N/A'}")
             
             # 从 content_stack 获取实际的标签页内容
             tab = self.content_stack.widget(index) if hasattr(self, 'content_stack') else self.tab_widget.widget(index)
@@ -6856,6 +6957,7 @@ class MainWindow(QMainWindow):
             self.update_navigation_buttons()
             # 同步 AI 聊天面板的当前目录提示
             self.update_chat_context()
+            self._schedule_session_snapshot()
         
         # 更新所有标签页的字体：选中的加粗，未选中的正常
         from PyQt5.QtGui import QFont
@@ -8045,11 +8147,78 @@ class MainWindow(QMainWindow):
                 show_toast(self, "复制成功", f"路径: {path_text}", level="info")
             else:
                 show_toast(self, "提示", "未选中文件，也无法获取路径栏地址", level="warning")
+
+    def quick_find_in_current_directory(self):
+        """通过关键字快速检索当前目录下的文件或文件夹名，并在当前目录中选中目标。"""
+        current_tab = self.get_current_tab_widget()
+        if not current_tab or not hasattr(current_tab, 'current_path'):
+            show_toast(self, "提示", "当前没有可用的标签页路径", level="warning")
+            return
+
+        search_root = current_tab.current_path
+        if not isinstance(search_root, str) or not search_root or search_root.startswith('shell:') or '::' in search_root:
+            show_toast(self, "提示", "当前路径不支持快捷检索", level="warning")
+            return
+        if not os.path.isdir(search_root):
+            show_toast(self, "提示", "当前目录无效", level="warning")
+            return
+
+        keyword, ok = QInputDialog.getText(self, "快捷定位", "请输入要检索的文件或文件夹关键字：")
+        self._guard_shortcuts_after_modal()
+        if not ok:
+            return
+
+        keyword = keyword.strip()
+        if not keyword:
+            show_toast(self, "提示", "请输入搜索关键词", level="warning")
+            return
+
+        keyword_lower = keyword.lower()
+        matched_paths = []
+        max_matches = 200
+
+        try:
+            with os.scandir(search_root) as entries:
+                sorted_entries = sorted(entries, key=lambda entry: entry.name.lower())
+                for entry in sorted_entries:
+                    if keyword_lower in entry.name.lower():
+                        matched_paths.append(entry.path)
+                        if len(matched_paths) >= max_matches:
+                            break
+        except Exception as e:
+            show_toast(self, "错误", f"快捷检索失败: {e}", level="error")
+            return
+
+        if not matched_paths:
+            show_toast(self, "提示", f"当前目录下未找到包含“{keyword}”的文件或文件夹名", level="warning")
+            return
+
+        matched_paths.sort(key=lambda item: os.path.basename(item).lower())
+        selected_path = matched_paths[0]
+        if len(matched_paths) > 1:
+            picker = QuickFindResultsDialog(matched_paths, self)
+            picker.setWindowTitle(f"选择匹配项（共 {len(matched_paths)} 项）")
+            ok = picker.exec_()
+            self._guard_shortcuts_after_modal()
+            if not ok or not picker.selected_path:
+                return
+            selected_path = picker.selected_path
+
+        selected_name = os.path.basename(selected_path)
+        current_tab.select_file_in_explorer(selected_name)
+        item_type = "文件夹" if os.path.isdir(selected_path) else "文件"
+        show_toast(self, "快捷定位", f"已在当前目录选中{item_type}: {selected_name}", level="info")
     
     def keyPressEvent(self, event):
         """处理快捷键（备用方案，主要使用QShortcut）"""
         # 保留此方法以防QShortcut在某些情况下不工作
         super().keyPressEvent(event)
+
+    def _guard_shortcuts_after_modal(self, cooldown_ms=250):
+        """模态输入框关闭后，短暂屏蔽轮询快捷键，避免把输入过程误判为组合键。"""
+        self._last_keys_state.clear()
+        self._shortcut_modal_guard_until = time.monotonic() + max(0, cooldown_ms) / 1000.0
+        self._shortcut_wait_for_modifier_release = True
     
     def eventFilter(self, obj, event):
         """应用级别的事件过滤器（暂时不使用，因为被QAxWidget拦截）"""
@@ -8115,6 +8284,20 @@ class MainWindow(QMainWindow):
                     return is_down
                 was_pressed_since_last = (state & 0x0001) != 0
                 return is_down or was_pressed_since_last
+
+            modifiers_down = (
+                is_key_pressed(VK_CONTROL, require_down=True)
+                or is_key_pressed(VK_SHIFT, require_down=True)
+                or is_key_pressed(VK_MENU, require_down=True)
+            )
+
+            if getattr(self, '_shortcut_wait_for_modifier_release', False):
+                if modifiers_down:
+                    return
+                self._shortcut_wait_for_modifier_release = False
+
+            if time.monotonic() < getattr(self, '_shortcut_modal_guard_until', 0):
+                return
             
             hotkeys = self.config.get("hotkeys", {})
             
@@ -8209,6 +8392,17 @@ class MainWindow(QMainWindow):
                     return
                 else:
                     self._last_keys_state["Ctrl+F"] = False
+
+                # Ctrl+G (0x47) - 快速检索当前目录中的文件/文件夹名
+                if is_key_pressed(0x47) and hotkeys.get("quick_find_current_dir", True):
+                    key_combo = "Ctrl+G"
+                    if not self._last_keys_state.get(key_combo, False):
+                        debug_print("[Shortcut Poll] Detected Ctrl+G")
+                        self.quick_find_in_current_directory()
+                        self._last_keys_state[key_combo] = True
+                    return
+                else:
+                    self._last_keys_state["Ctrl+G"] = False
                 
                 # Ctrl+D (0x44)
                 if is_key_pressed(0x44) and hotkeys.get("add_bookmark", True):
@@ -8330,6 +8524,7 @@ class MainWindow(QMainWindow):
             self.config["hotkeys"]["refresh"] = dlg.hotkey_refresh.isChecked()
             self.config["hotkeys"]["add_bookmark"] = dlg.hotkey_add_bookmark.isChecked()
             self.config["hotkeys"]["copy_filename"] = dlg.hotkey_copy_filename.isChecked()
+            self.config["hotkeys"]["quick_find_current_dir"] = dlg.hotkey_quick_find_current_dir.isChecked()
             
             self.save_config()
 
@@ -8588,6 +8783,7 @@ class MainWindow(QMainWindow):
         # 更新config并保存
         self.config["pinned_tabs"] = pinned_paths
         self.save_config()
+        self._schedule_session_snapshot()
         
         print(f"[Config] Saved {len(pinned_paths)} pinned tabs to config.json")
 
@@ -8680,6 +8876,14 @@ class MainWindow(QMainWindow):
         self._shortcut_timer = QTimer(self)
         self._shortcut_timer.timeout.connect(self._check_shortcuts)
         self._shortcut_timer.start(SHORTCUT_POLL_ACTIVE_MS)
+
+        # 运行期间持续保存标签会话，异常退出后仍可恢复最近窗口列表。
+        self._session_snapshot_debounce_timer = QTimer(self)
+        self._session_snapshot_debounce_timer.setSingleShot(True)
+        self._session_snapshot_debounce_timer.timeout.connect(self.save_session_snapshot)
+        self._session_snapshot_timer = QTimer(self)
+        self._session_snapshot_timer.timeout.connect(self.save_session_snapshot)
+        self._session_snapshot_timer.start(SESSION_SNAPSHOT_INTERVAL_MS)
         
         # 性能优化：延迟加载非关键功能（100ms后加载）
         QTimer.singleShot(100, self._delayed_initialization)
@@ -8738,6 +8942,7 @@ class MainWindow(QMainWindow):
             "pinned_tabs": [],  # 默认没有固定标签页
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
+            "last_active_tab_path": "",  # 最近一次激活的标签页路径
             "enable_tortoisegit_buttons": False,  # 默认关闭TortoiseGit按钮
             "preferred_terminal_tool": "cmd",  # 默认终端类型
             "enable_title_shortcuts": True,  # 默认启用标题栏快捷方式区域
@@ -8749,6 +8954,7 @@ class MainWindow(QMainWindow):
                 "reopen_tab": True,        # Ctrl+Shift+T
                 "switch_tab": True,        # Ctrl+Tab / Ctrl+Shift+Tab
                 "search": True,            # Ctrl+F
+                "quick_find_current_dir": True,  # Ctrl+G
                 "navigate": True,          # Alt+Left/Right
                 "go_up": True,             # Alt+Up
                 "refresh": True,           # F5
@@ -8849,6 +9055,83 @@ class MainWindow(QMainWindow):
                 os.remove(tmp_path)
             except Exception:
                 pass
+
+    def _collect_cached_tabs(self):
+        cached_tabs = []
+        seen_paths = set()
+        pinned_norm = {
+            self._normalize_path_for_compare(p)
+            for p in self.config.get("pinned_tabs", []) if p
+        }
+
+        if not hasattr(self, 'tab_widget'):
+            return cached_tabs
+
+        for i in range(self.tab_widget.count()):
+            tab = self.get_tab_widget(i)
+            if not tab or not hasattr(tab, 'current_path'):
+                continue
+            if getattr(tab, 'is_pinned', False):
+                continue
+
+            current_path = getattr(tab, 'current_path', '')
+            if not current_path:
+                continue
+
+            norm = self._normalize_path_for_compare(current_path)
+            if norm in pinned_norm or norm in seen_paths:
+                continue
+
+            seen_paths.add(norm)
+            cached_tabs.append({
+                'path': current_path,
+                'is_shell': current_path.startswith('shell:'),
+            })
+
+        return cached_tabs
+
+    def _get_last_active_tab_path(self):
+        try:
+            current_tab = self.get_current_tab_widget()
+            current_path = getattr(current_tab, 'current_path', '') if current_tab else ''
+            return current_path or ""
+        except Exception:
+            return ""
+
+    def _schedule_session_snapshot(self, delay_ms=SESSION_SNAPSHOT_DEBOUNCE_MS):
+        if not hasattr(self, '_session_snapshot_debounce_timer') or self._session_snapshot_debounce_timer is None:
+            return
+        self._session_snapshot_debounce_timer.start(max(0, int(delay_ms)))
+
+    def _restore_last_active_tab(self):
+        last_active_path = self.config.get("last_active_tab_path", "")
+        if not last_active_path:
+            return False
+
+        tab_index = self.find_tab_index_by_path(last_active_path)
+        if tab_index < 0:
+            return False
+
+        self.tab_widget.setCurrentIndex(tab_index)
+        return True
+
+    def save_session_snapshot(self, immediate=False):
+        if not hasattr(self, 'config') or not hasattr(self, 'tab_widget'):
+            return
+
+        try:
+            cached_tabs = []
+            if self.config.get("enable_cache_tabs", True):
+                cached_tabs = self._collect_cached_tabs()
+
+            self.config["cached_tabs"] = cached_tabs
+            self.config["last_active_tab_path"] = self._get_last_active_tab_path()
+            self.save_config(immediate=immediate)
+            debug_print(
+                f"[App] 会话快照已更新: tabs={len(cached_tabs)}, active='{self.config.get('last_active_tab_path', '')}'"
+            )
+        except Exception as e:
+            print(f"Error saving session snapshot: {e}")
 
     def ensure_default_bookmarks(self):
         bm = self.bookmark_manager
@@ -9426,10 +9709,6 @@ class MainWindow(QMainWindow):
                                 continue
                             self.add_new_tab(path)
                     debug_print(f"[App] 恢复缓存标签后标签页数: {self.tab_widget.count()}")
-                    # 恢复后清除缓存
-                    self.config['cached_tabs'] = []
-                    self.save_config()
-                    debug_print("[App] 缓存标签页已恢复并清除")
                 else:
                     # 没有缓存标签且没有固定标签，现在添加默认标签
                     if self.tab_widget.count() == 0:
@@ -9455,6 +9734,11 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(500, self.start_explorer_monitor)
         except Exception as e:
             debug_print(f"[Performance] Failed to start explorer monitor: {e}")
+
+        restored_active = self._restore_last_active_tab()
+        if restored_active:
+            debug_print("[App] 已恢复上次激活的标签页")
+        self.save_session_snapshot(immediate=True)
         
         # 恢复完成：取消恢复状态并更新标题
         self.is_restoring = False
@@ -9812,41 +10096,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭时停止服务器和监听"""
-        # 缓存非固定标签（如果启用）
         try:
-            cached_tabs = []
-            if self.config.get("enable_cache_tabs", True):
-                seen_paths = set()
-                pinned_norm = {
-                    self._normalize_path_for_compare(p)
-                    for p in self.config.get("pinned_tabs", []) if p
-                }
-                for i in range(self.tab_widget.count()):
-                    tab = self.get_tab_widget(i)
-                    if tab and hasattr(tab, 'current_path'):
-                        # 只缓存非固定标签
-                        if not getattr(tab, 'is_pinned', False):
-                            current_path = tab.current_path
-                            norm = self._normalize_path_for_compare(current_path)
-                            if not current_path:
-                                continue
-                            # 不缓存已固定路径，避免下次启动重复
-                            if norm in pinned_norm:
-                                continue
-                            # 去重缓存，避免同路径多次恢复
-                            if norm in seen_paths:
-                                continue
-                            seen_paths.add(norm)
-                            cached_tabs.append({
-                                'path': current_path,
-                                'is_shell': current_path.startswith('shell:') if current_path else False
-                            })
-
-            # 无论是否启用缓存，都覆盖写入 cached_tabs，避免残留旧会话数据
-            self.config['cached_tabs'] = cached_tabs
-            # 关闭流程必须立即落盘，避免防抖定时器来不及触发
-            self.save_config(immediate=True)
-            debug_print(f"[App] 关闭时写入缓存标签页: {len(cached_tabs)}")
+            self.save_session_snapshot(immediate=True)
         except Exception as e:
             print(f"Error caching tabs: {e}")
         
@@ -9905,6 +10156,10 @@ class MainWindow(QMainWindow):
         try:
             tab = self.get_current_tab_widget()
             if not tab or not getattr(tab, 'current_path', None):
+                return
+            if getattr(tab, '_suppress_auto_refresh', False) or getattr(tab, '_navigating_folder', False):
+                return
+            if hasattr(tab, '_refresh_active') and not getattr(tab, '_refresh_active', True):
                 return
             norm_loaded = os.path.abspath(path) if path else None
             norm_tab = os.path.abspath(tab.current_path) if tab.current_path else None
@@ -10430,6 +10685,9 @@ class SettingsDialog(QDialog):
         self.hotkey_search = QCheckBox("Ctrl+F - 打开搜索对话框")
         self.hotkey_search.setChecked(hotkeys.get("search", True))
         hotkey_layout.addWidget(self.hotkey_search)
+        self.hotkey_quick_find_current_dir = QCheckBox("Ctrl+G - 检索当前目录文件夹/文件名")
+        self.hotkey_quick_find_current_dir.setChecked(hotkeys.get("quick_find_current_dir", True))
+        hotkey_layout.addWidget(self.hotkey_quick_find_current_dir)
         self.hotkey_navigate = QCheckBox("Alt+Left/Right - 前进/后退")
         self.hotkey_navigate.setChecked(hotkeys.get("navigate", True))
         hotkey_layout.addWidget(self.hotkey_navigate)
@@ -10752,6 +11010,7 @@ class SettingsDialog(QDialog):
                 "reopen_tab": self.hotkey_reopen_tab.isChecked(),
                 "switch_tab": self.hotkey_switch_tab.isChecked(),
                 "search": self.hotkey_search.isChecked(),
+                "quick_find_current_dir": self.hotkey_quick_find_current_dir.isChecked(),
                 "navigate": self.hotkey_navigate.isChecked(),
                 "go_up": self.hotkey_go_up.isChecked(),
                 "refresh": self.hotkey_refresh.isChecked(),
