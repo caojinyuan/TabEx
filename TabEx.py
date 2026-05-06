@@ -88,6 +88,11 @@ SEARCH_METADATA_DEGRADE_QUEUE_RATIO = 0.75  # 触发降级的队列占用比例
 MAX_CLOSED_TABS_HISTORY = 20  # 关闭标签页历史最大数量（从10增加到20）
 MAX_SEARCH_HISTORY = 30  # 搜索历史最大数量（从20增加到30）
 MAX_NAVIGATION_HISTORY = 50  # 导航历史最大数量
+MAX_ACTIVE_TOASTS = 5  # 同时显示的提示数量上限
+MAX_CHAT_HISTORY_MESSAGES = 80  # AI 聊天历史最大消息数
+MAX_CHAT_MESSAGE_CHARS = 12000  # 单条 AI 消息最大长度，防止历史长期膨胀
+HOUSEKEEPING_INTERVAL_MS = 5 * 60 * 1000  # 低频运行时清理周期（5分钟）
+HOUSEKEEPING_GC_EVERY_N = 3  # 每 N 次清理执行一次 gc.collect()
 SESSION_SNAPSHOT_INTERVAL_MS = 15000  # 崩溃恢复兜底：定期写入当前会话快照
 SESSION_SNAPSHOT_DEBOUNCE_MS = 1200  # 标签/路径变化后的会话快照防抖时间
 
@@ -717,6 +722,34 @@ class SearchDialog(QDialog):
         self.ui_update_timer = QTimer(self)
         self.ui_update_timer.timeout.connect(self.update_ui_from_queue)
         self.ui_update_timer.start(80)  # 搜索时动态提速，空闲时降频
+
+    def _drain_result_queue(self):
+        if not self.result_queue:
+            return
+        while True:
+            try:
+                self.result_queue.get_nowait()
+            except Exception:
+                break
+
+    def _release_search_resources(self):
+        self.is_searching = False
+        self.queue_overflow_count = 0
+        self._queue_idle_ticks = 0
+
+        if self.ui_update_timer:
+            self.ui_update_timer.stop()
+
+        self._drain_result_queue()
+
+        if hasattr(self, 'result_model') and self.result_model:
+            self.result_model.clear()
+        self.current_result_count = 0
+        self.search_thread = None
+
+    def closeEvent(self, event):
+        self._release_search_resources()
+        super().closeEvent(event)
 
     def _ensure_ui_update_timer(self, interval=None):
         if not self.ui_update_timer:
@@ -1769,6 +1802,50 @@ def set_explorer_monitor_debug(enabled):
     debug_print(f"[Config] Explorer Monitor debug output: {'enabled' if enabled else 'disabled'}")
 
 
+def get_process_memory_usage_mb():
+    """Return current process working set in MB on Windows, else None."""
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+            _fields_ = [
+                ('cb', wintypes.DWORD),
+                ('PageFaultCount', wintypes.DWORD),
+                ('PeakWorkingSetSize', ctypes.c_size_t),
+                ('WorkingSetSize', ctypes.c_size_t),
+                ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                ('PagefileUsage', ctypes.c_size_t),
+                ('PeakPagefileUsage', ctypes.c_size_t),
+                ('PrivateUsage', ctypes.c_size_t),
+            ]
+
+        counters = PROCESS_MEMORY_COUNTERS_EX()
+        counters.cb = ctypes.sizeof(counters)
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        psapi = ctypes.WinDLL('psapi', use_last_error=True)
+        get_current_process = kernel32.GetCurrentProcess
+        get_current_process.restype = wintypes.HANDLE
+        get_process_memory_info = psapi.GetProcessMemoryInfo
+        get_process_memory_info.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX),
+            wintypes.DWORD,
+        ]
+        get_process_memory_info.restype = wintypes.BOOL
+
+        if get_process_memory_info(get_current_process(), ctypes.byref(counters), counters.cb):
+            return round(float(counters.WorkingSetSize) / (1024 * 1024), 2)
+    except Exception:
+        return None
+    return None
+
+
 # 启动外部进程时与当前进程解耦，避免主程序退出时连带关闭子进程
 _DETACHED_FLAGS = 0
 _NEW_PROCESS_GROUP = 0
@@ -1982,6 +2059,12 @@ class ToastMessage(QWidget):
 def show_toast(parent, title, message, level="info", duration=5000):
     """在右下角显示非阻塞提示"""
     anchor = parent.window() if isinstance(parent, QWidget) else None
+    while len(_active_toasts) >= MAX_ACTIVE_TOASTS:
+        old_toast = _active_toasts.pop(0)
+        try:
+            old_toast.close()
+        except Exception:
+            pass
     toast = ToastMessage(anchor, title, message, level=level, duration=duration)
     _active_toasts.append(toast)
     toast.show()
@@ -3897,7 +3980,7 @@ class FileExplorerTab(QWidget):
                                             self._navigating_folder = False
                                         # 重启路径同步定时器（短窗口按需轮询）
                                         self.start_path_sync_timer(duration_ms=2000)
-                                t2 = QTimer()
+                                t2 = QTimer(self)
                                 t2.setSingleShot(True)
                                 t2.timeout.connect(final_confirm_and_go_up)
                                 t2.start(700)  # 增加到 700ms 以确保导航有足够时间完成
@@ -3913,7 +3996,7 @@ class FileExplorerTab(QWidget):
                             self._selected_before_click = None
 
                     # 使用 400ms 延迟，给更多时间让文件夹导航完成
-                    timer = QTimer()
+                    timer = QTimer(self)
                     timer.setSingleShot(True)
                     timer.timeout.connect(check_and_handle)
                     timer.start(400)
@@ -3994,13 +4077,14 @@ class FileExplorerTab(QWidget):
         self._pending_double_click_timers = []
         # 双击事件唯一ID，用于区分不同的双击操作
         self._double_click_id = 0
+        self._is_cleaning_up = False
         
         # 文件系统监控（监控当前路径的变化）
-        self.file_watcher = QFileSystemWatcher()
+        self.file_watcher = QFileSystemWatcher(self)
         self.file_watcher.directoryChanged.connect(self.on_directory_changed)
         self.file_watcher.fileChanged.connect(self.on_file_changed)
         # 延迟刷新定时器（避免频繁刷新）
-        self.refresh_timer = QTimer()
+        self.refresh_timer = QTimer(self)
         self.refresh_timer.setSingleShot(True)
         self.refresh_timer.timeout.connect(self.delayed_refresh)
         self.refresh_delay_ms = 500  # 500ms延迟
@@ -4031,7 +4115,7 @@ class FileExplorerTab(QWidget):
 
         # 目录轮询刷新兜底：处理部分编辑器改文件但目录 watcher 不触发的情况
         self.dir_mtime = None
-        self.dir_poll_timer = QTimer()
+        self.dir_poll_timer = QTimer(self)
         self.dir_poll_timer.setInterval(8000)  # 8s 低频轮询，后台标签降低I/O开销
         self.dir_poll_timer.timeout.connect(self._poll_directory_changes)
         
@@ -4049,6 +4133,100 @@ class FileExplorerTab(QWidget):
         # 增加延迟时间确保文件夹完全加载
         if self.select_file:
             QTimer.singleShot(1500, lambda: self.select_file_in_explorer(self.select_file))
+
+    def _release_folder_checker(self, wait_ms=150):
+        checker = getattr(self, 'folder_checker', None)
+        self.folder_checker = None
+        if not checker:
+            return
+        try:
+            checker.finished.disconnect()
+        except Exception:
+            pass
+        try:
+            checker.stop()
+        except Exception:
+            pass
+        try:
+            if checker.isRunning():
+                checker.wait(wait_ms)
+        except Exception:
+            pass
+        try:
+            checker.deleteLater()
+        except Exception:
+            pass
+
+    def cleanup(self):
+        if self._is_cleaning_up:
+            return
+        self._is_cleaning_up = True
+
+        if hasattr(self, '_pending_double_click_timers'):
+            for timer in self._pending_double_click_timers:
+                try:
+                    timer.stop()
+                    timer.deleteLater()
+                except Exception:
+                    pass
+            self._pending_double_click_timers = []
+
+        for timer_name in (
+            'refresh_timer',
+            'status_update_timer',
+            'status_tracking_timer',
+            'dir_poll_timer',
+            '_path_sync_timer',
+            '_path_sync_stop_timer',
+        ):
+            timer = getattr(self, timer_name, None)
+            if timer:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+
+        watcher = getattr(self, 'file_watcher', None)
+        if watcher:
+            try:
+                watched_paths = watcher.directories() + watcher.files()
+                if watched_paths:
+                    watcher.removePaths(watched_paths)
+            except Exception:
+                pass
+
+        self._release_folder_checker(wait_ms=150)
+
+        explorer = getattr(self, 'explorer', None)
+        if explorer:
+            try:
+                explorer.removeEventFilter(self)
+            except Exception:
+                pass
+            try:
+                explorer.dynamicCall('Stop()')
+            except Exception:
+                pass
+            try:
+                explorer.clear()
+            except Exception:
+                pass
+
+        try:
+            self.removeEventFilter(self)
+        except Exception:
+            pass
+
+        self._watched_files.clear()
+        self._last_watcher_event.clear()
+        self._last_file_event.clear()
+        self._last_dir_snapshot = None
+        self._selection_cache = {'path': None, 'entries': None, 'ts_ms': 0}
+        self._entry_count_cache = {'path': None, 'count': None, 'ts_ms': 0}
+
+    def closeEvent(self, event):
+        self.cleanup()
+        super().closeEvent(event)
 
     # 移除重复的setup_ui，保留带路径栏的实现
 
@@ -4103,8 +4281,7 @@ class FileExplorerTab(QWidget):
 
         # 停止之前的文件夹检查线程（减少等待时间）
         if hasattr(self, 'folder_checker') and self.folder_checker and self.folder_checker.isRunning():
-            self.folder_checker.stop()
-            self.folder_checker.wait(50)  # 减少等待时间从100ms到50ms
+            self._release_folder_checker(wait_ms=50)  # 减少等待时间从100ms到50ms
 
         # 支持本地路径和shell特殊路径
         if is_shell:
@@ -4178,14 +4355,18 @@ class FileExplorerTab(QWidget):
         self._show_loading_indicator()
         self._folder_checker_done = False
 
+        self._release_folder_checker(wait_ms=50)
+
         # 创建并启动检查线程
         self.folder_checker = FolderSizeChecker(path, self)
 
         def _on_checker_finished(p, count, is_large):
             if getattr(self, '_folder_checker_done', False):
+                self._release_folder_checker(wait_ms=0)
                 return  # 已由超时保护处理
             self._folder_checker_done = True
             self._on_folder_size_checked(p, count, is_large, add_to_history)
+            self._release_folder_checker(wait_ms=0)
 
         self.folder_checker.finished.connect(_on_checker_finished)
         self.folder_checker.start()
@@ -4197,7 +4378,7 @@ class FileExplorerTab(QWidget):
                 return  # 线程已正常结束
             debug_print(f"[AsyncLoad] FolderSizeChecker timeout, forcing navigation: {path}")
             if hasattr(self, 'folder_checker') and self.folder_checker:
-                self.folder_checker.stop()
+                self._release_folder_checker(wait_ms=50)
             self._folder_checker_done = True
             self._on_folder_size_checked(path, 0, False, add_to_history)
 
@@ -5433,6 +5614,7 @@ class ChatPanel(QWidget):
         self.messages = []   # 对话历史（不含 system prompt）
         self.worker = None
         self.history_file = get_app_data_path("chat_history.json")
+        self._is_loading_history = False
         # 给 ChatPanel 独立的 Win32 HWND，避免 QAxWidget(Shell Explorer) 抢占鼠标/键盘头
         self.setAttribute(Qt.WA_NativeWindow, True)
         self.setFocusPolicy(Qt.ClickFocus)
@@ -5580,8 +5762,83 @@ class ChatPanel(QWidget):
         self.chat_display.clear()
         self._delete_history()  # 清空时删除保存文件
 
-    def append_bubble(self, role: str, content: str):
-        """向聊天区追加一条消息气泡（HTML 格式）。"""
+    def _cleanup_worker(self):
+        worker = self.worker
+        self.worker = None
+        if worker:
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+
+    def cleanup(self):
+        try:
+            self.input_box.removeEventFilter(self)
+        except Exception:
+            pass
+        try:
+            self.input_box.viewport().removeEventFilter(self)
+        except Exception:
+            pass
+
+        worker = self.worker
+        self.worker = None
+        if worker:
+            for signal_name, handler in (
+                ('response_received', self._on_response),
+                ('error_occurred', self._on_error),
+                ('finished', self._cleanup_worker),
+            ):
+                try:
+                    getattr(worker, signal_name).disconnect(handler)
+                except Exception:
+                    pass
+
+            try:
+                worker.requestInterruption()
+            except Exception:
+                pass
+
+            if worker.isRunning():
+                try:
+                    worker.finished.connect(worker.deleteLater)
+                except Exception:
+                    pass
+                try:
+                    worker.setParent(None)
+                except Exception:
+                    pass
+            else:
+                try:
+                    worker.deleteLater()
+                except Exception:
+                    pass
+
+    def closeEvent(self, event):
+        self.cleanup()
+        super().closeEvent(event)
+
+    def _sanitize_chat_message(self, message):
+        if not isinstance(message, dict):
+            return None
+        role = str(message.get("role", "system") or "system")
+        if role not in ("system", "user", "assistant"):
+            role = "system"
+        content = str(message.get("content", "") or "")
+        if len(content) > MAX_CHAT_MESSAGE_CHARS:
+            omitted = len(content) - MAX_CHAT_MESSAGE_CHARS
+            content = content[:MAX_CHAT_MESSAGE_CHARS] + f"\n\n【已截断 {omitted} 个字符】"
+        return {"role": role, "content": content}
+
+    def _trim_chat_history(self):
+        trimmed = []
+        for message in self.messages[-MAX_CHAT_HISTORY_MESSAGES:]:
+            sanitized = self._sanitize_chat_message(message)
+            if sanitized is not None:
+                trimmed.append(sanitized)
+        self.messages = trimmed
+
+    def _build_bubble_html(self, role: str, content: str):
         import html as _html
         if role == "user":
             color, prefix, bg = "#1976D2", "👤 你", "#E3F2FD"
@@ -5591,16 +5848,29 @@ class ChatPanel(QWidget):
             color, prefix, bg = "#888", "ℹ 系统", "#F5F5F5"
 
         escaped = _html.escape(content).replace('\n', '<br>')
-        bubble = (
+        return (
             f'<div style="margin:4px 0;padding:6px 10px;background:{bg};'
             f'border-radius:6px;border-left:3px solid {color};">'
             f'<b style="color:{color};">{prefix}</b><br>{escaped}</div>'
         )
+
+    def _rebuild_chat_display(self):
+        self.chat_display.clear()
+        for message in self.messages:
+            self.chat_display.append(self._build_bubble_html(message.get("role", "system"), message.get("content", "")))
+        self.chat_display.verticalScrollBar().setValue(
+            self.chat_display.verticalScrollBar().maximum()
+        )
+
+    def append_bubble(self, role: str, content: str, save_history=True):
+        """向聊天区追加一条消息气泡（HTML 格式）。"""
+        bubble = self._build_bubble_html(role, content)
         self.chat_display.append(bubble)
         self.chat_display.verticalScrollBar().setValue(
             self.chat_display.verticalScrollBar().maximum()
         )
-        self._save_history()  # 每次追加气泡时保存历史
+        if save_history and not self._is_loading_history:
+            self._save_history()  # 每次追加气泡时保存历史
 
     # ── 发送消息 ─────────────────────────────────────────────────────────────
     def send_message(self):
@@ -5657,13 +5927,15 @@ class ChatPanel(QWidget):
 
         # 保存对话历史（不含 system，不含 ctx_prefix）
         self.messages.append({"role": "user", "content": text})
+        self._trim_chat_history()
 
         # 启动工作线程
         self.send_btn.setEnabled(False)
         self.status_lbl.setText("⏳ 正在请求 AI…")
-        self.worker = ChatWorker(full_messages, api_url, api_key, model)
+        self.worker = ChatWorker(full_messages, api_url, api_key, model, self)
         self.worker.response_received.connect(self._on_response)
         self.worker.error_occurred.connect(self._on_error)
+        self.worker.finished.connect(self._cleanup_worker)
         self.worker.start()
 
     def _handle_user_file_input(self, text):
@@ -5688,6 +5960,7 @@ class ChatPanel(QWidget):
         self.send_btn.setEnabled(True)
         self.status_lbl.setText("")
         self.messages.append({"role": "assistant", "content": content})
+        self._trim_chat_history()
         display_content = self._apply_actions(content)
         self.append_bubble("assistant", display_content)
 
@@ -5772,6 +6045,10 @@ class ChatPanel(QWidget):
         """保存聊天记录到 JSON 文件。"""
         import json
         try:
+            before_len = len(self.messages)
+            self._trim_chat_history()
+            if len(self.messages) != before_len:
+                self._rebuild_chat_display()
             with open(self.history_file, 'w', encoding='utf-8') as f:
                 json.dump(self.messages, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -5783,14 +6060,16 @@ class ChatPanel(QWidget):
         if os.path.exists(self.history_file):
             try:
                 with open(self.history_file, 'r', encoding='utf-8') as f:
-                    self.messages = json.load(f)
+                    loaded_messages = json.load(f)
+                self.messages = loaded_messages if isinstance(loaded_messages, list) else []
+                self._trim_chat_history()
                 # 重新显示所有消息
-                for msg in self.messages:
-                    role = msg.get("role", "system")
-                    content = msg.get("content", "")
-                    # 仅回显历史文本，不在启动时执行 [OPEN_DIR:] / [RUN_SCRIPT:] 指令
-                    self.append_bubble(role, content)
+                self._is_loading_history = True
+                self._rebuild_chat_display()
+                self._is_loading_history = False
+                self._save_history()
             except Exception as e:
+                self._is_loading_history = False
                 print(f"加载聊天记录失败: {e}")
 
     def _delete_history(self):
@@ -6842,6 +7121,11 @@ class MainWindow(QMainWindow):
 
     def close_tab(self, index):
         tab = self.get_tab_widget(index)
+        if tab and hasattr(tab, 'cleanup'):
+            try:
+                tab.cleanup()
+            except Exception as e:
+                debug_print(f"[ClosedTabs] Tab cleanup failed: {e}")
         if tab and hasattr(tab, 'set_refresh_active'):
             try:
                 tab.set_refresh_active(False)
@@ -8821,6 +9105,14 @@ class MainWindow(QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+
+        self.server_socket = None
+        self.server_thread = None
+        self.monitor_thread = None
+        self.server_running = False
+        self.explorer_monitoring = False
+        self.known_explorer_windows = set()
+        self.last_check_time = 0
         
         # 启用主窗口拖拽支持
         self.setAcceptDrops(True)
@@ -8884,6 +9176,10 @@ class MainWindow(QMainWindow):
         self._session_snapshot_timer = QTimer(self)
         self._session_snapshot_timer.timeout.connect(self.save_session_snapshot)
         self._session_snapshot_timer.start(SESSION_SNAPSHOT_INTERVAL_MS)
+        self._housekeeping_runs = 0
+        self._housekeeping_timer = QTimer(self)
+        self._housekeeping_timer.timeout.connect(self._run_housekeeping)
+        self._housekeeping_timer.start(self._get_housekeeping_interval_ms())
         
         # 性能优化：延迟加载非关键功能（100ms后加载）
         QTimer.singleShot(100, self._delayed_initialization)
@@ -8939,6 +9235,8 @@ class MainWindow(QMainWindow):
             "enable_explorer_monitor": True,  # 默认启用Explorer监听
             "debug_mode": False,  # 默认关闭调试输出
             "explorer_monitor_debug": False,  # 默认关闭Explorer Monitor调试输出
+            "resource_snapshot_logging": False,  # 默认关闭运行资源快照日志
+            "resource_snapshot_interval_ms": HOUSEKEEPING_INTERVAL_MS,
             "pinned_tabs": [],  # 默认没有固定标签页
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
@@ -9102,6 +9400,100 @@ class MainWindow(QMainWindow):
         if not hasattr(self, '_session_snapshot_debounce_timer') or self._session_snapshot_debounce_timer is None:
             return
         self._session_snapshot_debounce_timer.start(max(0, int(delay_ms)))
+
+    def _get_housekeeping_interval_ms(self):
+        try:
+            value = int(self.config.get("resource_snapshot_interval_ms", HOUSEKEEPING_INTERVAL_MS))
+        except Exception:
+            value = HOUSEKEEPING_INTERVAL_MS
+        return max(60 * 1000, min(60 * 60 * 1000, value))
+
+    def _append_resource_snapshot_log(self, reason="periodic"):
+        if not self.config.get("resource_snapshot_logging", False):
+            return
+        try:
+            from datetime import datetime
+
+            rss_mb = get_process_memory_usage_mb()
+            search_dialogs = len(getattr(self, 'search_dialogs', []) or [])
+            tabs = self.tab_widget.count() if hasattr(self, 'tab_widget') else 0
+            chat_worker_running = 0
+            if hasattr(self, 'chat_panel') and self.chat_panel:
+                worker = getattr(self.chat_panel, 'worker', None)
+                if worker and worker.isRunning():
+                    chat_worker_running = 1
+
+            line = (
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                f" reason={reason}"
+                f" rss_mb={rss_mb if rss_mb is not None else 'n/a'}"
+                f" threads={threading.active_count()}"
+                f" tabs={tabs}"
+                f" search_dialogs={search_dialogs}"
+                f" toasts={len(_active_toasts)}"
+                f" chat_worker={chat_worker_running}"
+                f" shortcuts_tracked={len(getattr(self, '_last_keys_state', {}) or {})}"
+            )
+            with open(get_app_data_path('runtime_health.log'), 'a', encoding='utf-8') as f:
+                f.write(line + "\n")
+        except Exception as e:
+            debug_print(f"[Housekeeping] resource snapshot failed: {e}")
+
+    def _prune_search_dialog_refs(self):
+        dialogs = getattr(self, 'search_dialogs', None)
+        if dialogs is None:
+            return 0
+        alive_dialogs = []
+        removed = 0
+        for dlg in dialogs:
+            try:
+                dlg.isVisible()
+                alive_dialogs.append(dlg)
+            except RuntimeError:
+                removed += 1
+            except Exception:
+                alive_dialogs.append(dlg)
+        self.search_dialogs = alive_dialogs
+        return removed
+
+    def _prune_toast_refs(self):
+        global _active_toasts
+        alive_toasts = []
+        removed = 0
+        for toast in list(_active_toasts):
+            try:
+                if toast.isVisible():
+                    alive_toasts.append(toast)
+                else:
+                    removed += 1
+            except RuntimeError:
+                removed += 1
+            except Exception:
+                alive_toasts.append(toast)
+        _active_toasts = alive_toasts[:MAX_ACTIVE_TOASTS]
+        return removed
+
+    def _run_housekeeping(self):
+        self._housekeeping_runs += 1
+        removed_dialogs = self._prune_search_dialog_refs()
+        removed_toasts = self._prune_toast_refs()
+        if not self.isActiveWindow():
+            self._last_keys_state.clear()
+
+        self._append_resource_snapshot_log(reason="periodic")
+
+        gc_collected = None
+        if self._housekeeping_runs % HOUSEKEEPING_GC_EVERY_N == 0:
+            try:
+                import gc
+                gc_collected = gc.collect()
+            except Exception as e:
+                debug_print(f"[Housekeeping] gc.collect failed: {e}")
+
+        if removed_dialogs or removed_toasts or gc_collected is not None:
+            debug_print(
+                f"[Housekeeping] dialogs={removed_dialogs} toasts={removed_toasts} gc={gc_collected}"
+            )
 
     def _restore_last_active_tab(self):
         last_active_path = self.config.get("last_active_tab_path", "")
@@ -9753,6 +10145,10 @@ class MainWindow(QMainWindow):
     
     def start_instance_server(self):
         """启动本地服务器监听其他实例的请求"""
+        if self.server_thread and self.server_thread.is_alive():
+            debug_print("[Server] Instance server already running")
+            return
+
         def server_thread():
             try:
                 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -9780,9 +10176,13 @@ class MainWindow(QMainWindow):
                         continue
             except Exception as e:
                 debug_print(f"[Server] Failed to start server: {e}")
+            finally:
+                self.server_socket = None
+                self.server_running = False
         
         self.server_running = True
         server_thread_obj = threading.Thread(target=server_thread, daemon=True)
+        self.server_thread = server_thread_obj
         server_thread_obj.start()
         # 等待服务器启动
         time.sleep(0.2)
@@ -9811,6 +10211,10 @@ class MainWindow(QMainWindow):
     
     def _start_monitor_thread(self):
         """实际启动监听线程（延迟调用）"""
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            debug_print("[Explorer Monitor] Monitor thread already running")
+            return
+
         try:
             self.monitor_our_window = int(self.winId())  # 记录我们自己的窗口句柄
             self.explorer_monitoring = True
@@ -9818,6 +10222,7 @@ class MainWindow(QMainWindow):
             
             # 启动监听线程
             monitor_thread = threading.Thread(target=self._explorer_monitor_loop, daemon=True)
+            self.monitor_thread = monitor_thread
             monitor_thread.start()
         except Exception as e:
             debug_print(f"[Explorer Monitor] Failed to start: {e}")
@@ -9825,11 +10230,20 @@ class MainWindow(QMainWindow):
     def stop_explorer_monitor(self):
         """停止Explorer窗口监听"""
         self.explorer_monitoring = False
+        self.known_explorer_windows.clear()
         debug_print("[Explorer Monitor] Stopped")
     
     def _explorer_monitor_loop(self):
         """Explorer窗口监听循环（优化版 - 降低CPU占用）"""
+        pythoncom_initialized = False
         try:
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+                pythoncom_initialized = True
+            except Exception as e:
+                debug_print(f"[Explorer Monitor] COM init failed: {e}")
+
             # 首先记录所有已存在的Explorer窗口
             def enum_windows_callback(hwnd, _):
                 try:
@@ -9938,33 +10352,6 @@ class MainWindow(QMainWindow):
                                 debug_print(f"[Explorer Monitor] ✓ Closed original Explorer (hwnd={hwnd})")
                             except Exception as e:
                                 debug_print(f"[Explorer Monitor] ✗ Failed to close: {e}")
-                            def _is_control_panel_path_for_monitor(self, path):
-                                """判断路径是否为控制面板或其子目录（用于Explorer Monitor拦截）"""
-                                if not path:
-                                    return False
-                                s = str(path).lower()
-                                # shell:ControlPanelFolder
-                                if s.startswith('shell:controlpanelfolder'):
-                                    return True
-                                # 控制面板 CLSID
-                                if '::{26ee0668-a00a-44d7-9371-beb064c98683}' in s:
-                                    return True
-                                # 控制面板的子项目通常以 control panel/ 或 control panel\\ 开头
-                                if s.startswith('control panel') or s.startswith('control panel/') or s.startswith('control panel\\'):
-                                    return True
-                                # 也可能是 file:///c:/windows/system32/control.exe 或类似
-                                if 'control.exe' in s:
-                                    return True
-                                # 也可能是 shell:::{26ee0668-a00a-44d7-9371-beb064c98683} 或其子路径
-                                if s.startswith('shell:::{26ee0668-a00a-44d7-9371-beb064c98683}'):
-                                    return True
-                                # 也可能是 explorer.exe 打开的控制面板子页面，带有 control panel 字样
-                                if '/control panel/' in s or '\\control panel\\' in s:
-                                    return True
-                                # 也可能是 LocationName 为“用户帐户”等典型控制面板子页面
-                                if s in ['用户帐户', 'user accounts', 'useraccount', 'useraccountcontrol']:
-                                    return True
-                                return False
                         else:
                             debug_print(f"[Explorer Monitor] ✗ Could not get path from {hwnd}")
                     
@@ -9978,6 +10365,15 @@ class MainWindow(QMainWindow):
             debug_print(f"[Explorer Monitor] Monitor loop error: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            self.explorer_monitoring = False
+            self.known_explorer_windows.clear()
+            self.monitor_thread = None
+            if pythoncom_initialized:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
     
     def _get_explorer_path(self, hwnd):
         """通过COM接口获取Explorer窗口的当前路径"""
@@ -10097,6 +10493,29 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """窗口关闭时停止服务器和监听"""
         try:
+            app = QApplication.instance()
+            if app:
+                app.removeEventFilter(self)
+        except Exception as e:
+            print(f"Error removing app event filter: {e}")
+
+        if hasattr(self, 'search_dialogs'):
+            for dlg in list(self.search_dialogs):
+                try:
+                    dlg.close()
+                except Exception as e:
+                    print(f"Error closing search dialog: {e}")
+            self.search_dialogs = []
+
+        if hasattr(self, 'chat_panel') and self.chat_panel:
+            try:
+                self.chat_panel.cleanup()
+            except Exception as e:
+                print(f"Error cleaning chat panel: {e}")
+
+        self._append_resource_snapshot_log(reason="close")
+
+        try:
             self.save_session_snapshot(immediate=True)
         except Exception as e:
             print(f"Error caching tabs: {e}")
@@ -10116,17 +10535,50 @@ class MainWindow(QMainWindow):
                 self.server_socket.close()
             except Exception as e:
                 print(f"Error closing server socket: {e}")
+
+        if self.server_thread and self.server_thread.is_alive():
+            try:
+                self.server_thread.join(timeout=1.5)
+            except Exception as e:
+                print(f"Error waiting for server thread: {e}")
+        self.server_thread = None
         
         # 停止Explorer监听
         try:
             self.stop_explorer_monitor()
         except Exception as e:
             print(f"Error stopping explorer monitor: {e}")
+
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            try:
+                self.monitor_thread.join(timeout=max(1.5, float(getattr(self, 'monitor_interval', 2.0)) + 0.5))
+            except Exception as e:
+                print(f"Error waiting for monitor thread: {e}")
+        self.monitor_thread = None
+
+        for timer_name in (
+            '_shortcut_timer',
+            '_session_snapshot_debounce_timer',
+            '_session_snapshot_timer',
+            '_housekeeping_timer',
+            '_config_save_timer',
+        ):
+            timer = getattr(self, timer_name, None)
+            if timer:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
         
         # 停止所有标签页中的定时器和COM对象
         try:
             for i in range(self.tab_widget.count()):
                 tab = self.get_tab_widget(i)
+                if hasattr(tab, 'cleanup'):
+                    try:
+                        tab.cleanup()
+                    except Exception as cleanup_error:
+                        print(f"Error cleaning tab resources: {cleanup_error}")
                 if hasattr(tab, '_path_sync_timer') and tab._path_sync_timer:
                     tab._path_sync_timer.stop()
                     tab._path_sync_timer.deleteLater()
@@ -10483,7 +10935,7 @@ class MainWindow(QMainWindow):
 class SettingsDialog(QDialog):
 
     def __init__(self, config, parent=None):
-        from PyQt5.QtWidgets import QDialogButtonBox, QLabel, QGroupBox, QComboBox, QHBoxLayout, QVBoxLayout, QCheckBox
+        from PyQt5.QtWidgets import QDialogButtonBox, QLabel, QGroupBox, QComboBox, QHBoxLayout, QVBoxLayout, QCheckBox, QSpinBox
         super().__init__(parent)
         self.setWindowTitle("设置")
         # 设置为不可调边框的对话框
@@ -10580,11 +11032,44 @@ class SettingsDialog(QDialog):
         self.explorer_monitor_debug_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.explorer_monitor_debug_cb.setToolTip("单独控制 Explorer Monitor 的日志输出（需要先启用调试输出）")
         debug_layout.addWidget(self.explorer_monitor_debug_cb)
+        self.resource_snapshot_logging_cb = QCheckBox("启用资源快照日志", self)
+        self.resource_snapshot_logging_cb.setChecked(config.get("resource_snapshot_logging", False))
+        self.resource_snapshot_logging_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.resource_snapshot_logging_cb.setToolTip("定时写入 runtime_health.log，用于观察长期运行时的内存和线程趋势")
+        debug_layout.addWidget(self.resource_snapshot_logging_cb)
+
+        resource_interval_layout = QHBoxLayout()
+        resource_interval_layout.addWidget(QLabel("资源快照间隔（分钟）:"))
+        self.resource_snapshot_interval_spin = QSpinBox(self)
+        self.resource_snapshot_interval_spin.setRange(1, 60)
+        self.resource_snapshot_interval_spin.setSingleStep(1)
+        interval_minutes = max(1, int(config.get("resource_snapshot_interval_ms", HOUSEKEEPING_INTERVAL_MS) / 60000))
+        self.resource_snapshot_interval_spin.setValue(interval_minutes)
+        self.resource_snapshot_interval_spin.setToolTip("资源快照日志写入周期，建议 5 分钟或更长")
+        self.resource_snapshot_interval_spin.setEnabled(self.resource_snapshot_logging_cb.isChecked())
+        self.resource_snapshot_logging_cb.toggled.connect(self.resource_snapshot_interval_spin.setEnabled)
+        resource_interval_layout.addWidget(self.resource_snapshot_interval_spin)
+        resource_interval_layout.addWidget(QLabel("分钟"))
+        resource_interval_layout.addStretch(1)
+        debug_layout.addLayout(resource_interval_layout)
+
+        resource_log_layout = QHBoxLayout()
+        self.open_resource_log_btn = QPushButton("打开资源日志", self)
+        self.open_resource_log_btn.setToolTip("打开 runtime_health.log；如果日志尚未生成，则打开所在目录")
+        self.open_resource_log_btn.clicked.connect(self._open_resource_snapshot_log)
+        resource_log_layout.addWidget(self.open_resource_log_btn)
+        resource_log_layout.addStretch(1)
+        debug_layout.addLayout(resource_log_layout)
         debug_group.setLayout(debug_layout)
         compact_groupbox(debug_group)
         for i in range(debug_layout.count()):
-            w = debug_layout.itemAt(i).widget()
-            if w: compact_widget(w)
+            item = debug_layout.itemAt(i)
+            if item.layout():
+                for j in range(item.layout().count()):
+                    w = item.layout().itemAt(j).widget()
+                    if w: compact_widget(w)
+            elif item.widget():
+                compact_widget(item.widget())
         left_col.addWidget(debug_group)
 
         # 标签页设置组
@@ -10982,6 +11467,23 @@ class SettingsDialog(QDialog):
             return exe_path
         
         return None
+
+    def _open_resource_snapshot_log(self):
+        log_path = get_app_data_path('runtime_health.log')
+        log_dir = os.path.dirname(log_path)
+        try:
+            if os.path.exists(log_path):
+                os.startfile(log_path)
+            elif os.path.isdir(log_dir):
+                os.startfile(log_dir)
+                if self.parent():
+                    show_toast(self.parent(), "资源日志", "日志尚未生成，已打开日志目录", level="info")
+            else:
+                if self.parent():
+                    show_toast(self.parent(), "资源日志", "日志目录不存在", level="warning")
+        except Exception as e:
+            if self.parent():
+                show_toast(self.parent(), "资源日志", f"无法打开资源日志: {e}", level="error")
     
     def accept(self):
         """保存设置"""
@@ -10997,6 +11499,8 @@ class SettingsDialog(QDialog):
             self.parent().config["explorer_monitor_interval"] = self.interval_spinbox.value()
             self.parent().config["debug_mode"] = self.debug_mode_cb.isChecked()
             self.parent().config["explorer_monitor_debug"] = self.explorer_monitor_debug_cb.isChecked()
+            self.parent().config["resource_snapshot_logging"] = self.resource_snapshot_logging_cb.isChecked()
+            self.parent().config["resource_snapshot_interval_ms"] = self.resource_snapshot_interval_spin.value() * 60 * 1000
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
             self.parent().config["preferred_terminal_tool"] = normalize_terminal_tool_name(self.preferred_terminal_combo.currentData())
@@ -11032,6 +11536,8 @@ class SettingsDialog(QDialog):
             # 应用设置
             set_debug_mode(self.parent().config.get("debug_mode", False))
             set_explorer_monitor_debug(self.parent().config.get("explorer_monitor_debug", False))
+            if hasattr(self.parent(), '_housekeeping_timer') and self.parent()._housekeeping_timer:
+                self.parent()._housekeeping_timer.start(self.parent()._get_housekeeping_interval_ms())
             self.parent().apply_tortoisegit_buttons_config()
             # 重新设置快捷键
             self.parent().setup_shortcuts()
