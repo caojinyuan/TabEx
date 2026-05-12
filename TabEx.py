@@ -8598,10 +8598,17 @@ class MainWindow(QMainWindow):
                 self._shortcut_timer.setInterval(SHORTCUT_POLL_ACTIVE_MS)
             
             foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
-            current_hwnd = int(self.winId())
-            
-            # 如果前台窗口不是TabEx，则不响应快捷键
-            if foreground_hwnd != current_hwnd:
+
+            # 允许前台窗口是 TabEx 主窗口本身，或同进程内的子窗口（如嵌入的 Shell.Explorer ActiveX 控件）。
+            # Shell.Explorer 控件会将其内部 HWND 注册为前台窗口，与 TabEx 主窗口 HWND 不同，
+            # 但它们运行在同一进程中，因此用进程 ID 做匹配而非精确 HWND 匹配。
+            fg_same_process = False
+            if foreground_hwnd:
+                fg_pid = ctypes.c_ulong(0)
+                ctypes.windll.user32.GetWindowThreadProcessId(foreground_hwnd, ctypes.byref(fg_pid))
+                fg_same_process = (fg_pid.value == os.getpid())
+
+            if not fg_same_process:
                 self._last_keys_state.clear()
                 if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
                     self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
