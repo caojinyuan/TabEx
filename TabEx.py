@@ -1876,10 +1876,30 @@ if os.name == 'nt':
 
 
 def launch_detached(cmd, cwd=None, extra_creationflags=0):
-    """以与主进程解耦的方式启动外部程序"""
+    """以与主进程解耦的方式启动外部程序，确保主进程退出后子进程仍然存活。
+
+    在 VS Code / CI 等受限 Job Object 环境下，CREATE_BREAKAWAY_FROM_JOB 会被拒绝
+    （ERROR_ACCESS_DENIED）。此时自动降级到 ShellExecuteW，Shell 进程本身在 Job
+    之外创建新进程，完全独立于父进程的生命周期。
+    """
     if os.name == 'nt':
         flags = _DETACHED_FLAGS | _NEW_PROCESS_GROUP | _BREAKAWAY_FROM_JOB | extra_creationflags
-        return subprocess.Popen(cmd, cwd=cwd, creationflags=flags, close_fds=True)
+        try:
+            return subprocess.Popen(cmd, cwd=cwd, creationflags=flags, close_fds=True)
+        except OSError:
+            # Job Object 不允许 breakaway —— 改用 ShellExecuteW（经由 Shell 创建，天然在 Job 外）
+            exe = cmd[0] if isinstance(cmd, list) else cmd
+            params = subprocess.list2cmdline(cmd[1:]) if isinstance(cmd, list) and len(cmd) > 1 else None
+            try:
+                import ctypes
+                ctypes.windll.shell32.ShellExecuteW(
+                    None, 'open', exe, params, cwd, 1  # 1 = SW_SHOWNORMAL
+                )
+                return None  # ShellExecuteW 不返回 Popen 对象
+            except Exception:
+                # 最终兜底：cmd /c start "" 也能从 Job Object 解脱
+                start_cmd = ['cmd.exe', '/c', 'start', '""'] + (cmd if isinstance(cmd, list) else [cmd])
+                return subprocess.Popen(start_cmd, cwd=cwd, close_fds=True)
     # 非 Windows 环境使用新 session，避免收到父进程信号
     return subprocess.Popen(cmd, cwd=cwd, start_new_session=True, close_fds=True)
 
