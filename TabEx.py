@@ -3173,12 +3173,8 @@ class FileExplorerTab(QWidget):
 
     def sync_path_bar_with_explorer(self):
         # 通过QAxWidget的LocationURL属性获取当前路径
-        # 若当前标签页不是活跃标签，直接停止同步（避免背景标签持续COM轮询）
-        is_active_tab = (
-            self.main_window is not None
-            and self.main_window.get_current_tab_widget() is self
-        )
-        if not is_active_tab:
+        # 若当前标签页不是活跃标签（_refresh_active=False），直接停止同步（避免背景标签持续COM轮询）
+        if not getattr(self, '_refresh_active', True):
             self._stop_path_sync_timer()
             return
         try:
