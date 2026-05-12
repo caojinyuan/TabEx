@@ -2420,10 +2420,11 @@ class BreadcrumbPathBar(QWidget):
         if self.edit_mode:
             return
         
-        # 清空现有的面包屑
+        # 清空现有的面包屑（先 hide 再 deleteLater，防止旧 widget 在下一帧仍可见/可点击）
         while self.breadcrumb_layout.count() > 1:  # 保留最后的stretch
             item = self.breadcrumb_layout.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().deleteLater()
         
         if not self.current_path:
@@ -2613,6 +2614,7 @@ class BreadcrumbPathBar(QWidget):
     def on_segment_clicked(self, path):
         """点击某个层级时触发"""
         self.current_path = path
+        self.update_breadcrumbs()  # 立即高亮当前层级，不等导航完成
         self.pathChanged.emit(path)
         # 不在这里立即更新面包屑，等待navigate_to完成后会自动调用set_path更新
         # self.update_breadcrumbs()  # 注释掉，避免竟态条件
