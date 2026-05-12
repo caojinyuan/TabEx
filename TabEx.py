@@ -4360,7 +4360,7 @@ class FileExplorerTab(QWidget):
             debug_print(f"[navigate_to] Path does not exist: {path}")
 
     def _is_slow_path(self, path):
-        """检测OneDrive/网络路径——这类路径上os.scandir()可能永久阻塞"""
+        """检测OneDrive/网络/映射网络驱动器路径——这类路径上os.scandir()可能阻塞UI线程"""
         if not path:
             return False
         # 网络UNC路径
@@ -4370,6 +4370,16 @@ class FileExplorerTab(QWidget):
         path_lower = path.replace('\\', '/').lower()
         if 'onedrive' in path_lower:
             return True
+        # 映射网络驱动器（盘符类型 DRIVE_REMOTE=4）——网络抖动时os.scandir()同样永久阻塞
+        try:
+            import ctypes
+            drive = os.path.splitdrive(path)[0]  # e.g. 'D:'
+            if drive:
+                DRIVE_REMOTE = 4
+                if ctypes.windll.kernel32.GetDriveTypeW(drive + '\\') == DRIVE_REMOTE:
+                    return True
+        except Exception:
+            pass
         return False
 
     def _is_control_panel_path(self, path):
@@ -5010,6 +5020,8 @@ class FileExplorerTab(QWidget):
     def _count_dir_entries(self, path):
         """计算目录下的项目数"""
         try:
+            if self._is_slow_path(path):
+                return None
             now_ms = int(time.time() * 1000)
             cache_path = self._entry_count_cache.get('path')
             cache_count = self._entry_count_cache.get('count')
