@@ -3173,6 +3173,14 @@ class FileExplorerTab(QWidget):
 
     def sync_path_bar_with_explorer(self):
         # 通过QAxWidget的LocationURL属性获取当前路径
+        # 若当前标签页不是活跃标签，直接停止同步（避免背景标签持续COM轮询）
+        is_active_tab = (
+            self.main_window is not None
+            and self.main_window.get_current_tab_widget() is self
+        )
+        if not is_active_tab:
+            self._stop_path_sync_timer()
+            return
         try:
             url = self.explorer.property('LocationURL')
             if url:
@@ -4221,8 +4229,10 @@ class FileExplorerTab(QWidget):
             if timer:
                 try:
                     timer.stop()
+                    timer.deleteLater()
                 except Exception:
                     pass
+                setattr(self, timer_name, None)
 
         watcher = getattr(self, 'file_watcher', None)
         if watcher:
@@ -5909,6 +5919,9 @@ class ChatPanel(QWidget):
             self.chat_display.verticalScrollBar().maximum()
         )
 
+    # 气泡过多时 QTextDocument 不会自动截断——超过此块数则重建显示
+    _MAX_CHAT_DISPLAY_BLOCKS = 400
+
     def append_bubble(self, role: str, content: str, save_history=True):
         """向聊天区追加一条消息气泡（HTML 格式）。"""
         bubble = self._build_bubble_html(role, content)
@@ -5916,8 +5929,20 @@ class ChatPanel(QWidget):
         self.chat_display.verticalScrollBar().setValue(
             self.chat_display.verticalScrollBar().maximum()
         )
+        # 防止 QTextDocument 无限增长：超块数时重建（已有 _rebuild_chat_display 函数）
+        if self.chat_display.document().blockCount() > self._MAX_CHAT_DISPLAY_BLOCKS:
+            self._rebuild_chat_display()
         if save_history and not self._is_loading_history:
-            self._save_history()  # 每次追加气泡时保存历史
+            self._schedule_save_history()  # 防抖写盘，避免每条气泡都触发 I/O
+
+    def _schedule_save_history(self):
+        """聊天记录防抖写盘（500ms 内多次追加只写一次磁盘）。"""
+        if not hasattr(self, '_history_save_timer') or self._history_save_timer is None:
+            from PyQt5.QtCore import QTimer
+            self._history_save_timer = QTimer(self)
+            self._history_save_timer.setSingleShot(True)
+            self._history_save_timer.timeout.connect(self._save_history)
+        self._history_save_timer.start(500)
 
     # ── 发送消息 ─────────────────────────────────────────────────────────────
     def send_message(self):
@@ -8623,13 +8648,14 @@ class MainWindow(QMainWindow):
             # 获取键盘状态
             # require_down=True: 必须当前按住（用于 Ctrl/Shift/Alt 等修饰键）
             # require_down=False: 支持“当前按住”或“自上次轮询以来被按下过一次”（修复短按漏检）
+            _GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
+
             def is_key_pressed(vk_code, require_down=False):
-                state = ctypes.windll.user32.GetAsyncKeyState(vk_code)
+                state = _GetAsyncKeyState(vk_code)
                 is_down = (state & 0x8000) != 0
                 if require_down:
                     return is_down
-                was_pressed_since_last = (state & 0x0001) != 0
-                return is_down or was_pressed_since_last
+                return is_down or bool(state & 0x0001)
 
             modifiers_down = (
                 is_key_pressed(VK_CONTROL, require_down=True)

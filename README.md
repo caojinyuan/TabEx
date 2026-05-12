@@ -39,6 +39,13 @@
 
 ## 🆕 最近更新
 
+### v3.24 (2026-05-12)
+- **性能优化：对话历史写入防抖**：`ChatPanel` 每次追加气泡时改为 500 ms 防抖写入，避免连续追加时反复触发 JSON 序列化与磁盘 I/O
+- **性能优化：QTextBrowser 显示块数量上限**：聊天显示框累计 block 超过 400 时自动重建，防止长时间使用后渲染耗时持续增长
+- **性能优化：定时器资源释放**：`FileExplorerTab.cleanup()` 停止各定时器后补充调用 `deleteLater()` 并置 `None`，确保 Qt 对象树彻底释放
+- **性能优化：`is_key_pressed` 闭包消除**：将 `ctypes.windll.user32.GetAsyncKeyState` 提取为局部变量 `_GetAsyncKeyState`，避免每次 160 ms 轮询时重建闭包与属性查找链
+- **性能优化：后台标签页路径同步跳过**：`sync_path_bar_with_explorer` 检测到本标签非当前活跃标签时，立即停止同步定时器并返回，消除后台标签的持续 COM 跨进程调用
+
 ### v3.23 (2026-05-12)
 - **修复搜索对话框关闭后约 43 MB 内存未释放的问题**：
   - 根本原因：`SearchDialog` 未设置 `Qt.WA_DeleteOnClose`，导致关闭后 Qt C++ 对象（含所有子控件）不会自动销毁，持续占用内存
