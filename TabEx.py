@@ -3828,11 +3828,12 @@ class FileExplorerTab(QWidget):
                         debug_print(f"[DoubleClick] hit-test={hit}, path_before='{path_before}'")
                         if hit:
                             # 点中了项目，让 Explorer 自己处理（打开文件夹/文件）
-                            # 如果有选中项说明即将导航，设置标志防止 path_sync 误触发刷新
+                            # 无论是否能立即检测到选中项，都启动路径同步定时器，
+                            # 确保进入子目录后地址栏及时更新（Explorer可能在双击瞬间已清除选中状态）
                             sel = self._get_selected_count_safe()
                             if sel and int(sel) > 0:
                                 self._navigating_folder = True
-                                QTimer.singleShot(350, self._resume_path_sync_after_navigation)
+                            QTimer.singleShot(100, self._resume_path_sync_after_navigation)
                         else:
                             # 空白区域双击 —— 用极短延迟（50ms）执行 go_up，
                             # 50ms 仅为让 Explorer 完成 dblclick 内部处理，不会有可见延迟
