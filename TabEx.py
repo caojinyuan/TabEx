@@ -566,6 +566,8 @@ class SearchDialog(QDialog):
         self.setWindowTitle(f"搜索 - {search_path}")
         # 设置为可调整大小的对话框
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        # 关闭时立即销毁 C++ 对象（释放所有 Qt 子控件占用的内存）
+        self.setAttribute(Qt.WA_DeleteOnClose)
         self.resize(800, 500)  # 初始大小，但允许调整
         self.search_path = search_path
         self.main_window = parent
