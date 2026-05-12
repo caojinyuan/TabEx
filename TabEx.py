@@ -886,21 +886,26 @@ class SearchDialog(QDialog):
     
     def start_search(self):
         keyword = self.search_input.currentText().strip()  # 改用currentText获取输入或选中的文本
-        if not keyword:
-            show_toast(self, "提示", "请输入搜索关键词", level="warning")
-            return
+        keyword_is_empty = not keyword
         
-        # 将搜索关键词添加到历史记录（通过主窗口）
-        if self.main_window and hasattr(self.main_window, 'add_search_history'):
-            self.main_window.add_search_history(keyword)
-            # 更新下拉列表
-            self.search_input.clear()
-            if hasattr(self.main_window, 'search_history'):
-                self.search_input.addItems(self.main_window.search_history)
-            # 设置当前文本为刚刚搜索的关键词
-            self.search_input.setCurrentText(keyword)
+        # 仅在有关键词时才添加到历史记录
+        if not keyword_is_empty:
+            if self.main_window and hasattr(self.main_window, 'add_search_history'):
+                self.main_window.add_search_history(keyword)
+                # 更新下拉列表
+                self.search_input.clear()
+                if hasattr(self.main_window, 'search_history'):
+                    self.search_input.addItems(self.main_window.search_history)
+                # 设置当前文本为刚刚搜索的关键词
+                self.search_input.setCurrentText(keyword)
         
-        if not self.search_filename_cb.isChecked() and not self.search_content_cb.isChecked():
+        # 空关键词时：禁用内容搜索（搜索空内容无意义），确保文件名搜索开启
+        do_search_filename = self.search_filename_cb.isChecked()
+        do_search_content = self.search_content_cb.isChecked() and not keyword_is_empty
+        if keyword_is_empty and not do_search_filename:
+            do_search_filename = True  # 空关键词时自动启用文件名搜索
+        
+        if not do_search_filename and not do_search_content:
             show_toast(self, "提示", "请至少选择一种搜索类型", level="warning")
             return
         
@@ -935,9 +940,9 @@ class SearchDialog(QDialog):
         global _search_cache
         force_metadata_degrade = self.force_lightweight_cb.isChecked()
         cache_key = _search_cache.get_key(
-            search_path, keyword, 
-            self.search_filename_cb.isChecked(), 
-            self.search_content_cb.isChecked(), 
+            search_path, keyword,
+            do_search_filename,
+            do_search_content,
             file_types,
             force_metadata_degrade,
             self.match_case_cb.isChecked(),
@@ -975,7 +980,11 @@ class SearchDialog(QDialog):
         self.is_searching = True
         self.search_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.status_label.setText(f"搜索中... (最多显示{self.max_results}个结果)")
+        if keyword_is_empty:
+            file_types_hint = f"（{file_types}）" if file_types else ""
+            self.status_label.setText(f"列举文件中{file_types_hint}... (最多显示{self.max_results}个结果)")
+        else:
+            self.status_label.setText(f"搜索中... (最多显示{self.max_results}个结果)")
         if self.ui_update_timer:
             self._queue_idle_ticks = 0
             self._ensure_ui_update_timer(20)
@@ -987,7 +996,7 @@ class SearchDialog(QDialog):
         match_whole_word = self.match_whole_word_cb.isChecked()
         self.search_thread = threading.Thread(
             target=self.do_search,
-            args=(keyword, self.search_filename_cb.isChecked(), self.search_content_cb.isChecked(), file_types, cache_key, use_everything, force_metadata_degrade, match_case, match_whole_word)
+            args=(keyword, do_search_filename, do_search_content, file_types, cache_key, use_everything, force_metadata_degrade, match_case, match_whole_word)
         )
         self.search_thread.daemon = True
         self.search_thread.start()
@@ -1331,8 +1340,8 @@ class SearchDialog(QDialog):
                 
                 folder_count += 1
                 
-                # 搜索文件夹名
-                if search_filename:
+                # 搜索文件夹名（空关键词时跳过目录，因为目录无扩展名无法匹配文件类型过滤）
+                if search_filename and keyword:
                     for dirname in dirs:
                         if not self.is_searching:
                             break
