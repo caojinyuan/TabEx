@@ -8579,31 +8579,12 @@ class MainWindow(QMainWindow):
                     self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
                 return
 
-            # 严格检查窗口是否激活 - 使用多重检查确保只在TabEx激活时响应
-            # 1. 检查Qt窗口是否激活
-            if not self.isActiveWindow():
-                self._last_keys_state.clear()
-                if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
-                    self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
-                return
-            
-            # 2. 检查应用程序焦点窗口
-            if QApplication.activeWindow() != self:
-                self._last_keys_state.clear()
-                if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
-                    self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
-                return
-            
-            # 3. 使用Windows API检查前台窗口是否是当前窗口
+            # 窗口激活检查：以 Windows API 进程归属为唯一可靠依据。
+            # 原因：QApplication.activeWindow() 和 isActiveWindow() 在嵌入的
+            # Shell.Explorer ActiveX 控件持有 Win32 焦点时会返回 None/False，
+            # 导致误判为"窗口不活跃"→ 降频至 500ms → 快捷键漏检或延迟。
             import ctypes
-            if self._shortcut_timer.interval() != SHORTCUT_POLL_ACTIVE_MS:
-                self._shortcut_timer.setInterval(SHORTCUT_POLL_ACTIVE_MS)
-            
             foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
-
-            # 允许前台窗口是 TabEx 主窗口本身，或同进程内的子窗口（如嵌入的 Shell.Explorer ActiveX 控件）。
-            # Shell.Explorer 控件会将其内部 HWND 注册为前台窗口，与 TabEx 主窗口 HWND 不同，
-            # 但它们运行在同一进程中，因此用进程 ID 做匹配而非精确 HWND 匹配。
             fg_same_process = False
             if foreground_hwnd:
                 fg_pid = ctypes.c_ulong(0)
@@ -8611,10 +8592,27 @@ class MainWindow(QMainWindow):
                 fg_same_process = (fg_pid.value == os.getpid())
 
             if not fg_same_process:
+                # 前台窗口属于其他进程 → 降频并消耗所有非修饰键的粘性位，
+                # 防止切换回来时因积累的 GetAsyncKeyState bit0 产生幽灵触发。
+                self._last_keys_state.clear()
+                if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
+                    self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
+                for _vk in (0x5A, 0x58, 0x4C, 0x54, 0x41, 0x57, 0x46, 0x47, 0x44, 0x09, 0x25, 0x27, 0x26, 0x74):
+                    ctypes.windll.user32.GetAsyncKeyState(_vk)
+                return
+
+            # 前台属于本进程。若是本进程的其他 Qt 顶层窗口（如非模态搜索对话框）
+            # 持有焦点，也应暂停快捷键响应，避免后台误触。
+            active_win = QApplication.activeWindow()
+            if active_win is not None and active_win is not self:
                 self._last_keys_state.clear()
                 if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
                     self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
                 return
+
+            # 本进程主窗口或 Shell.Explorer 子窗口处于前台 → 启用高频轮询
+            if self._shortcut_timer.interval() != SHORTCUT_POLL_ACTIVE_MS:
+                self._shortcut_timer.setInterval(SHORTCUT_POLL_ACTIVE_MS)
             
             # Windows虚拟键码
             VK_CONTROL = 0x11
