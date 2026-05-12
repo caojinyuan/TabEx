@@ -3420,63 +3420,11 @@ class FileExplorerTab(QWidget):
                         if hasattr(self, 'path_bar'):
                             self.path_bar.set_path(local_path)
                         self._schedule_status_update(track_selection=True)
-                        # 导航完成，延迟清除导航标志（等待双击检查完成，避免时序问题）
+                        # 导航完成，清除导航标志（hit-test在双击时已完成判断，100ms后清除即可）
                         if hasattr(self, '_navigating_folder') and self._navigating_folder:
                             from PyQt5.QtCore import QTimer
-                            # 延迟1500ms清除，确保700ms的双击最终确认已完成
-                            QTimer.singleShot(1500, lambda: setattr(self, '_navigating_folder', False))
+                            QTimer.singleShot(100, lambda: setattr(self, '_navigating_folder', False))
         return super().event(e)
-
-    def explorer_double_click(self, event):
-        # 优化：使用多重检测避免误判
-        # 1. 检查鼠标按下时是否点击在项目上（原生API）
-        # 2. 检查是否有选中项
-        # 3. 检查路径是否发生变化（多次检查）
-        from PyQt5.QtCore import QTimer
-        
-        # 记录双击前的路径，用于检测是否发生了导航
-        try:
-            self._path_before_double = getattr(self, 'current_path', None)
-        except Exception:
-            self._path_before_double = None
-        
-        def _check_and_go_up():
-            # 优先级1: 如果按下时点击测试显示点击在项目上，直接跳过
-            if getattr(self, '_clicked_on_item', False):
-                self._clicked_on_item = False
-                return
-            
-            # 优先级2: 如果路径已经改变（说明进入了文件夹），跳过
-            try:
-                before_path = getattr(self, '_path_before_double', None)
-                cur_path = getattr(self, 'current_path', None)
-                if before_path is not None and cur_path is not None and cur_path != before_path:
-                    # 路径已改变，说明双击了文件夹并进入了，清理标志
-                    self._path_before_double = None
-                    return
-            except Exception:
-                pass
-            
-            # 优先级3: 如果按下时有选中项，跳过
-            before = getattr(self, '_selected_before_click', None)
-            if before is not None:
-                try:
-                    if int(before) > 0:
-                        return
-                except Exception:
-                    pass
-            
-            # 确认是空白区域双击，返回上一级
-            try:
-                self.go_up(force=True)
-            except Exception:
-                pass
-            finally:
-                # 清理标志
-                self._path_before_double = None
-
-        # 延迟150ms检查，给Explorer充足的时间完成导航
-        QTimer.singleShot(150, _check_and_go_up)
 
     def open_tortoisegit_log(self):
         """打开 TortoiseGit 日志查看器"""
@@ -3864,191 +3812,74 @@ class FileExplorerTab(QWidget):
                 elif event.type() == QEvent.MouseButtonDblClick:
                     self._schedule_status_update(track_selection=True)
                     # 取消所有之前待处理的双击检查
-                    try:
-                        for timer in getattr(self, '_pending_double_click_timers', []):
-                            try:
-                                timer.stop()
-                            except Exception:
-                                pass
-                        self._pending_double_click_timers = []
-                    except Exception:
-                        self._pending_double_click_timers = []
-                    
-                    # 记录双击发生时的状态和鼠标位置
-                    path_before = getattr(self, 'current_path', None)
-                    selected_before = getattr(self, '_selected_before_click', None)
-                    # 保存双击时的鼠标全局位置，用于后续hit-test
+                    for _t in getattr(self, '_pending_double_click_timers', []):
+                        try: _t.stop()
+                        except Exception: pass
+                    self._pending_double_click_timers = []
+
+                    # 立即在双击位置做 native hit-test —— 这是最可靠的判断
+                    # True  = 点中了列表项（文件夹/文件），不触发 go_up
+                    # False = 点在空白区，触发 go_up
                     double_click_pos = QCursor.pos()
-                    
-                    # 立即检查当前选中项数量（双击时刻）
-                    current_selection = self._get_selected_count_safe()
-                    
-                    debug_print(f"[DoubleClick] path_before='{path_before}', selected_before={selected_before}, current_selection={current_selection}")
-                    
-                    # 如果双击时有选中项，设置导航标志（防止误判为空白双击）
-                    if current_selection is not None and int(current_selection) > 0:
-                        self._navigating_folder = True
-                        debug_print(f"[DoubleClick] Set navigation flag (has selection)")
-                        # 暂停路径同步定时器，避免导航期间的干扰
-                        if hasattr(self, '_path_sync_timer') and self._path_sync_timer:
-                            self._path_sync_timer.stop()
-                            debug_print(f"[DoubleClick] Path sync timer paused")
-                        # 导航后兜底恢复路径同步（防止计时器永久停止）
-                        try:
-                            from PyQt5.QtCore import QTimer
-                            QTimer.singleShot(350, self._resume_path_sync_after_navigation)
-                        except Exception:
-                            pass
+                    path_before = getattr(self, 'current_path', None)
 
-                    # 使用延迟检查，给足够时间让文件夹导航完成
-                    def check_and_handle():
-                        try:
-                            # 优先检查导航标志
-                            if getattr(self, '_navigating_folder', False):
-                                debug_print(f"[DoubleClick] Navigation flag is set, skip go_up")
-                                self._selected_before_click = None
-                                return
-                            
-                            # 优先使用 native hit-test 检查双击位置是否有项目（最可靠）
-                            hit_test_result = None
-                            if HAS_PYWIN:
+                    if HAS_PYWIN:
+                        hit = self._native_listview_hit_test(double_click_pos.x(), double_click_pos.y())
+                        debug_print(f"[DoubleClick] hit-test={hit}, path_before='{path_before}'")
+                        if hit:
+                            # 点中了项目，让 Explorer 自己处理（打开文件夹/文件）
+                            # 如果有选中项说明即将导航，设置标志防止 path_sync 误触发刷新
+                            sel = self._get_selected_count_safe()
+                            if sel and int(sel) > 0:
+                                self._navigating_folder = True
+                                QTimer.singleShot(350, self._resume_path_sync_after_navigation)
+                        else:
+                            # 空白区域双击 —— 用极短延迟（50ms）执行 go_up，
+                            # 50ms 仅为让 Explorer 完成 dblclick 内部处理，不会有可见延迟
+                            def _do_go_up_blank():
                                 try:
-                                    # 使用保存的双击位置进行检测
-                                    hit_test_result = self._native_listview_hit_test(double_click_pos.x(), double_click_pos.y())
-                                    if hit_test_result:
-                                        debug_print(f"[DoubleClick] Hit test positive at double-click position, skip go_up")
-                                        self._selected_before_click = None
+                                    # 二次安全确认：路径未变且无选中，再 go_up
+                                    if getattr(self, 'current_path', None) != path_before:
                                         return
-                                    else:
-                                        debug_print(f"[DoubleClick] Hit test negative (no item at click position)")
+                                    cnt = self._get_selected_count_safe()
+                                    if cnt and int(cnt) > 0:
+                                        return
+                                    debug_print(f"[DoubleClick] Blank area confirmed, executing go_up")
+                                    self.go_up(force=True)
                                 except Exception as e:
-                                    debug_print(f"[DoubleClick] Hit test exception: {e}")
-                                    hit_test_result = None
-                            
-                            # 1. 检查是否点击前有选中项
-                            # 注意：selected_before 可能是上一帧/上一操作遗留状态，
-                            # 若当前已无选中且 hit-test 明确为空白，不应据此阻止 go_up。
-                            if selected_before is not None and int(selected_before) > 0:
-                                if ((current_selection is not None and int(current_selection) > 0) or
-                                    hit_test_result is True):
-                                    debug_print(f"[DoubleClick] Had selection before: {selected_before}, and current confirms item interaction, skip go_up")
-                                    self._selected_before_click = None
+                                    debug_print(f"[DoubleClick] go_up exception: {e}")
+                            t = QTimer(self)
+                            t.setSingleShot(True)
+                            t.timeout.connect(_do_go_up_blank)
+                            t.start(50)
+                            self._pending_double_click_timers.append(t)
+                    else:
+                        # 无 pywin32：退回到 150ms 路径/选中检查（比原 400ms+700ms 仍快很多）
+                        selected_before = getattr(self, '_selected_before_click', None)
+                        def _fallback_check():
+                            try:
+                                if getattr(self, '_navigating_folder', False):
+                                    self._navigating_folder = False
                                     return
-                                else:
-                                    debug_print(f"[DoubleClick] Had selection before: {selected_before}, but current_selection={current_selection}, hit_test={hit_test_result}; treat as stale and continue")
-                            
-                            # 2. 检查当前选中项数量
-                            cnt = self._get_selected_count_safe()
-                            
-                            debug_print(f"[DoubleClick] SelectedItems count: {cnt}")
-                            
-                            if cnt is not None and int(cnt) > 0:
-                                debug_print(f"[DoubleClick] Has selection: {cnt}, skip go_up")
-                                self._selected_before_click = None
-                                return
-                            
-                            # 3. 检查路径是否变化（进入了文件夹）
-                            cur_path = getattr(self, 'current_path', None)
-                            if path_before is not None and cur_path is not None and cur_path != path_before:
-                                debug_print(f"[DoubleClick] Path changed: '{path_before}' -> '{cur_path}', skip go_up")
-                                self._selected_before_click = None
-                                return
-                            
-                            # 严格判断：只有在明确确认是空白区域时才执行 go_up
-                            # 如果 SelectedItems 无法获取（cnt=None），检查其他信号
-                            if cnt is None:
-                                # 当 cnt=None 时，使用多重信号确认是否为空白双击：
-                                # 1. hit-test 必须明确为 False（空白区域）
-                                # 2. selected_before 必须为 None 或 0（双击前无选中）
-                                # 3. 路径未改变（未进入文件夹）
-                                cur_path_check = getattr(self, 'current_path', None)
-                                if (hit_test_result is False and 
-                                    (selected_before is None or selected_before == 0) and
-                                    path_before is not None and cur_path_check == path_before):
-                                    # 满足所有条件，执行最终确认后 go_up
-                                    debug_print(f"[DoubleClick] cnt=None but all other signals confirm blank area, proceed to final check")
-                                else:
-                                    debug_print(f"[DoubleClick] Cannot determine selection state (cnt=None), insufficient signals for go_up")
-                                    self._selected_before_click = None
+                                cur_path = getattr(self, 'current_path', None)
+                                if path_before is not None and cur_path != path_before:
                                     return
-                            
-                            # 如果 hit-test 明确返回 False (空白区域) 且 cnt=0 或满足上述fallback条件，执行最终确认后再 go_up
-                            if hit_test_result is False and (cnt == 0 or cnt is None):
-                                # 终次确认：延迟700ms确认路径仍未变化且无导航活动，再执行 go_up，避免误判
-                                def final_confirm_and_go_up():
-                                    try:
-                                        # 首先检查导航标志
-                                        if getattr(self, '_navigating_folder', False):
-                                            debug_print(f"[DoubleClick] Final confirm: navigation flag is set, skip go_up")
-                                            self._navigating_folder = False
-                                            return
-                                        
-                                        cur_path3 = getattr(self, 'current_path', None)
-                                        debug_print(f"[DoubleClick] Final confirm: path_before='{path_before}', cur_path='{cur_path3}'")
-                                        
-                                        # 检查路径是否变化（包括正在导航的情况）
-                                        if path_before is not None and cur_path3 != path_before:
-                                            debug_print(f"[DoubleClick] Final confirm: path changed to '{cur_path3}', skip go_up")
-                                            return
-                                        
-                                        # 再次检查是否有选中项（可能导航过程中有选中）
-                                        cnt_final = self._get_selected_count_safe()
-                                        debug_print(f"[DoubleClick] Final confirm: selection count = {cnt_final}")
-                                        if cnt_final is not None and int(cnt_final) > 0:
-                                            debug_print(f"[DoubleClick] Final confirm: found selection ({cnt_final}), skip go_up")
-                                            return
-                                        
-                                        # 再次执行 hit-test 以提高准确性（最关键的检查）
-                                        r2 = hit_test_result
-                                        if HAS_PYWIN:
-                                            try:
-                                                r2 = self._native_listview_hit_test(double_click_pos.x(), double_click_pos.y())
-                                                debug_print(f"[DoubleClick] Final confirm: re-run hit-test result = {r2}")
-                                            except Exception as e:
-                                                debug_print(f"[DoubleClick] Final confirm: hit-test exception: {e}")
-                                                pass
-                                        
-                                        # 只有当 hit-test 仍然确认是空白区域时才执行 go_up
-                                        if r2 is False:
-                                            debug_print(f"[DoubleClick] Execute go_up after final confirm (blank area)")
-                                            self.go_up(force=True)
-                                        elif r2 is True:
-                                            debug_print(f"[DoubleClick] Final confirm: hit-test found item, skip go_up")
-                                        else:
-                                            debug_print(f"[DoubleClick] Final confirm: hit-test inconclusive (r2={r2}), skip go_up for safety")
-                                    except Exception as e:
-                                        debug_print(f"[DoubleClick] Final confirm exception: {e}")
-                                        import traceback
-                                        traceback.print_exc()
-                                    finally:
-                                        # 最终确认完成，清除导航标志（双保险）
-                                        if hasattr(self, '_navigating_folder'):
-                                            self._navigating_folder = False
-                                        # 重启路径同步定时器（短窗口按需轮询）
-                                        self.start_path_sync_timer(duration_ms=2000)
-                                t2 = QTimer(self)
-                                t2.setSingleShot(True)
-                                t2.timeout.connect(final_confirm_and_go_up)
-                                t2.start(700)  # 增加到 700ms 以确保导航有足够时间完成
-                                if not hasattr(self, '_pending_double_click_timers'):
-                                    self._pending_double_click_timers = []
-                                self._pending_double_click_timers.append(t2)
-                            else:
-                                debug_print(f"[DoubleClick] Uncertain state (hit_test={hit_test_result}, cnt={cnt}), skip go_up for safety")
-                            
-                        except Exception as e:
-                            debug_print(f"[DoubleClick] Exception in check_and_handle: {e}")
-                        finally:
-                            self._selected_before_click = None
-
-                    # 使用 400ms 延迟，给更多时间让文件夹导航完成
-                    timer = QTimer(self)
-                    timer.setSingleShot(True)
-                    timer.timeout.connect(check_and_handle)
-                    timer.start(400)
-                    if not hasattr(self, '_pending_double_click_timers'):
-                        self._pending_double_click_timers = []
-                    self._pending_double_click_timers.append(timer)
+                                cnt = self._get_selected_count_safe()
+                                if cnt is not None and int(cnt) > 0:
+                                    return
+                                if selected_before is not None and int(selected_before) > 0:
+                                    return
+                                debug_print(f"[DoubleClick] Fallback: blank area confirmed, executing go_up")
+                                self.go_up(force=True)
+                            except Exception as e:
+                                debug_print(f"[DoubleClick] Fallback exception: {e}")
+                            finally:
+                                self._selected_before_click = None
+                        t = QTimer(self)
+                        t.setSingleShot(True)
+                        t.timeout.connect(_fallback_check)
+                        t.start(150)
+                        self._pending_double_click_timers.append(t)
                 elif event.type() in (QEvent.KeyRelease, QEvent.FocusIn, QEvent.Wheel):
                     self._schedule_status_update(track_selection=True)
         except Exception:
