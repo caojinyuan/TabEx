@@ -2630,8 +2630,13 @@ class BreadcrumbPathBar(QWidget):
                 separator.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
                 self.breadcrumb_layout.insertWidget(widget_index, separator)
                 widget_index += 1
-    
-    def on_segment_clicked(self, path):
+
+        # 强制立即重算布局几何，确保 childAt() 在下一个事件前就能正确命中新建的 label
+        # （Qt 默认延迟几何计算到下一次绘制，导致导航后立即点击路径栏时 childAt() 返回 None）
+        try:
+            self.breadcrumb_widget.layout().activate()
+        except Exception:
+            pass
         """点击某个层级时触发"""
         self.current_path = path
         self.update_breadcrumbs()  # 立即高亮当前层级，不等导航完成
@@ -3846,12 +3851,12 @@ class FileExplorerTab(QWidget):
                         debug_print(f"[DoubleClick] hit-test={hit}, path_before='{path_before}'")
                         if hit:
                             # 点中了项目，让 Explorer 自己处理（打开文件夹/文件）
-                            # 无论是否能立即检测到选中项，都启动路径同步定时器，
-                            # 确保进入子目录后地址栏及时更新（Explorer可能在双击瞬间已清除选中状态）
+                            # 无论是否能立即检测到选中项，都立即启动路径同步定时器，
+                            # 确保进入子目录后地址栏及时更新
                             sel = self._get_selected_count_safe()
                             if sel and int(sel) > 0:
                                 self._navigating_folder = True
-                            QTimer.singleShot(100, self._resume_path_sync_after_navigation)
+                            self._resume_path_sync_after_navigation()
                         else:
                             # 空白区域双击 —— 用极短延迟（50ms）执行 go_up，
                             # 50ms 仅为让 Explorer 完成 dblclick 内部处理，不会有可见延迟
