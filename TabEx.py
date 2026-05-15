@@ -2630,13 +2630,8 @@ class BreadcrumbPathBar(QWidget):
                 separator.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
                 self.breadcrumb_layout.insertWidget(widget_index, separator)
                 widget_index += 1
-
-        # 强制立即重算布局几何，确保 childAt() 在下一个事件前就能正确命中新建的 label
-        # （Qt 默认延迟几何计算到下一次绘制，导致导航后立即点击路径栏时 childAt() 返回 None）
-        try:
-            self.breadcrumb_widget.layout().activate()
-        except Exception:
-            pass
+    
+    def on_segment_clicked(self, path):
         """点击某个层级时触发"""
         self.current_path = path
         self.update_breadcrumbs()  # 立即高亮当前层级，不等导航完成
@@ -3401,7 +3396,14 @@ class FileExplorerTab(QWidget):
             self.explorer.installEventFilter(self)
         except Exception:
             pass
-        
+
+        # 直接连接 NavigateComplete2 信号，实现路径栏即时更新（无 polling 延迟）
+        try:
+            self.explorer.NavigateComplete2.connect(self._on_shell_navigate_complete)
+            debug_print("[Explorer] NavigateComplete2 signal connected")
+        except (AttributeError, TypeError) as e:
+            debug_print(f"[Explorer] NavigateComplete2 direct signal unavailable: {e}")
+
         # 初始设置路径栏（确保路径栏显示初始路径）
         if hasattr(self, 'path_bar'):
             self.path_bar.set_path(self.current_path)
@@ -3414,9 +3416,53 @@ class FileExplorerTab(QWidget):
         # 初始导航到当前路径（在setup_ui最后调用，确保所有设置已应用）
         self.explorer.dynamicCall('Navigate(const QString&)', QDir.toNativeSeparators(self.current_path))
 
+    def _on_shell_navigate_complete(self, *args):
+        """Shell.Explorer NavigateComplete2 直接信号处理：路径栏即时更新"""
+        try:
+            # NavigateComplete2 签名: (IDispatch* pDisp, VARIANT* URL)
+            # PyQt5 传入参数可能是 (dispatch, url) 或仅 (url,)
+            url = None
+            for arg in args:
+                s = str(arg)
+                if s.startswith('file:///') or s.startswith('shell:') or '::' in s:
+                    url = s
+                    break
+            if url is None and args:
+                url = str(args[-1])
+            if not url:
+                return
+            if url.startswith('file:///'):
+                from urllib.parse import unquote
+                local_path = unquote(url[8:])
+                if os.name == 'nt' and local_path.startswith('/'):
+                    local_path = local_path[1:]
+                local_path = self._normalize_local_path(local_path)
+                current = self._normalize_local_path(getattr(self, 'current_path', ''))
+                if local_path and local_path != current:
+                    self.current_path = local_path
+                    if hasattr(self, 'path_bar'):
+                        self.path_bar.set_path(local_path)
+                    self.update_tab_title()
+                    self._schedule_status_update(track_selection=True)
+                    if not getattr(self, '_navigating_programmatically', False) and hasattr(self, '_add_to_history'):
+                        self._add_to_history(local_path)
+                    if self.main_window and hasattr(self.main_window, 'expand_dir_tree_to_path'):
+                        self.main_window.expand_dir_tree_to_path(local_path)
+                    if getattr(self, '_navigating_folder', False):
+                        self._navigating_folder = False
+                    if self.main_window and hasattr(self.main_window, 'update_chat_context'):
+                        try:
+                            if self.main_window.get_current_tab_widget() is self:
+                                self.main_window.update_chat_context()
+                        except Exception:
+                            pass
+                    debug_print(f"[NavigateComplete2] Path updated: {local_path}")
+        except Exception as ex:
+            debug_print(f"[NavigateComplete2] Error: {ex}")
+
     def event(self, e):
-        # 捕获QAxWidget的NavigateComplete2事件
-        if e.type() == 50:  # QEvent.MetaCall, QAxWidget信号事件
+        # 捕获QAxWidget的NavigateComplete2事件（MetaCall备用通道，type=43）
+        if e.type() == 43:  # QEvent.MetaCall
             if hasattr(e, 'arguments') and hasattr(e, 'signal'):
                 if e.signal == 'NavigateComplete2(IDispatch*, QVariant&)':
                     url = str(e.arguments[1])
@@ -3447,6 +3493,12 @@ class FileExplorerTab(QWidget):
                         if hasattr(self, '_navigating_folder') and self._navigating_folder:
                             from PyQt5.QtCore import QTimer
                             QTimer.singleShot(100, lambda: setattr(self, '_navigating_folder', False))
+                        if self.main_window and hasattr(self.main_window, 'update_chat_context'):
+                            try:
+                                if self.main_window.get_current_tab_widget() is self:
+                                    self.main_window.update_chat_context()
+                            except Exception:
+                                pass
         return super().event(e)
 
     def open_tortoisegit_log(self):
@@ -3851,12 +3903,13 @@ class FileExplorerTab(QWidget):
                         debug_print(f"[DoubleClick] hit-test={hit}, path_before='{path_before}'")
                         if hit:
                             # 点中了项目，让 Explorer 自己处理（打开文件夹/文件）
-                            # 无论是否能立即检测到选中项，都立即启动路径同步定时器，
-                            # 确保进入子目录后地址栏及时更新
+                            # 无论是否能立即检测到选中项，都启动路径同步定时器，
+                            # 确保进入子目录后地址栏及时更新（Explorer可能在双击瞬间已清除选中状态）
                             sel = self._get_selected_count_safe()
                             if sel and int(sel) > 0:
                                 self._navigating_folder = True
-                            self._resume_path_sync_after_navigation()
+                            # 50ms 后启动 polling 兜底（NavigateComplete2 直连信号优先触发）
+                            QTimer.singleShot(50, self._resume_path_sync_after_navigation)
                         else:
                             # 空白区域双击 —— 用极短延迟（50ms）执行 go_up，
                             # 50ms 仅为让 Explorer 完成 dblclick 内部处理，不会有可见延迟
@@ -4374,6 +4427,12 @@ class FileExplorerTab(QWidget):
         self._update_dir_polling(path)
         
         self.update_tab_title()
+        if self.main_window and hasattr(self.main_window, 'get_current_tab_widget'):
+            try:
+                if self.main_window.get_current_tab_widget() is self:
+                    self.main_window.update_chat_context()
+            except Exception:
+                pass
         # 添加到历史记录
         if add_to_history:
             self._add_to_history(path)
@@ -7430,11 +7489,32 @@ class MainWindow(QMainWindow):
         self.git_commit_button.clicked.connect(self.open_tortoisegit_commit_current_tab)
         titlebar_layout.addWidget(self.git_commit_button)
 
+        # 工具按钮文字样式
+        tool_btn_font_size = max(int(8 * getattr(self, 'dpi_scale', 1.0)), 8)
+        def _tool_btn_style(color):
+            return f"""
+                QPushButton {{
+                    background: transparent;
+                    border: none;
+                    border-radius: {btn_radius}px;
+                    font-size: {tool_btn_font_size}pt;
+                    font-weight: bold;
+                    color: {color};
+                    padding: 0px;
+                }}
+                QPushButton:hover {{
+                    background: #e0e0e0;
+                }}
+                QPushButton:pressed {{
+                    background: #d0d0d0;
+                }}
+            """
+
         # Git Bash 按钮
-        self.git_bash_button = QPushButton("🐚")
+        self.git_bash_button = QPushButton("GB")
         self.git_bash_button.setToolTip("在当前标签页路径打开 Git Bash")
         self.git_bash_button.setFixedSize(btn_size, btn_size)
-        self.git_bash_button.setStyleSheet(git_btn_style)
+        self.git_bash_button.setStyleSheet(_tool_btn_style("#e44d26"))
         self.git_bash_button.clicked.connect(self.open_git_bash_current_tab)
         titlebar_layout.addWidget(self.git_bash_button)
 
@@ -7447,24 +7527,24 @@ class MainWindow(QMainWindow):
         titlebar_layout.addWidget(self.git_tools_separator)
 
         # 终端/工具按钮组（位于 Git 按钮右侧）
-        self.cmd_button = QPushButton("🪟")
+        self.cmd_button = QPushButton("CMD")
         self.cmd_button.setToolTip("在当前标签页路径打开 cmd")
         self.cmd_button.setFixedSize(btn_size, btn_size)
-        self.cmd_button.setStyleSheet(git_btn_style)
+        self.cmd_button.setStyleSheet(_tool_btn_style("#1a1a1a"))
         self.cmd_button.clicked.connect(self.open_cmd_current_tab)
         titlebar_layout.addWidget(self.cmd_button)
 
-        self.powershell_button = QPushButton("⚡")
+        self.powershell_button = QPushButton("PS")
         self.powershell_button.setToolTip("在当前标签页路径打开 PowerShell")
         self.powershell_button.setFixedSize(btn_size, btn_size)
-        self.powershell_button.setStyleSheet(git_btn_style)
+        self.powershell_button.setStyleSheet(_tool_btn_style("#2979ff"))
         self.powershell_button.clicked.connect(self.open_powershell_current_tab)
         titlebar_layout.addWidget(self.powershell_button)
 
-        self.calculator_button = QPushButton("🧮")
+        self.calculator_button = QPushButton("CAL")
         self.calculator_button.setToolTip("打开计算器")
         self.calculator_button.setFixedSize(btn_size, btn_size)
-        self.calculator_button.setStyleSheet(git_btn_style)
+        self.calculator_button.setStyleSheet(_tool_btn_style("#c43e1c"))
         self.calculator_button.clicked.connect(self.open_calculator)
         titlebar_layout.addWidget(self.calculator_button)
         
