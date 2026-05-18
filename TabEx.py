@@ -2108,6 +2108,69 @@ def show_toast(parent, title, message, level="info", duration=5000):
     toast.show()
 
 # ==================== 异步文件夹大小检查线程 ====================
+class GitStatusWorker(QThread):
+    """后台线程获取 Git 状态，避免阻塞 UI"""
+    finished = pyqtSignal(str, str, object)  # dir_path, repo_root, summary_or_None
+
+    def __init__(self, dir_path, repo_root, git_exe, parent=None):
+        super().__init__(parent)
+        self.dir_path = dir_path
+        self.repo_root = repo_root
+        self.git_exe = git_exe
+
+    def run(self):
+        try:
+            result = subprocess.run(
+                [self.git_exe, 'status', '--porcelain=v1', '-b', '--untracked-files=normal'],
+                cwd=self.repo_root,
+                capture_output=True, text=True, timeout=3,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000),
+            )
+            if result.returncode != 0:
+                self.finished.emit(self.dir_path, self.repo_root, None)
+                return
+            lines = result.stdout.strip().splitlines()
+            branch = ''
+            staged = 0
+            modified = 0
+            untracked = 0
+            for line in lines:
+                if line.startswith('## '):
+                    branch_info = line[3:]
+                    branch = branch_info.split('...')[0].split()[0] if branch_info else ''
+                    continue
+                if len(line) < 2:
+                    continue
+                x, y = line[0], line[1]
+                if x == '?' and y == '?':
+                    untracked += 1
+                else:
+                    if x in ('M', 'A', 'D', 'R', 'C'):
+                        staged += 1
+                    if y in ('M', 'D'):
+                        modified += 1
+            is_clean = (staged == 0 and modified == 0 and untracked == 0)
+            parts = []
+            if branch:
+                parts.append(f"分支: {branch}")
+            if is_clean:
+                parts.append('<span style="color:#2e7d32;font-weight:bold">✔ 无更改</span>')
+            else:
+                def _color(label, value, color_pos, color_zero='#2e7d32'):
+                    color = color_pos if value > 0 else color_zero
+                    return f'<span style="color:{color}">{label} {value}</span>'
+                status_parts = [
+                    _color("暂存(Add)", staged, "#d32f2f"),
+                    _color("修改(Commit)", modified, "#d32f2f"),
+                    _color("未跟踪(待Add)", untracked, "#f9a825"),
+                ]
+                parts.append('  '.join(status_parts))
+            summary = ' | '.join(parts) if parts else None
+            self.finished.emit(self.dir_path, self.repo_root, summary)
+        except Exception:
+            self.finished.emit(self.dir_path, self.repo_root, None)
+
+
 class FolderSizeChecker(QThread):
     """后台线程检查文件夹大小，避免阻塞UI"""
     finished = pyqtSignal(str, int, bool)  # path, file_count, is_large
@@ -3613,6 +3676,44 @@ class FileExplorerTab(QWidget):
             path = parent
         return None
 
+    def _request_git_status_async(self, dir_path):
+        """异步请求 Git 状态（不阻塞 UI 线程）"""
+        if not dir_path or dir_path.startswith('shell:') or '::' in dir_path:
+            return
+        # 防止重复请求同一路径
+        if getattr(self, '_git_status_pending_path', None) == dir_path:
+            return
+        cache = getattr(self, '_git_status_cache', None)
+        now_ms = int(time.time() * 1000)
+        if cache and cache.get('path') == dir_path and (now_ms - cache.get('ts_ms', 0)) < 5000:
+            return  # 缓存仍有效，无需重新查询
+        repo_root = self._find_git_root(dir_path)
+        if not repo_root:
+            self._git_status_cache = {'path': dir_path, 'result': None, 'ts_ms': now_ms}
+            return
+        git_exe = 'git.exe'
+        git_root = find_git_install_root()
+        if git_root:
+            candidate = os.path.join(git_root, 'cmd', 'git.exe')
+            if os.path.isfile(candidate):
+                git_exe = candidate
+        self._git_status_pending_path = dir_path
+        worker = GitStatusWorker(dir_path, repo_root, git_exe, parent=self)
+        worker.finished.connect(self._on_git_status_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._git_status_worker = worker  # prevent GC
+        worker.start()
+
+    def _on_git_status_finished(self, dir_path, repo_root, summary):
+        """Git 状态查询完成回调（主线程）"""
+        now_ms = int(time.time() * 1000)
+        self._git_status_cache = {'path': dir_path, 'result': summary, 'ts_ms': now_ms}
+        if getattr(self, '_git_status_pending_path', None) == dir_path:
+            self._git_status_pending_path = None
+        # 刷新状态栏（仅当当前路径匹配时）
+        if getattr(self, 'current_path', None) == dir_path:
+            self.update_explorer_status()
+
     def on_path_bar_changed(self, path):
         """处理面包屑路径栏的路径变化，支持特殊shell路径自动跳转"""
         import os
@@ -4379,6 +4480,9 @@ class FileExplorerTab(QWidget):
         # 更新当前路径
         self.current_path = path
         
+        # 导航到新目录时清除 Git 状态缓存
+        self._git_status_cache = None
+        
         # 停止目录轮询定时器，避免误触发刷新
         if hasattr(self, 'dir_poll_timer') and self.dir_poll_timer.isActive():
             self.dir_poll_timer.stop()
@@ -4724,30 +4828,37 @@ class FileExplorerTab(QWidget):
         # 统计选中项
         selection = self._get_selection_entries_cached()
         if selection is None:
-            text = f"{total} 项" if total is not None else "就绪"
-            self.status_bar.setText(text)
-            return
+            text = f"共 {total} 项" if total is not None else "就绪"
+        elif len(selection) == 0:
+            text = f"共 {total} 项" if total is not None else "就绪"
+        else:
+            sel_count = len(selection)
+            # 选中状态
+            text = f"已选 {sel_count} 项{total_text}"
+            metadata_limited = sel_count > STATUS_SELECTION_METADATA_LIMIT
+            if not metadata_limited and all(entry['is_file'] for entry in selection):
+                size_sum = sum(entry['size'] for entry in selection if entry['size'] is not None)
+                text += f"，总大小 {self._format_size(size_sum)}"
+            elif metadata_limited:
+                text += "，已省略大小统计"
+            if sel_count == 1:
+                entry = selection[0]
+                mtime = self._get_mtime(entry['path'])
+                if mtime:
+                    text += f"，修改时间 {mtime}"
 
-        sel_count = len(selection)
-        if sel_count == 0:
-            text = f"{total} 项" if total is not None else "就绪"
+        # 附加 Git 状态摘要（仅读缓存，不阻塞 UI）
+        cache = getattr(self, '_git_status_cache', None)
+        git_summary = cache.get('result') if (cache and cache.get('path') == path) else None
+        if git_summary:
+            import html as _html
+            # 用 <span> 分隔符拼接，确保 QLabel 始终以富文本（HTML）模式渲染
+            html_text = _html.escape(text) + '<span style="color:#bbb">  │  </span>' + git_summary
+            self.status_bar.setText(html_text)
+        else:
             self.status_bar.setText(text)
-            return
-
-        # 选中状态
-        text = f"已选 {sel_count} 项{total_text}"
-        metadata_limited = sel_count > STATUS_SELECTION_METADATA_LIMIT
-        if not metadata_limited and all(entry['is_file'] for entry in selection):
-            size_sum = sum(entry['size'] for entry in selection if entry['size'] is not None)
-            text += f"，总大小 {self._format_size(size_sum)}"
-        elif metadata_limited:
-            text += "，已省略大小统计"
-        if sel_count == 1:
-            entry = selection[0]
-            mtime = self._get_mtime(entry['path'])
-            if mtime:
-                text += f"，修改时间 {mtime}"
-        self.status_bar.setText(text)
+        # 异步刷新 Git 状态（后台线程）
+        self._request_git_status_async(path)
 
     def _get_selection_entries(self):
         """返回选中条目列表，每项包含 is_file 与 size"""
