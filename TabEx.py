@@ -3275,6 +3275,11 @@ class FileExplorerTab(QWidget):
                     if os.name == 'nt' and local_path.startswith('/'):
                         local_path = local_path[1:]
                     local_path = self._normalize_local_path(local_path)
+                # 处理 file://server/share 网络(UNC)路径
+                elif url_str.startswith('file://') and not url_str.startswith('file:///'):
+                    from urllib.parse import unquote
+                    local_path = '\\\\' + unquote(url_str[7:]).replace('/', '\\')
+                    local_path = self._normalize_local_path(local_path)
                 # 处理 shell: 特殊路径
                 elif url_str.startswith('shell:') or '::' in url_str:
                     # Shell特殊文件夹，通常以 shell: 或包含 CLSID (::)
@@ -3487,19 +3492,25 @@ class FileExplorerTab(QWidget):
             url = None
             for arg in args:
                 s = str(arg)
-                if s.startswith('file:///') or s.startswith('shell:') or '::' in s:
+                if s.startswith('file:///') or s.startswith('file://') or s.startswith('shell:') or '::' in s:
                     url = s
                     break
             if url is None and args:
                 url = str(args[-1])
             if not url:
                 return
+            local_path = None
             if url.startswith('file:///'):
                 from urllib.parse import unquote
                 local_path = unquote(url[8:])
                 if os.name == 'nt' and local_path.startswith('/'):
                     local_path = local_path[1:]
                 local_path = self._normalize_local_path(local_path)
+            elif url.startswith('file://') and not url.startswith('file:///'):
+                from urllib.parse import unquote
+                local_path = '\\\\' + unquote(url[7:]).replace('/', '\\')
+                local_path = self._normalize_local_path(local_path)
+            if local_path is not None:
                 current = self._normalize_local_path(getattr(self, 'current_path', ''))
                 if local_path and local_path != current:
                     self.current_path = local_path
@@ -3548,6 +3559,12 @@ class FileExplorerTab(QWidget):
                         local_path = unquote(url[8:])
                         if os.name == 'nt' and local_path.startswith('/'):
                             local_path = local_path[1:]
+                    elif url.startswith('file://') and not url.startswith('file:///'):
+                        from urllib.parse import unquote
+                        local_path = '\\\\' + unquote(url[7:]).replace('/', '\\')
+                    else:
+                        local_path = None
+                    if local_path is not None:
                         self.current_path = local_path
                         if hasattr(self, 'path_bar'):
                             self.path_bar.set_path(local_path)
@@ -3718,7 +3735,24 @@ class FileExplorerTab(QWidget):
         """处理面包屑路径栏的路径变化，支持特殊shell路径自动跳转"""
         import os
         path = path.strip()
+
+        # 处理 file: URL（从邮件/浏览器/SharePoint等复制的链接）
+        # 支持 file:///C:/path、file://server/share、file:\\server\share、file:\server\share 等格式
+        if path.lower().startswith('file:'):
+            from urllib.parse import unquote
+            raw = path[5:]  # 去掉 'file:'
+            # 去掉所有前导斜杠和反斜杠
+            stripped = raw.lstrip('/\\')
+            stripped = unquote(stripped).replace('/', '\\')
+            # 判断是本地路径(有盘符)还是UNC网络路径
+            if len(stripped) >= 2 and stripped[1] == ':':
+                path = stripped  # 本地路径 C:\path
+            else:
+                path = '\\\\' + stripped  # UNC路径 \\server\share
+            debug_print(f"[PathBar] file: URL converted to: {path}")
+
         lower_path = path.lower()
+        debug_print(f"[PathBar] on_path_bar_changed: '{path}'")
 
         if lower_path in ('terminal', 'term'):
             try:
@@ -3825,6 +3859,9 @@ class FileExplorerTab(QWidget):
         # 尝试中英文目录互转
         path2 = translate_common_path(path)
         if os.path.exists(path2):
+            self.navigate_to(path2)
+        elif path2.startswith('\\\\') or path2.startswith('//'):
+            # UNC 网络路径可能因网络延迟导致 os.path.exists 返回 False，直接尝试导航
             self.navigate_to(path2)
         else:
             show_toast(self, "路径错误", f"路径不存在: {path2}", level="warning")
@@ -4365,6 +4402,10 @@ class FileExplorerTab(QWidget):
             else:
                 # 异步检查文件夹大小
                 self._check_folder_size_async(path, add_to_history)
+        elif path.startswith('\\\\') or path.startswith('//'):
+            # UNC 网络路径可能因网络延迟导致 os.path.exists 返回 False，直接尝试导航
+            debug_print(f"[navigate_to] UNC path, attempting navigation despite exists=False: {path}")
+            self._perform_navigation(path, add_to_history)
         else:
             debug_print(f"[navigate_to] Path does not exist: {path}")
 
@@ -4725,6 +4766,8 @@ class FileExplorerTab(QWidget):
                 except Exception:
                     is_shell = self.current_path.startswith('shell:')
                     if is_shell:
+                        self.explorer.dynamicCall('Navigate(const QString&)', self.current_path)
+                    elif self.current_path.startswith('\\\\'):
                         self.explorer.dynamicCall('Navigate(const QString&)', self.current_path)
                     else:
                         url = 'file:///' + self.current_path.replace('\\', '/')
