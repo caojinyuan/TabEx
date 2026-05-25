@@ -3289,6 +3289,11 @@ class FileExplorerTab(QWidget):
                 current_path = self._normalize_local_path(self.current_path)
 
                 if local_path and local_path != current_path:
+                    # 程序化导航期间（Navigate2 已发出但 Shell.Explorer 尚未完成），
+                    # LocationURL 可能仍返回旧路径，此时不回写，避免路径栏倒退。
+                    # NavigateComplete2 信号会在导航真正完成后更新路径。
+                    if getattr(self, '_suppress_auto_refresh', False):
+                        return
                     self._path_sync_stable_hits = 0
                     self._path_sync_interval_ms = 120
                     if hasattr(self, '_path_sync_timer') and self._path_sync_timer and self._path_sync_timer.interval() != self._path_sync_interval_ms:
@@ -3318,6 +3323,9 @@ class FileExplorerTab(QWidget):
                         if self._path_sync_timer.interval() != target_interval:
                             self._path_sync_timer.setInterval(target_interval)
                     if self._path_sync_stable_hits >= 2:
+                        # 导航已确认完成（Shell.Explorer 稳定在 current_path），
+                        # 立即解除抑制标志，避免用户随后双击子目录时路径栏无法更新。
+                        self._suppress_auto_refresh = False
                         self._stop_path_sync_timer()
         except Exception as e:
             debug_print(f"[PathSync] ERROR: {e}")
@@ -4046,6 +4054,9 @@ class FileExplorerTab(QWidget):
                             sel = self._get_selected_count_safe()
                             if sel and int(sel) > 0:
                                 self._navigating_folder = True
+                            # 解除导航抑制标志，确保本次用户主动双击触发的 Explorer 内部
+                            # 导航能被路径同步定时器检测到，不被之前 navigate_to 的 3s 抑制窗口阻断。
+                            self._suppress_auto_refresh = False
                             # 50ms 后启动 polling 兜底（NavigateComplete2 直连信号优先触发）
                             QTimer.singleShot(50, self._resume_path_sync_after_navigation)
                         else:
@@ -5567,6 +5578,27 @@ class CustomTabBar(QTabBar):
         self.setMovable(True)  # 启用标签页拖拽排序
         # 连接标签移动信号
         self.tabMoved.connect(self.on_tab_moved)
+        # 拖拽期间抑制重型 on_tab_changed 操作
+        self._is_dragging_tab = False
+        from PyQt5.QtCore import QTimer
+        self._drag_end_timer = QTimer(self)
+        self._drag_end_timer.setSingleShot(True)
+        self._drag_end_timer.setInterval(150)
+        self._drag_end_timer.timeout.connect(self._on_drag_end_timeout)
+
+    def _on_drag_end_timeout(self):
+        """拖拽结束后触发一次完整的 on_tab_changed（去抖后执行）"""
+        self._is_dragging_tab = False
+        if self.main_window:
+            self.main_window._tab_drag_in_progress = False
+            idx = self.main_window.tab_widget.currentIndex()
+            self.main_window.on_tab_changed(idx)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        # 鼠标释放时启动去抖计时器完成最终更新
+        if self._is_dragging_tab:
+            self._drag_end_timer.start(150)
     
     def event(self, event):
         # 拦截所有事件，确保双击事件能被处理
@@ -5672,6 +5704,10 @@ class CustomTabBar(QTabBar):
         if not self.main_window:
             return
         debug_print(f"[TabMoved] Moving tab from {from_index} to {to_index}")
+        # 标记拖拽进行中，通知 on_tab_changed 跳过重型操作
+        self._is_dragging_tab = True
+        self.main_window._tab_drag_in_progress = True
+        self._drag_end_timer.start(150)  # 重置去抖计时器
         # 同步移动content_stack中的对应内容
         if hasattr(self.main_window, 'content_stack'):
             content_stack = self.main_window.content_stack
@@ -7271,10 +7307,6 @@ class MainWindow(QMainWindow):
         
         # 更新导航按钮状态（确保新标签页的按钮状态正确）
         self.update_navigation_buttons()
-        
-        # 激活窗口（当从其他实例接收到路径时）
-        self.activateWindow()
-        self.raise_()
 
         self._schedule_session_snapshot()
         
@@ -7361,6 +7393,22 @@ class MainWindow(QMainWindow):
 
     def on_tab_changed(self, index):
         if index >= 0:
+            # 调试信息：检查同步状态
+            debug_print(f"[TabSwitch] Tab changed to index {index}")
+            if hasattr(self, 'content_stack'):
+                debug_print(f"[TabSwitch] content_stack has {self.content_stack.count()} widgets, tab_widget has {self.tab_widget.count()} tabs")
+
+            # 同步 content_stack 的显示（拖拽期间也需要保持同步）
+            if hasattr(self, 'content_stack') and index < self.content_stack.count():
+                self.content_stack.setCurrentIndex(index)
+                debug_print(f"[TabSwitch] Set content_stack to index {index}")
+            else:
+                debug_print(f"[TabSwitch] WARNING: Cannot sync - content_stack count is {self.content_stack.count() if hasattr(self, 'content_stack') else 'N/A'}")
+
+            # 拖拽进行中：仅同步 content_stack，跳过一切重型操作，等拖拽结束后统一执行
+            if getattr(self, '_tab_drag_in_progress', False):
+                return
+
             # 仅当前可见标签保持高频刷新；后台标签暂停轮询并仅记录脏状态
             for i in range(self.tab_widget.count()):
                 tab_item = self.get_tab_widget(i)
@@ -7369,18 +7417,6 @@ class MainWindow(QMainWindow):
                         tab_item.set_refresh_active(i == index)
                     except Exception:
                         pass
-
-            # 调试信息：检查同步状态
-            debug_print(f"[TabSwitch] Tab changed to index {index}")
-            if hasattr(self, 'content_stack'):
-                debug_print(f"[TabSwitch] content_stack has {self.content_stack.count()} widgets, tab_widget has {self.tab_widget.count()} tabs")
-            
-            # 同步 content_stack 的显示
-            if hasattr(self, 'content_stack') and index < self.content_stack.count():
-                self.content_stack.setCurrentIndex(index)
-                debug_print(f"[TabSwitch] Set content_stack to index {index}")
-            else:
-                debug_print(f"[TabSwitch] WARNING: Cannot sync - content_stack count is {self.content_stack.count() if hasattr(self, 'content_stack') else 'N/A'}")
             
             # 从 content_stack 获取实际的标签页内容
             tab = self.content_stack.widget(index) if hasattr(self, 'content_stack') else self.tab_widget.widget(index)
@@ -10265,6 +10301,39 @@ class MainWindow(QMainWindow):
         """窗口大小改变事件"""
         super().resizeEvent(event)
 
+    def _bring_to_front(self):
+        """强制将窗口置顶并获取焦点（兼容 Windows 防偷焦机制）"""
+        # 记录当前最大化状态：Win32 激活调用有时会意外取消最大化
+        was_maximized = self.isMaximized()
+        # 最小化时先恢复
+        if self.isMinimized():
+            self.showNormal()
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = int(self.winId())
+            # AttachThreadInput 技巧：临时附加到前台线程，绕过 Windows 偷焦保护
+            fg_hwnd = user32.GetForegroundWindow()
+            fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None)
+            my_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            attached = False
+            if fg_tid and fg_tid != my_tid:
+                user32.AttachThreadInput(fg_tid, my_tid, True)
+                attached = True
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            if attached:
+                user32.AttachThreadInput(fg_tid, my_tid, False)
+        except Exception:
+            pass
+        # Qt 层兜底
+        self.activateWindow()
+        self.raise_()
+        # Win32 激活调用有时会使最大化窗口还原；50ms 后检查并恢复
+        if was_maximized:
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(50, lambda: self.showMaximized() if not self.isMaximized() else None)
+
     def handle_open_path_from_instance(self, path):
         """处理从其他实例接收到的路径（在主线程中）"""
         existing_index = self.find_tab_index_by_path(path)
@@ -10274,12 +10343,8 @@ class MainWindow(QMainWindow):
         else:
             print(f"[MainWindow] Opening path in new tab: {path}")
             self.add_new_tab(path)
-        # 激活并置顶窗口
-        self.activateWindow()
-        self.raise_()
-        # 只在窗口最小化时恢复，保持最大化状态不变
-        if self.isMinimized():
-            self.showNormal()
+        # 强制置顶窗口（使用 Win32 API 绕过 Windows 偷焦保护）
+        self._bring_to_front()
     
     def _delayed_initialization(self):
         """延迟初始化非关键功能（性能优化）"""
