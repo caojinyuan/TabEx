@@ -39,6 +39,20 @@
 
 ## 🆕 最近更新
 
+### v3.29 (2026-05-25)
+- **修复路径栏在双击进入子目录后不更新的问题**：
+  - 根本原因：`navigate_to()` 导航后会抑制自动刷新 3000ms，而用户在此期间双击进入子目录时路径同步定时器的 2000ms 窗口会在抑制解除前到期，导致路径栏停留在旧路径
+  - 修复：在路径同步定时器确认 Shell.Explorer 已稳定（命中 2 次）时立即清除 `_suppress_auto_refresh` 标志；在双击事件命中项目时也立即清除该标志，确保用户主动导航始终可被同步定时器感知
+- **修复从其他应用打开目录时 TabEx 窗口不置顶的问题**：
+  - 根本原因：标准 `activateWindow()` + `raise_()` 在其他进程持有前台权限时无效
+  - 修复：新增 `_bring_to_front()` 方法，使用 Win32 `AttachThreadInput` 临时附加到前台线程，再调用 `BringWindowToTop` + `SetForegroundWindow`，绕过 Windows 防偷焦保护，确保 TabEx 可靠置顶
+- **修复标签页拖拽排序时界面卡顿的问题**：
+  - 根本原因：每次中间拖拽位置均触发 `tabMoved` → `on_tab_changed`，导致 DirPoll 启停、样式表重算、目录树展开等重型操作在每一步拖拽都执行一次，10 步拖拽等于 10 倍完整 pipeline
+  - 修复：在 `CustomTabBar` 中引入 `_is_dragging_tab` 标志和 150ms 去抖定时器，拖拽期间 `on_tab_changed` 仅同步 `content_stack` 显示，拖拽结束后统一执行一次完整切换逻辑
+- **修复从其他应用打开目录时 TabEx 最大化状态丢失的问题**：
+  - 根本原因：`AttachThreadInput` + `SetForegroundWindow` 会触发 Windows 内部消息，导致最大化窗口意外经历多次 `WindowStateChange`，最终停留在非最大化状态
+  - 修复：`_bring_to_front()` 在 Win32 调用前记录 `was_maximized`，调用后通过 `QTimer.singleShot(50, ...)` 检查并恢复最大化状态；同时移除 `add_new_tab` 中多余的 `activateWindow()` + `raise_()` 调用（已由 `_bring_to_front` 统一处理）
+
 ### v3.28 (2026-05-18)
 - **状态栏新增 Git 仓库状态实时显示**：
   - 在 Git 仓库目录下，状态栏右侧自动显示当前分支名及三项文件状态计数
