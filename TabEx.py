@@ -1740,6 +1740,7 @@ class SearchDialog(QDialog):
             return
 
         self.result_list.selectRow(row)
+
         menu = QMenu(self)
 
         open_action = menu.addAction("打开")
@@ -1749,24 +1750,23 @@ class SearchDialog(QDialog):
         open_folder_action.triggered.connect(lambda: self._open_result_parent_folder(file_path))
 
         if os.path.isfile(file_path):
-            open_with_menu = menu.addMenu("打开方式")
-
-            default_action = open_with_menu.addAction("系统默认程序")
+            default_action = menu.addAction("用系统默认程序打开")
             default_action.triggered.connect(lambda: self.open_result_with_default_app(file_path))
 
-            open_with_menu.addSeparator()
+            menu.addSeparator()
 
-            notepad_action = open_with_menu.addAction("记事本")
+            notepad_action = menu.addAction("用记事本打开")
             notepad_action.triggered.connect(lambda: self.open_result_with_notepad(file_path))
 
-            notepadpp_action = open_with_menu.addAction("Notepad++")
-            notepadpp_action.setEnabled(bool(self.notepad_plus_plus_path))
-            if not self.notepad_plus_plus_path:
+            notepadpp_action = menu.addAction("用 Notepad++ 打开")
+            notepadpp_action.setEnabled(bool(getattr(self, 'notepad_plus_plus_path', None)))
+            if not getattr(self, 'notepad_plus_plus_path', None):
                 notepadpp_action.setToolTip("未检测到 Notepad++")
             notepadpp_action.triggered.connect(lambda: self.open_result_with_notepad_plus_plus(file_path))
 
-            open_with_menu.addSeparator()
-            system_dialog_action = open_with_menu.addAction("选择其他应用...")
+            menu.addSeparator()
+
+            system_dialog_action = menu.addAction("选择其他应用...")
             system_dialog_action.triggered.connect(lambda: self.open_result_with_system_dialog(file_path))
 
         menu.exec_(self.result_list.viewport().mapToGlobal(pos))
@@ -2496,6 +2496,28 @@ class BreadcrumbPathBar(QWidget):
         # 总是更新面包屑，无论是否处于编辑模式
         # 这是因为导航操作通常会调用set_path，需要立即刷新显示
         self.update_breadcrumbs()
+        self._flush_path_bar_display(norm_path)
+        QTimer.singleShot(0, lambda expected_path=norm_path: self._flush_path_bar_display(expected_path))
+
+    def _flush_path_bar_display(self, expected_path=None):
+        """确保路径栏在导航时序竞争下也能及时恢复显示。"""
+        current_path = getattr(self, 'current_path', '')
+        if expected_path and current_path != expected_path:
+            return
+        if hasattr(self, 'path_edit'):
+            try:
+                self.path_edit.blockSignals(True)
+                self.path_edit.setText(current_path)
+            finally:
+                self.path_edit.blockSignals(False)
+        if hasattr(self, 'breadcrumb_layout'):
+            self.breadcrumb_layout.activate()
+        if hasattr(self, 'breadcrumb_widget'):
+            self.breadcrumb_widget.show()
+            self.breadcrumb_widget.updateGeometry()
+            self.breadcrumb_widget.update()
+        self.updateGeometry()
+        self.update()
     
     def update_breadcrumbs(self):
         """更新面包屑显示"""
@@ -5039,6 +5061,7 @@ class FileExplorerTab(QWidget):
         if not file_path or not os.path.exists(file_path):
             return False
 
+
         menu = QMenu(self)
         open_action = menu.addAction("打开")
         open_action.triggered.connect(lambda: self.open_selected_with_default_app(file_path))
@@ -5047,25 +5070,23 @@ class FileExplorerTab(QWidget):
         open_folder_action.triggered.connect(lambda: self.open_selected_parent_folder(file_path))
 
         if os.path.isfile(file_path):
-            open_with_menu = menu.addMenu("打开方式")
-
-            default_action = open_with_menu.addAction("系统默认程序")
+            default_action = menu.addAction("用系统默认程序打开")
             default_action.triggered.connect(lambda: self.open_selected_with_default_app(file_path))
 
-            open_with_menu.addSeparator()
+            menu.addSeparator()
 
-            notepad_action = open_with_menu.addAction("记事本")
+            notepad_action = menu.addAction("用记事本打开")
             notepad_action.triggered.connect(lambda: self.open_selected_with_notepad(file_path))
 
-            notepadpp_action = open_with_menu.addAction("Notepad++")
+            notepadpp_action = menu.addAction("用 Notepad++ 打开")
             notepadpp_action.setEnabled(bool(getattr(self, 'notepad_plus_plus_path', None)))
             if not getattr(self, 'notepad_plus_plus_path', None):
                 notepadpp_action.setToolTip("未检测到 Notepad++")
             notepadpp_action.triggered.connect(lambda: self.open_selected_with_notepad_plus_plus(file_path))
 
-            open_with_menu.addSeparator()
+            menu.addSeparator()
 
-            system_dialog_action = open_with_menu.addAction("选择其他应用...")
+            system_dialog_action = menu.addAction("选择其他应用...")
             system_dialog_action.triggered.connect(lambda: self.open_selected_with_system_dialog(file_path))
 
         menu.exec_(global_pos)
