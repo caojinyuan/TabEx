@@ -8417,6 +8417,39 @@ class MainWindow(QMainWindow):
                 # 解析消息结构
                 msg = cast(int(message), POINTER(wintypes.MSG)).contents
 
+                # WM_GETMINMAXINFO - 限制最大化时的窗口尺寸为当前屏幕的工作区域（不遮挡任务栏）
+                if msg.message == 0x0024:  # WM_GETMINMAXINFO
+                    import ctypes.wintypes as wt
+
+                    class MINMAXINFO(ctypes.Structure):
+                        _fields_ = [
+                            ("ptReserved", wt.POINT),
+                            ("ptMaxSize", wt.POINT),
+                            ("ptMaxPosition", wt.POINT),
+                            ("ptMinTrackSize", wt.POINT),
+                            ("ptMaxTrackSize", wt.POINT),
+                        ]
+
+                    info = cast(msg.lParam, POINTER(MINMAXINFO)).contents
+
+                    # 获取窗口当前所在的屏幕
+                    from PyQt5.QtWidgets import QApplication
+                    screen = QApplication.screenAt(self.geometry().center())
+                    if screen is None:
+                        screen = QApplication.primaryScreen()
+                    available = screen.availableGeometry()
+                    screen_geo = screen.geometry()
+
+                    # ptMaxPosition 是相对于当前监视器左上角的偏移
+                    info.ptMaxPosition.x = available.x() - screen_geo.x()
+                    info.ptMaxPosition.y = available.y() - screen_geo.y()
+                    info.ptMaxSize.x = available.width()
+                    info.ptMaxSize.y = available.height()
+                    info.ptMaxTrackSize.x = available.width()
+                    info.ptMaxTrackSize.y = available.height()
+
+                    return True, 0
+
                 # WM_NCHITTEST - 让 Windows 自己处理无边框窗口的拖动调整大小
                 if msg.message == 0x0084:  # WM_NCHITTEST
                     from PyQt5.QtCore import QPoint
