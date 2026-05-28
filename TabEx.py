@@ -2308,7 +2308,7 @@ class BreadcrumbPathBar(QWidget):
             self._resize_timer = QTimer(self)
             self._resize_timer.setSingleShot(True)
             self._resize_timer.setInterval(50)  # 减少到50ms以加快响应
-            self._resize_timer.timeout.connect(self.update_breadcrumbs)
+            self._resize_timer.timeout.connect(self._on_resize_timer_timeout)
         except Exception:
             self._resize_timer = None
         # 标志：导航触发的更新（跳过节流），vs resize触发的更新（使用节流）
@@ -2327,7 +2327,8 @@ class BreadcrumbPathBar(QWidget):
         self.path_edit.setStyleSheet("QLineEdit { font-size: 10pt; padding: 2px; border: 1px solid #ccc; }")
         self.path_edit.hide()
         self.path_edit.returnPressed.connect(self.on_edit_finished)
-        self.path_edit.editingFinished.connect(self.exit_edit_mode)
+        # editingFinished 改用延迟检查，防止定时器刷新等短暂焦点丢失误退出编辑模式
+        self.path_edit.editingFinished.connect(self._on_path_edit_editing_finished)
         
         # 设置路径自动补全
         self.setup_path_completer()
@@ -2363,16 +2364,17 @@ class BreadcrumbPathBar(QWidget):
     def resizeEvent(self, event):
         """当路径栏宽度变化时，节流更新面包屑，减少重绘卡顿"""
         try:
-            # 只在非导航更新时进行节流，导航时立即更新
-            if self._is_navigation_update:
-                # 导航更新直接执行，不等待
-                self.update_breadcrumbs()
-                self._is_navigation_update = False
-            elif getattr(self, '_resize_timer', None):
-                # Resize事件使用节流定时器，合并连续events
-                self._resize_timer.start()
-            else:
-                self.update_breadcrumbs()
+            if not self.edit_mode:  # 编辑模式不重建面包屑，防止干扰 path_edit
+                # 只在非导航更新时进行节流，导航时立即更新
+                if self._is_navigation_update:
+                    # 导航更新直接执行，不等待
+                    self.update_breadcrumbs()
+                    self._is_navigation_update = False
+                elif getattr(self, '_resize_timer', None):
+                    # Resize事件使用节流定时器，合并连续events
+                    self._resize_timer.start()
+                else:
+                    self.update_breadcrumbs()
         except Exception:
             pass
         super().resizeEvent(event)
@@ -2474,10 +2476,11 @@ class BreadcrumbPathBar(QWidget):
         self.current_path = norm_path
         path_changed = (norm_path != old_path)
         # 用户正在地址栏输入时（且路径未变化），不要被后台同步打断。
+        # 注意：不检查 hasFocus()——焦点可能尚未稳定（enter_edit_mode 刚调用 setFocus），
+        # 用焦点丢失判断应由 _check_exit_edit_mode_by_focus 来处理，而不是 set_path 强制退出。
         if (self.edit_mode and
             hasattr(self, 'path_edit') and
             self.path_edit.isVisible() and
-            self.path_edit.hasFocus() and
             not path_changed):
             debug_print(f"[PathBar] set_path: in edit_mode, skip update. path={path}")
             return
@@ -2517,29 +2520,82 @@ class BreadcrumbPathBar(QWidget):
         self.repaint()
         self._flush_path_bar_display(norm_path)
         QTimer.singleShot(0, lambda expected_path=norm_path: self._flush_path_bar_display(expected_path))
+        QTimer.singleShot(50, lambda expected_path=norm_path: self._flush_path_bar_display(expected_path))
 
     def _flush_path_bar_display(self, expected_path=None):
         """确保路径栏在导航时序竞争下也能及时恢复显示。"""
+        # 关闭标签页时，Qt 会先销毁子控件（C++ 对象），
+        # 但队列中的 singleShot 定时器仍会触发——此时访问已删除对象会崩溃。
+        # 在入口检测存活性，已销毁则直接忽略。
+        try:
+            _ = self.isWidgetType()  # 任意 C++ 属性访问；若 self 已销毁则抛 RuntimeError
+        except RuntimeError:
+            return
         current_path = getattr(self, 'current_path', '')
         if expected_path and current_path != expected_path:
+            return
+        if self.edit_mode:
+            # 编辑模式中不干扰 path_edit，避免定时器强制显示面包屑覆盖输入框
             return
         if hasattr(self, 'path_edit'):
             try:
                 self.path_edit.blockSignals(True)
                 self.path_edit.setText(current_path)
+            except RuntimeError:
+                return  # path_edit C++ 对象已销毁
             finally:
-                self.path_edit.blockSignals(False)
+                try:
+                    self.path_edit.blockSignals(False)
+                except RuntimeError:
+                    pass
         if hasattr(self, 'breadcrumb_layout'):
-            self.breadcrumb_layout.activate()
+            try:
+                self.breadcrumb_layout.activate()
+            except RuntimeError:
+                return
         if hasattr(self, 'breadcrumb_widget'):
-            self.breadcrumb_widget.show()
-            self.breadcrumb_widget.updateGeometry()
-            self.breadcrumb_widget.update()
-        self.updateGeometry()
-        self.update()
+            try:
+                self.breadcrumb_widget.show()
+                self.breadcrumb_widget.updateGeometry()
+                self.breadcrumb_widget.update()
+                self.breadcrumb_widget.repaint()
+            except RuntimeError:
+                return
+        try:
+            self.updateGeometry()
+            self.update()
+            self.repaint()
+        except RuntimeError:
+            pass
     
+    def _on_resize_timer_timeout(self):
+        """_resize_timer 到期：重建面包屑并强制刷新视觉"""
+        if self.edit_mode:
+            return
+        self.update_breadcrumbs()  # 内部已调用 activate()，无需再次调用，避免触发多余 resizeEvent
+        if hasattr(self, 'breadcrumb_widget'):
+            try:
+                self.breadcrumb_widget.repaint()
+            except RuntimeError:
+                return
+        try:
+            self.repaint()
+        except RuntimeError:
+            pass
+
     def update_breadcrumbs(self):
         """更新面包屑显示"""
+        # 重入守卫：防止 activate() 触发 resizeEvent 再次进入本函数造成无限循环
+        if getattr(self, '_in_update_breadcrumbs', False):
+            return
+        self._in_update_breadcrumbs = True
+        try:
+            self._update_breadcrumbs_impl()
+        finally:
+            self._in_update_breadcrumbs = False
+
+    def _update_breadcrumbs_impl(self):
+        """update_breadcrumbs 的实际实现（由重入守卫包裹）"""
         debug_print(f"[PathBar] update_breadcrumbs: current_path={getattr(self, 'current_path', None)}, edit_mode={self.edit_mode}")
         # 如果处于编辑模式，则不更新面包屑显示（只显示编辑框）
         if self.edit_mode:
@@ -2627,6 +2683,10 @@ class BreadcrumbPathBar(QWidget):
         self.breadcrumb_layout.activate()
         self.breadcrumb_widget.updateGeometry()
         debug_print(f"[PathBar] update_breadcrumbs: done, layout_count={self.breadcrumb_layout.count()}")
+        # 确保视觉刷新（无论由哪个调用路径触发，包括 _resize_timer）
+        if not self.edit_mode:
+            self.breadcrumb_widget.update()
+            self.update()
     
     def _create_breadcrumb_widgets(self, parts):
         """创建面包屑widget，如果空间不足则显示省略版本"""
@@ -2778,7 +2838,16 @@ class BreadcrumbPathBar(QWidget):
             self.path_edit.hide()
             self.breadcrumb_widget.show()
             self.update_breadcrumbs()
-    
+
+    def _on_path_edit_editing_finished(self):
+        """path_edit.editingFinished 信号处理：延迟检查焦点，防止短暂焦点丢失误退出编辑模式"""
+        QTimer.singleShot(0, self._check_exit_edit_mode_by_focus)
+
+    def _check_exit_edit_mode_by_focus(self):
+        """检查 path_edit 是否真的失去焦点，若已失焦则退出编辑模式"""
+        if self.edit_mode and hasattr(self, 'path_edit') and not self.path_edit.hasFocus():
+            self.exit_edit_mode()
+
     def on_edit_finished(self):
         """编辑完成时触发"""
         new_path = self.path_edit.text().strip()
@@ -3384,10 +3453,21 @@ class FileExplorerTab(QWidget):
                         if self._path_sync_timer.interval() != target_interval:
                             self._path_sync_timer.setInterval(target_interval)
                     if self._path_sync_stable_hits >= 2:
-                        # 导航已确认完成（Shell.Explorer 稳定在 current_path），
-                        # 立即解除抑制标志，避免用户随后双击子目录时路径栏无法更新。
-                        self._suppress_auto_refresh = False
-                        self._stop_path_sync_timer()
+                        # 若停止定时器剩余时间较长（说明调用方设置了长窗口，例如 SelectFile 后的 8s），
+                        # 不提前退出——继续以 360ms 低频轮询，等待用户按 Enter 进入子目录。
+                        # 若剩余时间较短（正常 2s 窗口快到期），才做提前停止优化。
+                        _remaining_ms = 0
+                        try:
+                            if (hasattr(self, '_path_sync_stop_timer') and self._path_sync_stop_timer
+                                    and self._path_sync_stop_timer.isActive()):
+                                _remaining_ms = self._path_sync_stop_timer.remainingTime()
+                        except Exception:
+                            pass
+                        if _remaining_ms <= 2000:
+                            # 导航已确认完成（Shell.Explorer 稳定在 current_path），
+                            # 立即解除抑制标志，避免用户随后双击子目录时路径栏无法更新。
+                            self._suppress_auto_refresh = False
+                            self._stop_path_sync_timer()
         except Exception as e:
             debug_print(f"[PathSync] ERROR: {e}")
 
@@ -3923,6 +4003,13 @@ class FileExplorerTab(QWidget):
                         self.path_bar.set_path(self.current_path)
                 return
             self.navigate_to(path, is_shell=True)
+            return
+
+        # 路径与当前路径相同时（如 resizeEvent 误触发 pathChanged），跳过导航，防止循环刷新
+        current_norm = getattr(self, 'current_path', '').replace('/', '\\').lower().rstrip('\\')
+        path_norm = path.replace('/', '\\').lower().rstrip('\\')
+        if path_norm == current_norm:
+            debug_print(f"[PathBar] on_path_bar_changed: same as current_path, skip navigate")
             return
 
         # 尝试中英文目录互转
@@ -5342,6 +5429,11 @@ class FileExplorerTab(QWidget):
                                             user32.SetFocus(listview_hwnd)
                                             
                                             debug_print(f"[SelectFile] Successfully selected file via API: {filename}")
+                                            # 用户随后可能按 Enter 进入选中的文件夹。
+                                            # NavigateComplete2 信号在某些环境下不可用，
+                                            # 通过启动路径同步定时器来兜底捕获导航变化。
+                                            self._suppress_auto_refresh = False
+                                            self.start_path_sync_timer(duration_ms=8000)
                                             return True
                     except Exception as e:
                         debug_print(f"[SelectFile] Error matching item {i}: {e}")
@@ -8813,6 +8905,16 @@ class MainWindow(QMainWindow):
     def _guard_shortcuts_after_modal(self, cooldown_ms=250):
         """模态输入框关闭后，短暂屏蔽轮询快捷键，避免把输入过程误判为组合键。"""
         self._last_keys_state.clear()
+        # 立即消耗所有非修饰键的 GetAsyncKeyState 粘性位（bit0）。
+        # 场景：用户在弹窗内输入了包含快捷键字符的关键词（如 "em_rtc" 含 't'），
+        # 弹窗关闭后该粘性位残留，下次用户恰好按住 Ctrl 时会产生幽灵 Ctrl+T 触发。
+        try:
+            _drain = ctypes.windll.user32.GetAsyncKeyState
+            for _vk in (0x5A, 0x58, 0x4C, 0x54, 0x41, 0x57, 0x46, 0x47,
+                        0x44, 0x09, 0x25, 0x27, 0x26, 0x28, 0x74):
+                _drain(_vk)
+        except Exception:
+            pass
         self._shortcut_modal_guard_until = time.monotonic() + max(0, cooldown_ms) / 1000.0
         self._shortcut_wait_for_modifier_release = True
     
@@ -8899,6 +9001,10 @@ class MainWindow(QMainWindow):
                 self._shortcut_wait_for_modifier_release = False
 
             if time.monotonic() < getattr(self, '_shortcut_modal_guard_until', 0):
+                # 守卫期间每轮都消耗一次非修饰键粘性位，防止守卫窗口内新产生的按键残留。
+                for _vk in (0x5A, 0x58, 0x4C, 0x54, 0x41, 0x57, 0x46, 0x47,
+                            0x44, 0x09, 0x25, 0x27, 0x26, 0x28, 0x74):
+                    _GetAsyncKeyState(_vk)
                 return
             
             hotkeys = self.config.get("hotkeys", {})
@@ -9751,16 +9857,37 @@ class MainWindow(QMainWindow):
                 if worker and worker.isRunning():
                     chat_worker_running = 1
 
+            thread_count = threading.active_count()
+            # 当线程数异常增多时，记录线程名称以诊断泄漏
+            thread_detail = ""
+            if thread_count > 10:
+                try:
+                    names = [t.name for t in threading.enumerate()]
+                    from collections import Counter
+                    name_counts = Counter(names)
+                    # 只记录出现超过1次的线程名，或全部（若总数<=20）
+                    if thread_count <= 20:
+                        thread_detail = " thread_names=[" + ",".join(names) + "]"
+                    else:
+                        repeated = {k: v for k, v in name_counts.items() if v > 1}
+                        if repeated:
+                            thread_detail = " thread_repeats=" + str(dict(repeated))
+                        else:
+                            thread_detail = " thread_names=[" + ",".join(names[:20]) + "...]"
+                except Exception:
+                    pass
+
             line = (
                 f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 f" reason={reason}"
                 f" rss_mb={rss_mb if rss_mb is not None else 'n/a'}"
-                f" threads={threading.active_count()}"
+                f" threads={thread_count}"
                 f" tabs={tabs}"
                 f" search_dialogs={search_dialogs}"
                 f" toasts={len(_active_toasts)}"
                 f" chat_worker={chat_worker_running}"
                 f" shortcuts_tracked={len(getattr(self, '_last_keys_state', {}) or {})}"
+                f"{thread_detail}"
             )
             with open(get_app_data_path('runtime_health.log'), 'a', encoding='utf-8') as f:
                 f.write(line + "\n")
@@ -9801,6 +9928,31 @@ class MainWindow(QMainWindow):
         _active_toasts = alive_toasts[:MAX_ACTIVE_TOASTS]
         return removed
 
+    @staticmethod
+    def _cleanup_dead_dummy_threads():
+        """清除 threading._active 中死亡 QThread 遗留的 _DummyThread 条目。
+
+        PyQt5 的 QThread 子类在运行 Python run() 方法时，会在 threading._active 中
+        登记一个 _DummyThread 占位对象。由于 _active 持有强引用，Python 3.9 的
+        _DummyThread.__del__ 无法被 GC 触发，导致计数永久增长。
+        用 sys._current_frames() 判断底层 OS 线程是否仍存活，对死亡条目执行手动清除。
+        """
+        import sys
+        try:
+            live_idents = set(sys._current_frames().keys())
+            cleaned = 0
+            with threading._active_limbo_lock:
+                dead = [
+                    ident for ident, t in list(threading._active.items())
+                    if isinstance(t, threading._DummyThread) and ident not in live_idents
+                ]
+                for ident in dead:
+                    del threading._active[ident]
+                    cleaned += 1
+            return cleaned
+        except Exception:
+            return 0
+
     def _run_housekeeping(self):
         self._housekeeping_runs += 1
         removed_dialogs = self._prune_search_dialog_refs()
@@ -9811,16 +9963,19 @@ class MainWindow(QMainWindow):
         self._append_resource_snapshot_log(reason="periodic")
 
         gc_collected = None
+        dummy_cleaned = 0
         if self._housekeeping_runs % HOUSEKEEPING_GC_EVERY_N == 0:
             try:
                 import gc
                 gc_collected = gc.collect()
             except Exception as e:
                 debug_print(f"[Housekeeping] gc.collect failed: {e}")
+            dummy_cleaned = self._cleanup_dead_dummy_threads()
 
-        if removed_dialogs or removed_toasts or gc_collected is not None:
+        if removed_dialogs or removed_toasts or gc_collected is not None or dummy_cleaned:
             debug_print(
-                f"[Housekeeping] dialogs={removed_dialogs} toasts={removed_toasts} gc={gc_collected}"
+                f"[Housekeeping] dialogs={removed_dialogs} toasts={removed_toasts}"
+                f" gc={gc_collected} dummy_threads_cleaned={dummy_cleaned}"
             )
 
     def _restore_last_active_tab(self):

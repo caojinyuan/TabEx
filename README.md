@@ -39,6 +39,17 @@
 
 ## 🆕 最近更新
 
+### v3.32 (2026-05-28)
+- **修复 Ctrl+G 搜索后按 Enter 进入子目录路径栏不更新的问题**：
+  - 根本原因：`select_file_in_explorer` 完成后启动 8 秒路径同步窗口，但同步回调在约 340ms 内检测到两次"路径稳定"就提前停止轮询，用户还没来得及按 Enter，计时器已停止
+  - 修复：在"稳定命中提前停止"逻辑中加入剩余时间检查，若停止定时器剩余时间 > 2000ms（说明调用方设置了长窗口），跳过提前停止，继续以 360ms 低频轮询，直至用户导航完成或窗口自然到期
+- **修复幽灵 Ctrl+T（用户未按 Ctrl+T 却自动新建标签页）**：
+  - 根本原因：用户在 Ctrl+G 弹窗内输入含 `t` 的关键字（如 `em_rtc`），`GetAsyncKeyState(0x54)` 的粘性位（bit 0）被置位；弹窗关闭后的守卫期内，`_check_shortcuts` 提前 return 而不调用 `GetAsyncKeyState(T)` 消耗该位；守卫期结束后用户恰好按住 Ctrl（如 Ctrl+C）时，残留的粘性位触发伪 Ctrl+T
+  - 修复：`_guard_shortcuts_after_modal` 关闭弹窗时立即遍历所有非修饰键 VK 码消耗粘性位；`_check_shortcuts` 守卫期分支改为每轮也消耗一次，防止守卫窗口内新产生的残留积累
+- **修复长时间运行后线程数持续增长**：
+  - 根本原因：PyQt5 的 QThread 在 Python 3.9 中执行 Python 代码时会在 `threading._active` 中注册 `_DummyThread`，但不会自动删除，导致线程计数无限增长（实测从 3 增至 1800+）
+  - 修复：新增 `_cleanup_dead_dummy_threads()` 方法，利用 `sys._current_frames()` 识别已无活跃帧的 `_DummyThread` 并从 `threading._active` 中移除；每 15 分钟在 housekeeping 中自动调用一次
+
 ### v3.31 (2026-05-28)
 - **修复路径栏在导航后不立即刷新的问题**：
   - 根本原因：`repaint()` 在 `update_breadcrumbs()` 之前调用，导致新标签尺寸为 0 而画面空白；且异步 `update()` 被事件队列中大量快照/FileWatcher 事件堵塞，延迟数秒才刷新
@@ -46,24 +57,6 @@
 - **会话快照节流优化**：
   - 新增 `SESSION_SNAPSHOT_MIN_INTERVAL_MS = 8000` 最小写盘间隔常量
   - `_schedule_session_snapshot()` 加节流逻辑：若距上次实际写入不足 8 秒，自动将延迟延长到补足 8 秒，防止 DirPoll/FileWatcher 持续触发导致 config.json 频繁写盘并阻塞事件队列
-
-### v3.30 (2026-05-27)
-- **搜索界面右键菜单优化**：
-  - “打开方式”相关项（如“用系统默认程序打开”“用记事本打开”“用 Notepad++ 打开”“选择其他应用...”）已直接平铺到主菜单，无需再点开子菜单。
-
-### v3.29 (2026-05-25)
-- **修复路径栏在双击进入子目录后不更新的问题**：
-  - 根本原因：`navigate_to()` 导航后会抑制自动刷新 3000ms，而用户在此期间双击进入子目录时路径同步定时器的 2000ms 窗口会在抑制解除前到期，导致路径栏停留在旧路径
-  - 修复：在路径同步定时器确认 Shell.Explorer 已稳定（命中 2 次）时立即清除 `_suppress_auto_refresh` 标志；在双击事件命中项目时也立即清除该标志，确保用户主动导航始终可被同步定时器感知
-- **修复从其他应用打开目录时 TabEx 窗口不置顶的问题**：
-  - 根本原因：标准 `activateWindow()` + `raise_()` 在其他进程持有前台权限时无效
-  - 修复：新增 `_bring_to_front()` 方法，使用 Win32 `AttachThreadInput` 临时附加到前台线程，再调用 `BringWindowToTop` + `SetForegroundWindow`，绕过 Windows 防偷焦保护，确保 TabEx 可靠置顶
-- **修复标签页拖拽排序时界面卡顿的问题**：
-  - 根本原因：每次中间拖拽位置均触发 `tabMoved` → `on_tab_changed`，导致 DirPoll 启停、样式表重算、目录树展开等重型操作在每一步拖拽都执行一次，10 步拖拽等于 10 倍完整 pipeline
-  - 修复：在 `CustomTabBar` 中引入 `_is_dragging_tab` 标志和 150ms 去抖定时器，拖拽期间 `on_tab_changed` 仅同步 `content_stack` 显示，拖拽结束后统一执行一次完整切换逻辑
-- **修复从其他应用打开目录时 TabEx 最大化状态丢失的问题**：
-  - 根本原因：`AttachThreadInput` + `SetForegroundWindow` 会触发 Windows 内部消息，导致最大化窗口意外经历多次 `WindowStateChange`，最终停留在非最大化状态
-  - 修复：`_bring_to_front()` 在 Win32 调用前记录 `was_maximized`，调用后通过 `QTimer.singleShot(50, ...)` 检查并恢复最大化状态；同时移除 `add_new_tab` 中多余的 `activateWindow()` + `raise_()` 调用（已由 `_bring_to_front` 统一处理）
 
 ---
 
