@@ -39,6 +39,14 @@
 
 ## 🆕 最近更新
 
+### v3.31 (2026-05-28)
+- **修复路径栏在导航后不立即刷新的问题**：
+  - 根本原因：`repaint()` 在 `update_breadcrumbs()` 之前调用，导致新标签尺寸为 0 而画面空白；且异步 `update()` 被事件队列中大量快照/FileWatcher 事件堵塞，延迟数秒才刷新
+  - 修复：调整执行顺序为 `update_breadcrumbs()` → `layout.activate()` → 同步 `repaint()`，绕过事件队列立即绘制；对从布局中移除的旧 widget 显式调用 `setParent(None)` 彻底脱离父树防止"幽灵"绘制干扰；新增 widget 插入后显式调用 `show()`（Qt 不保证自动显示）
+- **会话快照节流优化**：
+  - 新增 `SESSION_SNAPSHOT_MIN_INTERVAL_MS = 8000` 最小写盘间隔常量
+  - `_schedule_session_snapshot()` 加节流逻辑：若距上次实际写入不足 8 秒，自动将延迟延长到补足 8 秒，防止 DirPoll/FileWatcher 持续触发导致 config.json 频繁写盘并阻塞事件队列
+
 ### v3.30 (2026-05-27)
 - **搜索界面右键菜单优化**：
   - “打开方式”相关项（如“用系统默认程序打开”“用记事本打开”“用 Notepad++ 打开”“选择其他应用...”）已直接平铺到主菜单，无需再点开子菜单。
