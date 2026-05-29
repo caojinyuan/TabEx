@@ -10202,12 +10202,22 @@ class MainWindow(QMainWindow):
             self._config_save_timer.start(500)
 
     def _flush_config_to_disk(self):
-        """实际写入config.json（原子写入：先写临时文件再重命名）"""
+        """实际写入config.json（原子写入：先写临时文件再重命名；内容无变化时跳过写盘）"""
         config_path = get_app_data_path("config.json")
         tmp_path = config_path + ".tmp"
         try:
+            new_content = json.dumps(self.config, ensure_ascii=False, indent=2)
+            # 若文件已存在且内容相同，则跳过写盘
+            if os.path.isfile(config_path):
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        existing_content = f.read()
+                    if existing_content == new_content:
+                        return
+                except Exception:
+                    pass
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=2)
+                f.write(new_content)
             os.replace(tmp_path, config_path)
         except Exception as e:
             print(f"Failed to save config: {e}")
