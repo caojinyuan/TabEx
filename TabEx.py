@@ -1,4 +1,4 @@
-# 全局搜索缓存（LRU缓存，最多缓存50个搜索结果）
+﻿# 全局搜索缓存（LRU缓存，最多缓存50个搜索结果）
 
 from collections import OrderedDict
 import hashlib
@@ -2957,9 +2957,15 @@ class BreadcrumbPathBar(QWidget):
             if not self.edit_mode:  # 编辑模式不重建面包屑，防止干扰 path_edit
                 # 只在非导航更新时进行节流，导航时立即更新
                 if self._is_navigation_update:
-                    # 导航更新直接执行，不等待
-                    self.update_breadcrumbs()
-                    self._is_navigation_update = False
+                    if not getattr(self, '_in_update_breadcrumbs', False):
+                        # 重入守卫未激活：立即重建面包屑
+                        self.update_breadcrumbs()
+                        self._is_navigation_update = False
+                    else:
+                        # 重入守卫激活中（update_breadcrumbs 正在执行）：
+                        # 不重置标志，启动短延迟定时器，确保守卫释放后还能刷新
+                        if getattr(self, '_resize_timer', None):
+                            self._resize_timer.start()
                 elif getattr(self, '_resize_timer', None):
                     # Resize事件使用节流定时器，合并连续events
                     self._resize_timer.start()
@@ -4036,8 +4042,22 @@ class FileExplorerTab(QWidget):
                 elif local_path and local_path == current_path:
                     self._path_sync_stable_hits = int(getattr(self, '_path_sync_stable_hits', 0)) + 1
                     # 即使路径未变化，也做一次轻量UI回写，修复偶发地址栏未重绘。
+                    # 优化：若面包屑已存在，只做 repaint 而非全量重建，减少控件析构/创建开销。
                     if hasattr(self, 'path_bar'):
-                        self.path_bar.set_path(local_path)
+                        pb = self.path_bar
+                        _has_crumbs = (hasattr(pb, 'breadcrumb_layout') and
+                                       pb.breadcrumb_layout.count() > 1 and
+                                       not pb.edit_mode)
+                        if _has_crumbs:
+                            try:
+                                pb.breadcrumb_widget.update()
+                                pb.breadcrumb_widget.repaint()
+                                pb.update()
+                                pb.repaint()
+                            except Exception:
+                                pass
+                        else:
+                            pb.set_path(local_path)
                     if hasattr(self, '_path_sync_timer') and self._path_sync_timer:
                         target_interval = 220 if self._path_sync_stable_hits == 1 else 360
                         if self._path_sync_timer.interval() != target_interval:
@@ -4298,13 +4318,16 @@ class FileExplorerTab(QWidget):
                         local_path = unquote(url[8:])
                         if os.name == 'nt' and local_path.startswith('/'):
                             local_path = local_path[1:]
+                        local_path = self._normalize_local_path(local_path)
                     elif url.startswith('file://') and not url.startswith('file:///'):
                         from urllib.parse import unquote
-                        local_path = '\\\\' + unquote(url[7:]).replace('/', '\\')
+                        local_path = self._normalize_local_path('\\\\' + unquote(url[7:]).replace('/', '\\'))
                     else:
                         local_path = None
                     if local_path is not None:
-                        self.current_path = local_path
+                        current = self._normalize_local_path(getattr(self, 'current_path', ''))
+                        if local_path != current:
+                            self.current_path = local_path
                         if hasattr(self, 'path_bar'):
                             self.path_bar.set_path(local_path)
                         self._schedule_status_update(track_selection=True)
