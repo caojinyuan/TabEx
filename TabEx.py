@@ -1,8 +1,593 @@
-﻿# 全局搜索缓存（LRU缓存，最多缓存50个搜索结果）
+# 全局搜索缓存（LRU缓存，最多缓存50个搜索结果）
 
 from collections import OrderedDict
 import hashlib
 import os
+
+
+# TabEx i18n module
+# Usage: tr("中文") returns English when language is "en", else returns the Chinese original.
+# This module is inserted near the top of TabEx.py before any UI code.
+
+_app_language = "zh"  # default; overridden from config.json at startup
+
+def _set_app_language(lang):
+    global _app_language
+    _app_language = lang if lang in ("zh", "en") else "zh"
+
+def tr(zh_text):
+    """Return translated string. Falls back to zh_text if no translation found."""
+    if _app_language != "en":
+        return zh_text
+    return _LANG_EN.get(zh_text, zh_text)
+
+_LANG_EN = {
+    # ── Common buttons / actions ──────────────────────────────────────────
+    "关闭": "Close",
+    "确定": "OK",
+    "取消": "Cancel",
+    "删除": "Delete",
+    "复制": "Copy",
+    "编辑": "Edit",
+    "保存": "Save",
+    "设置": "Settings",
+    "上移": "Move Up",
+    "下移": "Move Down",
+    "重命名": "Rename",
+    "无": "None",
+    "成功": "Success",
+    "错误": "Error",
+    "提示": "Notice",
+    "不支持": "Not Supported",
+    "警告": "Warning",
+    "格式错误": "Format Error",
+    "已打开": "Opened",
+    "已停止": "Stopped",
+    "已删除": "Deleted",
+    "已启动": "Started",
+    "已保存": "Saved",
+    "已选择": "Selected",  # alias
+    "未选择": "Not Selected",
+    "保存失败": "Save Failed",
+    "导入失败": "Import Failed",
+    "导出失败": "Export Failed",
+    "导入成功": "Imported",
+    "导出成功": "Exported",
+    "添加失败": "Add Failed",
+    "打开失败": "Open Failed",
+    # ── Dialogs ───────────────────────────────────────────────────────────
+    "书签": "Bookmarks",
+    "书签管理": "Bookmarks",
+    "书签管理器": "Bookmark Manager",
+    "书签名称": "Bookmark Name",
+    "书签栏": "Bookmark Bar",
+    "名称": "Name",
+    "路径": "Path",
+    "路径错误": "Path Error",
+    "选择匹配项": "Select Match",
+    "类型": "Type",
+    "完整路径": "Full Path",
+    "文件夹": "Folder",
+    "文件": "File",
+    # ── Search dialog ─────────────────────────────────────────────────────
+    "文件名": "File Name",
+    "修改日期": "Modified",
+    "大小": "Size",
+    "搜索:": "Search:",
+    "搜索": "Search",
+    "搜索路径:": "Search Path:",
+    "文件类型:": "File Type:",
+    "就绪": "Ready",
+    "🔍 搜索": "🔍 Search",
+    "⏹ 停止": "⏹ Stop",
+    "搜索文件名": "Search File Name",
+    "搜索文件内容": "Search Content",
+    "区分大小写": "Case Sensitive",
+    "全词匹配": "Whole Word",
+    "使用 Everything (极速)": "Use Everything (Ultra-fast)",
+    "轻量模式(更快)": "Lightweight (Faster)",
+    "输入搜索关键词...": "Enter search keyword...",
+    "输入要搜索的文件夹路径...": "Enter folder path to search...",
+    "例如: *.c,*.h,*.xml (留空表示搜索所有类型)": "e.g. *.c,*.h,*.xml (empty = all types)",
+    "区分大小写匹配文件名和文件内容": "Case-sensitive match for filename and content",
+    "仅匹配完整单词，避免命中更长字符串的一部分": "Whole-word match only, avoid partial string hits",
+    "勾选后搜索结果将优先显示核心路径信息，可能省略修改时间/大小": "Prioritize path info; may omit modified date/size",
+    "使用Everything搜索引擎\n路径: {}\n只搜索文件名，速度极快": "Using Everything engine\nPath: {}\nFilename search only, blazing fast",
+    "未检测到Everything，请从 https://www.voidtools.com/ 下载安装": "Everything not found. Install from https://www.voidtools.com/",
+    "搜索 - {}": "Search - {}",
+    "正在加载缓存结果...": "Loading cached results...",
+    "已停止": "Stopped",
+    "列举文件中{}... (最多显示{}个结果)": "Listing files {}... (max {} results)",
+    "搜索中... (最多显示{}个结果)": "Searching... (max {} results)",
+    "搜索中... 已扫描 {} 个文件，找到 {} 个结果": "Searching... scanned {} files, {} found",
+    "搜索完成（缓存），共显示 {} 个结果": "Search complete (cache), {} results",
+    "搜索完成，共找到 {} 个结果（扫描了 {} 个文件）": "Search complete, {} results ({} files scanned)",
+    "搜索完成（已限制），显示前 {} 个结果（扫描了 {} 个文件）⚠️": "Search limited, showing first {} results ({} files scanned) ⚠️",
+    "Everything搜索完成，共找到 {} 个结果{}": "Everything search done, {} results{}",
+    # ── Search log messages ───────────────────────────────────────────────
+    "[Search] 开始搜索路径: {}": "[Search] Start path: {}",
+    "[Search] 搜索关键词: {}": "[Search] Keyword: {}",
+    "[Search] 搜索文件名: {}, 搜索内容: {}": "[Search] File name: {}, Content: {}",
+    "[Search] 文件类型过滤: {}": "[Search] File type filter: {}",
+    "[Search] 搜索完成，共扫描 {} 个文件，找到 {} 个结果": "[Search] Done, scanned {} files, {} results",
+    "[Search] 搜索被中断": "[Search] Search interrupted",
+    "[Search] 搜索被中断（文件循环）": "[Search] Interrupted (file loop)",
+    "[Search] 搜索缓存已清除": "[Search] Cache cleared",
+    "[Search] 文件被类型过滤跳过: {}": "[Search] File skipped by type filter: {}",
+    "[Search] 无法读取文件 {}: {}": "[Search] Cannot read file {}: {}",
+    "[Search] 读取文件失败 {} (编码 {}): {}": "[Search] Read failed {} (encoding {}): {}",
+    "[Search] 跳过 {} 个二进制文件（不搜索内容）": "[Search] Skipped {} binary files",
+    "[Search] ⚠️ 队列溢出 {} 次（部分结果未显示）": "[Search] ⚠️ Queue overflow {} times (some results hidden)",
+    "[Search] 搜索缓存已清除": "[Search] Search cache cleared",
+    '[Search] UI更新已调度（使用队列）': '[Search] UI update queued',
+    '[Search] ⚠️ 队列满，最终状态更新失败': '[Search] ⚠️ Queue full, final status update failed',
+    'Using Everything搜索引擎...': 'Using Everything search engine...',
+    # ── Context menu (search results) ────────────────────────────────────
+    "打开": "Open",
+    "打开所在目录": "Open Containing Folder",
+    "用系统默认程序打开": "Open with Default App",
+    "用记事本打开": "Open with Notepad",
+    "用 Notepad++ 打开": "Open with Notepad++",
+    "选择其他应用...": "Open with...",
+    "未检测到 Notepad++": "Notepad++ not detected",
+    "该搜索结果不是可打开的文件": "This result is not an openable file",
+    "当前系统不支持打开\u201c选择其他应用\u201d对话框": "This system does not support 'Open with' dialog",
+    "无法使用 {} 打开文件: {}": "Cannot open file with {}: {}",
+    "无法使用系统默认程序打开文件: {}": "Cannot open file with default app: {}",
+    '无法打开\u201c选择其他应用\u201d对话框: {}': "Cannot open 'Open with' dialog: {}",
+    "当前选中项不可打开": "Selected item cannot be opened",
+    "当前选中项不是可打开的文件": "Selected item is not an openable file",
+    # ── BookmarkDialog ────────────────────────────────────────────────────
+    "名称": "Name",
+    "路径": "Path",
+    "关闭": "Close",
+    "无可用书签文件夹": "No bookmark folders available",
+    "请先在 bookmarks.json 中添加至少一个文件夹。": "Add at least one folder in bookmarks.json first.",
+    "选择书签文件夹": "Select Bookmark Folder",
+    "请选择父文件夹：": "Select parent folder:",
+    "请输入书签名称：": "Enter bookmark name:",
+    "未能添加书签，请检查父文件夹。": "Failed to add bookmark. Check parent folder.",
+    "不支持的书签": "Unsupported Bookmark",
+    "🗑️ 删除书签": "🗑️ Delete Bookmark",
+    "已删除": "Deleted",
+    "书签 '{}' 已删除": "Bookmark '{}' deleted",
+    "书签已保存": "Bookmarks saved",
+    "书签已成功导出到:\n{}": "Bookmarks exported to:\n{}",
+    "成功导入 {} 个书签项": "Imported {} bookmark items",
+    "选中的书签/文件夹已删除": "Selected bookmark/folder deleted",
+    "请先选择要上移的书签或文件夹。": "Select a bookmark or folder to move up.",
+    "请先选择要下移的书签或文件夹。": "Select a bookmark or folder to move down.",
+    "请先选择要删除的书签或文件夹。": "Select a bookmark or folder to delete.",
+    "请先选择要编辑的书签或文件夹。": "Select a bookmark or folder to edit.",
+    "请先选择要重命名的书签或文件夹。": "Select a bookmark or folder to rename.",
+    "暂不支持打开此类型书签: {}": "Cannot open bookmark type: {}",
+    "请输入文件夹名称：": "Enter folder name:",
+    "请输入新名称：": "Enter new name:",
+    "请输入新路径：": "Enter new path:",
+    "编辑书签": "Edit Bookmark",
+    "编辑文件夹": "Edit Folder",
+    "保存当前书签顺序和层级": "Save current bookmark order and hierarchy",
+    "💾 保存": "💾 Save",
+    "📑 添加书签": "📑 Add Bookmark",
+    "📤 导出": "📤 Export",
+    "📥 导入": "📥 Import",
+    "导入书签": "Import Bookmarks",
+    "导出书签": "Export Bookmarks",
+    "从JSON文件导入书签": "Import Bookmarks from JSON",
+    "导出书签到JSON文件": "Export Bookmarks to JSON",
+    "导入方式": "Import Method",
+    "已自动选择合并模式，将导入内容追加到现有书签。": "Auto-selected merge mode; imported bookmarks appended.",
+    "导入的文件不是有效的JSON格式": "File is not valid JSON",
+    "导入的文件中没有书签内容": "No bookmark content in file",
+    "导入的文件格式不正确，必须包含 'bookmark_bar' 节点": "Invalid format; must contain 'bookmark_bar' node",
+    # ── QuickFindResultsDialog ────────────────────────────────────────────
+    "选择匹配项": "Select Match",
+    "名称": "Name",
+    "类型": "Type",
+    "完整路径": "Full Path",
+    "确定": "OK",
+    "取消": "Cancel",
+    "文件夹": "Folder",
+    "文件": "File",
+    # ── SettingsDialog ────────────────────────────────────────────────────
+    "路径栏分隔符设置": "Path Bar Separator",
+    "路径栏拷贝分隔符:": "Copy Separator:",
+    "设置从路径栏拷贝时使用的分隔符": "Separator used when copying from path bar",
+    "Explorer监听设置": "Explorer Monitor",
+    "监听新Explorer窗口": "Monitor New Explorer Windows",
+    "监听间隔（秒）:": "Monitor Interval (s):",
+    "检查新Explorer窗口的时间间隔，更长的间隔降低CPU占用": "Interval for checking new Explorer windows; longer = less CPU",
+    "（推荐: 2.0秒）": "(Recommended: 2.0s)",
+    "调试设置": "Debug Settings",
+    "启用调试输出（输出到终端）": "Enable Debug Output (to terminal)",
+    "启用后将在终端输出调试信息，用于开发和问题排查": "Outputs debug info to terminal for development",
+    "启用 Explorer Monitor 调试输出": "Enable Explorer Monitor Debug Output",
+    "单独控制 Explorer Monitor 的日志输出（需要先启用调试输出）": "Control Explorer Monitor logging (requires debug output enabled)",
+    "启用资源快照日志": "Enable Resource Snapshot Log",
+    "定时写入 runtime_health.log，用于观察长期运行时的内存和线程趋势": "Periodically write runtime_health.log for long-term monitoring",
+    "资源快照间隔（分钟）:": "Snapshot Interval (min):",
+    "资源快照日志写入周期，建议 5 分钟或更长": "Snapshot write period; 5 min or more recommended",
+    "分钟": "min",
+    "打开资源日志": "Open Resource Log",
+    "打开 runtime_health.log；如果日志尚未生成，则打开所在目录": "Open runtime_health.log, or its directory if not yet created",
+    "标签页设置": "Tab Settings",
+    "关闭时缓存当前标签页，下次启动时恢复": "Cache tabs on close, restore on next launch",
+    "关闭软件时保存非固定标签，下次启动时自动恢复（不包括固定标签）": "Save non-pinned tabs on close; restore at next launch",
+    "开机启动设置": "Auto-start",
+    "开机自动启动 TabExplorer": "Auto-start TabExplorer at login",
+    "在 Windows 启动时自动运行 TabExplorer.exe": "Run TabExplorer.exe automatically at Windows startup",
+    "Git 工具设置": "Git Tools",
+    "显示 TortoiseGit 快捷按钮（标题栏）": "Show TortoiseGit buttons (title bar)",
+    "在标题栏显示 Git Log 和 Git Commit 快捷按钮": "Show Git Log and Commit buttons in title bar",
+    "默认终端:": "Default Terminal:",
+    "路径栏输入 terminal 或 term 时使用的默认终端": "Default terminal when typing 'terminal' in the path bar",
+    "快捷方式设置": "Launcher Settings",
+    "启用标题栏启动区（可拖拽应用、快捷方式或脚本并点击启动）": "Enable title bar launcher (drag apps/shortcuts/scripts to launch)",
+    "拖拽应用、快捷方式或脚本到标题栏 Git 左侧区域，后续可一键启动": "Drag apps/shortcuts/scripts to the title bar for one-click launch",
+    "快捷键设置": "Hotkey Settings",
+    "Ctrl+T - 新建标签页": "Ctrl+T - New Tab",
+    "Ctrl+W - 关闭当前标签页": "Ctrl+W - Close Tab",
+    "Ctrl+Shift+T - 恢复关闭的标签页": "Ctrl+Shift+T - Reopen Tab",
+    "Ctrl+Tab / Ctrl+Shift+Tab - 切换标签页": "Ctrl+Tab / Ctrl+Shift+Tab - Switch Tab",
+    "Ctrl+F - 打开搜索对话框": "Ctrl+F - Open Search",
+    "Ctrl+G - 检索当前目录文件夹/文件名": "Ctrl+G - Quick Find in Current Dir",
+    "Alt+Left/Right - 前进/后退": "Alt+Left/Right - Back/Forward",
+    "Alt+Up - 返回上级目录": "Alt+Up - Go Up",
+    "F5 - 刷新当前路径": "F5 - Refresh",
+    "Ctrl+D - 添加当前路径到书签": "Ctrl+D - Add Bookmark",
+    "Alt+Z - 复制选中文件名（含后缀）": "Alt+Z - Copy File Name (with ext)",
+    "Alt+X - 复制文件路径\\文件名": "Alt+X - Copy File Path",
+    "💡 提示：取消勾选可禁用对应的快捷键": "💡 Tip: Uncheck to disable a shortcut",
+    "AI 助手设置": "AI Assistant Settings",
+    "启用 AI 助手（显示标题栏机器人按钮🤖）": "Enable AI Assistant (show 🤖 button in title bar)",
+    "── 请选择预设服务商 ──": "── Select AI Provider ──",
+    "Groq（免费·极速·推荐）": "Groq (Free · Ultra-fast · Recommended)",
+    "SiliconFlow 硅基流动（免费额度·国内快）": "SiliconFlow (Free quota · Fast in China)",
+    "DeepSeek（注册送额度·中文强）": "DeepSeek (Free credits · Strong Chinese)",
+    "Google Gemini（免费版）": "Google Gemini (Free tier)",
+    "OpenRouter（含永久免费模型）": "OpenRouter (Includes free models)",
+    "本地 LM Studio（无需Key）": "Local LM Studio (No key required)",
+    "本地 Ollama（无需Key）": "Local Ollama (No key required)",
+    "── 自定义（手动填写下方） ──": "── Custom (fill in manually) ──",
+    "免费注册获取Key: https://console.groq.com/keys": "Get free key: https://console.groq.com/keys",
+    "免费注册获取Key: https://cloud.siliconflow.cn": "Get free key: https://cloud.siliconflow.cn",
+    "注册获取Key: https://platform.deepseek.com/api_keys": "Get key: https://platform.deepseek.com/api_keys",
+    "免费获取Key: https://aistudio.google.com/app/apikey": "Get free key: https://aistudio.google.com/app/apikey",
+    "注册获取Key: https://openrouter.ai/keys": "Get key: https://openrouter.ai/keys",
+    "启动 LM Studio → Local Server 后使用": "Start LM Studio → Local Server, then use",
+    "安装 Ollama 并运行模型后使用": "Install Ollama, run a model, then use",
+    "快速选择:": "Quick Select:",
+    "选择预设后自动填充地址和模型名，然后只需粘贴对应的 API Key": "Select preset to auto-fill URL and model; just paste the API key",
+    "API 地址:": "API URL:",
+    "例: https://api.groq.com/openai/v1": "e.g. https://api.groq.com/openai/v1",
+    "填写 OpenAI 兼容 API 的基础地址（不含 /chat/completions）": "OpenAI-compatible API base URL (without /chat/completions)",
+    "API 密钥:": "API Key:",
+    "粘贴从服务商网站获取的 Key（本地模型可留空）": "Paste the API key (leave empty for local models)",
+    "模型名称:": "Model:",
+    "例: llama-3.3-70b-versatile": "e.g. llama-3.3-70b-versatile",
+    "系统提示词（留空使用默认）:": "System Prompt (empty = built-in default):",
+    "留空则使用内置提示词（支持 [OPEN_DIR:] 和 [RUN_SCRIPT:] 指令）": "Leave empty to use built-in prompt",
+    "面板宽度 (px):": "Panel Width (px):",
+    "点击链接在浏览器中打开 GitHub Releases 页面": "Click to open GitHub Releases in browser",
+    '检查更新: <a href="https://github.com/caojinyuan/TabEx/releases">https://github.com/caojinyuan/TabEx/releases</a>':
+        'Check for updates: <a href="https://github.com/caojinyuan/TabEx/releases">https://github.com/caojinyuan/TabEx/releases</a>',
+    "语言 / Language:": "语言 / Language:",
+    # ── Auto-start toasts ─────────────────────────────────────────────────
+    "已启用开机自动启动": "Auto-start enabled",
+    "已禁用开机自动启动": "Auto-start disabled",
+    "设置开机启动失败: {}": "Failed to set auto-start: {}",
+    "未找到 TabExplorer.exe，请确保程序已正确安装": "TabExplorer.exe not found. Please ensure it is installed.",
+    # ── Resource log ──────────────────────────────────────────────────────
+    "资源日志": "Resource Log",
+    "日志尚未生成，已打开日志目录": "Log not yet generated; opened log directory",
+    "日志目录不存在": "Log directory does not exist",
+    "无法打开资源日志: {}": "Cannot open resource log: {}",
+    # ── Toast messages ────────────────────────────────────────────────────
+    "请至少选择一种搜索类型": "Please select at least one search type",
+    "请输入搜索路径": "Please enter a search path",
+    "不支持搜索特殊路径（shell:）": "Special shell: paths are not supported for search",
+    "路径不存在: {}": "Path does not exist: {}",
+    "路径不存在:\n{}": "Path does not exist:\n{}",
+    "路径不是文件夹:\n{}": "Path is not a folder:\n{}",
+    "控制面板已在新窗口打开": "Control Panel opened in new window",
+    "无法打开控制面板: {}": "Cannot open Control Panel: {}",
+    "当前路径无效": "Invalid current path",
+    "当前目录不是 Git 仓库，未找到 .git": "Current dir is not a Git repo (.git not found)",
+    "未找到 TortoiseGit，请确认已安装 TortoiseGit\n下载地址: https://tortoisegit.org/download/": "TortoiseGit not found.\nDownload: https://tortoisegit.org/download/",
+    "无法打开 TortoiseGit Log: {}": "Cannot open TortoiseGit Log: {}",
+    "无法打开 TortoiseGit Commit: {}": "Cannot open TortoiseGit Commit: {}",
+    "当前路径无效，无法启动终端": "Invalid path; cannot open terminal",
+    "未找到 Git Bash，请确认已安装 Git for Windows": "Git Bash not found. Install Git for Windows.",
+    "未找到可用的 Git Bash 可执行文件": "No Git Bash executable found",
+    "无法打开 Git Bash: {}": "Cannot open Git Bash: {}",
+    "当前系统不支持打开计算器": "Calculator is not supported on this system",
+    "无法打开计算器: {}": "Cannot open calculator: {}",
+    "当前路径无效，无法打开默认终端": "Invalid path; cannot open default terminal",
+    "当前路径无效，无法打开命令行": "Invalid path; cannot open command line",
+    "当前路径无效，无法打开 PowerShell": "Invalid path; cannot open PowerShell",
+    "当前路径无效，无法打开 Git Bash": "Invalid path; cannot open Git Bash",
+    "无法打开 cmd: {}": "Cannot open cmd: {}",
+    "无法打开 PowerShell: {}": "Cannot open PowerShell: {}",
+    "无法打开命令行: {}": "Cannot open command line: {}",
+    "无法打开默认终端: {}": "Cannot open default terminal: {}",
+    "无法打开浏览器: {}": "Cannot open browser: {}",
+    "当前为特殊路径，无法定位到 cmd 或 PowerShell": "Special path; cannot open cmd or PowerShell",
+    "正在加载大文件夹...": "Loading large folder...",
+    "复制成功": "Copied",
+    "文件名: {}": "File name: {}",
+    "路径: {}": "Path: {}",
+    "未选中文件，也无法获取路径栏地址": "No file selected and path bar address unavailable",
+    "当前没有可用的标签页路径": "No active tab path available",
+    "当前路径不支持快捷检索": "Path does not support quick find",
+    "当前目录无效": "Invalid current directory",
+    "快捷定位": "Quick Find",
+    "请输入要检索的文件或文件夹关键字：": "Enter keyword to search for file or folder:",
+    "请输入搜索关键词": "Please enter a keyword",
+    "快捷检索失败: {}": "Quick find failed: {}",
+    "当前目录下未找到包含\"{}\"的文件或文件夹名": "No file/folder matching \"{}\" in current directory",
+    "当前标签自动刷新已冻结": "Auto-refresh frozen for current tab",
+    "当前标签自动刷新已恢复": "Auto-refresh resumed for current tab",
+    "当前标签页路径无效": "Current tab path is invalid",
+    "设置已更新": "Settings Updated",
+    "无法嵌入该窗口，已尝试用系统资源管理器打开。\n{}": "Cannot embed window; opened with Explorer instead.\n{}",
+    "无法启动快捷方式: {}": "Cannot launch shortcut: {}",
+    "无法打开选中项: {}": "Cannot open selection: {}",
+    "快捷方式不存在，已从列表移除": "Shortcut not found; removed from list",
+    "拖拽保存失败: {}": "Drag-save failed: {}",
+    "检查更新": "Check for Updates",
+    "已在浏览器中打开更新页面": "Update page opened in browser",
+    "请先打开一个文件夹": "Please open a folder first",
+    "已在当前目录选中{}: {}": "Selected {} in current dir: {}",
+    "启动文件夹不存在: {}": "Startup folder does not exist: {}",
+    "Explorer窗口监听已{}\n{}": "Explorer window monitoring {}\n{}",
+    # ── Status bar ────────────────────────────────────────────────────────
+    "就绪": "Ready",
+    "共 {} 项": "{} items",
+    "（共 {} 项）": "({} items)",
+    "已选 {} 项{}": "Selected {}{}",
+    "，已省略大小统计": ", size stats omitted",
+    "，修改时间 {}": ", modified {}",
+    "分支: {}": "Branch: {}",
+    '✔ 无更改': '✔ No changes',
+    '<span style="color:#2e7d32;font-weight:bold">✔ 无更改</span>': '<span style="color:#2e7d32;font-weight:bold">✔ No changes</span>',
+    "暂存(Add)": "Staged (Add)",
+    "修改(Commit)": "Modified (Commit)",
+    "未跟踪(待Add)": "Untracked (Pending Add)",
+    "，元数据降级 {} 条": ", {} items degraded",
+    # ── Main window toolbar / menus ───────────────────────────────────────
+    "后退 (Alt+←)": "Back (Alt+←)",
+    "前进 (Alt+→)": "Forward (Alt+→)",
+    "新建标签页 (Ctrl+T)": "New Tab (Ctrl+T)",
+    "恢复关闭的标签页 (Ctrl+Shift+T)": "Reopen Tab (Ctrl+Shift+T)",
+    "搜索当前文件夹 (Ctrl+F)": "Search Current Folder (Ctrl+F)",
+    "书签管理": "Bookmarks",
+    "设置": "Settings",
+    "AI 助手面板 (Ctrl+Shift+A)": "AI Assistant (Ctrl+Shift+A)",
+    "打开 TortoiseGit 日志": "Open TortoiseGit Log",
+    "打开 TortoiseGit 提交窗口": "Open TortoiseGit Commit",
+    "在当前标签页路径打开 Git Bash": "Open Git Bash here",
+    "在当前标签页路径打开 cmd": "Open cmd here",
+    "在当前标签页路径打开 PowerShell": "Open PowerShell here",
+    "打开计算器": "Open Calculator",
+    # ── Title bar launcher ────────────────────────────────────────────────
+    "拖入应用或快捷方式": "Drop app or shortcut",
+    "+ 拖入应用或快捷方式": "+ Drop app or shortcut",
+    "移除该快捷方式": "Remove shortcut",
+    # ── Tab context menu ──────────────────────────────────────────────────
+    "📌 取消固定": "📌 Unpin",
+    "📌 固定": "📌 Pin",
+    "🔨 取消固定": "🔨 Unpin",
+    "🔖 添加书签": "🔖 Add Bookmark",
+    "▶ 恢复自动刷新": "▶ Resume Auto-refresh",
+    "⏸ 冻结自动刷新": "⏸ Freeze Auto-refresh",
+    "自动刷新": "Auto-refresh",
+    "当前标签自动刷新已冻结": "Auto-refresh frozen",
+    "当前标签自动刷新已恢复": "Auto-refresh resumed",
+    # ── File operations ───────────────────────────────────────────────────
+    "新建文件夹": "New Folder",
+    "编辑": "Edit",
+    # ── AI panel ─────────────────────────────────────────────────────────
+    "🤖 AI 助手": "🤖 AI Assistant",
+    "清空": "Clear",
+    "当前目录: {}": "Current Dir: {}",
+    "当前目录: —": "Current Dir: —",
+    "输入问题… (Enter 发送，Shift+Enter 换行)": "Ask a question… (Enter to send, Shift+Enter for newline)",
+    "发 送": "Send",
+    "复制": "Copy",
+    "全选": "Select All",
+    "清空聊天": "Clear Chat",
+    "👤 你": "👤 You",
+    "🖥 系统": "🖥 System",
+    "⏳ AI 思考中…": "⏳ AI thinking…",
+    "⏳ AI 推理中{}…": "⏳ AI reasoning{}…",
+    "⏳ AI 第 {} 轮推理中…": "⏳ AI round {} reasoning…",
+    "⚠️ 检测到重复工具调用，强制要求给出结论…": "⚠️ Repeated tool call detected, forcing conclusion…",
+    "空路径": "Empty path",
+    "❌ 请先在 设置 → AI 助手 中填写 API 地址": "❌ Please fill in API URL in Settings → AI Assistant",
+    "❌ 请求失败: {}": "❌ Request failed: {}",
+    "⏸ 已取消删除: {}": "⏸ Delete cancelled: {}",
+    "⏸ 已取消覆盖文件: {}": "⏸ File overwrite cancelled: {}",
+    "⏸ 已取消运行脚本: {}": "⏸ Script run cancelled: {}",
+    "确认运行脚本": "Confirm Run Script",
+    "确认覆盖文件": "Confirm Overwrite File",
+    "目录（及其所有内容）": "directory (and all contents)",
+    "确认删除": "Confirm Delete",
+    "全量覆盖会丢失未读内容。": "Full overwrite will discard unread content.",
+    "请改用 [PATCH_FILE: 路径|旧文本|新文本] 进行局部修改。": "Use [PATCH_FILE: path|old|new] for partial edits instead.",
+    # ── AI tool result strings ────────────────────────────────────────────
+    "[LIST_DIR 结果] 目录 {}:\n{}": "[LIST_DIR result] Directory {}:\n{}",
+    "[当前目录: {}]\n": "[Current dir: {}]\n",
+    "📁 目录列表: {}\n{}": "📁 Directory listing: {}\n{}",
+    "📂 打开目录: {}": "📂 Open dir: {}",
+    "📄 文件内容（{}-{}/{}字节，{}）: {}": "📄 File content ({}-{}/{}B, {}): {}",
+    "✅ 已写入文件: {}": "✅ Written: {}",
+    "✅ 已创建目录: {}": "✅ Created dir: {}",
+    "✅ 已删除{}: {}": "✅ Deleted {}: {}",
+    "✅ 已启动脚本: {}": "✅ Script started: {}",
+    "✅ 已在当前标签切换到目录: {}": "✅ Switched to dir: {}",
+    "✅ 已打开目录: {}": "✅ Opened dir: {}",
+    "✅ 补丁成功: {}": "✅ Patch applied: {}",
+    "❌ PATCH_FILE 格式: [PATCH_FILE: 路径|旧文本|新文本]": "❌ PATCH_FILE format: [PATCH_FILE: path|old|new]",
+    "❌ 写入失败: {}": "❌ Write failed: {}",
+    "❌ 写入失败: {}（{}）": "❌ Write failed: {} ({})",
+    "❌ 写入失败: 格式应为 [WRITE_FILE: 路径|内容]": "❌ Write failed: format must be [WRITE_FILE: path|content]",
+    "❌ 列目录失败: {}": "❌ List dir failed: {}",
+    "❌ 列目录失败: {}（{}）": "❌ List dir failed: {} ({})",
+    "❌ 创建目录失败: {}": "❌ Create dir failed: {}",
+    "❌ 创建目录失败: {}（{}）": "❌ Create dir failed: {} ({})",
+    "❌ 删除失败: {}": "❌ Delete failed: {}",
+    "❌ 删除失败: {}（{}）": "❌ Delete failed: {} ({})",
+    "❌ 打开目录失败: {}（{}）": "❌ Open dir failed: {} ({})",
+    "❌ 文件不存在: {}": "❌ File not found: {}",
+    "❌ 无法读取文件: {}": "❌ Cannot read file: {}",
+    "❌ 目录不存在: {}": "❌ Dir not found: {}",
+    "❌ 补丁失败: {}": "❌ Patch failed: {}",
+    "❌ 补丁失败: {}（{}）": "❌ Patch failed: {} ({})",
+    "❌ 补丁失败：在 {} 中未找到目标文本": "❌ Patch failed: target text not found in {}",
+    "❌ 读取失败: {}": "❌ Read failed: {}",
+    "❌ 读取失败: {}（{}）": "❌ Read failed: {} ({})",
+    "❌ 路径不存在: {}": "❌ Path not found: {}",
+    "❌ 运行脚本失败: {}（{}）": "❌ Script failed: {} ({})",
+    "⚠️ 文件太大（{:.1f}MB），无法读取": "⚠️ File too large ({:.1f}MB) to read",
+    "⚠️ 目录不存在: {}": "⚠️ Dir not found: {}",
+    "⚠️ 脚本不存在: {}": "⚠️ Script not found: {}",
+    "\n⚠️ 文件过大，仅读取前 {} 字符，剩余 {} 字节未读": "\n⚠️ File too large; read first {} chars, {} bytes remaining",
+    "\n\n【已截断 {} 个字符】": "\n\n[Truncated {} chars]",
+    "（这是文件，请用 READ_FILE）": "(This is a file; use READ_FILE)",
+    "（这是目录，请用 LIST_DIR 列目录，或直接指定具体 .c/.h 文件路径）": "(This is a directory; use LIST_DIR or specify a .c/.h file path)",
+    "运行: {}": "Run: {}",
+    "超出当前目录范围: {}": "Outside current directory scope: {}",
+    "路径非法: {}": "Invalid path: {}",
+    "路径使用 Windows 格式。": "Use Windows path format.",
+    "路径使用 Windows 格式，例如 D:\\project\\src。": "Use Windows path format, e.g. D:\\project\\src.",
+    "路径使用 Windows 格式，例如 D:\\project\\src。\n": "Use Windows path format, e.g. D:\\project\\src.\n",
+    "保存聊天记录失败: {}": "Failed to save chat history: {}",
+    "加载聊天记录失败: {}": "Failed to load chat history: {}",
+    "删除聊天记录文件失败: {}": "Failed to delete chat history file: {}",
+    "保存失败: {}": "Save failed: {}",
+    "第 {} 轮": "Round {}",
+    "ℹ 当前标签已在该目录: {}": "ℹ Current tab is already at: {}",
+    "ℹ 系统": "ℹ System",
+    # ── AI system prompts ─────────────────────────────────────────────────
+    "你是一个智能文件管理助手。": "You are an intelligent file management assistant.",
+    "你是一个智能文件管理助手，帮助用户管理文件系统、打开目录和运行脚本。\n":
+        "You are an intelligent file management assistant that helps users manage the file system, open directories, and run scripts.\n",
+    "你是一个智能文件管理助手，正在通过工具调用完成用户任务。\n":
+        "You are an intelligent file management assistant completing user tasks via tool calls.\n",
+    "⚠️ 只有当用户明确要求'切换/打开目录'时，才在回复末尾添加：[OPEN_DIR: 目录完整路径]。":
+        "⚠️ Only when the user explicitly asks to 'switch/open a directory', append: [OPEN_DIR: full/path].",
+    "普通问答不要输出任何操作指令。\n": "Do not output any operation commands for general Q&A.\n",
+    "⚠️ 只有当用户明确要求运行脚本时，才添加：[RUN_SCRIPT: 脚本完整路径]。\n":
+        "⚠️ Only when the user explicitly asks to run a script, append: [RUN_SCRIPT: full/script/path].\n",
+    "⚠️ 仅当用户明确要求时，才可使用以下指令：\n": "⚠️ Use the following commands ONLY when explicitly requested:\n",
+    "[READ_FILE: 文件路径] 读取文件（系统自动分段读取大文件，无需手动指定偏移）；\n":
+        "[READ_FILE: path] Read file (system auto-paginates large files; no offset needed);\n",
+    "[PATCH_FILE: 路径|旧文本|新文本] 局部修改已有文件（安全，仅替换目标内容段）；\n":
+        "[PATCH_FILE: path|old_text|new_text] Partial edit of existing file (safe, replaces only target section);\n",
+    "⚠️ 修改已有文件时必须使用 PATCH_FILE，禁止用 WRITE_FILE 覆盖已有大文件；\n":
+        "⚠️ Use PATCH_FILE for existing files; do NOT use WRITE_FILE to overwrite large existing files;\n",
+    "⚠️ PATCH_FILE 使用规范：\n": "⚠️ PATCH_FILE usage rules:\n",
+    "⚠️ PATCH_FILE 最小改动规范：\n": "⚠️ PATCH_FILE minimal-diff rules:\n",
+    "  1. 旧文本只需包含被修改的行及前后各1-2行（足够唯一定位即可），不要复制整个函数体；\n":
+        "  1. old_text only needs the changed line(s) plus 1-2 lines of context (enough to uniquely locate); don't copy whole functions;\n",
+    "  1. 旧文本只取被修改行及前后各1-2行（能唯一定位即可），不要复制整个函数；\n":
+        "  1. old_text: only the changed line(s) + 1-2 context lines (uniquely locatable); don't copy whole functions;\n",
+    "  2. 对同一文件做多个 PATCH_FILE 时，第二个 patch 的旧文本必须是第一个 patch 应用后的实际内容；\n":
+        "  2. For multiple PATCHes on the same file, each old_text must reflect content after previous patches;\n",
+    "  2. 对同一文件连续多个 PATCH_FILE 时，后一个的旧文本必须反映前一个 patch 已应用后的文件内容；\n":
+        "  2. For sequential PATCHes, each old_text must reflect the file state after prior patches;\n",
+    "  3. 最小改动原则：新文本只改动必要的行，不要重写周围未变更的代码。\n":
+        "  3. Minimal change principle: new_text only changes necessary lines; don't rewrite unchanged surrounding code.\n",
+    "  3. 新文本只改动必要的行，保留其余未变行，使 diff 最小化。\n":
+        "  3. new_text changes only necessary lines; keep unchanged lines to minimize diff.\n",
+    "[WRITE_FILE: 文件路径|文件内容] 仅用于创建全新文件（已有文件禁止使用）；\n":
+        "[WRITE_FILE: path|content] Only for creating brand-new files (forbidden for existing files);\n",
+    "[LIST_DIR: 目录路径] 列出目录；\n": "[LIST_DIR: path] List directory;\n",
+    "[MKDIR: 目录路径] 创建目录；\n": "[MKDIR: path] Create directory;\n",
+    "[DELETE: 路径] 删除文件或目录（需用户确认）。\n": "[DELETE: path] Delete file or directory (requires user confirmation).\n",
+    "可以在同一回复中包含多个操作命令。": "Multiple operation commands may appear in the same reply.",
+    "你可以自由使用以下工具指令：\n": "You may freely use these tool commands:\n",
+    "[READ_FILE: 路径] 读文件（优先读 .c/.h 源代码）；": "[READ_FILE: path] Read file (prefer .c/.h source);\n",
+    "[PATCH_FILE: 路径|旧文本|新文本] 局部修改文件（修改已有文件时必须用此，禁止用 WRITE_FILE 覆盖已有大文件）；":
+        "[PATCH_FILE: path|old|new] Partial file edit (required for existing files; never use WRITE_FILE to overwrite);",
+    "[LIST_DIR: 路径] 列目录（仅在不知道源码位置时使用）；": "[LIST_DIR: path] List dir (use only when source location is unknown);",
+    "[OPEN_DIR: 路径] [MKDIR: 路径] [WRITE_FILE: 路径|内容]（仅用于创建新文件） [DELETE: 路径]。\n":
+        "[OPEN_DIR: path] [MKDIR: path] [WRITE_FILE: path|content] (new files only) [DELETE: path].\n",
+    "ℹ️ 工作原则：得到目录列表后尽快选择源代码文件直接阅读，":
+        "ℹ️ Workflow: after listing a directory, immediately select and read source files,",
+    "而不要反复展开子目录；修改文件时优先使用 PATCH_FILE 安全替换具体代码段。\n":
+        " rather than repeatedly expanding subdirectories; prefer PATCH_FILE for safe targeted edits.\n",
+    "以上是工具调用结果。请高效利用工具，": "The above are tool call results. Use tools efficiently:",
+    "优先阅读源代码文件（.c/.h）而非反复列目录，": " prefer reading source files (.c/.h) over repeatedly listing dirs,",
+    "并尽快基于收集到的信息给出具体结论或优化建议。": " and provide concrete conclusions or optimization suggestions promptly.",
+    "以上是最后一批工具调用结果。不要再调用任何工具指令，": "The above are the last tool call results. Do not call any more tools.",
+    "必须直接基于已收集的所有信息给出具体的结论、优化建议或解决方案。":
+        " Give specific conclusions, optimization suggestions, or solutions based on all collected information.",
+    "不能将任何工具指令放入回复，": "Do not include any tool commands in the reply;",
+    "必须直接基于已收集的全部信息给出具体的结论、优化建议或解决方案。":
+        " give specific conclusions, suggestions, or solutions based on all collected information.",
+    "请直接基于已收集的全部信息给出具体的结论、优化建议或解决方案。":
+        "Provide specific conclusions, suggestions, or solutions based on all collected information.",
+    "以上是工具调用结果。要高效利用工具，": "The above are tool call results. Use tools efficiently:",
+    "你是一个智能文件管理助手，帮助用户管理文件系统。\n": "You are a smart file management assistant helping users manage the filesystem.\n",
+    "不要将任何工具指令放入回复，": "Do not include any tool commands in the reply,",
+    # ── Misc app messages ─────────────────────────────────────────────────
+    "[App] 已加载固定标签页": "[App] Pinned tabs loaded",
+    "[App] 已恢复上次激活的标签页": "[App] Last active tab restored",
+    "[App] 没有缓存和固定标签，添加默认主目录标签": "[App] No cached/pinned tabs; adding default home tab",
+    "[App] 程序关闭，已清除搜索缓存": "[App] App closed, search cache cleared",
+    "[App] 跳过缓存标签（已固定）: {}": "[App] Skipped cached tab (pinned): {}",
+    "[App] 跳过缓存标签（已打开）: {}": "[App] Skipped cached tab (already open): {}",
+    " - 窗口恢复中": " - Restoring...",
+    "{} - 窗口恢复中": "{} - Restoring...",
+    # ── Windows special folders (used for shell path detection) ───────────
+    "控制面板": "Control Panel",
+    '控制面板': "Control Panel",
+    '控制面板 - ': "Control Panel - ",
+    '控制面板\\': "Control Panel\\",
+    '\\控制面板\\': "\\Control Panel\\",
+    "回收站": "Recycle Bin",
+    "此电脑": "This PC",
+    "我的电脑": "My Computer",
+    "网络": "Network",
+    "启动文件夹": "Startup Folder",
+    "启动项": "Startup Items",
+    "开机启动项": "Startup Items",
+    "用户帐户": "User Accounts",
+    "程序和功能": "Programs and Features",
+    "系统": "System",
+    "设备管理器": "Device Manager",
+    "网络和共享中心": "Network and Sharing Center",
+    "记事本": "Notepad",
+    # ── Misc ──────────────────────────────────────────────────────────────
+    "(空目录)": "(Empty directory)",
+    "💡 提示：可以拖动书签和文件夹调整顺序和层级，调整后点击【保存】按钮保存更改":
+        "💡 Tip: Drag bookmarks/folders to reorder; click 【Save】 to apply",
+    "保存聊天记录失败: {}": "Failed to save chat: {}",
+    "加载聊天记录失败: {}": "Failed to load chat: {}",
+    "❌ 流式响应被服务器提前关闭（上下文可能过长）。\n":
+        "❌ Streaming response closed early by server (context may be too long).\n",
+    "❌ 流式响应被服务器提前关闭（上下文可能过长，请清空聊天记录重试）。\n":
+        "❌ Streaming response closed early (context too long; please clear chat and retry).\n",
+    "未找到 {}": "{} not found",
+    "暂不支持打开此类型书签: {}": "Cannot open bookmark type: {}",
+    "已在当前目录选中{}: {}": "Selected {} in current dir: {}",
+}
+
+
+
+import json as _json_lang, sys as _sys_lang
+try:
+    _cfg_lang_path = os.path.join(
+        os.path.dirname(os.path.abspath(
+            _sys_lang.executable if getattr(_sys_lang, 'frozen', False) else __file__
+        )), 'config.json')
+    with open(_cfg_lang_path, 'r', encoding='utf-8') as _lf:
+        _app_language = _json_lang.load(_lf).get('language', 'zh')
+except Exception:
+    _app_language = 'zh'
+del _json_lang, _sys_lang
+
 
 
 def get_app_base_dir():
@@ -293,16 +878,16 @@ from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, 
 class BookmarkDialog(QDialog):
     def __init__(self, bookmark_manager, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("书签")
+        self.setWindowTitle(tr("书签"))
         self.resize(500, 600)
         self.bookmark_manager = bookmark_manager
         layout = QVBoxLayout(self)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["名称", "路径"])
+        self.tree.setHeaderLabels([tr("名称"), tr("路径")])
         layout.addWidget(self.tree)
         self.populate_tree()
         self.tree.itemDoubleClicked.connect(self.on_item_double_clicked)
-        close_btn = QPushButton("关闭")
+        close_btn = QPushButton(tr("关闭"))
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
 
@@ -341,13 +926,13 @@ class BookmarkDialog(QDialog):
                 if self.parent() and hasattr(self.parent(), 'add_new_tab'):
                     self.parent().add_new_tab(local_path2)
             else:
-                show_toast(self, "路径错误", f"路径不存在: {local_path2}", level="warning")
+                show_toast(self, tr("路径错误"), tr("路径不存在: {}").format(local_path2), level="warning")
 
 
 class QuickFindResultsDialog(QDialog):
     def __init__(self, matched_paths, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("选择匹配项")
+        self.setWindowTitle(tr("选择匹配项"))
         self.resize(680, 420)
         self.selected_path = None
 
@@ -355,7 +940,7 @@ class QuickFindResultsDialog(QDialog):
 
         self.table = QTableWidget(self)
         self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["名称", "类型", "完整路径"])
+        self.table.setHorizontalHeaderLabels([tr("名称"), tr("类型"), tr("完整路径")])
         self.table.setRowCount(len(matched_paths))
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -370,7 +955,7 @@ class QuickFindResultsDialog(QDialog):
 
         for row, path in enumerate(matched_paths):
             name_item = QTableWidgetItem(os.path.basename(path))
-            type_item = QTableWidgetItem("文件夹" if os.path.isdir(path) else "文件")
+            type_item = QTableWidgetItem(tr("文件夹") if os.path.isdir(path) else tr("文件"))
             path_item = QTableWidgetItem(path)
             name_item.setData(Qt.UserRole, path)
             self.table.setItem(row, 0, name_item)
@@ -384,8 +969,8 @@ class QuickFindResultsDialog(QDialog):
 
         button_layout = QHBoxLayout()
         button_layout.addStretch(1)
-        ok_btn = QPushButton("确定", self)
-        cancel_btn = QPushButton("取消", self)
+        ok_btn = QPushButton(tr("确定"), self)
+        cancel_btn = QPushButton(tr("取消"), self)
         ok_btn.clicked.connect(self._accept_current_selection)
         cancel_btn.clicked.connect(self.reject)
         button_layout.addWidget(ok_btn)
@@ -426,11 +1011,15 @@ class ElideLeftDelegate(QStyledItemDelegate):
 
 
 class SearchResultsTableModel(QAbstractTableModel):
-    HEADERS = ["文件名", "类型", "修改日期", "大小"]
+    _HEADER_KEYS = ["文件名", "类型", "修改日期", "大小"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rows = []
+
+    @property
+    def HEADERS(self):
+        return [tr(k) for k in self._HEADER_KEYS]
 
     def rowCount(self, parent=QModelIndex()):
         if parent.isValid():
@@ -565,7 +1154,7 @@ from PyQt5.QtCore import pyqtSignal as _pyqtSignal
 class SearchDialog(QDialog):    
     def __init__(self, search_path, parent=None, search_history=None):
         super().__init__(parent)
-        self.setWindowTitle(f"搜索 - {search_path}")
+        self.setWindowTitle(tr("搜索 - {}").format(search_path))
         # 设置为可调整大小的对话框
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         # 关闭时立即销毁 C++ 对象（释放所有 Qt 子控件占用的内存）
@@ -601,7 +1190,7 @@ class SearchDialog(QDialog):
         search_options.setSpacing(5)  # 设置控件间距为5像素
         
         # 搜索关键词（改为QComboBox支持历史记录）
-        search_label = QLabel("搜索:")
+        search_label = QLabel(tr("搜索:"))
         search_label.setFixedWidth(40)  # 固定标签宽度
         search_options.addWidget(search_label)
         from PyQt5.QtWidgets import QComboBox
@@ -609,7 +1198,7 @@ class SearchDialog(QDialog):
         self.search_input.setEditable(True)
         self.search_input.setInsertPolicy(QComboBox.NoInsert)  # 不自动插入新条目
         self.search_input.setMinimumWidth(300)  # 设置最小宽度300像素
-        self.search_input.lineEdit().setPlaceholderText("输入搜索关键词...")
+        self.search_input.lineEdit().setPlaceholderText(tr("输入搜索关键词..."))
         self.search_input.lineEdit().returnPressed.connect(self.start_search)
         # 填充历史记录
         if self.search_history:
@@ -617,12 +1206,12 @@ class SearchDialog(QDialog):
         search_options.addWidget(self.search_input, 1)  # 添加stretch factor，让搜索框可以拉伸
         
         # 搜索按钮
-        self.search_btn = QPushButton("🔍 搜索")
+        self.search_btn = QPushButton(tr("🔍 搜索"))
         self.search_btn.clicked.connect(self.start_search)
         search_options.addWidget(self.search_btn)
         
         # 停止按钮
-        self.stop_btn = QPushButton("⏹ 停止")
+        self.stop_btn = QPushButton(tr("⏹ 停止"))
         self.stop_btn.clicked.connect(self.stop_search)
         self.stop_btn.setEnabled(False)
         search_options.addWidget(self.stop_btn)
@@ -631,46 +1220,46 @@ class SearchDialog(QDialog):
         
         # 搜索路径输入框（可编辑）
         path_layout = QHBoxLayout()
-        path_layout.addWidget(QLabel("搜索路径:"))
+        path_layout.addWidget(QLabel(tr("搜索路径:")))
         self.path_input = QLineEdit(search_path)
         self.path_input.setStyleSheet("QLineEdit { color: #0066cc; font-weight: bold; padding: 5px; }")
-        self.path_input.setPlaceholderText("输入要搜索的文件夹路径...")
+        self.path_input.setPlaceholderText(tr("输入要搜索的文件夹路径..."))
         path_layout.addWidget(self.path_input)
         layout.addLayout(path_layout)
         
         # 搜索类型选择
         type_options = QHBoxLayout()
-        self.search_filename_cb = QCheckBox("搜索文件名")
+        self.search_filename_cb = QCheckBox(tr("搜索文件名"))
         self.search_filename_cb.setChecked(True)
         type_options.addWidget(self.search_filename_cb)
         
-        self.search_content_cb = QCheckBox("搜索文件内容")
+        self.search_content_cb = QCheckBox(tr("搜索文件内容"))
         self.search_content_cb.setChecked(True)  # 默认也选中
         type_options.addWidget(self.search_content_cb)
 
-        self.match_case_cb = QCheckBox("区分大小写")
-        self.match_case_cb.setToolTip("区分大小写匹配文件名和文件内容")
+        self.match_case_cb = QCheckBox(tr("区分大小写"))
+        self.match_case_cb.setToolTip(tr("区分大小写匹配文件名和文件内容"))
         type_options.addWidget(self.match_case_cb)
 
-        self.match_whole_word_cb = QCheckBox("全词匹配")
-        self.match_whole_word_cb.setToolTip("仅匹配完整单词，避免命中更长字符串的一部分")
+        self.match_whole_word_cb = QCheckBox(tr("全词匹配"))
+        self.match_whole_word_cb.setToolTip(tr("仅匹配完整单词，避免命中更长字符串的一部分"))
         type_options.addWidget(self.match_whole_word_cb)
         
         # Everything搜索选项
-        self.use_everything_cb = QCheckBox("使用 Everything (极速)")
+        self.use_everything_cb = QCheckBox(tr("使用 Everything (极速)"))
         if self.everything_path:
             self.use_everything_cb.setChecked(True)  # 如果有Everything，默认启用
-            self.use_everything_cb.setToolTip(f"使用Everything搜索引擎\n路径: {self.everything_path}\n只搜索文件名，速度极快")
+            self.use_everything_cb.setToolTip(tr("使用Everything搜索引擎\n路径: {}\n只搜索文件名，速度极快").format(self.everything_path))
         else:
             self.use_everything_cb.setEnabled(False)
-            self.use_everything_cb.setToolTip("未检测到Everything，请从 https://www.voidtools.com/ 下载安装")
+            self.use_everything_cb.setToolTip(tr("未检测到Everything，请从 https://www.voidtools.com/ 下载安装"))
         self.use_everything_cb.stateChanged.connect(self.on_everything_toggled)
         type_options.addWidget(self.use_everything_cb)
 
         # 手动轻量模式：强制降级元数据以提升吞吐
-        self.force_lightweight_cb = QCheckBox("轻量模式(更快)")
+        self.force_lightweight_cb = QCheckBox(tr("轻量模式(更快)"))
         self.force_lightweight_cb.setChecked(False)
-        self.force_lightweight_cb.setToolTip("勾选后搜索结果将优先显示核心路径信息，可能省略修改时间/大小")
+        self.force_lightweight_cb.setToolTip(tr("勾选后搜索结果将优先显示核心路径信息，可能省略修改时间/大小"))
         type_options.addWidget(self.force_lightweight_cb)
         
         type_options.addStretch(1)
@@ -678,16 +1267,16 @@ class SearchDialog(QDialog):
         
         # 文件类型过滤
         file_type_layout = QHBoxLayout()
-        file_type_layout.addWidget(QLabel("文件类型:"))
+        file_type_layout.addWidget(QLabel(tr("文件类型:")))
         self.file_type_input = QLineEdit()
-        self.file_type_input.setPlaceholderText("例如: *.c,*.h,*.xml (留空表示搜索所有类型)")
+        self.file_type_input.setPlaceholderText(tr("例如: *.c,*.h,*.xml (留空表示搜索所有类型)"))
         self.file_type_input.setText("*.c,*.h,*.xdm,*.arxml,*.xml")  # 默认值
         self.file_type_input.setStyleSheet("QLineEdit { padding: 5px; }")
         file_type_layout.addWidget(self.file_type_input)
         layout.addLayout(file_type_layout)
         
         # 状态标签
-        self.status_label = QLabel("就绪")
+        self.status_label = QLabel(tr("就绪"))
         layout.addWidget(self.status_label)
         
         # 结果表格
@@ -886,7 +1475,7 @@ class SearchDialog(QDialog):
         """清除所有搜索缓存（内部使用，软件关闭时自动调用）"""
         global _search_cache
         _search_cache.clear()
-        debug_print("[Search] 搜索缓存已清除")
+        debug_print(tr("[Search] 搜索缓存已清除"))
     
     def start_search(self):
         keyword = self.search_input.currentText().strip()  # 改用currentText获取输入或选中的文本
@@ -910,28 +1499,28 @@ class SearchDialog(QDialog):
             do_search_filename = True  # 空关键词时自动启用文件名搜索
         
         if not do_search_filename and not do_search_content:
-            show_toast(self, "提示", "请至少选择一种搜索类型", level="warning")
+            show_toast(self, tr("提示"), tr("请至少选择一种搜索类型"), level="warning")
             return
         
         # 获取并验证搜索路径
         search_path = self.path_input.text().strip()
         if not search_path:
-            show_toast(self, "提示", "请输入搜索路径", level="warning")
+            show_toast(self, tr("提示"), tr("请输入搜索路径"), level="warning")
             return
         
         # 检查路径是否存在
         if not os.path.exists(search_path):
-            show_toast(self, "路径错误", f"路径不存在:\n{search_path}", level="warning")
+            show_toast(self, tr("路径错误"), tr("路径不存在:\n{}").format(search_path), level="warning")
             return
         
         # 检查是否是目录
         if not os.path.isdir(search_path):
-            show_toast(self, "路径错误", f"路径不是文件夹:\n{search_path}", level="warning")
+            show_toast(self, tr("路径错误"), tr("路径不是文件夹:\n{}").format(search_path), level="warning")
             return
         
         # 检查是否是特殊路径（不支持搜索）
         if search_path.startswith('shell:'):
-            show_toast(self, "不支持", "不支持搜索特殊路径（shell:）", level="warning")
+            show_toast(self, tr("不支持"), tr("不支持搜索特殊路径（shell:）"), level="warning")
             return
         
         # 更新搜索路径
@@ -959,7 +1548,7 @@ class SearchDialog(QDialog):
             debug_print(f"[Search] 使用缓存结果，共 {len(cached_results)} 个")
             self.result_model.clear()
             self.current_result_count = 0
-            self.status_label.setText("正在加载缓存结果...")
+            self.status_label.setText(tr("正在加载缓存结果..."))
             
             # 批量添加缓存结果
             sorting_enabled = self.result_list.isSortingEnabled()
@@ -969,7 +1558,7 @@ class SearchDialog(QDialog):
             
             self.result_list.setSortingEnabled(sorting_enabled)
             shown_count = min(len(cached_results), self.max_results)
-            self.status_label.setText(f"搜索完成（缓存），共显示 {shown_count} 个结果")
+            self.status_label.setText(tr("搜索完成（缓存），共显示 {} 个结果").format(shown_count))
             if self.ui_update_timer and self.ui_update_timer.isActive():
                 self.ui_update_timer.stop()
             return
@@ -986,9 +1575,9 @@ class SearchDialog(QDialog):
         self.stop_btn.setEnabled(True)
         if keyword_is_empty:
             file_types_hint = f"（{file_types}）" if file_types else ""
-            self.status_label.setText(f"列举文件中{file_types_hint}... (最多显示{self.max_results}个结果)")
+            self.status_label.setText(tr("列举文件中{}... (最多显示{}个结果)").format(file_types_hint, self.max_results))
         else:
-            self.status_label.setText(f"搜索中... (最多显示{self.max_results}个结果)")
+            self.status_label.setText(tr("搜索中... (最多显示{}个结果)").format(self.max_results))
         if self.ui_update_timer:
             self._queue_idle_ticks = 0
             self._ensure_ui_update_timer(20)
@@ -1009,7 +1598,7 @@ class SearchDialog(QDialog):
         self.is_searching = False
         self.search_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.status_label.setText("已停止")
+        self.status_label.setText(tr("已停止"))
         if self.ui_update_timer:
             self._queue_idle_ticks = 0
             self._ensure_ui_update_timer(220)
@@ -1130,7 +1719,7 @@ class SearchDialog(QDialog):
 
         # 如果使用Everything搜索
         if use_everything and self.everything_path:
-            self.result_queue.put({'type': 'status', 'text': 'Using Everything搜索引擎...'})
+            self.result_queue.put({'type': 'status', 'text': tr('Using Everything搜索引擎...')})
             
             try:
                 results = self.search_with_everything(keyword, self.search_path, file_types, match_case=match_case, match_whole_word=match_whole_word)
@@ -1149,7 +1738,7 @@ class SearchDialog(QDialog):
                         basename = os.path.basename(file_path)
                         name_without_ext, file_ext = os.path.splitext(basename)
                         path_without_ext = os.path.join(os.path.dirname(file_path), name_without_ext)
-                        file_type = file_ext[1:].upper() if file_ext else "无"
+                        file_type = file_ext[1:].upper() if file_ext else tr("无")
                         sort_date_ts = None
                         sort_size_bytes = None
                         if _should_degrade_metadata():
@@ -1199,8 +1788,8 @@ class SearchDialog(QDialog):
                 
                 # 搜索完成
                 final_count = len(results)
-                degrade_note = f"，元数据降级 {metadata_degrade_count} 条" if metadata_degrade_count > 0 else ""
-                self.result_queue.put({'type': 'status', 'text': f'Everything搜索完成，共找到 {final_count} 个结果{degrade_note}'})
+                degrade_note = tr("，元数据降级 {} 条").format(metadata_degrade_count) if metadata_degrade_count > 0 else ""
+                self.result_queue.put({'type': 'status', 'text': tr("Everything搜索完成，共找到 {} 个结果{}").format(final_count, degrade_note)})
                 
             except Exception as e:
                 self.result_queue.put({'type': 'error', 'text': f'Everything搜索错误: {str(e)}'})
@@ -1327,10 +1916,10 @@ class SearchDialog(QDialog):
                     file_extensions.add(ft.lower())  # 直接使用输入的扩展名
         
         # 调试信息：输出搜索路径
-        debug_print(f"[Search] 开始搜索路径: {self.search_path}")
-        debug_print(f"[Search] 搜索关键词: {keyword}")
-        debug_print(f"[Search] 搜索文件名: {search_filename}, 搜索内容: {search_content}")
-        debug_print(f"[Search] 文件类型过滤: {file_extensions if file_extensions else '所有类型'}")
+        debug_print(tr("[Search] 开始搜索路径: {}").format(self.search_path))
+        debug_print(tr("[Search] 搜索关键词: {}").format(keyword))
+        debug_print(tr("[Search] 搜索文件名: {}, 搜索内容: {}").format(search_filename, search_content))
+        debug_print(tr("[Search] 文件类型过滤: {}").format(file_extensions if file_extensions else '所有类型'))
         
         try:
             scanned_files = 0
@@ -1339,7 +1928,7 @@ class SearchDialog(QDialog):
             last_status_update_ms = int(time.time() * 1000)
             for root, dirs, files in os.walk(self.search_path):
                 if not self.is_searching:
-                    debug_print("[Search] 搜索被中断")
+                    debug_print(tr("[Search] 搜索被中断"))
                     break
                 
                 folder_count += 1
@@ -1381,7 +1970,7 @@ class SearchDialog(QDialog):
                                 'path': dir_path,
                                 'name': f"📁 {dirname}",
                                 'full_path': f"📁 {dir_path}",
-                                'file_type': '文件夹',
+                                'file_type': tr('文件夹'),
                                 'date': mtime,
                                 'size': size_str,
                                 'sort_date_ts': sort_date_ts,
@@ -1402,7 +1991,7 @@ class SearchDialog(QDialog):
                 # 搜索文件名和文件内容
                 for filename in files:
                     if not self.is_searching:
-                        debug_print("[Search] 搜索被中断（文件循环）")
+                        debug_print(tr("[Search] 搜索被中断（文件循环）"))
                         break
 
                     filename_lower = filename.lower()
@@ -1423,7 +2012,7 @@ class SearchDialog(QDialog):
                     if file_extensions and file_ext not in file_extensions:
                         # 调试：显示被过滤的文件（仅对特定文件名）
                         if 'TstMgr' in filename or scanned_files < 5:
-                            debug_print(f"[Search] 文件被类型过滤跳过: {filename}")
+                            debug_print(tr("[Search] 文件被类型过滤跳过: {}").format(filename))
                         continue  # 跳过不匹配的文件类型
                     
                     scanned_files += 1
@@ -1438,7 +2027,7 @@ class SearchDialog(QDialog):
                             should_update_status = True
 
                     if should_update_status:
-                        status_text = f"搜索中... 已扫描 {scanned_files} 个文件，找到 {found_count} 个结果"
+                        status_text = tr("搜索中... 已扫描 {} 个文件，找到 {} 个结果").format(scanned_files, found_count)
                         try:
                             self.result_queue.put({'type': 'status', 'text': status_text}, timeout=0.1)
                             last_status_update_ms = int(time.time() * 1000)
@@ -1564,11 +2153,11 @@ class SearchDialog(QDialog):
                                         continue
                                     except Exception as e:
                                         # 其他错误，记录日志并尝试下一个编码
-                                        debug_print(f"[Search] 读取文件失败 {file_path} (编码 {encoding}): {e}")
+                                        debug_print(tr("[Search] 读取文件失败 {} (编码 {}): {}").format(file_path, encoding, e))
                                         continue
                         except Exception as e:
                             # 如果无法以文本方式读取，记录日志并跳过该文件
-                            debug_print(f"[Search] 无法读取文件 {file_path}: {e}")
+                            debug_print(tr("[Search] 无法读取文件 {}: {}").format(file_path, e))
                             pass
                     
                     if matched:
@@ -1603,7 +2192,7 @@ class SearchDialog(QDialog):
                         
                         # 获取不带扩展名的完整路径
                         path_without_ext = os.path.join(root, name_without_ext)
-                        file_type = file_ext.upper() if file_ext else "无"
+                        file_type = file_ext.upper() if file_ext else tr("无")
                         
                         result_item = {
                             'path': file_path,
@@ -1629,11 +2218,11 @@ class SearchDialog(QDialog):
             _flush_results_buffer(force=True)
         
         # 调试信息
-        debug_print(f"[Search] 搜索完成，共扫描 {scanned_files} 个文件，找到 {found_count} 个结果")
+        debug_print(tr("[Search] 搜索完成，共扫描 {} 个文件，找到 {} 个结果").format(scanned_files, found_count))
         if search_content and skipped_binary_files > 0:
-            debug_print(f"[Search] 跳过 {skipped_binary_files} 个二进制文件（不搜索内容）")
+            debug_print(tr("[Search] 跳过 {} 个二进制文件（不搜索内容）").format(skipped_binary_files))
         if self.queue_overflow_count > 0:
-            debug_print(f"[Search] ⚠️ 队列溢出 {self.queue_overflow_count} 次（部分结果未显示）")
+            debug_print(tr("[Search] ⚠️ 队列溢出 {} 次（部分结果未显示）").format(self.queue_overflow_count))
         
         # 将结果存入缓存（限制缓存大小，防止内存溢出）
         if cache_key and all_results:
@@ -1648,11 +2237,11 @@ class SearchDialog(QDialog):
         
         # 搜索完成，更新UI状态（使用带超时的put，避免卡死）
         if results_limited:
-            final_status = f"搜索完成（已限制），显示前 {found_count} 个结果（扫描了 {scanned_files} 个文件）⚠️"
+            final_status = tr("搜索完成（已限制），显示前 {} 个结果（扫描了 {} 个文件）⚠️").format(found_count, scanned_files)
         else:
-            final_status = f"搜索完成，共找到 {found_count} 个结果（扫描了 {scanned_files} 个文件）"
+            final_status = tr("搜索完成，共找到 {} 个结果（扫描了 {} 个文件）").format(found_count, scanned_files)
         if metadata_degrade_count > 0:
-            final_status += f"，元数据降级 {metadata_degrade_count} 条"
+            final_status += tr("，元数据降级 {} 条").format(metadata_degrade_count)
         
         # 使用超时put，防止队列满时卡死
         try:
@@ -1662,9 +2251,9 @@ class SearchDialog(QDialog):
             # 搜索完成后启用排序
             self.result_queue.put({'type': 'enable_sorting'}, timeout=1)
         except:
-            debug_print(f"[Search] ⚠️ 队列满，最终状态更新失败")
+            debug_print(tr('[Search] ⚠️ 队列满，最终状态更新失败'))
         
-        debug_print(f"[Search] UI更新已调度（使用队列）")
+        debug_print(tr('[Search] UI更新已调度（使用队列）'))
     
     def on_result_double_clicked(self, index):
         """双击搜索结果，打开文件所在文件夹或文件夹本身，并选中文件"""
@@ -1685,27 +2274,27 @@ class SearchDialog(QDialog):
 
     def _launch_file_with_program(self, file_path, program_path, display_name):
         if not file_path or not os.path.isfile(file_path):
-            show_toast(self, "提示", "该搜索结果不是可打开的文件", level="warning")
+            show_toast(self, tr("提示"), tr("该搜索结果不是可打开的文件"), level="warning")
             return False
         if not program_path:
-            show_toast(self, "提示", f"未找到 {display_name}", level="warning")
+            show_toast(self, tr("提示"), tr("未找到 {}").format(display_name), level="warning")
             return False
         try:
             launch_detached([program_path, file_path], cwd=os.path.dirname(file_path) or None)
             return True
         except Exception as e:
-            show_toast(self, "错误", f"无法使用 {display_name} 打开文件: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法使用 {} 打开文件: {}").format(display_name, e), level="error")
             return False
 
     def open_result_with_notepad(self, file_path):
-        self._launch_file_with_program(file_path, 'notepad.exe', '记事本')
+        self._launch_file_with_program(file_path, 'notepad.exe', tr('记事本'))
 
     def open_result_with_notepad_plus_plus(self, file_path):
         self._launch_file_with_program(file_path, self.notepad_plus_plus_path, 'Notepad++')
 
     def open_result_with_default_app(self, file_path):
         if not file_path or not os.path.isfile(file_path):
-            show_toast(self, "提示", "该搜索结果不是可打开的文件", level="warning")
+            show_toast(self, tr("提示"), tr("该搜索结果不是可打开的文件"), level="warning")
             return False
         try:
             if os.name == 'nt':
@@ -1714,21 +2303,21 @@ class SearchDialog(QDialog):
                 launch_detached([file_path], cwd=os.path.dirname(file_path) or None)
             return True
         except Exception as e:
-            show_toast(self, "错误", f"无法使用系统默认程序打开文件: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法使用系统默认程序打开文件: {}").format(e), level="error")
             return False
 
     def open_result_with_system_dialog(self, file_path):
         if not file_path or not os.path.isfile(file_path):
-            show_toast(self, "提示", "该搜索结果不是可打开的文件", level="warning")
+            show_toast(self, tr("提示"), tr("该搜索结果不是可打开的文件"), level="warning")
             return False
         if os.name != 'nt':
-            show_toast(self, "提示", "当前系统不支持打开“选择其他应用”对话框", level="warning")
+            show_toast(self, tr("提示"), tr("当前系统不支持打开“选择其他应用”对话框"), level="warning")
             return False
         try:
             launch_detached(['rundll32.exe', 'shell32.dll,OpenAs_RunDLL', file_path], cwd=os.path.dirname(file_path) or None)
             return True
         except Exception as e:
-            show_toast(self, "错误", f"无法打开“选择其他应用”对话框: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法打开“选择其他应用”对话框: {}").format(e), level="error")
             return False
 
     def show_result_context_menu(self, pos):
@@ -1745,30 +2334,30 @@ class SearchDialog(QDialog):
 
         menu = QMenu(self)
 
-        open_action = menu.addAction("打开")
+        open_action = menu.addAction(tr("打开"))
         open_action.triggered.connect(lambda: self.on_result_double_clicked(index))
 
-        open_folder_action = menu.addAction("打开所在目录")
+        open_folder_action = menu.addAction(tr("打开所在目录"))
         open_folder_action.triggered.connect(lambda: self._open_result_parent_folder(file_path))
 
         if os.path.isfile(file_path):
-            default_action = menu.addAction("用系统默认程序打开")
+            default_action = menu.addAction(tr("用系统默认程序打开"))
             default_action.triggered.connect(lambda: self.open_result_with_default_app(file_path))
 
             menu.addSeparator()
 
-            notepad_action = menu.addAction("用记事本打开")
+            notepad_action = menu.addAction(tr("用记事本打开"))
             notepad_action.triggered.connect(lambda: self.open_result_with_notepad(file_path))
 
-            notepadpp_action = menu.addAction("用 Notepad++ 打开")
+            notepadpp_action = menu.addAction(tr("用 Notepad++ 打开"))
             notepadpp_action.setEnabled(bool(getattr(self, 'notepad_plus_plus_path', None)))
             if not getattr(self, 'notepad_plus_plus_path', None):
-                notepadpp_action.setToolTip("未检测到 Notepad++")
+                notepadpp_action.setToolTip(tr("未检测到 Notepad++"))
             notepadpp_action.triggered.connect(lambda: self.open_result_with_notepad_plus_plus(file_path))
 
             menu.addSeparator()
 
-            system_dialog_action = menu.addAction("选择其他应用...")
+            system_dialog_action = menu.addAction(tr("选择其他应用..."))
             system_dialog_action.triggered.connect(lambda: self.open_result_with_system_dialog(file_path))
 
         menu.exec_(self.result_list.viewport().mapToGlobal(pos))
@@ -1927,7 +2516,7 @@ def launch_shell_tool(tool_name, cwd=None):
 
     if tool_name in ('cmd', 'powershell', 'git-bash'):
         if not cwd or not os.path.isdir(cwd):
-            raise FileNotFoundError("当前路径无效，无法启动终端")
+            raise FileNotFoundError(tr("当前路径无效，无法启动终端"))
 
     if tool_name == 'cmd':
         return subprocess.Popen(
@@ -1947,10 +2536,10 @@ def launch_shell_tool(tool_name, cwd=None):
     if tool_name == 'git-bash':
         git_root = find_git_install_root()
         if not git_root:
-            raise FileNotFoundError("未找到 Git Bash，请确认已安装 Git for Windows")
+            raise FileNotFoundError(tr("未找到 Git Bash，请确认已安装 Git for Windows"))
         git_bash_exe = os.path.join(git_root, 'git-bash.exe')
         if not os.path.exists(git_bash_exe):
-            raise FileNotFoundError("未找到可用的 Git Bash 可执行文件")
+            raise FileNotFoundError(tr("未找到可用的 Git Bash 可执行文件"))
         return subprocess.Popen([
             'cmd.exe',
             '/c',
@@ -1963,7 +2552,7 @@ def launch_shell_tool(tool_name, cwd=None):
 
     if tool_name == 'calculator':
         if os.name != 'nt':
-            raise OSError("当前系统不支持打开计算器")
+            raise OSError(tr("当前系统不支持打开计算器"))
         return subprocess.Popen(['calc.exe'])
 
     raise ValueError(f"Unsupported tool: {tool_name}")
@@ -2154,17 +2743,17 @@ class GitStatusWorker(QThread):
             is_clean = (staged == 0 and modified == 0 and untracked == 0)
             parts = []
             if branch:
-                parts.append(f"分支: {branch}")
+                parts.append(tr("分支: {}").format(branch))
             if is_clean:
-                parts.append('<span style="color:#2e7d32;font-weight:bold">✔ 无更改</span>')
+                parts.append(tr('<span style="color:#2e7d32;font-weight:bold">✔ 无更改</span>'))
             else:
                 def _color(label, value, color_pos, color_zero='#2e7d32'):
                     color = color_pos if value > 0 else color_zero
                     return f'<span style="color:{color}">{label} {value}</span>'
                 status_parts = [
-                    _color("暂存(Add)", staged, "#d32f2f"),
-                    _color("修改(Commit)", modified, "#d32f2f"),
-                    _color("未跟踪(待Add)", untracked, "#f9a825"),
+                    _color(tr("暂存(Add)"), staged, "#d32f2f"),
+                    _color(tr("修改(Commit)"), modified, "#d32f2f"),
+                    _color(tr("未跟踪(待Add)"), untracked, "#f9a825"),
                 ]
                 parts.append('  '.join(status_parts))
             summary = ' | '.join(parts) if parts else None
@@ -2433,7 +3022,7 @@ class BreadcrumbPathBar(QWidget):
         if not text:
             return
         # 特殊命令不需要补全
-        if text.startswith('shell:') or text in ['cmd', '回收站', '此电脑', '我的电脑', '桌面', '网络']:
+        if text.startswith('shell:') or text in ['cmd', tr('回收站'), tr('此电脑'), tr('我的电脑'), '桌面', tr('网络')]:
             return
         # 标准化路径分隔符
         normalized_path = text.replace('/', '\\') if os.name == 'nt' else text
@@ -3299,10 +3888,10 @@ class FileExplorerTab(QWidget):
 
             # shell: 路径中文映射（字典 O(1) 查找）
             _SHELL_PATH_MAP = {
-                'shell:RecycleBinFolder': '回收站',
-                'shell:MyComputerFolder': '此电脑',
+                'shell:RecycleBinFolder': tr('回收站'),
+                'shell:MyComputerFolder': tr('此电脑'),
                 'shell:Desktop': '桌面',
-                'shell:NetworkPlacesFolder': '网络',
+                'shell:NetworkPlacesFolder': tr('网络'),
             }
             path = self.current_path
             display = _SHELL_PATH_MAP.get(path, None)
@@ -3546,7 +4135,7 @@ class FileExplorerTab(QWidget):
         self.loading_bar = QProgressBar(self)
         self.loading_bar.setMaximum(0)  # 不确定进度模式
         self.loading_bar.setTextVisible(True)
-        self.loading_bar.setFormat("正在加载大文件夹...")
+        self.loading_bar.setFormat(tr("正在加载大文件夹..."))
         self.loading_bar.setMaximumHeight(20)
         self.loading_bar.hide()
         layout.addWidget(self.loading_bar)
@@ -3569,7 +4158,7 @@ class FileExplorerTab(QWidget):
         layout.addWidget(self.explorer)
 
         # 状态栏（参考系统 Explorer 样式：细高、浅底色、顶部分割线）
-        self.status_bar = QLabel("就绪")
+        self.status_bar = QLabel(tr("就绪"))
         self.status_bar.setFixedHeight(20)
         self.status_bar.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.status_bar.setStyleSheet(
@@ -3695,9 +4284,9 @@ class FileExplorerTab(QWidget):
                         try:
                             import subprocess
                             subprocess.Popen(['explorer.exe', url])
-                            show_toast(self, "已打开", "控制面板已在新窗口打开", level="info", duration=2000)
+                            show_toast(self, tr("已打开"), tr("控制面板已在新窗口打开"), level="info", duration=2000)
                         except Exception as ex:
-                            show_toast(self, "错误", f"无法打开控制面板: {ex}", level="error")
+                            show_toast(self, tr("错误"), tr("无法打开控制面板: {}").format(ex), level="error")
                         # 关闭当前标签页
                         if self.main_window and hasattr(self.main_window, 'tab_widget'):
                             idx = self.main_window.tab_widget.indexOf(self)
@@ -3736,12 +4325,12 @@ class FileExplorerTab(QWidget):
         try:
             current_path = self.current_path
             if not current_path or not os.path.exists(current_path):
-                show_toast(self, "提示", "当前路径无效", level="warning")
+                show_toast(self, tr("提示"), tr("当前路径无效"), level="warning")
                 return
 
             repo_root = self._find_git_root(current_path)
             if not repo_root:
-                show_toast(self, "提示", "当前目录不是 Git 仓库，未找到 .git", level="warning")
+                show_toast(self, tr("提示"), tr("当前目录不是 Git 仓库，未找到 .git"), level="warning")
                 return
             
             # TortoiseGit 命令行：TortoiseGitProc.exe /command:log /path:"路径"
@@ -3760,8 +4349,8 @@ class FileExplorerTab(QWidget):
             if not tortoisegit_exe:
                 show_toast(
                     self,
-                    "提示",
-                    "未找到 TortoiseGit，请确认已安装 TortoiseGit\n下载地址: https://tortoisegit.org/download/",
+                    tr("提示"),
+                    tr("未找到 TortoiseGit，请确认已安装 TortoiseGit\n下载地址: https://tortoisegit.org/download/"),
                     level="warning",
                 )
                 return
@@ -3771,7 +4360,7 @@ class FileExplorerTab(QWidget):
             debug_print(f"[TortoiseGit] Opened log for: {repo_root}")
             
         except Exception as e:
-            show_toast(self, "错误", f"无法打开 TortoiseGit Log: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法打开 TortoiseGit Log: {}").format(e), level="error")
             debug_print(f"[TortoiseGit] Failed to open log: {e}")
     
     def open_tortoisegit_commit(self):
@@ -3779,12 +4368,12 @@ class FileExplorerTab(QWidget):
         try:
             current_path = self.current_path
             if not current_path or not os.path.exists(current_path):
-                show_toast(self, "提示", "当前路径无效", level="warning")
+                show_toast(self, tr("提示"), tr("当前路径无效"), level="warning")
                 return
 
             repo_root = self._find_git_root(current_path)
             if not repo_root:
-                show_toast(self, "提示", "当前目录不是 Git 仓库，未找到 .git", level="warning")
+                show_toast(self, tr("提示"), tr("当前目录不是 Git 仓库，未找到 .git"), level="warning")
                 return
             
             # TortoiseGit 命令行：TortoiseGitProc.exe /command:commit /path:"路径"
@@ -3802,8 +4391,8 @@ class FileExplorerTab(QWidget):
             if not tortoisegit_exe:
                 show_toast(
                     self,
-                    "提示",
-                    "未找到 TortoiseGit，请确认已安装 TortoiseGit\n下载地址: https://tortoisegit.org/download/",
+                    tr("提示"),
+                    tr("未找到 TortoiseGit，请确认已安装 TortoiseGit\n下载地址: https://tortoisegit.org/download/"),
                     level="warning",
                 )
                 return
@@ -3813,7 +4402,7 @@ class FileExplorerTab(QWidget):
             debug_print(f"[TortoiseGit] Opened commit for: {repo_root}")
             
         except Exception as e:
-            show_toast(self, "错误", f"无法打开 TortoiseGit Commit: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法打开 TortoiseGit Commit: {}").format(e), level="error")
             debug_print(f"[TortoiseGit] Failed to open commit: {e}")
 
     def _find_git_root(self, start_path):
@@ -3914,9 +4503,9 @@ class FileExplorerTab(QWidget):
                     launch_shell_tool(preferred_tool, current_dir)
                     self.path_bar.set_path(current_dir)
                 else:
-                    show_toast(self, "错误", "当前路径无效，无法打开默认终端", level="error")
+                    show_toast(self, tr("错误"), tr("当前路径无效，无法打开默认终端"), level="error")
             except Exception as e:
-                show_toast(self, "错误", f"无法打开默认终端: {e}", level="error")
+                show_toast(self, tr("错误"), tr("无法打开默认终端: {}").format(e), level="error")
             return
 
         # 处理cmd命令
@@ -3927,9 +4516,9 @@ class FileExplorerTab(QWidget):
                     launch_shell_tool('cmd', current_dir)
                     self.path_bar.set_path(current_dir)
                 else:
-                    show_toast(self, "错误", "当前路径无效，无法打开命令行", level="error")
+                    show_toast(self, tr("错误"), tr("当前路径无效，无法打开命令行"), level="error")
             except Exception as e:
-                show_toast(self, "错误", f"无法打开命令行: {e}", level="error")
+                show_toast(self, tr("错误"), tr("无法打开命令行: {}").format(e), level="error")
             return
 
         if lower_path in ('powershell', 'ps', 'pwsh'):
@@ -3939,9 +4528,9 @@ class FileExplorerTab(QWidget):
                     launch_shell_tool('powershell', current_dir)
                     self.path_bar.set_path(current_dir)
                 else:
-                    show_toast(self, "错误", "当前路径无效，无法打开 PowerShell", level="error")
+                    show_toast(self, tr("错误"), tr("当前路径无效，无法打开 PowerShell"), level="error")
             except Exception as e:
-                show_toast(self, "错误", f"无法打开 PowerShell: {e}", level="error")
+                show_toast(self, tr("错误"), tr("无法打开 PowerShell: {}").format(e), level="error")
             return
 
         if lower_path in ('gitbash', 'git-bash', 'bash'):
@@ -3951,23 +4540,23 @@ class FileExplorerTab(QWidget):
                     launch_shell_tool('git-bash', current_dir)
                     self.path_bar.set_path(current_dir)
                 else:
-                    show_toast(self, "错误", "当前路径无效，无法打开 Git Bash", level="error")
+                    show_toast(self, tr("错误"), tr("当前路径无效，无法打开 Git Bash"), level="error")
             except FileNotFoundError as e:
-                show_toast(self, "提示", str(e), level="warning")
+                show_toast(self, tr("提示"), str(e), level="warning")
             except Exception as e:
-                show_toast(self, "错误", f"无法打开 Git Bash: {e}", level="error")
+                show_toast(self, tr("错误"), tr("无法打开 Git Bash: {}").format(e), level="error")
             return
 
         # 支持特殊shell路径映射
         special_map = {
-            '回收站': 'shell:RecycleBinFolder',
-            '此电脑': 'shell:MyComputerFolder',
-            '我的电脑': 'shell:MyComputerFolder',
+            tr('回收站'): 'shell:RecycleBinFolder',
+            tr('此电脑'): 'shell:MyComputerFolder',
+            tr('我的电脑'): 'shell:MyComputerFolder',
             '桌面': 'shell:Desktop',
-            '网络': 'shell:NetworkPlacesFolder',
-            '启动项': 'shell:Startup',
-            '开机启动项': 'shell:Startup',
-            '启动文件夹': 'shell:Startup',
+            tr('网络'): 'shell:NetworkPlacesFolder',
+            tr('启动项'): 'shell:Startup',
+            tr('开机启动项'): 'shell:Startup',
+            tr('启动文件夹'): 'shell:Startup',
             'Startup': 'shell:Startup',
         }
         # shell:Startup 等特殊路径，自动解析为真实系统路径
@@ -3983,7 +4572,7 @@ class FileExplorerTab(QWidget):
                 if os.path.exists(real_path):
                     self.navigate_to(real_path)
                 else:
-                    show_toast(self, "路径错误", f"启动文件夹不存在: {real_path}", level="warning")
+                    show_toast(self, tr("路径错误"), tr("启动文件夹不存在: {}").format(real_path), level="warning")
                     if hasattr(self, 'current_path') and self.current_path:
                         self.path_bar.set_path(self.current_path)
                 return
@@ -3999,7 +4588,7 @@ class FileExplorerTab(QWidget):
                 if os.path.exists(real_path):
                     self.navigate_to(real_path)
                 else:
-                    show_toast(self, "路径错误", f"启动文件夹不存在: {real_path}", level="warning")
+                    show_toast(self, tr("路径错误"), tr("启动文件夹不存在: {}").format(real_path), level="warning")
                     if hasattr(self, 'current_path') and self.current_path:
                         self.path_bar.set_path(self.current_path)
                 return
@@ -4021,7 +4610,7 @@ class FileExplorerTab(QWidget):
             # UNC 网络路径可能因网络延迟导致 os.path.exists 返回 False，直接尝试导航
             self.navigate_to(path2)
         else:
-            show_toast(self, "路径错误", f"路径不存在: {path2}", level="warning")
+            show_toast(self, tr("路径错误"), tr("路径不存在: {}").format(path2), level="warning")
             if hasattr(self, 'current_path') and self.current_path:
                 self.path_bar.set_path(self.current_path)
 
@@ -4517,9 +5106,9 @@ class FileExplorerTab(QWidget):
             try:
                 import subprocess
                 subprocess.Popen(['explorer.exe', path])
-                show_toast(self, "已打开", "控制面板已在新窗口打开", level="info", duration=2000)
+                show_toast(self, tr("已打开"), tr("控制面板已在新窗口打开"), level="info", duration=2000)
             except Exception as e:
-                show_toast(self, "错误", f"无法打开控制面板: {e}", level="error")
+                show_toast(self, tr("错误"), tr("无法打开控制面板: {}").format(e), level="error")
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(self.current_path)
             return
@@ -5016,7 +5605,7 @@ class FileExplorerTab(QWidget):
             return
         path = getattr(self, 'current_path', None)
         if not path:
-            self.status_bar.setText("就绪")
+            self.status_bar.setText(tr("就绪"))
             return
 
         # shell 路径直接展示提示
@@ -5026,29 +5615,29 @@ class FileExplorerTab(QWidget):
 
         # 目录总项目数始终显示
         total = self._count_dir_entries(path)
-        total_text = f"（共 {total} 项）" if total is not None else ""
+        total_text = tr("（共 {} 项）").format(total) if total is not None else ""
 
         # 统计选中项
         selection = self._get_selection_entries_cached()
         if selection is None:
-            text = f"共 {total} 项" if total is not None else "就绪"
+            text = tr("共 {} 项").format(total) if total is not None else tr("就绪")
         elif len(selection) == 0:
-            text = f"共 {total} 项" if total is not None else "就绪"
+            text = tr("共 {} 项").format(total) if total is not None else tr("就绪")
         else:
             sel_count = len(selection)
             # 选中状态
-            text = f"已选 {sel_count} 项{total_text}"
+            text = tr("已选 {} 项{}").format(sel_count, total_text)
             metadata_limited = sel_count > STATUS_SELECTION_METADATA_LIMIT
             if not metadata_limited and all(entry['is_file'] for entry in selection):
                 size_sum = sum(entry['size'] for entry in selection if entry['size'] is not None)
                 text += f"，总大小 {self._format_size(size_sum)}"
             elif metadata_limited:
-                text += "，已省略大小统计"
+                text += tr("，已省略大小统计")
             if sel_count == 1:
                 entry = selection[0]
                 mtime = self._get_mtime(entry['path'])
                 if mtime:
-                    text += f"，修改时间 {mtime}"
+                    text += tr("，修改时间 {}").format(mtime)
 
         # 附加 Git 状态摘要（仅读缓存，不阻塞 UI）
         cache = getattr(self, '_git_status_cache', None)
@@ -5120,21 +5709,21 @@ class FileExplorerTab(QWidget):
 
     def _launch_selected_file_with_program(self, file_path, program_path, display_name):
         if not file_path or not os.path.isfile(file_path):
-            show_toast(self, "提示", "当前选中项不是可打开的文件", level="warning")
+            show_toast(self, tr("提示"), tr("当前选中项不是可打开的文件"), level="warning")
             return False
         if not program_path:
-            show_toast(self, "提示", f"未找到 {display_name}", level="warning")
+            show_toast(self, tr("提示"), tr("未找到 {}").format(display_name), level="warning")
             return False
         try:
             launch_detached([program_path, file_path], cwd=os.path.dirname(file_path) or None)
             return True
         except Exception as e:
-            show_toast(self, "错误", f"无法使用 {display_name} 打开文件: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法使用 {} 打开文件: {}").format(display_name, e), level="error")
             return False
 
     def open_selected_with_default_app(self, file_path):
         if not file_path or not os.path.exists(file_path):
-            show_toast(self, "提示", "当前选中项不可打开", level="warning")
+            show_toast(self, tr("提示"), tr("当前选中项不可打开"), level="warning")
             return False
         try:
             if os.path.isdir(file_path):
@@ -5146,27 +5735,27 @@ class FileExplorerTab(QWidget):
                 launch_detached([file_path], cwd=os.path.dirname(file_path) or None)
             return True
         except Exception as e:
-            show_toast(self, "错误", f"无法打开选中项: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法打开选中项: {}").format(e), level="error")
             return False
 
     def open_selected_with_notepad(self, file_path):
-        return self._launch_selected_file_with_program(file_path, 'notepad.exe', '记事本')
+        return self._launch_selected_file_with_program(file_path, 'notepad.exe', tr('记事本'))
 
     def open_selected_with_notepad_plus_plus(self, file_path):
         return self._launch_selected_file_with_program(file_path, getattr(self, 'notepad_plus_plus_path', None), 'Notepad++')
 
     def open_selected_with_system_dialog(self, file_path):
         if not file_path or not os.path.isfile(file_path):
-            show_toast(self, "提示", "当前选中项不是可打开的文件", level="warning")
+            show_toast(self, tr("提示"), tr("当前选中项不是可打开的文件"), level="warning")
             return False
         if os.name != 'nt':
-            show_toast(self, "提示", "当前系统不支持打开“选择其他应用”对话框", level="warning")
+            show_toast(self, tr("提示"), tr("当前系统不支持打开“选择其他应用”对话框"), level="warning")
             return False
         try:
             launch_detached(['rundll32.exe', 'shell32.dll,OpenAs_RunDLL', file_path], cwd=os.path.dirname(file_path) or None)
             return True
         except Exception as e:
-            show_toast(self, "错误", f"无法打开“选择其他应用”对话框: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法打开“选择其他应用”对话框: {}").format(e), level="error")
             return False
 
     def open_selected_parent_folder(self, file_path):
@@ -5190,30 +5779,30 @@ class FileExplorerTab(QWidget):
 
 
         menu = QMenu(self)
-        open_action = menu.addAction("打开")
+        open_action = menu.addAction(tr("打开"))
         open_action.triggered.connect(lambda: self.open_selected_with_default_app(file_path))
 
-        open_folder_action = menu.addAction("打开所在目录")
+        open_folder_action = menu.addAction(tr("打开所在目录"))
         open_folder_action.triggered.connect(lambda: self.open_selected_parent_folder(file_path))
 
         if os.path.isfile(file_path):
-            default_action = menu.addAction("用系统默认程序打开")
+            default_action = menu.addAction(tr("用系统默认程序打开"))
             default_action.triggered.connect(lambda: self.open_selected_with_default_app(file_path))
 
             menu.addSeparator()
 
-            notepad_action = menu.addAction("用记事本打开")
+            notepad_action = menu.addAction(tr("用记事本打开"))
             notepad_action.triggered.connect(lambda: self.open_selected_with_notepad(file_path))
 
-            notepadpp_action = menu.addAction("用 Notepad++ 打开")
+            notepadpp_action = menu.addAction(tr("用 Notepad++ 打开"))
             notepadpp_action.setEnabled(bool(getattr(self, 'notepad_plus_plus_path', None)))
             if not getattr(self, 'notepad_plus_plus_path', None):
-                notepadpp_action.setToolTip("未检测到 Notepad++")
+                notepadpp_action.setToolTip(tr("未检测到 Notepad++"))
             notepadpp_action.triggered.connect(lambda: self.open_selected_with_notepad_plus_plus(file_path))
 
             menu.addSeparator()
 
-            system_dialog_action = menu.addAction("选择其他应用...")
+            system_dialog_action = menu.addAction(tr("选择其他应用..."))
             system_dialog_action.triggered.connect(lambda: self.open_selected_with_system_dialog(file_path))
 
         menu.exec_(global_pos)
@@ -5933,7 +6522,7 @@ class ChatWorker(QThread):
                 except requests.exceptions.ConnectionError as _ce:
                     if 'prematurely' in str(_ce).lower() or 'protocol' in str(_ce).lower():
                         self.error_occurred.emit(
-                            '❌ 流式响应被服务器提前关闭（上下文可能过长）。\n' + str(_ce)
+                            tr('❌ 流式响应被服务器提前关闭（上下文可能过长）。\n') + str(_ce)
                         )
                         return
                     raise
@@ -5968,7 +6557,7 @@ class ChatWorker(QThread):
                             self.response_received.emit(partial)
                         else:
                             self.error_occurred.emit(
-                                '❌ 流式响应被服务器提前关闭（上下文可能过长，请清空聊天记录重试）。\n' + _msg
+                                tr('❌ 流式响应被服务器提前关闭（上下文可能过长，请清空聊天记录重试）。\n') + _msg
                             )
                         return
                     raise
@@ -6012,11 +6601,11 @@ class ChatPanel(QWidget):
         header.setStyleSheet("background: #E3F2FD; border-radius: 4px;")
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(8, 4, 8, 4)
-        title_lbl = QLabel("🤖 AI 助手")
+        title_lbl = QLabel(tr("🤖 AI 助手"))
         title_lbl.setStyleSheet("font-weight: bold; font-size: 10.5pt; background: transparent;")
         header_layout.addWidget(title_lbl)
         header_layout.addStretch()
-        clear_btn = QPushButton("清空")
+        clear_btn = QPushButton(tr("清空"))
         clear_btn.setFixedHeight(22)
         clear_btn.setStyleSheet(
             "QPushButton{background:#fff;border:1px solid #90CAF9;border-radius:3px;font-size:9pt;padding:0 6px;}"
@@ -6027,7 +6616,7 @@ class ChatPanel(QWidget):
         layout.addWidget(header)
 
         # 当前目录提示条
-        self.context_label = QLabel("当前目录: —")
+        self.context_label = QLabel(tr("当前目录: —"))
         self.context_label.setStyleSheet(
             "color:#555; font-size:8.5pt; padding:2px 6px;"
             "background:#f0f4f8; border-radius:3px;"
@@ -6052,7 +6641,7 @@ class ChatPanel(QWidget):
 
         # 输入框
         self.input_box = QPlainTextEdit()
-        self.input_box.setPlaceholderText("输入问题… (Enter 发送，Shift+Enter 换行)")
+        self.input_box.setPlaceholderText(tr("输入问题… (Enter 发送，Shift+Enter 换行)"))
         self.input_box.setFixedHeight(72)
         self.input_box.setReadOnly(False)
         self.input_box.setFocusPolicy(Qt.StrongFocus)
@@ -6069,7 +6658,7 @@ class ChatPanel(QWidget):
 
         # 发送按钮行
         btn_row = QHBoxLayout()
-        self.send_btn = QPushButton("发 送")
+        self.send_btn = QPushButton(tr("发 送"))
         self.send_btn.setFixedHeight(28)
         self.send_btn.setStyleSheet(
             "QPushButton{background:#1976D2;color:white;border:none;border-radius:4px;"
@@ -6116,20 +6705,20 @@ class ChatPanel(QWidget):
         """更新当前目录提示。"""
         if path:
             display = path if len(path) <= 55 else '…' + path[-52:]
-            self.context_label.setText(f"当前目录: {display}")
+            self.context_label.setText(tr("当前目录: {}").format(display))
 
     def _show_context_menu(self, pos):
         """显示右键菜单（复制、全选等）。"""
         menu = QMenu(self)
         
-        copy_action = menu.addAction("复制")
+        copy_action = menu.addAction(tr("复制"))
         copy_action.triggered.connect(self.chat_display.copy)
         
-        select_all_action = menu.addAction("全选")
+        select_all_action = menu.addAction(tr("全选"))
         select_all_action.triggered.connect(self.chat_display.selectAll)
         
         menu.addSeparator()
-        clear_action = menu.addAction("清空聊天")
+        clear_action = menu.addAction(tr("清空聊天"))
         clear_action.triggered.connect(self.clear_chat)
         
         menu.exec_(self.chat_display.mapToGlobal(pos))
@@ -6210,7 +6799,7 @@ class ChatPanel(QWidget):
         content = str(message.get("content", "") or "")
         if len(content) > MAX_CHAT_MESSAGE_CHARS:
             omitted = len(content) - MAX_CHAT_MESSAGE_CHARS
-            content = content[:MAX_CHAT_MESSAGE_CHARS] + f"\n\n【已截断 {omitted} 个字符】"
+            content = content[:MAX_CHAT_MESSAGE_CHARS] + tr("\n\n【已截断 {} 个字符】").format(omitted)
         return {"role": role, "content": content}
 
     def _trim_chat_history(self):
@@ -6378,11 +6967,11 @@ class ChatPanel(QWidget):
     def _build_bubble_html(self, role: str, content: str):
         import html as _html
         if role == "user":
-            color, prefix, bg = "#1976D2", "👤 你", "#E3F2FD"
+            color, prefix, bg = "#1976D2", tr("👤 你"), "#E3F2FD"
         elif role == "assistant":
             color, prefix, bg = "#2E7D32", "🤖 AI", "#F1F8E9"
         else:
-            color, prefix, bg = "#888", "ℹ 系统", "#F5F5F5"
+            color, prefix, bg = "#888", tr("ℹ 系统"), "#F5F5F5"
 
         if role == "assistant":
             body = self._md_to_html(content)
@@ -6442,7 +7031,7 @@ class ChatPanel(QWidget):
         model   = cfg.get("model", "gpt-3.5-turbo").strip() or "gpt-3.5-turbo"
 
         if not api_url:
-            self.append_bubble("system", "❌ 请先在 设置 → AI 助手 中填写 API 地址")
+            self.append_bubble("system", tr("❌ 请先在 设置 → AI 助手 中填写 API 地址"))
             return
 
         self.input_box.clear()
@@ -6461,27 +7050,27 @@ class ChatPanel(QWidget):
         system_prompt = cfg.get("system_prompt", "").strip()
         if not system_prompt:
             system_prompt = (
-                "你是一个智能文件管理助手，帮助用户管理文件系统、打开目录和运行脚本。\n"
-                "⚠️ 只有当用户明确要求‘切换/打开目录’时，才在回复末尾添加：[OPEN_DIR: 目录完整路径]。"
-                "普通问答不要输出任何操作指令。\n"
-                "⚠️ 只有当用户明确要求运行脚本时，才添加：[RUN_SCRIPT: 脚本完整路径]。\n"
-                "⚠️ 仅当用户明确要求时，才可使用以下指令：\n"
-                "[READ_FILE: 文件路径] 读取文件（系统自动分段读取大文件，无需手动指定偏移）；\n"
-                "[PATCH_FILE: 路径|旧文本|新文本] 局部修改已有文件（安全，仅替换目标内容段）；\n"
-                "⚠️ 修改已有文件时必须使用 PATCH_FILE，禁止用 WRITE_FILE 覆盖已有大文件；\n"
-                "⚠️ PATCH_FILE 使用规范：\n"
-                "  1. 旧文本只需包含被修改的行及前后各1-2行（足够唯一定位即可），不要复制整个函数体；\n"
-                "  2. 对同一文件做多个 PATCH_FILE 时，第二个 patch 的旧文本必须是第一个 patch 应用后的实际内容；\n"
-                "  3. 最小改动原则：新文本只改动必要的行，不要重写周围未变更的代码。\n"
-                "[WRITE_FILE: 文件路径|文件内容] 仅用于创建全新文件（已有文件禁止使用）；\n"
-                "[LIST_DIR: 目录路径] 列出目录；\n"
-                "[MKDIR: 目录路径] 创建目录；\n"
-                "[DELETE: 路径] 删除文件或目录（需用户确认）。\n"
-                "路径使用 Windows 格式，例如 D:\\project\\src。\n"
-                "可以在同一回复中包含多个操作命令。"
+                tr("你是一个智能文件管理助手，帮助用户管理文件系统、打开目录和运行脚本。\n") +
+                tr("⚠️ 只有当用户明确要求‘切换/打开目录’时，才在回复末尾添加：[OPEN_DIR: 目录完整路径]。") +
+                tr("普通问答不要输出任何操作指令。\n") +
+                tr("⚠️ 只有当用户明确要求运行脚本时，才添加：[RUN_SCRIPT: 脚本完整路径]。\n") +
+                tr("⚠️ 仅当用户明确要求时，才可使用以下指令：\n") +
+                tr("[READ_FILE: 文件路径] 读取文件（系统自动分段读取大文件，无需手动指定偏移）；\n") +
+                tr("[PATCH_FILE: 路径|旧文本|新文本] 局部修改已有文件（安全，仅替换目标内容段）；\n") +
+                tr("⚠️ 修改已有文件时必须使用 PATCH_FILE，禁止用 WRITE_FILE 覆盖已有大文件；\n") +
+                tr("⚠️ PATCH_FILE 使用规范：\n") +
+                tr("  1. 旧文本只需包含被修改的行及前后各1-2行（足够唯一定位即可），不要复制整个函数体；\n") +
+                tr("  2. 对同一文件做多个 PATCH_FILE 时，第二个 patch 的旧文本必须是第一个 patch 应用后的实际内容；\n") +
+                tr("  3. 最小改动原则：新文本只改动必要的行，不要重写周围未变更的代码。\n") +
+                tr("[WRITE_FILE: 文件路径|文件内容] 仅用于创建全新文件（已有文件禁止使用）；\n") +
+                tr("[LIST_DIR: 目录路径] 列出目录；\n") +
+                tr("[MKDIR: 目录路径] 创建目录；\n") +
+                tr("[DELETE: 路径] 删除文件或目录（需用户确认）。\n") +
+                tr("路径使用 Windows 格式，例如 D:\\project\\src。\n") +
+                tr("可以在同一回复中包含多个操作命令。")
             )
 
-        ctx_prefix = f"[当前目录: {current_path}]\n" if current_path else ""
+        ctx_prefix = tr("[当前目录: {}]\n").format(current_path) if current_path else ""
         full_messages = [{"role": "system", "content": system_prompt}]
         full_messages.extend(self.messages)
         full_messages.append({"role": "user", "content": ctx_prefix + text})
@@ -6495,7 +7084,7 @@ class ChatPanel(QWidget):
         self._last_agentic_feed = None  # 重复调用检测用
         self._streaming_chars = 0
         self.send_btn.setEnabled(False)
-        self.status_lbl.setText("⏳ AI 思考中…")
+        self.status_lbl.setText(tr("⏳ AI 思考中…"))
         self.worker = ChatWorker(full_messages, api_url, api_key, model, stream=True, parent=self)
         self.worker.token_received.connect(self._on_token)
         self.worker.response_received.connect(self._on_response)
@@ -6514,19 +7103,19 @@ class ChatPanel(QWidget):
                 # 打开文件所在目录
                 folder = os.path.dirname(path)
                 if os.path.isdir(folder):
-                    self.append_bubble("system", f"📂 打开目录: {folder}")
+                    self.append_bubble("system", tr("📂 打开目录: {}").format(folder))
                     self.main_window.add_new_tab(folder)
             elif os.path.isdir(path):
                 # 直接打开目录
-                self.append_bubble("system", f"📂 打开目录: {path}")
+                self.append_bubble("system", tr("📂 打开目录: {}").format(path))
                 self.main_window.add_new_tab(path)
 
     def _on_token(self, chunk: str):
         """流式 token 到达——实时更新聊天气泡（VS Code Copilot 效果）。"""
         self._streaming_buffer = getattr(self, '_streaming_buffer', '') + chunk
         step = getattr(self, '_agentic_steps', 0)
-        label = f"第 {step + 1} 轮" if step > 0 else ""
-        self.status_lbl.setText(f"⏳ AI 推理中{label}…")
+        label = tr("第 {} 轮").format(step + 1) if step > 0 else ""
+        self.status_lbl.setText(tr("⏳ AI 推理中{}…").format(label))
 
         if not getattr(self, '_streaming_bubble_open', False):
             # 第一个 token：记录插入位置，后续刷新替换这段内容
@@ -6588,7 +7177,7 @@ class ChatPanel(QWidget):
             stuck = (last_feed is not None and feedable == last_feed)
             self._last_agentic_feed = feedable
             if stuck:
-                self.status_lbl.setText("⚠️ 检测到重复工具调用，强制要求给出结论…")
+                self.status_lbl.setText(tr("⚠️ 检测到重复工具调用，强制要求给出结论…"))
             if hasattr(self, '_streaming_flush_timer') and self._streaming_flush_timer:
                 self._streaming_flush_timer.stop()
             self._streaming_buffer = ""
@@ -6624,14 +7213,14 @@ class ChatPanel(QWidget):
 
         if force_final:
             continuation = (
-                "以上是最后一批工具调用结果。不要再调用任何工具指令，"
-                "请直接基于已收集的全部信息给出具体的结论、优化建议或解决方案。"
+                tr("以上是最后一批工具调用结果。不要再调用任何工具指令，") +
+                tr("请直接基于已收集的全部信息给出具体的结论、优化建议或解决方案。")
             )
         else:
             continuation = (
-                "以上是工具调用结果。请高效利用工具，"
-                "优先阅读源代码文件（.c/.h）而非反复列目录，"
-                "并尽快基于收集到的信息给出具体结论或优化建议。"
+                tr("以上是工具调用结果。请高效利用工具，") +
+                tr("优先阅读源代码文件（.c/.h）而非反复列目录，") +
+                tr("并尽快基于收集到的信息给出具体结论或优化建议。")
             )
         feed_msg = {"role": "user", "content": feed_text + "\n\n" + continuation}
 
@@ -6646,32 +7235,32 @@ class ChatPanel(QWidget):
         if not system_prompt:
             if force_final:
                 system_prompt = (
-                    "你是一个智能文件管理助手。"
-                    "不能将任何工具指令放入回复，"
-                    "必须直接基于已收集的所有信息给出具体的结论、优化建议或解决方案。"
-                    "路径使用 Windows 格式。"
+                    tr("你是一个智能文件管理助手。") +
+                    tr("不能将任何工具指令放入回复，") +
+                    tr("必须直接基于已收集的所有信息给出具体的结论、优化建议或解决方案。") +
+                    tr("路径使用 Windows 格式。")
                 )
             else:
                 system_prompt = (
-                    "你是一个智能文件管理助手，正在通过工具调用完成用户任务。\n"
-                    "你可以自由使用以下工具指令：\n"
-                    "[READ_FILE: 路径] 读文件（优先读 .c/.h 源代码）；"
-                    "[PATCH_FILE: 路径|旧文本|新文本] 局部修改文件（修改已有文件时必须用此，禁止用 WRITE_FILE 覆盖已有大文件）；"
-                    "[LIST_DIR: 路径] 列目录（仅在不知道源码位置时使用）；"
-                    "[OPEN_DIR: 路径] [MKDIR: 路径] [WRITE_FILE: 路径|内容]（仅用于创建新文件） [DELETE: 路径]。\n"
-                    "ℹ️ 工作原则：得到目录列表后尽快选择源代码文件直接阅读，"
-                    "而不要反复展开子目录；修改文件时优先使用 PATCH_FILE 安全替换具体代码段。\n"
-                    "⚠️ PATCH_FILE 最小改动规范：\n"
-                    "  1. 旧文本只取被修改行及前后各1-2行（能唯一定位即可），不要复制整个函数；\n"
-                    "  2. 对同一文件连续多个 PATCH_FILE 时，后一个的旧文本必须反映前一个 patch 已应用后的文件内容；\n"
-                    "  3. 新文本只改动必要的行，保留其余未变行，使 diff 最小化。\n"
-                    "路径使用 Windows 格式，例如 D:\\project\\src。"
+                    tr("你是一个智能文件管理助手，正在通过工具调用完成用户任务。\n") +
+                    tr("你可以自由使用以下工具指令：\n") +
+                    tr("[READ_FILE: 路径] 读文件（优先读 .c/.h 源代码）；") +
+                    tr("[PATCH_FILE: 路径|旧文本|新文本] 局部修改文件（修改已有文件时必须用此，禁止用 WRITE_FILE 覆盖已有大文件）；") +
+                    tr("[LIST_DIR: 路径] 列目录（仅在不知道源码位置时使用）；") +
+                    tr("[OPEN_DIR: 路径] [MKDIR: 路径] [WRITE_FILE: 路径|内容]（仅用于创建新文件） [DELETE: 路径]。\n") +
+                    tr("ℹ️ 工作原则：得到目录列表后尽快选择源代码文件直接阅读，") +
+                    tr("而不要反复展开子目录；修改文件时优先使用 PATCH_FILE 安全替换具体代码段。\n") +
+                    tr("⚠️ PATCH_FILE 最小改动规范：\n") +
+                    tr("  1. 旧文本只取被修改行及前后各1-2行（能唯一定位即可），不要复制整个函数；\n") +
+                    tr("  2. 对同一文件连续多个 PATCH_FILE 时，后一个的旧文本必须反映前一个 patch 已应用后的文件内容；\n") +
+                    tr("  3. 新文本只改动必要的行，保留其余未变行，使 diff 最小化。\n") +
+                    tr("路径使用 Windows 格式，例如 D:\\project\\src。")
                 )
         full_messages = [{"role": "system", "content": system_prompt}]
         full_messages.extend(self.messages)
 
         self._streaming_chars = 0
-        self.status_lbl.setText(f"⏳ AI 第 {step} 轮推理中…")
+        self.status_lbl.setText(tr("⏳ AI 第 {} 轮推理中…").format(step))
         self.worker = ChatWorker(full_messages, api_url, api_key, model, stream=True, parent=self)
         self.worker.token_received.connect(self._on_token)
         self.worker.response_received.connect(self._on_response)
@@ -6683,7 +7272,7 @@ class ChatPanel(QWidget):
         self._close_streaming_bubble()   # 移除未完成的流式气泡
         self.send_btn.setEnabled(True)
         self.status_lbl.setText("")
-        self.append_bubble("system", f"❌ 请求失败: {msg}")
+        self.append_bubble("system", tr("❌ 请求失败: {}").format(msg))
 
     # ── 拖拽文件支持 ──────────────────────────────────────────────────────────
     def dragEnterEvent(self, event):
@@ -6717,12 +7306,12 @@ class ChatPanel(QWidget):
     def _read_and_display_file(self, file_path):
         """读取文件并在聊天窗口中显示"""
         if not os.path.isfile(file_path):
-            self.append_bubble("system", f"❌ 文件不存在: {file_path}")
+            self.append_bubble("system", tr("❌ 文件不存在: {}").format(file_path))
             return
         
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
         if file_size_mb > 10:  # 超过10MB不读取
-            self.append_bubble("system", f"⚠️ 文件太大（{file_size_mb:.1f}MB），无法读取")
+            self.append_bubble("system", tr("⚠️ 文件太大（{:.1f}MB），无法读取").format(file_size_mb))
             return
         
         try:
@@ -6741,7 +7330,7 @@ class ChatPanel(QWidget):
                         raw = f.read(1000)
                     content = f"[二进制文件，前 {len(raw)} 字节]\n{raw[:200]}"
                 except Exception as e:
-                    self.append_bubble("system", f"❌ 无法读取文件: {e}")
+                    self.append_bubble("system", tr("❌ 无法读取文件: {}").format(e))
                     return
         
         # 截断长内容（超过5000字符）
@@ -6768,7 +7357,7 @@ class ChatPanel(QWidget):
             with open(self.history_file, 'w', encoding='utf-8') as f:
                 json.dump(self.messages, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"保存聊天记录失败: {e}")
+            print(tr("保存聊天记录失败: {}").format(e))
 
     def _load_history(self):
         """从 JSON 文件加载聊天记录。"""
@@ -6786,7 +7375,7 @@ class ChatPanel(QWidget):
                 self._save_history()
             except Exception as e:
                 self._is_loading_history = False
-                print(f"加载聊天记录失败: {e}")
+                print(tr("加载聊天记录失败: {}").format(e))
 
     def _delete_history(self):
         """删除保存的聊天记录文件。"""
@@ -6794,7 +7383,7 @@ class ChatPanel(QWidget):
             if os.path.exists(self.history_file):
                 os.remove(self.history_file)
         except Exception as e:
-            print(f"删除聊天记录文件失败: {e}")
+            print(tr("删除聊天记录文件失败: {}").format(e))
 
     def _get_action_base_dir(self):
         """获取动作执行的基准目录（当前标签目录）。"""
@@ -6811,7 +7400,7 @@ class ChatPanel(QWidget):
         """解析动作路径，限制在当前目录范围内。"""
         p = (raw_path or '').strip().strip('"\'')
         if not p:
-            return None, "空路径"
+            return None, tr("空路径")
 
         p = p.replace('/', '\\')
         base_dir = self._get_action_base_dir()
@@ -6826,9 +7415,9 @@ class ChatPanel(QWidget):
             base_norm = os.path.normcase(os.path.normpath(base_dir))
             path_norm = os.path.normcase(os.path.normpath(p))
             if not (path_norm == base_norm or path_norm.startswith(base_norm + os.sep)):
-                return None, f"超出当前目录范围: {p}"
+                return None, tr("超出当前目录范围: {}").format(p)
         except Exception:
-            return None, f"路径非法: {p}"
+            return None, tr("路径非法: {}").format(p)
 
         return p, None
 
@@ -6899,17 +7488,17 @@ class ChatPanel(QWidget):
                                     == self.main_window._normalize_path_for_compare(path)
                                 )
                             if same_path:
-                                notes.append(f"ℹ 当前标签已在该目录: {path}")
+                                notes.append(tr("ℹ 当前标签已在该目录: {}").format(path))
                             else:
                                 current_tab.navigate_to(path, skip_async_check=True)
-                                notes.append(f"✅ 已在当前标签切换到目录: {path}")
+                                notes.append(tr("✅ 已在当前标签切换到目录: {}").format(path))
                         else:
                             self.main_window.add_new_tab(path)
-                            notes.append(f"✅ 已打开目录: {path}")
+                            notes.append(tr("✅ 已打开目录: {}").format(path))
                     except Exception as e:
-                        notes.append(f"❌ 打开目录失败: {path}（{e}）")
+                        notes.append(tr("❌ 打开目录失败: {}（{}）").format(path, e))
                 else:
-                    notes.append(f"⚠️ 目录不存在: {path}")
+                    notes.append(tr("⚠️ 目录不存在: {}").format(path))
 
             # ── RUN_SCRIPT ──────────────────────────────────────────────────
             elif atype == 'RUN_SCRIPT':
@@ -6918,41 +7507,41 @@ class ChatPanel(QWidget):
                 if os.path.isfile(script):
                     try:
                         if not self._confirm_danger_action(
-                            "确认运行脚本",
-                            f"AI 请求运行脚本：\n{script}\n\n是否继续？"
+                            tr("确认运行脚本"),
+                            tr("AI 请求运行脚本：\n{}\n\n是否继续？").format(script)
                         ):
-                            notes.append(f"⏸ 已取消运行脚本: {script}")
+                            notes.append(tr("⏸ 已取消运行脚本: {}").format(script))
                             continue
                         subprocess.Popen(script, shell=True, cwd=os.path.dirname(script))
-                        notes.append(f"✅ 已启动脚本: {script}")
+                        notes.append(tr("✅ 已启动脚本: {}").format(script))
                     except Exception as e:
-                        notes.append(f"❌ 运行脚本失败: {script}（{e}）")
+                        notes.append(tr("❌ 运行脚本失败: {}（{}）").format(script, e))
                 else:
-                    notes.append(f"⚠️ 脚本不存在: {script}")
+                    notes.append(tr("⚠️ 脚本不存在: {}").format(script))
 
             # ── LIST_DIR ────────────────────────────────────────────────────
             elif atype == 'LIST_DIR':
                 raw = m.group(1)
                 path, err = self._resolve_action_path(raw)
                 if err:
-                    _emsg = f"❌ 列目录失败: {err}"
+                    _emsg = tr("❌ 列目录失败: {}").format(err)
                     notes.append(_emsg); feedable.append(_emsg)
                     continue
                 if not os.path.isdir(path):
-                    _emsg = f"❌ 目录不存在: {path}"
+                    _emsg = tr("❌ 目录不存在: {}").format(path)
                     if os.path.isfile(path):
-                        _emsg += "（这是文件，请用 READ_FILE）"
+                        _emsg += tr("（这是文件，请用 READ_FILE）")
                     notes.append(_emsg); feedable.append(_emsg)
                     continue
                 try:
                     items = os.listdir(path)
-                    preview = "\n".join(items[:50]) if items else "(空目录)"
+                    preview = "\n".join(items[:50]) if items else tr("(空目录)")
                     if len(items) > 50:
                         preview += f"\n... 其余 {len(items) - 50} 项省略"
-                    notes.append(f"📁 目录列表: {path}\n{preview}")
-                    feedable.append(f"[LIST_DIR 结果] 目录 {path}:\n{preview}")
+                    notes.append(tr("📁 目录列表: {}\n{}").format(path, preview))
+                    feedable.append(tr("[LIST_DIR 结果] 目录 {}:\n{}").format(path, preview))
                 except Exception as e:
-                    notes.append(f"❌ 列目录失败: {path}（{e}）")
+                    notes.append(tr("❌ 列目录失败: {}（{}）").format(path, e))
 
             # ── READ_FILE ───────────────────────────────────────────────────
             elif atype == 'READ_FILE':
@@ -6967,13 +7556,13 @@ class ChatPanel(QWidget):
                         pass
                 path, err = self._resolve_action_path(raw_path)
                 if err:
-                    _emsg = f"❌ 读取失败: {err}"
+                    _emsg = tr("❌ 读取失败: {}").format(err)
                     notes.append(_emsg); feedable.append(_emsg)
                     continue
                 if not os.path.isfile(path):
-                    _emsg = f"❌ 文件不存在: {path}"
+                    _emsg = tr("❌ 文件不存在: {}").format(path)
                     if os.path.isdir(path):
-                        _emsg += "（这是目录，请用 LIST_DIR 列目录，或直接指定具体 .c/.h 文件路径）"
+                        _emsg += tr("（这是目录，请用 LIST_DIR 列目录，或直接指定具体 .c/.h 文件路径）")
                     notes.append(_emsg); feedable.append(_emsg)
                     continue
                 CHUNK = 5000
@@ -7000,41 +7589,41 @@ class ChatPanel(QWidget):
                     full_text = ''.join(all_text)
                     total_read = sum(len(t) for t in all_text)
                     truncated = (start_offset + total_read) < file_size
-                    info = f"📄 文件内容（{start_offset}-{start_offset+total_read}/{file_size}字节，{enc}）: {path}"
+                    info = tr("📄 文件内容（{}-{}/{}字节，{}）: {}").format(start_offset, start_offset+total_read, file_size, enc, path)
                     if truncated:
-                        info += f"\n⚠️ 文件过大，仅读取前 {MAX_TOTAL} 字符，剩余 {file_size - start_offset - total_read} 字节未读"
+                        info += tr("\n⚠️ 文件过大，仅读取前 {} 字符，剩余 {} 字节未读").format(MAX_TOTAL, file_size - start_offset - total_read)
                     notes.append(f"{info}\n{full_text}")
                     feedable.append(f"{info}\n{full_text}")
                 except Exception as e:
-                    notes.append(f"❌ 读取失败: {path}（{e}）")
+                    notes.append(tr("❌ 读取失败: {}（{}）").format(path, e))
 
             # ── MKDIR ───────────────────────────────────────────────────────
             elif atype == 'MKDIR':
                 raw = m.group(1)
                 path, err = self._resolve_action_path(raw)
                 if err:
-                    notes.append(f"❌ 创建目录失败: {err}")
+                    notes.append(tr("❌ 创建目录失败: {}").format(err))
                     continue
                 try:
                     os.makedirs(path, exist_ok=True)
-                    notes.append(f"✅ 已创建目录: {path}")
+                    notes.append(tr("✅ 已创建目录: {}").format(path))
                 except Exception as e:
-                    notes.append(f"❌ 创建目录失败: {path}（{e}）")
+                    notes.append(tr("❌ 创建目录失败: {}（{}）").format(path, e))
 
             # ── PATCH_FILE ──────────────────────────────────────────────────
             elif atype == 'PATCH_FILE':
                 raw = m.group(1)
                 parts = raw.split('|', 2)
                 if len(parts) < 3:
-                    notes.append("❌ PATCH_FILE 格式: [PATCH_FILE: 路径|旧文本|新文本]")
+                    notes.append(tr("❌ PATCH_FILE 格式: [PATCH_FILE: 路径|旧文本|新文本]"))
                     continue
                 raw_path, old_text, new_text = parts
                 path, err = self._resolve_action_path(raw_path.strip())
                 if err:
-                    notes.append(f"❌ 补丁失败: {err}")
+                    notes.append(tr("❌ 补丁失败: {}").format(err))
                     continue
                 if not os.path.isfile(path):
-                    notes.append(f"❌ 文件不存在: {path}")
+                    notes.append(tr("❌ 文件不存在: {}").format(path))
                     continue
                 try:
                     enc = 'utf-8'
@@ -7046,71 +7635,71 @@ class ChatPanel(QWidget):
                         file_src = _f.read()
                     count = file_src.count(old_text)
                     if count == 0:
-                        notes.append(f"❌ 补丁失败：在 {path} 中未找到目标文本")
+                        notes.append(tr("❌ 补丁失败：在 {} 中未找到目标文本").format(path))
                         continue
                     if count > 1:
                         notes.append(f"⚠️ 目标文本在 {os.path.basename(path)} 中出现 {count} 次，仅替换第一处")
                     patched = file_src.replace(old_text, new_text, 1)
                     with open(path, 'w', encoding=enc) as _f:
                         _f.write(patched)
-                    notes.append(f"✅ 补丁成功: {path}")
+                    notes.append(tr("✅ 补丁成功: {}").format(path))
                 except Exception as e:
-                    notes.append(f"❌ 补丁失败: {path}（{e}）")
+                    notes.append(tr("❌ 补丁失败: {}（{}）").format(path, e))
 
             # ── WRITE_FILE ──────────────────────────────────────────────────
             elif atype == 'WRITE_FILE':
                 raw = m.group(1)
                 if '|' not in raw:
-                    notes.append("❌ 写入失败: 格式应为 [WRITE_FILE: 路径|内容]")
+                    notes.append(tr("❌ 写入失败: 格式应为 [WRITE_FILE: 路径|内容]"))
                     continue
                 raw_path, file_content = raw.split('|', 1)
                 path, err = self._resolve_action_path(raw_path)
                 if err:
-                    notes.append(f"❌ 写入失败: {err}")
+                    notes.append(tr("❌ 写入失败: {}").format(err))
                     continue
                 try:
                     file_exists = os.path.exists(path)
                     # 已有文件且较大时，拒绝全量覆盖，引导用 PATCH_FILE
                     if file_exists and os.path.getsize(path) > 5000:
                         notes.append(
-                            f"❌ 已拒绝覆盖：{os.path.basename(path)} 已存在且大于 5KB，"
-                            "全量覆盖会丢失未读内容。"
-                            "请改用 [PATCH_FILE: 路径|旧文本|新文本] 进行局部修改。"
+                            f"❌ 已拒绝覆盖：{os.path.basename(path)} 已存在且大于 5KB，" +
+                            tr("全量覆盖会丢失未读内容。") +
+                            tr("请改用 [PATCH_FILE: 路径|旧文本|新文本] 进行局部修改。")
                         )
                         continue
                     if file_exists:
                         if not self._confirm_danger_action(
-                            "确认覆盖文件",
-                            f"AI 请求覆盖文件：\n{path}\n\n是否继续？"
+                            tr("确认覆盖文件"),
+                            tr("AI 请求覆盖文件：\n{}\n\n是否继续？").format(path)
                         ):
-                            notes.append(f"⏸ 已取消覆盖文件: {path}")
+                            notes.append(tr("⏸ 已取消覆盖文件: {}").format(path))
                             continue
                     parent = os.path.dirname(path)
                     if parent and not os.path.exists(parent):
                         os.makedirs(parent, exist_ok=True)
                     with open(path, 'w', encoding='utf-8') as f:
                         f.write(file_content)
-                    notes.append(f"✅ 已写入文件: {path}")
+                    notes.append(tr("✅ 已写入文件: {}").format(path))
                 except Exception as e:
-                    notes.append(f"❌ 写入失败: {path}（{e}）")
+                    notes.append(tr("❌ 写入失败: {}（{}）").format(path, e))
 
             # ── DELETE ──────────────────────────────────────────────────────
             elif atype == 'DELETE':
                 raw = m.group(1).strip()
                 path, err = self._resolve_action_path(raw)
                 if err:
-                    notes.append(f"❌ 删除失败: {err}")
+                    notes.append(tr("❌ 删除失败: {}").format(err))
                     continue
                 if not os.path.exists(path):
-                    notes.append(f"❌ 路径不存在: {path}")
+                    notes.append(tr("❌ 路径不存在: {}").format(path))
                     continue
                 is_dir = os.path.isdir(path)
-                type_label = "目录（及其所有内容）" if is_dir else "文件"
+                type_label = tr("目录（及其所有内容）") if is_dir else tr("文件")
                 if not self._confirm_danger_action(
-                    "确认删除",
-                    f"AI 请求删除{type_label}：\n{path}\n\n⚠️ 此操作不可撤销！是否继续？"
+                    tr("确认删除"),
+                    tr("AI 请求删除{}：\n{}\n\n⚠️ 此操作不可撤销！是否继续？").format(type_label, path)
                 ):
-                    notes.append(f"⏸ 已取消删除: {path}")
+                    notes.append(tr("⏸ 已取消删除: {}").format(path))
                     continue
                 try:
                     if is_dir:
@@ -7118,9 +7707,9 @@ class ChatPanel(QWidget):
                         shutil.rmtree(path)
                     else:
                         os.remove(path)
-                    notes.append(f"✅ 已删除{type_label}: {path}")
+                    notes.append(tr("✅ 已删除{}: {}").format(type_label, path))
                 except Exception as e:
-                    notes.append(f"❌ 删除失败: {path}（{e}）")
+                    notes.append(tr("❌ 删除失败: {}（{}）").format(path, e))
 
         if notes:
             content = content + "\n\n" + "\n".join(notes)
@@ -7148,7 +7737,7 @@ class TitleShortcutBar(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(8)
 
-        self._hint_label = QLabel("拖入应用或快捷方式")
+        self._hint_label = QLabel(tr("拖入应用或快捷方式"))
         self._hint_label.setStyleSheet("QLabel { color: #666; font-size: 9pt; padding: 0 4px; }")
         self._hint_label.setAcceptDrops(True)
         self._hint_label.installEventFilter(self)
@@ -7338,7 +7927,7 @@ class TitleShortcutBar(QWidget):
                 widget.deleteLater()
 
         # 提示文字固定在最左侧
-            self._hint_label = QLabel("+ 拖入应用或快捷方式")
+            self._hint_label = QLabel(tr("+ 拖入应用或快捷方式"))
         self._hint_label.setStyleSheet("QLabel { color: #888; font-size: 9pt; padding: 0 4px; }")
         self._hint_label.setAcceptDrops(True)
         self._hint_label.installEventFilter(self)
@@ -7379,7 +7968,7 @@ class TitleShortcutBar(QWidget):
         if not path:
             return
         menu = QMenu(self)
-        remove_action = menu.addAction("移除该快捷方式")
+        remove_action = menu.addAction(tr("移除该快捷方式"))
         action = menu.exec_(btn.mapToGlobal(pos))
         if action == remove_action:
             self._remove_shortcut(path)
@@ -7478,9 +8067,9 @@ class MainWindow(QMainWindow):
         if not downloads_path or not os.path.exists(downloads_path):
             downloads_path = os.path.join(os.path.expanduser('~'), 'Downloads')
         icon_map = [
-            ("🖥️", "此电脑", "shell:MyComputerFolder"),
+            ("🖥️", tr("此电脑"), "shell:MyComputerFolder"),
             ("🗔", "桌面", "shell:Desktop"),
-            ("🗑️", "回收站", "shell:RecycleBinFolder"),
+            ("🗑️", tr("回收站"), "shell:RecycleBinFolder"),
             ("⬇️", "下载", downloads_path),
         ]
         names_set = set([n for _, n, _ in icon_map])
@@ -7623,16 +8212,16 @@ class MainWindow(QMainWindow):
         current_path = getattr(current_tab, 'current_path', '') if current_tab else ''
 
         if not current_path:
-            show_toast(self, "提示", "当前没有可用的标签页路径", level="warning")
+            show_toast(self, tr("提示"), tr("当前没有可用的标签页路径"), level="warning")
             return None
         if isinstance(current_path, str) and current_path.startswith('shell:'):
-            show_toast(self, "提示", "当前为特殊路径，无法定位到 cmd 或 PowerShell", level="warning")
+            show_toast(self, tr("提示"), tr("当前为特殊路径，无法定位到 cmd 或 PowerShell"), level="warning")
             return None
         if os.path.isdir(current_path):
             return normalize_external_launch_dir(current_path)
         if os.path.exists(current_path):
             return normalize_external_launch_dir(os.path.dirname(current_path))
-        show_toast(self, "提示", "当前标签页路径无效", level="warning")
+        show_toast(self, tr("提示"), tr("当前标签页路径无效"), level="warning")
         return None
 
     def get_preferred_terminal_tool(self):
@@ -7645,9 +8234,9 @@ class MainWindow(QMainWindow):
         try:
             launch_shell_tool(self.get_preferred_terminal_tool(), current_dir)
         except FileNotFoundError as e:
-            show_toast(self, "提示", str(e), level="warning")
+            show_toast(self, tr("提示"), str(e), level="warning")
         except Exception as e:
-            show_toast(self, "错误", f"无法打开默认终端: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法打开默认终端: {}").format(e), level="error")
 
     def open_cmd_current_tab(self):
         """在当前标签页目录打开 cmd。"""
@@ -7657,7 +8246,7 @@ class MainWindow(QMainWindow):
         try:
             launch_shell_tool('cmd', current_dir)
         except Exception as e:
-            show_toast(self, "错误", f"无法打开 cmd: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法打开 cmd: {}").format(e), level="error")
 
     def open_powershell_current_tab(self):
         """在当前标签页目录打开 PowerShell。"""
@@ -7667,7 +8256,7 @@ class MainWindow(QMainWindow):
         try:
             launch_shell_tool('powershell', current_dir)
         except Exception as e:
-            show_toast(self, "错误", f"无法打开 PowerShell: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法打开 PowerShell: {}").format(e), level="error")
 
     def open_git_bash_current_tab(self):
         """在当前标签页目录打开 Git Bash。"""
@@ -7677,18 +8266,18 @@ class MainWindow(QMainWindow):
         try:
             launch_shell_tool('git-bash', current_dir)
         except FileNotFoundError as e:
-            show_toast(self, "提示", str(e), level="warning")
+            show_toast(self, tr("提示"), str(e), level="warning")
         except Exception as e:
-            show_toast(self, "错误", f"无法打开 Git Bash: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法打开 Git Bash: {}").format(e), level="error")
 
     def open_calculator(self):
         """打开系统计算器。"""
         try:
             launch_shell_tool('calculator')
         except OSError as e:
-            show_toast(self, "提示", str(e), level="warning")
+            show_toast(self, tr("提示"), str(e), level="warning")
         except Exception as e:
-            show_toast(self, "错误", f"无法打开计算器: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法打开计算器: {}").format(e), level="error")
     
     def apply_tortoisegit_buttons_config(self):
         """根据配置显示/隐藏 TortoiseGit 按钮"""
@@ -7749,7 +8338,7 @@ class MainWindow(QMainWindow):
     def open_title_shortcut(self, path):
         """点击标题栏快捷方式后启动对应程序。"""
         if not path or not os.path.exists(path):
-            show_toast(self, "提示", "快捷方式不存在，已从列表移除", level="warning")
+            show_toast(self, tr("提示"), tr("快捷方式不存在，已从列表移除"), level="warning")
             shortcuts = self.config.get("title_shortcuts", [])
             if path in shortcuts:
                 shortcuts = [p for p in shortcuts if p != path]
@@ -7774,9 +8363,9 @@ class MainWindow(QMainWindow):
                 os.startfile(path)
             else:
                 launch_detached([path])
-            show_toast(self, "已启动", f"运行: {display_name}", level="info")
+            show_toast(self, tr("已启动"), tr("运行: {}").format(display_name), level="info")
         except Exception as e:
-            show_toast(self, "错误", f"无法启动快捷方式: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法启动快捷方式: {}").format(e), level="error")
 
     def toggle_chat_panel(self):
         """切换 AI 聊天面板的显示/隐藏。"""
@@ -7825,7 +8414,7 @@ class MainWindow(QMainWindow):
         # 更新自定义标题栏文本
         if hasattr(self, 'title_label'):
             if self.is_restoring:
-                self.title_label.setText(f"{base_title} - 窗口恢复中")
+                self.title_label.setText(tr("{} - 窗口恢复中").format(base_title))
             else:
                 self.title_label.setText(base_title)
 
@@ -7835,7 +8424,7 @@ class MainWindow(QMainWindow):
         else:
             title = base_title
         if self.is_restoring:
-            title = f"{title} - 窗口恢复中"
+            title = tr("{} - 窗口恢复中").format(title)
         try:
             self.setWindowTitle(title)
         except Exception:
@@ -7867,7 +8456,7 @@ class MainWindow(QMainWindow):
                     subprocess.Popen(['explorer.exe', path])
             except Exception as open_error:
                 debug_print(f"[MainWindow] Fallback explorer launch failed for '{path}': {open_error}")
-            show_toast(self, "打开失败", f"无法嵌入该窗口，已尝试用系统资源管理器打开。\n{e}", level="error", duration=3500)
+            show_toast(self, tr("打开失败"), tr("无法嵌入该窗口，已尝试用系统资源管理器打开。\n{}").format(e), level="error", duration=3500)
             return -1
         tab.is_pinned = False
         short = path[-16:] if len(path) > 16 else path
@@ -8255,7 +8844,7 @@ class MainWindow(QMainWindow):
         
         # Git Log 按钮
         self.git_log_button = QPushButton("🐢")
-        self.git_log_button.setToolTip("打开 TortoiseGit 日志")
+        self.git_log_button.setToolTip(tr("打开 TortoiseGit 日志"))
         self.git_log_button.setFixedSize(btn_size, btn_size)
         self.git_log_button.setStyleSheet(git_btn_style)
         self.git_log_button.clicked.connect(self.open_tortoisegit_log_current_tab)
@@ -8263,7 +8852,7 @@ class MainWindow(QMainWindow):
         
         # Git Commit 按钮
         self.git_commit_button = QPushButton("📤")
-        self.git_commit_button.setToolTip("打开 TortoiseGit 提交窗口")
+        self.git_commit_button.setToolTip(tr("打开 TortoiseGit 提交窗口"))
         self.git_commit_button.setFixedSize(btn_size, btn_size)
         self.git_commit_button.setStyleSheet(git_btn_style)
         self.git_commit_button.clicked.connect(self.open_tortoisegit_commit_current_tab)
@@ -8292,7 +8881,7 @@ class MainWindow(QMainWindow):
 
         # Git Bash 按钮
         self.git_bash_button = QPushButton("GB")
-        self.git_bash_button.setToolTip("在当前标签页路径打开 Git Bash")
+        self.git_bash_button.setToolTip(tr("在当前标签页路径打开 Git Bash"))
         self.git_bash_button.setFixedSize(btn_size, btn_size)
         self.git_bash_button.setStyleSheet(_tool_btn_style("#e44d26"))
         self.git_bash_button.clicked.connect(self.open_git_bash_current_tab)
@@ -8308,21 +8897,21 @@ class MainWindow(QMainWindow):
 
         # 终端/工具按钮组（位于 Git 按钮右侧）
         self.cmd_button = QPushButton("CMD")
-        self.cmd_button.setToolTip("在当前标签页路径打开 cmd")
+        self.cmd_button.setToolTip(tr("在当前标签页路径打开 cmd"))
         self.cmd_button.setFixedSize(btn_size, btn_size)
         self.cmd_button.setStyleSheet(_tool_btn_style("#1a1a1a"))
         self.cmd_button.clicked.connect(self.open_cmd_current_tab)
         titlebar_layout.addWidget(self.cmd_button)
 
         self.powershell_button = QPushButton("PS")
-        self.powershell_button.setToolTip("在当前标签页路径打开 PowerShell")
+        self.powershell_button.setToolTip(tr("在当前标签页路径打开 PowerShell"))
         self.powershell_button.setFixedSize(btn_size, btn_size)
         self.powershell_button.setStyleSheet(_tool_btn_style("#2979ff"))
         self.powershell_button.clicked.connect(self.open_powershell_current_tab)
         titlebar_layout.addWidget(self.powershell_button)
 
         self.calculator_button = QPushButton("CAL")
-        self.calculator_button.setToolTip("打开计算器")
+        self.calculator_button.setToolTip(tr("打开计算器"))
         self.calculator_button.setFixedSize(btn_size, btn_size)
         self.calculator_button.setStyleSheet(_tool_btn_style("#c43e1c"))
         self.calculator_button.clicked.connect(self.open_calculator)
@@ -8339,7 +8928,7 @@ class MainWindow(QMainWindow):
         # 标签栏导航按钮（从标签栏移到这里）
         # 后退按钮
         self.back_button = QPushButton("◀")
-        self.back_button.setToolTip("后退 (Alt+←)")
+        self.back_button.setToolTip(tr("后退 (Alt+←)"))
         self.back_button.setFixedSize(btn_size, btn_size)
         self.back_button.setStyleSheet(f"""
             QPushButton {{
@@ -8368,7 +8957,7 @@ class MainWindow(QMainWindow):
         
         # 前进按钮
         self.forward_button = QPushButton("▶")
-        self.forward_button.setToolTip("前进 (Alt+→)")
+        self.forward_button.setToolTip(tr("前进 (Alt+→)"))
         self.forward_button.setFixedSize(btn_size, btn_size)
         self.forward_button.setStyleSheet(f"""
             QPushButton {{
@@ -8397,7 +8986,7 @@ class MainWindow(QMainWindow):
         
         # 新建标签页按钮
         self.add_tab_button = QPushButton("+")
-        self.add_tab_button.setToolTip("新建标签页 (Ctrl+T)")
+        self.add_tab_button.setToolTip(tr("新建标签页 (Ctrl+T)"))
         self.add_tab_button.setFixedSize(btn_size, btn_size)
         self.add_tab_button.setStyleSheet(f"""
             QPushButton {{
@@ -8422,7 +9011,7 @@ class MainWindow(QMainWindow):
         
         # 恢复标签页按钮
         self.reopen_tab_button = QPushButton("↺")
-        self.reopen_tab_button.setToolTip("恢复关闭的标签页 (Ctrl+Shift+T)")
+        self.reopen_tab_button.setToolTip(tr("恢复关闭的标签页 (Ctrl+Shift+T)"))
         self.reopen_tab_button.setFixedSize(btn_size, btn_size)
         self.reopen_tab_button.setStyleSheet(f"""
             QPushButton {{
@@ -8451,7 +9040,7 @@ class MainWindow(QMainWindow):
         
         # 搜索按钮
         self.search_button = QPushButton("⌕")
-        self.search_button.setToolTip("搜索当前文件夹 (Ctrl+F)")
+        self.search_button.setToolTip(tr("搜索当前文件夹 (Ctrl+F)"))
         self.search_button.setFixedSize(btn_size, btn_size)
         search_icon_size = int(13 * getattr(self, 'dpi_scale', 1.0))
         self.search_button.setStyleSheet(f"""
@@ -8487,7 +9076,7 @@ class MainWindow(QMainWindow):
         
         # 书签管理按钮
         bookmark_btn = QPushButton("★")
-        bookmark_btn.setToolTip("书签管理")
+        bookmark_btn.setToolTip(tr("书签管理"))
         bookmark_btn_width = int(40 * getattr(self, 'dpi_scale', 1.0))
         bookmark_btn.setFixedSize(bookmark_btn_width, titlebar_height)
         bookmark_btn.setStyleSheet(f"""
@@ -8512,7 +9101,7 @@ class MainWindow(QMainWindow):
         
         # 设置按钮
         settings_btn = QPushButton("⚙")
-        settings_btn.setToolTip("设置")
+        settings_btn.setToolTip(tr("设置"))
         settings_btn.setFixedSize(bookmark_btn_width, titlebar_height)
         settings_btn.setStyleSheet(f"""
             QPushButton {{
@@ -8536,7 +9125,7 @@ class MainWindow(QMainWindow):
 
         # AI 助手面板切换按钮
         self.ai_chat_btn = QPushButton("🤖")
-        self.ai_chat_btn.setToolTip("AI 助手面板 (Ctrl+Shift+A)")
+        self.ai_chat_btn.setToolTip(tr("AI 助手面板 (Ctrl+Shift+A)"))
         self.ai_chat_btn.setFixedSize(bookmark_btn_width, titlebar_height)
         self.ai_chat_btn.setCheckable(True)
         self.ai_chat_btn.setStyleSheet(f"""
@@ -9247,17 +9836,17 @@ class MainWindow(QMainWindow):
                 text = ", ".join(full_paths)
                 QApplication.clipboard().setText(text)
                 if len(full_paths) == 1:
-                    show_toast(self, "复制成功", f"路径: {full_paths[0]}", level="info")
+                    show_toast(self, tr("复制成功"), tr("路径: {}").format(full_paths[0]), level="info")
                 else:
-                    show_toast(self, "复制成功", f"已复制 {len(full_paths)} 个路径", level="info")
+                    show_toast(self, tr("复制成功"), f"已复制 {len(full_paths)} 个路径", level="info")
             else:
                 # 只拷贝文件名
                 filenames_text = ", ".join(names)
                 QApplication.clipboard().setText(filenames_text)
                 if len(names) == 1:
-                    show_toast(self, "复制成功", f"文件名: {names[0]}", level="info")
+                    show_toast(self, tr("复制成功"), tr("文件名: {}").format(names[0]), level="info")
                 else:
-                    show_toast(self, "复制成功", f"已复制 {len(names)} 个文件名", level="info")
+                    show_toast(self, tr("复制成功"), f"已复制 {len(names)} 个文件名", level="info")
         else:
             # 未选中文件时，复制路径栏地址，按设置分隔符
             separator = self.config.get("breadcrumb_copy_separator", "/")
@@ -9270,33 +9859,33 @@ class MainWindow(QMainWindow):
             if path_bar and hasattr(path_bar, 'get_path_for_copy'):
                 path_text = path_bar.get_path_for_copy(separator)
                 QApplication.clipboard().setText(path_text)
-                show_toast(self, "复制成功", f"路径: {path_text}", level="info")
+                show_toast(self, tr("复制成功"), tr("路径: {}").format(path_text), level="info")
             else:
-                show_toast(self, "提示", "未选中文件，也无法获取路径栏地址", level="warning")
+                show_toast(self, tr("提示"), tr("未选中文件，也无法获取路径栏地址"), level="warning")
 
     def quick_find_in_current_directory(self):
         """通过关键字快速检索当前目录下的文件或文件夹名，并在当前目录中选中目标。"""
         current_tab = self.get_current_tab_widget()
         if not current_tab or not hasattr(current_tab, 'current_path'):
-            show_toast(self, "提示", "当前没有可用的标签页路径", level="warning")
+            show_toast(self, tr("提示"), tr("当前没有可用的标签页路径"), level="warning")
             return
 
         search_root = current_tab.current_path
         if not isinstance(search_root, str) or not search_root or search_root.startswith('shell:') or '::' in search_root:
-            show_toast(self, "提示", "当前路径不支持快捷检索", level="warning")
+            show_toast(self, tr("提示"), tr("当前路径不支持快捷检索"), level="warning")
             return
         if not os.path.isdir(search_root):
-            show_toast(self, "提示", "当前目录无效", level="warning")
+            show_toast(self, tr("提示"), tr("当前目录无效"), level="warning")
             return
 
-        keyword, ok = QInputDialog.getText(self, "快捷定位", "请输入要检索的文件或文件夹关键字：")
+        keyword, ok = QInputDialog.getText(self, tr("快捷定位"), tr("请输入要检索的文件或文件夹关键字："))
         self._guard_shortcuts_after_modal()
         if not ok:
             return
 
         keyword = keyword.strip()
         if not keyword:
-            show_toast(self, "提示", "请输入搜索关键词", level="warning")
+            show_toast(self, tr("提示"), tr("请输入搜索关键词"), level="warning")
             return
 
         keyword_lower = keyword.lower()
@@ -9312,11 +9901,11 @@ class MainWindow(QMainWindow):
                         if len(matched_paths) >= max_matches:
                             break
         except Exception as e:
-            show_toast(self, "错误", f"快捷检索失败: {e}", level="error")
+            show_toast(self, tr("错误"), tr("快捷检索失败: {}").format(e), level="error")
             return
 
         if not matched_paths:
-            show_toast(self, "提示", f"当前目录下未找到包含“{keyword}”的文件或文件夹名", level="warning")
+            show_toast(self, tr("提示"), tr("当前目录下未找到包含“{}”的文件或文件夹名").format(keyword), level="warning")
             return
 
         matched_paths.sort(key=lambda item: os.path.basename(item).lower())
@@ -9332,8 +9921,8 @@ class MainWindow(QMainWindow):
 
         selected_name = os.path.basename(selected_path)
         current_tab.select_file_in_explorer(selected_name)
-        item_type = "文件夹" if os.path.isdir(selected_path) else "文件"
-        show_toast(self, "快捷定位", f"已在当前目录选中{item_type}: {selected_name}", level="info")
+        item_type = tr("文件夹") if os.path.isdir(selected_path) else tr("文件")
+        show_toast(self, tr("快捷定位"), tr("已在当前目录选中{}: {}").format(item_type, selected_name), level="info")
     
     def keyPressEvent(self, event):
         """处理快捷键（备用方案，主要使用QShortcut）"""
@@ -9704,15 +10293,15 @@ class MainWindow(QMainWindow):
         import webbrowser
         try:
             webbrowser.open("https://github.com/caojinyuan/TabEx/releases")
-            show_toast(self, "检查更新", "已在浏览器中打开更新页面", level="info")
+            show_toast(self, tr("检查更新"), tr("已在浏览器中打开更新页面"), level="info")
         except Exception as e:
-            show_toast(self, "错误", f"无法打开浏览器: {e}", level="error")
+            show_toast(self, tr("错误"), tr("无法打开浏览器: {}").format(e), level="error")
     
     def show_search_dialog(self):
         """显示搜索对话框（非模态）"""
         current_tab = self.get_current_tab_widget()
         if not current_tab or not hasattr(current_tab, 'current_path'):
-            show_toast(self, "提示", "请先打开一个文件夹", level="warning")
+            show_toast(self, tr("提示"), tr("请先打开一个文件夹"), level="warning")
             self.setFocus()
             return
         
@@ -9720,12 +10309,12 @@ class MainWindow(QMainWindow):
         
         # 不支持搜索特殊路径
         if search_path.startswith('shell:'):
-            show_toast(self, "提示", "不支持搜索特殊路径（shell:）", level="warning")
+            show_toast(self, tr("提示"), tr("不支持搜索特殊路径（shell:）"), level="warning")
             self.setFocus()
             return
         
         if not os.path.exists(search_path):
-            show_toast(self, "提示", f"路径不存在: {search_path}", level="warning")
+            show_toast(self, tr("提示"), tr("路径不存在: {}").format(search_path), level="warning")
             self.setFocus()
             return
         
@@ -9792,25 +10381,25 @@ class MainWindow(QMainWindow):
         menu = QMenu()
         # 图标可用emoji或标准QIcon
         if is_pinned:
-            pin_action = QAction("🔨 取消固定", self)
+            pin_action = QAction(tr("🔨 取消固定"), self)
             pin_action.triggered.connect(lambda: self.unpin_tab(tab_index))
             menu.addAction(pin_action)
         else:
-            pin_action = QAction("📌 固定", self)
+            pin_action = QAction(tr("📌 固定"), self)
             pin_action.triggered.connect(lambda: self.pin_tab(tab_index))
             menu.addAction(pin_action)
 
         # 添加“添加书签”菜单项，使用书签emoji
-        add_bm_action = QAction("📑 添加书签", self)
+        add_bm_action = QAction(tr("📑 添加书签"), self)
         add_bm_action.triggered.connect(lambda: self.add_tab_bookmark(tab))
         menu.addAction(add_bm_action)
 
         if hasattr(tab, 'set_auto_refresh_frozen'):
             if tab.is_auto_refresh_frozen():
-                refresh_action = QAction("▶ 恢复自动刷新", self)
+                refresh_action = QAction(tr("▶ 恢复自动刷新"), self)
                 refresh_action.triggered.connect(lambda: self.toggle_tab_auto_refresh(tab_index, False))
             else:
-                refresh_action = QAction("⏸ 冻结自动刷新", self)
+                refresh_action = QAction(tr("⏸ 冻结自动刷新"), self)
                 refresh_action.triggered.connect(lambda: self.toggle_tab_auto_refresh(tab_index, True))
             menu.addAction(refresh_action)
 
@@ -9823,8 +10412,8 @@ class MainWindow(QMainWindow):
         is_frozen = tab.set_auto_refresh_frozen(frozen)
         show_toast(
             self,
-            "自动刷新",
-            "当前标签自动刷新已冻结" if is_frozen else "当前标签自动刷新已恢复",
+            tr("自动刷新"),
+            tr("当前标签自动刷新已冻结") if is_frozen else tr("当前标签自动刷新已恢复"),
             level="info",
             duration=1800,
         )
@@ -9846,19 +10435,19 @@ class MainWindow(QMainWindow):
         for root in tree.values():
             collect_folders(root)
         if not folder_list:
-            show_toast(self, "无可用书签文件夹", "请先在 bookmarks.json 中添加至少一个文件夹。", level="warning")
+            show_toast(self, tr("无可用书签文件夹"), tr("请先在 bookmarks.json 中添加至少一个文件夹。"), level="warning")
             return
         # 选择父文件夹
         folder_names = [f"{name} (id:{fid})" for fid, name in folder_list]
         from PyQt5.QtWidgets import QInputDialog
-        idx, ok = QInputDialog.getItem(self, "选择书签文件夹", "请选择父文件夹：", folder_names, 0, False)
+        idx, ok = QInputDialog.getItem(self, tr("选择书签文件夹"), tr("请选择父文件夹："), folder_names, 0, False)
         # 对话框关闭后，强制将焦点设回主窗口，防止QAxWidget拦截快捷键
         self.setFocus()
         if not ok:
             return
         folder_id = folder_list[folder_names.index(idx)][0]
         # 输入书签名称
-        name, ok = QInputDialog.getText(self, "书签名称", "请输入书签名称：", text=os.path.basename(tab.current_path))
+        name, ok = QInputDialog.getText(self, tr("书签名称"), tr("请输入书签名称："), text=os.path.basename(tab.current_path))
         # 对话框关闭后，强制将焦点设回主窗口
         self.setFocus()
         if not ok or not name:
@@ -9868,7 +10457,7 @@ class MainWindow(QMainWindow):
         if bm.add_bookmark(folder_id, name, url):
             self.populate_bookmark_bar_menu()
         else:
-            show_toast(self, "添加失败", "未能添加书签，请检查父文件夹。", level="warning")
+            show_toast(self, tr("添加失败"), tr("未能添加书签，请检查父文件夹。"), level="warning")
 
     def pin_tab(self, tab_index):
         tab = self.get_tab_widget(tab_index)
@@ -10007,7 +10596,7 @@ class MainWindow(QMainWindow):
 
         # 窗口恢复状态标记（用于在标题上显示“窗口恢复中”）
         self.is_restoring = False
-        self._restore_title_suffix = " - 窗口恢复中"
+        self._restore_title_suffix = tr(" - 窗口恢复中")
         
         # 性能优化：延迟初始化UI（先显示基本界面）
         self.init_ui()
@@ -10121,7 +10710,8 @@ class MainWindow(QMainWindow):
                 "add_bookmark": True,      # Ctrl+D
                 "copy_filename": True,     # Alt+Z - 复制选中文件名
                 "copy_filepath": True      # Alt+X - 复制文件路径\文件名
-            }
+            },
+            "language": "zh",              # 界面语言：zh / en
         }
         default_config["ai_chat"] = {
             "enabled": False,
@@ -10179,6 +10769,7 @@ class MainWindow(QMainWindow):
                         config["performance"] = default_config["performance"]
 
                     apply_runtime_performance_config(config.get("performance"))
+                    _set_app_language(config.get("language", "zh"))
                     return config
             else:
                 print("No config file found, starting with default config")
@@ -10469,7 +11060,7 @@ class MainWindow(QMainWindow):
             tree['bookmark_bar'] = {
                 "date_added": bar_id,
                 "id": bar_id,
-                "name": "书签栏",
+                "name": tr("书签栏"),
                 "type": "folder",
                 "children": []
             }
@@ -10489,9 +11080,9 @@ class MainWindow(QMainWindow):
                     "url": url
                 }
             bar['children'] = [
-                make_bm("此电脑", "shell:MyComputerFolder", "🖥️"),
+                make_bm(tr("此电脑"), "shell:MyComputerFolder", "🖥️"),
                 make_bm("桌面", "shell:Desktop", "🗔"),
-                make_bm("回收站", "shell:RecycleBinFolder", "🗑️"),
+                make_bm(tr("回收站"), "shell:RecycleBinFolder", "🗑️"),
             ]
             bm.save_bookmarks()
 
@@ -11036,7 +11627,7 @@ class MainWindow(QMainWindow):
             has_pinned = self.load_pinned_tabs()
             debug_print(f"[App] 加载固定标签后标签页数: {self.tab_widget.count()}")
             if has_pinned:
-                debug_print("[App] 已加载固定标签页")
+                debug_print(tr("[App] 已加载固定标签页"))
         except Exception as e:
             debug_print(f"[Performance] Failed to load pinned tabs: {e}")
         
@@ -11056,17 +11647,17 @@ class MainWindow(QMainWindow):
                         if path:
                             norm = self._normalize_path_for_compare(path)
                             if norm in pinned_norm:
-                                debug_print(f"[App] 跳过缓存标签（已固定）: {path}")
+                                debug_print(tr("[App] 跳过缓存标签（已固定）: {}").format(path))
                                 continue
                             if self.is_path_open(path):
-                                debug_print(f"[App] 跳过缓存标签（已打开）: {path}")
+                                debug_print(tr("[App] 跳过缓存标签（已打开）: {}").format(path))
                                 continue
                             self.add_new_tab(path)
                     debug_print(f"[App] 恢复缓存标签后标签页数: {self.tab_widget.count()}")
                 else:
                     # 没有缓存标签且没有固定标签，现在添加默认标签
                     if self.tab_widget.count() == 0:
-                        debug_print("[App] 没有缓存和固定标签，添加默认主目录标签")
+                        debug_print(tr("[App] 没有缓存和固定标签，添加默认主目录标签"))
                         self.add_new_tab(QDir.homePath())
         except Exception as e:
             debug_print(f"[Performance] Failed to restore cached tabs: {e}")
@@ -11091,7 +11682,7 @@ class MainWindow(QMainWindow):
 
         restored_active = self._restore_last_active_tab()
         if restored_active:
-            debug_print("[App] 已恢复上次激活的标签页")
+            debug_print(tr("[App] 已恢复上次激活的标签页"))
         self.save_session_snapshot(immediate=True)
         
         # 恢复完成：取消恢复状态并更新标题
@@ -11268,10 +11859,10 @@ class MainWindow(QMainWindow):
                         debug_print(f"[Explorer Monitor] Checking window: {hwnd} - {title}")
                         
                         # 检查窗口标题是否为控制面板或其子项
-                        if (title in ['控制面板', 'Control Panel'] or 
-                            title.startswith('控制面板\\') or title.startswith('控制面板 - ') or 
+                        if (title in [tr('控制面板'), 'Control Panel'] or 
+                            title.startswith(tr('控制面板\\')) or title.startswith(tr('控制面板 - ')) or 
                             title.startswith('Control Panel\\') or title.startswith('Control Panel - ') or
-                            '\\控制面板\\' in title):
+                            tr('\\控制面板\\') in title):
                             debug_print(f"[Explorer Monitor] Control Panel detected by title, keeping original window")
                             continue
                         
@@ -11369,7 +11960,7 @@ class MainWindow(QMainWindow):
                                 debug_print(f"[Explorer Monitor] LocationURL: {location}")
                                 
                                 # 检查是否为控制面板
-                                if location_name and location_name in ['控制面板', 'Control Panel']:
+                                if location_name and location_name in [tr('控制面板'), 'Control Panel']:
                                     debug_print(f"[Explorer Monitor] Control Panel detected by LocationName")
                                     return 'shell:ControlPanelFolder'
                                 
@@ -11414,16 +12005,16 @@ class MainWindow(QMainWindow):
                                         debug_print(f"[Explorer Monitor] LocationName: {location_name}")
                                         
                                         # 根据位置名称推断路径
-                                        if location_name in ['此电脑', 'This PC', 'My Computer']:
+                                        if location_name in [tr('此电脑'), 'This PC', 'My Computer']:
                                             return 'shell:MyComputerFolder'
-                                        elif location_name in ['网络', 'Network']:
+                                        elif location_name in [tr('网络'), 'Network']:
                                             return 'shell:NetworkPlacesFolder'
-                                        elif location_name in ['回收站', 'Recycle Bin']:
+                                        elif location_name in [tr('回收站'), 'Recycle Bin']:
                                             return 'shell:RecycleBinFolder'
                                         # 检查是否为控制面板相关项
-                                        elif location_name in ['控制面板', 'Control Panel', '用户帐户', 'User Accounts', 
-                                                              '程序和功能', 'Programs and Features', '系统', 'System',
-                                                              '设备管理器', 'Device Manager', '网络和共享中心', 'Network and Sharing Center']:
+                                        elif location_name in [tr('控制面板'), 'Control Panel', tr('用户帐户'), 'User Accounts', 
+                                                              tr('程序和功能'), 'Programs and Features', tr('系统'), 'System',
+                                                              tr('设备管理器'), 'Device Manager', tr('网络和共享中心'), 'Network and Sharing Center']:
                                             debug_print(f"[Explorer Monitor] Control Panel item detected by LocationName")
                                             return 'shell:ControlPanelFolder'
                                     except:
@@ -11486,7 +12077,7 @@ class MainWindow(QMainWindow):
         try:
             global _search_cache
             _search_cache.clear()
-            debug_print("[App] 程序关闭，已清除搜索缓存")
+            debug_print(tr("[App] 程序关闭，已清除搜索缓存"))
         except Exception as e:
             print(f"Error clearing search cache: {e}")
         
@@ -11610,13 +12201,13 @@ class MainWindow(QMainWindow):
             elif os.path.exists(local_path):
                 self.add_new_tab(local_path)
             else:
-                show_toast(self, "路径错误", f"路径不存在: {local_path}", level="warning")
+                show_toast(self, tr("路径错误"), tr("路径不存在: {}").format(local_path), level="warning")
         elif url.startswith('shell:'):
             self.add_new_tab(url, is_shell=True)
         elif os.path.isabs(url) and os.path.exists(url):
             self.add_new_tab(url)
         else:
-            show_toast(self, "不支持的书签", f"暂不支持打开此类型书签: {url}", level="warning")
+            show_toast(self, tr("不支持的书签"), tr("暂不支持打开此类型书签: {}").format(url), level="warning")
 
     def delete_bookmark_by_id(self, bookmark_id):
         """根据ID删除书签"""
@@ -11648,7 +12239,7 @@ class MainWindow(QMainWindow):
         debug_print(f"[DEBUG] show_bookmark_context_menu called: pos={pos}, id={bookmark_id}, name={bookmark_name}")
         menu = QMenu(self)
         
-        delete_action = menu.addAction("🗑️ 删除书签")
+        delete_action = menu.addAction(tr("🗑️ 删除书签"))
         delete_action.triggered.connect(lambda: self.confirm_delete_bookmark(bookmark_id, bookmark_name))
         
         debug_print(f"[DEBUG] Showing menu...")
@@ -11658,7 +12249,7 @@ class MainWindow(QMainWindow):
     def confirm_delete_bookmark(self, bookmark_id, bookmark_name):
         """直接删除书签并给出轻量提示"""
         self.delete_bookmark_by_id(bookmark_id)
-        show_toast(self, "已删除", f"书签 '{bookmark_name}' 已删除", level="info")
+        show_toast(self, tr("已删除"), tr("书签 '{}' 已删除").format(bookmark_name), level="info")
 
     def populate_bookmark_bar_menu(self):
         self.ensure_default_icons_on_bookmark_bar()
@@ -11884,8 +12475,8 @@ class MainWindow(QMainWindow):
         
         show_toast(
             self,
-            "设置已更新",
-            f"Explorer窗口监听已{'启用' if checked else '禁用'}\n{'新打开的文件管理器窗口将自动嵌入到标签页中' if checked else '新打开的文件管理器窗口将独立显示'}",
+            tr("设置已更新"),
+            tr("Explorer窗口监听已{}\n{}").format('启用' if checked else '禁用', '新打开的文件管理器窗口将自动嵌入到标签页中' if checked else '新打开的文件管理器窗口将独立显示'),
             level="info",
         )
 
@@ -11899,7 +12490,7 @@ class SettingsDialog(QDialog):
     def __init__(self, config, parent=None):
         from PyQt5.QtWidgets import QDialogButtonBox, QLabel, QGroupBox, QComboBox, QHBoxLayout, QVBoxLayout, QCheckBox, QSpinBox
         super().__init__(parent)
-        self.setWindowTitle("设置")
+        self.setWindowTitle(tr("设置"))
         # 设置为不可调边框的对话框
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         # 宽度固定，高度按内容自动计算
@@ -11930,16 +12521,16 @@ class SettingsDialog(QDialog):
                 widget.setStyleSheet("font-size: 10.5pt; padding: 2px 4px;")
 
         # 路径栏分隔符设置组
-        pathbar_group = QGroupBox("路径栏分隔符设置")
+        pathbar_group = QGroupBox(tr("路径栏分隔符设置"))
         pathbar_layout = QHBoxLayout()
-        pathbar_layout.addWidget(QLabel("路径栏拷贝分隔符:"))
+        pathbar_layout.addWidget(QLabel(tr("路径栏拷贝分隔符:")))
         self.path_separator_combo = QComboBox(self)
         self.path_separator_combo.addItem("/", "/")
         self.path_separator_combo.addItem("\\", "\\")
         sep = config.get("breadcrumb_copy_separator", "/")
         idx = 0 if sep == "/" else 1
         self.path_separator_combo.setCurrentIndex(idx)
-        self.path_separator_combo.setToolTip("设置从路径栏拷贝时使用的分隔符")
+        self.path_separator_combo.setToolTip(tr("设置从路径栏拷贝时使用的分隔符"))
         pathbar_layout.addWidget(self.path_separator_combo)
         pathbar_layout.addStretch(1)
         pathbar_group.setLayout(pathbar_layout)
@@ -11950,23 +12541,23 @@ class SettingsDialog(QDialog):
         left_col.addWidget(pathbar_group)
 
         # Explorer监听设置组
-        monitor_group = QGroupBox("Explorer监听设置")
+        monitor_group = QGroupBox(tr("Explorer监听设置"))
         monitor_layout = QVBoxLayout()
-        self.monitor_cb = QCheckBox("监听新Explorer窗口", self)
+        self.monitor_cb = QCheckBox(tr("监听新Explorer窗口"), self)
         self.monitor_cb.setChecked(config.get("enable_explorer_monitor", True))
         self.monitor_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         monitor_layout.addWidget(self.monitor_cb)
         # 监听间隔设置
         interval_layout = QHBoxLayout()
-        interval_layout.addWidget(QLabel("监听间隔（秒）:"))
+        interval_layout.addWidget(QLabel(tr("监听间隔（秒）:")))
         from PyQt5.QtWidgets import QDoubleSpinBox
         self.interval_spinbox = QDoubleSpinBox()
         self.interval_spinbox.setRange(0.5, 10.0)
         self.interval_spinbox.setSingleStep(0.5)
         self.interval_spinbox.setValue(config.get("explorer_monitor_interval", 2.0))
-        self.interval_spinbox.setToolTip("检查新Explorer窗口的时间间隔，更长的间隔降低CPU占用")
+        self.interval_spinbox.setToolTip(tr("检查新Explorer窗口的时间间隔，更长的间隔降低CPU占用"))
         interval_layout.addWidget(self.interval_spinbox)
-        interval_layout.addWidget(QLabel("（推荐: 2.0秒）"))
+        interval_layout.addWidget(QLabel(tr("（推荐: 2.0秒）")))
         interval_layout.addStretch(1)
         monitor_layout.addLayout(interval_layout)
         monitor_group.setLayout(monitor_layout)
@@ -11982,42 +12573,42 @@ class SettingsDialog(QDialog):
         left_col.addWidget(monitor_group)
 
         # 调试设置组
-        debug_group = QGroupBox("调试设置")
+        debug_group = QGroupBox(tr("调试设置"))
         debug_layout = QVBoxLayout()
-        self.debug_mode_cb = QCheckBox("启用调试输出（输出到终端）", self)
+        self.debug_mode_cb = QCheckBox(tr("启用调试输出（输出到终端）"), self)
         self.debug_mode_cb.setChecked(config.get("debug_mode", False))
         self.debug_mode_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        self.debug_mode_cb.setToolTip("启用后将在终端输出调试信息，用于开发和问题排查")
+        self.debug_mode_cb.setToolTip(tr("启用后将在终端输出调试信息，用于开发和问题排查"))
         debug_layout.addWidget(self.debug_mode_cb)
-        self.explorer_monitor_debug_cb = QCheckBox("启用 Explorer Monitor 调试输出", self)
+        self.explorer_monitor_debug_cb = QCheckBox(tr("启用 Explorer Monitor 调试输出"), self)
         self.explorer_monitor_debug_cb.setChecked(config.get("explorer_monitor_debug", False))
         self.explorer_monitor_debug_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        self.explorer_monitor_debug_cb.setToolTip("单独控制 Explorer Monitor 的日志输出（需要先启用调试输出）")
+        self.explorer_monitor_debug_cb.setToolTip(tr("单独控制 Explorer Monitor 的日志输出（需要先启用调试输出）"))
         debug_layout.addWidget(self.explorer_monitor_debug_cb)
-        self.resource_snapshot_logging_cb = QCheckBox("启用资源快照日志", self)
+        self.resource_snapshot_logging_cb = QCheckBox(tr("启用资源快照日志"), self)
         self.resource_snapshot_logging_cb.setChecked(config.get("resource_snapshot_logging", False))
         self.resource_snapshot_logging_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        self.resource_snapshot_logging_cb.setToolTip("定时写入 runtime_health.log，用于观察长期运行时的内存和线程趋势")
+        self.resource_snapshot_logging_cb.setToolTip(tr("定时写入 runtime_health.log，用于观察长期运行时的内存和线程趋势"))
         debug_layout.addWidget(self.resource_snapshot_logging_cb)
 
         resource_interval_layout = QHBoxLayout()
-        resource_interval_layout.addWidget(QLabel("资源快照间隔（分钟）:"))
+        resource_interval_layout.addWidget(QLabel(tr("资源快照间隔（分钟）:")))
         self.resource_snapshot_interval_spin = QSpinBox(self)
         self.resource_snapshot_interval_spin.setRange(1, 60)
         self.resource_snapshot_interval_spin.setSingleStep(1)
         interval_minutes = max(1, int(config.get("resource_snapshot_interval_ms", HOUSEKEEPING_INTERVAL_MS) / 60000))
         self.resource_snapshot_interval_spin.setValue(interval_minutes)
-        self.resource_snapshot_interval_spin.setToolTip("资源快照日志写入周期，建议 5 分钟或更长")
+        self.resource_snapshot_interval_spin.setToolTip(tr("资源快照日志写入周期，建议 5 分钟或更长"))
         self.resource_snapshot_interval_spin.setEnabled(self.resource_snapshot_logging_cb.isChecked())
         self.resource_snapshot_logging_cb.toggled.connect(self.resource_snapshot_interval_spin.setEnabled)
         resource_interval_layout.addWidget(self.resource_snapshot_interval_spin)
-        resource_interval_layout.addWidget(QLabel("分钟"))
+        resource_interval_layout.addWidget(QLabel(tr("分钟")))
         resource_interval_layout.addStretch(1)
         debug_layout.addLayout(resource_interval_layout)
 
         resource_log_layout = QHBoxLayout()
-        self.open_resource_log_btn = QPushButton("打开资源日志", self)
-        self.open_resource_log_btn.setToolTip("打开 runtime_health.log；如果日志尚未生成，则打开所在目录")
+        self.open_resource_log_btn = QPushButton(tr("打开资源日志"), self)
+        self.open_resource_log_btn.setToolTip(tr("打开 runtime_health.log；如果日志尚未生成，则打开所在目录"))
         self.open_resource_log_btn.clicked.connect(self._open_resource_snapshot_log)
         resource_log_layout.addWidget(self.open_resource_log_btn)
         resource_log_layout.addStretch(1)
@@ -12035,12 +12626,12 @@ class SettingsDialog(QDialog):
         left_col.addWidget(debug_group)
 
         # 标签页设置组
-        tabs_group = QGroupBox("标签页设置")
+        tabs_group = QGroupBox(tr("标签页设置"))
         tabs_layout = QVBoxLayout()
-        self.cache_tabs_cb = QCheckBox("关闭时缓存当前标签页，下次启动时恢复", self)
+        self.cache_tabs_cb = QCheckBox(tr("关闭时缓存当前标签页，下次启动时恢复"), self)
         self.cache_tabs_cb.setChecked(config.get("enable_cache_tabs", True))
         self.cache_tabs_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        self.cache_tabs_cb.setToolTip("关闭软件时保存非固定标签，下次启动时自动恢复（不包括固定标签）")
+        self.cache_tabs_cb.setToolTip(tr("关闭软件时保存非固定标签，下次启动时自动恢复（不包括固定标签）"))
         tabs_layout.addWidget(self.cache_tabs_cb)
         tabs_group.setLayout(tabs_layout)
         compact_groupbox(tabs_group)
@@ -12050,12 +12641,12 @@ class SettingsDialog(QDialog):
         right_col.addWidget(tabs_group)
 
         # 开机启动设置组
-        startup_group = QGroupBox("开机启动设置")
+        startup_group = QGroupBox(tr("开机启动设置"))
         startup_layout = QVBoxLayout()
-        self.auto_startup_cb = QCheckBox("开机自动启动 TabExplorer", self)
+        self.auto_startup_cb = QCheckBox(tr("开机自动启动 TabExplorer"), self)
         self.auto_startup_cb.setChecked(self._is_auto_startup_enabled())
         self.auto_startup_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        self.auto_startup_cb.setToolTip("在 Windows 启动时自动运行 TabExplorer.exe")
+        self.auto_startup_cb.setToolTip(tr("在 Windows 启动时自动运行 TabExplorer.exe"))
         startup_layout.addWidget(self.auto_startup_cb)
         startup_group.setLayout(startup_layout)
         compact_groupbox(startup_group)
@@ -12065,16 +12656,16 @@ class SettingsDialog(QDialog):
         right_col.addWidget(startup_group)
 
         # Git 工具设置组
-        git_group = QGroupBox("Git 工具设置")
+        git_group = QGroupBox(tr("Git 工具设置"))
         git_layout = QVBoxLayout()
-        self.tortoisegit_buttons_cb = QCheckBox("显示 TortoiseGit 快捷按钮（标题栏）", self)
+        self.tortoisegit_buttons_cb = QCheckBox(tr("显示 TortoiseGit 快捷按钮（标题栏）"), self)
         self.tortoisegit_buttons_cb.setChecked(config.get("enable_tortoisegit_buttons", False))
         self.tortoisegit_buttons_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        self.tortoisegit_buttons_cb.setToolTip("在标题栏显示 Git Log 和 Git Commit 快捷按钮")
+        self.tortoisegit_buttons_cb.setToolTip(tr("在标题栏显示 Git Log 和 Git Commit 快捷按钮"))
         git_layout.addWidget(self.tortoisegit_buttons_cb)
 
         terminal_pref_layout = QHBoxLayout()
-        terminal_pref_layout.addWidget(QLabel("默认终端:"))
+        terminal_pref_layout.addWidget(QLabel(tr("默认终端:")))
         self.preferred_terminal_combo = QComboBox(self)
         self.preferred_terminal_combo.addItem("CMD", "cmd")
         self.preferred_terminal_combo.addItem("PowerShell", "powershell")
@@ -12082,7 +12673,7 @@ class SettingsDialog(QDialog):
         preferred_terminal = normalize_terminal_tool_name(config.get("preferred_terminal_tool", "cmd"))
         terminal_idx = max(0, self.preferred_terminal_combo.findData(preferred_terminal))
         self.preferred_terminal_combo.setCurrentIndex(terminal_idx)
-        self.preferred_terminal_combo.setToolTip("路径栏输入 terminal 或 term 时使用的默认终端")
+        self.preferred_terminal_combo.setToolTip(tr("路径栏输入 terminal 或 term 时使用的默认终端"))
         terminal_pref_layout.addWidget(self.preferred_terminal_combo)
         terminal_pref_layout.addStretch(1)
         git_layout.addLayout(terminal_pref_layout)
@@ -12099,12 +12690,12 @@ class SettingsDialog(QDialog):
         right_col.addWidget(git_group)
 
         # 快捷方式设置组（右侧独立分组）
-        shortcuts_group = QGroupBox("快捷方式设置")
+        shortcuts_group = QGroupBox(tr("快捷方式设置"))
         shortcuts_layout = QVBoxLayout()
-        self.title_shortcuts_cb = QCheckBox("启用标题栏启动区（可拖拽应用、快捷方式或脚本并点击启动）", self)
+        self.title_shortcuts_cb = QCheckBox(tr("启用标题栏启动区（可拖拽应用、快捷方式或脚本并点击启动）"), self)
         self.title_shortcuts_cb.setChecked(config.get("enable_title_shortcuts", True))
         self.title_shortcuts_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        self.title_shortcuts_cb.setToolTip("拖拽应用、快捷方式或脚本到标题栏 Git 左侧区域，后续可一键启动")
+        self.title_shortcuts_cb.setToolTip(tr("拖拽应用、快捷方式或脚本到标题栏 Git 左侧区域，后续可一键启动"))
         shortcuts_layout.addWidget(self.title_shortcuts_cb)
         shortcuts_group.setLayout(shortcuts_layout)
         compact_groupbox(shortcuts_group)
@@ -12114,47 +12705,47 @@ class SettingsDialog(QDialog):
         right_col.addWidget(shortcuts_group)
 
         # 快捷键设置组
-        hotkey_group = QGroupBox("快捷键设置")
+        hotkey_group = QGroupBox(tr("快捷键设置"))
         hotkey_layout = QVBoxLayout()
         hotkeys = config.get("hotkeys", {})
-        self.hotkey_new_tab = QCheckBox("Ctrl+T - 新建标签页")
+        self.hotkey_new_tab = QCheckBox(tr("Ctrl+T - 新建标签页"))
         self.hotkey_new_tab.setChecked(hotkeys.get("new_tab", True))
         hotkey_layout.addWidget(self.hotkey_new_tab)
-        self.hotkey_close_tab = QCheckBox("Ctrl+W - 关闭当前标签页")
+        self.hotkey_close_tab = QCheckBox(tr("Ctrl+W - 关闭当前标签页"))
         self.hotkey_close_tab.setChecked(hotkeys.get("close_tab", True))
         hotkey_layout.addWidget(self.hotkey_close_tab)
-        self.hotkey_reopen_tab = QCheckBox("Ctrl+Shift+T - 恢复关闭的标签页")
+        self.hotkey_reopen_tab = QCheckBox(tr("Ctrl+Shift+T - 恢复关闭的标签页"))
         self.hotkey_reopen_tab.setChecked(hotkeys.get("reopen_tab", True))
         hotkey_layout.addWidget(self.hotkey_reopen_tab)
-        self.hotkey_switch_tab = QCheckBox("Ctrl+Tab / Ctrl+Shift+Tab - 切换标签页")
+        self.hotkey_switch_tab = QCheckBox(tr("Ctrl+Tab / Ctrl+Shift+Tab - 切换标签页"))
         self.hotkey_switch_tab.setChecked(hotkeys.get("switch_tab", True))
         hotkey_layout.addWidget(self.hotkey_switch_tab)
-        self.hotkey_search = QCheckBox("Ctrl+F - 打开搜索对话框")
+        self.hotkey_search = QCheckBox(tr("Ctrl+F - 打开搜索对话框"))
         self.hotkey_search.setChecked(hotkeys.get("search", True))
         hotkey_layout.addWidget(self.hotkey_search)
-        self.hotkey_quick_find_current_dir = QCheckBox("Ctrl+G - 检索当前目录文件夹/文件名")
+        self.hotkey_quick_find_current_dir = QCheckBox(tr("Ctrl+G - 检索当前目录文件夹/文件名"))
         self.hotkey_quick_find_current_dir.setChecked(hotkeys.get("quick_find_current_dir", True))
         hotkey_layout.addWidget(self.hotkey_quick_find_current_dir)
-        self.hotkey_navigate = QCheckBox("Alt+Left/Right - 前进/后退")
+        self.hotkey_navigate = QCheckBox(tr("Alt+Left/Right - 前进/后退"))
         self.hotkey_navigate.setChecked(hotkeys.get("navigate", True))
         hotkey_layout.addWidget(self.hotkey_navigate)
-        self.hotkey_go_up = QCheckBox("Alt+Up - 返回上级目录")
+        self.hotkey_go_up = QCheckBox(tr("Alt+Up - 返回上级目录"))
         self.hotkey_go_up.setChecked(hotkeys.get("go_up", True))
         hotkey_layout.addWidget(self.hotkey_go_up)
-        self.hotkey_refresh = QCheckBox("F5 - 刷新当前路径")
+        self.hotkey_refresh = QCheckBox(tr("F5 - 刷新当前路径"))
         self.hotkey_refresh.setChecked(hotkeys.get("refresh", True))
         hotkey_layout.addWidget(self.hotkey_refresh)
-        self.hotkey_add_bookmark = QCheckBox("Ctrl+D - 添加当前路径到书签")
+        self.hotkey_add_bookmark = QCheckBox(tr("Ctrl+D - 添加当前路径到书签"))
         self.hotkey_add_bookmark.setChecked(hotkeys.get("add_bookmark", True))
         hotkey_layout.addWidget(self.hotkey_add_bookmark)
-        self.hotkey_copy_filename = QCheckBox("Alt+Z - 复制选中文件名（含后缀）")
+        self.hotkey_copy_filename = QCheckBox(tr("Alt+Z - 复制选中文件名（含后缀）"))
         self.hotkey_copy_filename.setChecked(hotkeys.get("copy_filename", True))
         hotkey_layout.addWidget(self.hotkey_copy_filename)
-        self.hotkey_copy_filepath = QCheckBox("Alt+X - 复制文件路径\\文件名")
+        self.hotkey_copy_filepath = QCheckBox(tr("Alt+X - 复制文件路径\\文件名"))
         self.hotkey_copy_filepath.setChecked(hotkeys.get("copy_filepath", True))
         hotkey_layout.addWidget(self.hotkey_copy_filepath)
         # 提示信息（放在快捷键设置框内）
-        tip_label = QLabel("💡 提示：取消勾选可禁用对应的快捷键")
+        tip_label = QLabel(tr("💡 提示：取消勾选可禁用对应的快捷键"))
         tip_label.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
         hotkey_layout.addWidget(tip_label)
         hotkey_group.setLayout(hotkey_layout)
@@ -12168,56 +12759,56 @@ class SettingsDialog(QDialog):
         right_col.addStretch(1)
 
             # AI 助手设置组
-        ai_group = QGroupBox("AI 助手设置")
+        ai_group = QGroupBox(tr("AI 助手设置"))
         ai_layout = QVBoxLayout()
         ai_layout.setSpacing(6)
         from PyQt5.QtWidgets import QLineEdit, QComboBox as _CB2
         # 启用 AI 助手开关
-        self.ai_enabled_cb = QCheckBox("启用 AI 助手（显示标题栏机器人按钮🤖）")
+        self.ai_enabled_cb = QCheckBox(tr("启用 AI 助手（显示标题栏机器人按钮🤖）"))
         self.ai_enabled_cb.setChecked(config.get("ai_chat", {}).get("enabled", True))
         ai_layout.addWidget(self.ai_enabled_cb)
 
         # ── 免费服务商预设 ──────────────────────────────────────────────────────
         # 格式: (显示名称, api_url, 默认model, 获取Key说明)
         _AI_PRESETS = [
-            ("── 请选择预设服务商 ──", "", "", ""),
-            ("Groq（免费·极速·推荐）",
+            (tr("── 请选择预设服务商 ──"), "", "", ""),
+            (tr("Groq（免费·极速·推荐）"),
              "https://api.groq.com/openai/v1",
              "llama-3.3-70b-versatile",
-             "免费注册获取Key: https://console.groq.com/keys"),
-            ("SiliconFlow 硅基流动（免费额度·国内快）",
+             tr("免费注册获取Key: https://console.groq.com/keys")),
+            (tr("SiliconFlow 硅基流动（免费额度·国内快）"),
              "https://api.siliconflow.cn/v1",
              "Qwen/Qwen2.5-7B-Instruct",
-             "免费注册获取Key: https://cloud.siliconflow.cn"),
-            ("DeepSeek（注册送额度·中文强）",
+             tr("免费注册获取Key: https://cloud.siliconflow.cn")),
+            (tr("DeepSeek（注册送额度·中文强）"),
              "https://api.deepseek.com/v1",
              "deepseek-chat",
-             "注册获取Key: https://platform.deepseek.com/api_keys"),
-            ("Google Gemini（免费版）",
+             tr("注册获取Key: https://platform.deepseek.com/api_keys")),
+            (tr("Google Gemini（免费版）"),
              "https://generativelanguage.googleapis.com/v1beta/openai",
              "gemini-2.0-flash",
-             "免费获取Key: https://aistudio.google.com/app/apikey"),
-            ("OpenRouter（含永久免费模型）",
+             tr("免费获取Key: https://aistudio.google.com/app/apikey")),
+            (tr("OpenRouter（含永久免费模型）"),
              "https://openrouter.ai/api/v1",
              "meta-llama/llama-3.3-70b-instruct:free",
-             "注册获取Key: https://openrouter.ai/keys"),
-            ("本地 LM Studio（无需Key）",
+             tr("注册获取Key: https://openrouter.ai/keys")),
+            (tr("本地 LM Studio（无需Key）"),
              "http://localhost:1234/v1",
              "local-model",
-             "启动 LM Studio → Local Server 后使用"),
-            ("本地 Ollama（无需Key）",
+             tr("启动 LM Studio → Local Server 后使用")),
+            (tr("本地 Ollama（无需Key）"),
              "http://localhost:11434/v1",
              "qwen2.5:7b",
-             "安装 Ollama 并运行模型后使用"),
-            ("── 自定义（手动填写下方） ──", "", "", ""),
+             tr("安装 Ollama 并运行模型后使用")),
+            (tr("── 自定义（手动填写下方） ──"), "", "", ""),
         ]
 
         preset_row = QHBoxLayout()
-        preset_row.addWidget(QLabel("快速选择:"))
+        preset_row.addWidget(QLabel(tr("快速选择:")))
         self.ai_preset_combo = _CB2()
         for name, url, model, tip in _AI_PRESETS:
             self.ai_preset_combo.addItem(name, (url, model, tip))
-        self.ai_preset_combo.setToolTip("选择预设后自动填充地址和模型名，然后只需粘贴对应的 API Key")
+        self.ai_preset_combo.setToolTip(tr("选择预设后自动填充地址和模型名，然后只需粘贴对应的 API Key"))
         preset_row.addWidget(self.ai_preset_combo, 1)
         ai_layout.addLayout(preset_row)
 
@@ -12246,18 +12837,18 @@ class SettingsDialog(QDialog):
 
         # API 地址
         api_url_row = QHBoxLayout()
-        api_url_row.addWidget(QLabel("API 地址:"))
+        api_url_row.addWidget(QLabel(tr("API 地址:")))
         self.ai_api_url_edit = QLineEdit()
-        self.ai_api_url_edit.setPlaceholderText("例: https://api.groq.com/openai/v1")
+        self.ai_api_url_edit.setPlaceholderText(tr("例: https://api.groq.com/openai/v1"))
         self.ai_api_url_edit.setText(config.get("ai_chat", {}).get("api_url", ""))
-        self.ai_api_url_edit.setToolTip("填写 OpenAI 兼容 API 的基础地址（不含 /chat/completions）")
+        self.ai_api_url_edit.setToolTip(tr("填写 OpenAI 兼容 API 的基础地址（不含 /chat/completions）"))
         api_url_row.addWidget(self.ai_api_url_edit, 1)
         ai_layout.addLayout(api_url_row)
         # API 密钥
         api_key_row = QHBoxLayout()
-        api_key_row.addWidget(QLabel("API 密钥:"))
+        api_key_row.addWidget(QLabel(tr("API 密钥:")))
         self.ai_api_key_edit = QLineEdit()
-        self.ai_api_key_edit.setPlaceholderText("粘贴从服务商网站获取的 Key（本地模型可留空）")
+        self.ai_api_key_edit.setPlaceholderText(tr("粘贴从服务商网站获取的 Key（本地模型可留空）"))
         self.ai_api_key_edit.setEchoMode(QLineEdit.Password)
         self.ai_api_key_edit.setText(config.get("ai_chat", {}).get("api_key", ""))
         # 显示/隐藏密钥按钮
@@ -12278,24 +12869,24 @@ class SettingsDialog(QDialog):
         ai_layout.addLayout(api_key_row)
         # 模型名称
         model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("模型名称:"))
+        model_row.addWidget(QLabel(tr("模型名称:")))
         self.ai_model_edit = QLineEdit()
-        self.ai_model_edit.setPlaceholderText("例: llama-3.3-70b-versatile")
+        self.ai_model_edit.setPlaceholderText(tr("例: llama-3.3-70b-versatile"))
         self.ai_model_edit.setText(config.get("ai_chat", {}).get("model", ""))
         model_row.addWidget(self.ai_model_edit, 1)
         ai_layout.addLayout(model_row)
         # 系统提示词
         from PyQt5.QtWidgets import QPlainTextEdit as _PE
-        sp_label = QLabel("系统提示词（留空使用默认）:")
+        sp_label = QLabel(tr("系统提示词（留空使用默认）:"))
         ai_layout.addWidget(sp_label)
         self.ai_system_prompt_edit = _PE()
         self.ai_system_prompt_edit.setFixedHeight(56)
-        self.ai_system_prompt_edit.setPlaceholderText("留空则使用内置提示词（支持 [OPEN_DIR:] 和 [RUN_SCRIPT:] 指令）")
+        self.ai_system_prompt_edit.setPlaceholderText(tr("留空则使用内置提示词（支持 [OPEN_DIR:] 和 [RUN_SCRIPT:] 指令）"))
         self.ai_system_prompt_edit.setPlainText(config.get("ai_chat", {}).get("system_prompt", ""))
         ai_layout.addWidget(self.ai_system_prompt_edit)
         # 面板宽度
         panel_w_row = QHBoxLayout()
-        panel_w_row.addWidget(QLabel("面板宽度 (px):"))
+        panel_w_row.addWidget(QLabel(tr("面板宽度 (px):")))
         from PyQt5.QtWidgets import QSpinBox as _SB
         self.ai_panel_width_spin = _SB()
         self.ai_panel_width_spin.setRange(200, 800)
@@ -12318,14 +12909,26 @@ class SettingsDialog(QDialog):
         # 底部区域（横跨整个宽度）
         bottom_layout = QVBoxLayout()
         bottom_layout.setSpacing(8)
+
+        # 语言 / Language 设置行
+        lang_row = QHBoxLayout()
+        lang_row.addWidget(QLabel(tr("语言 / Language:")))
+        self.lang_combo = QComboBox(self)
+        self.lang_combo.addItem("中文", "zh")
+        self.lang_combo.addItem("English", "en")
+        current_lang = config.get("language", "zh")
+        self.lang_combo.setCurrentIndex(0 if current_lang == "zh" else 1)
+        lang_row.addWidget(self.lang_combo)
+        lang_row.addStretch(1)
+        bottom_layout.addLayout(lang_row)
         
         # 检查更新链接
         update_link = QLabel()
-        update_link.setText('检查更新: <a href="https://github.com/caojinyuan/TabEx/releases">https://github.com/caojinyuan/TabEx/releases</a>')
+        update_link.setText(tr('检查更新: <a href="https://github.com/caojinyuan/TabEx/releases">https://github.com/caojinyuan/TabEx/releases</a>'))
         update_link.setOpenExternalLinks(True)
         update_link.setStyleSheet("QLabel { padding: 10px; font-size: 10pt; }")
         update_link.setTextFormat(Qt.RichText)
-        update_link.setToolTip("点击链接在浏览器中打开 GitHub Releases 页面")
+        update_link.setToolTip(tr("点击链接在浏览器中打开 GitHub Releases 页面"))
         update_link.setWordWrap(True)
         bottom_layout.addWidget(update_link)
         
@@ -12384,7 +12987,7 @@ class SettingsDialog(QDialog):
                 # 获取 TabExplorer.exe 路径
                 exe_path = self._get_exe_path()
                 if not exe_path or not os.path.exists(exe_path):
-                    show_toast(self.parent(), "错误", "未找到 TabExplorer.exe，请确保程序已正确安装", level="error")
+                    show_toast(self.parent(), tr("错误"), tr("未找到 TabExplorer.exe，请确保程序已正确安装"), level="error")
                     return False
                 
                 # 创建快捷方式（使用 win32com）
@@ -12397,16 +13000,16 @@ class SettingsDialog(QDialog):
                 shortcut.IconLocation = exe_path
                 shortcut.save()
                 
-                show_toast(self.parent(), "成功", "已启用开机自动启动", level="success")
+                show_toast(self.parent(), tr("成功"), tr("已启用开机自动启动"), level="success")
                 return True
             else:
                 # 删除快捷方式
                 if os.path.exists(shortcut_path):
                     os.remove(shortcut_path)
-                    show_toast(self.parent(), "成功", "已禁用开机自动启动", level="success")
+                    show_toast(self.parent(), tr("成功"), tr("已禁用开机自动启动"), level="success")
                 return True
         except Exception as e:
-            show_toast(self.parent(), "错误", f"设置开机启动失败: {e}", level="error")
+            show_toast(self.parent(), tr("错误"), tr("设置开机启动失败: {}").format(e), level="error")
             return False
     
     def _get_exe_path(self):
@@ -12439,13 +13042,13 @@ class SettingsDialog(QDialog):
             elif os.path.isdir(log_dir):
                 os.startfile(log_dir)
                 if self.parent():
-                    show_toast(self.parent(), "资源日志", "日志尚未生成，已打开日志目录", level="info")
+                    show_toast(self.parent(), tr("资源日志"), tr("日志尚未生成，已打开日志目录"), level="info")
             else:
                 if self.parent():
-                    show_toast(self.parent(), "资源日志", "日志目录不存在", level="warning")
+                    show_toast(self.parent(), tr("资源日志"), tr("日志目录不存在"), level="warning")
         except Exception as e:
             if self.parent():
-                show_toast(self.parent(), "资源日志", f"无法打开资源日志: {e}", level="error")
+                show_toast(self.parent(), tr("资源日志"), tr("无法打开资源日志: {}").format(e), level="error")
     
     def accept(self):
         """保存设置"""
@@ -12513,12 +13116,29 @@ class SettingsDialog(QDialog):
                 "system_prompt": self.ai_system_prompt_edit.toPlainText().strip(),
                 "panel_width": self.ai_panel_width_spin.value(),
             }
+
+            # 保存语言设置并应用
+            new_lang = self.lang_combo.currentData()
+            old_lang = self.parent().config.get("language", "zh")
+            self.parent().config["language"] = new_lang
+            _set_app_language(new_lang)
+
             self.parent().save_config()
             # 立即更新标题栏 AI 按钮显隐
             if hasattr(self.parent(), 'ai_chat_btn'):
                 self.parent().ai_chat_btn.setVisible(ai_enabled)
                 if not ai_enabled and hasattr(self.parent(), 'chat_panel'):
                     self.parent().chat_panel.setVisible(False)
+
+            # 语言切换提示（部分静态 UI 需重启生效）
+            if new_lang != old_lang:
+                from PyQt5.QtWidgets import QMessageBox
+                if new_lang == "en":
+                    QMessageBox.information(self, "Language Changed",
+                        "Language set to English.\nSome UI elements will update after restart.")
+                else:
+                    QMessageBox.information(self, "语言已切换",
+                        "界面语言已切换为中文。\n部分界面元素重启后生效。")
         
         super().accept()
 
@@ -12527,14 +13147,14 @@ from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, 
 class BookmarkManagerDialog(QDialog):
     def __init__(self, bookmark_manager, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("书签管理器")
+        self.setWindowTitle(tr("书签管理器"))
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         self.setFixedSize(600, 500)
 
     def move_item_up(self):
         item = self.tree.currentItem()
         if not item:
-            show_toast(self, "未选择", "请先选择要上移的书签或文件夹。", level="warning")
+            show_toast(self, tr("未选择"), tr("请先选择要上移的书签或文件夹。"), level="warning")
             return
         parent = item.parent()
         if parent:
@@ -12561,7 +13181,7 @@ class BookmarkManagerDialog(QDialog):
     def move_item_down(self):
         item = self.tree.currentItem()
         if not item:
-            show_toast(self, "未选择", "请先选择要下移的书签或文件夹。", level="warning")
+            show_toast(self, tr("未选择"), tr("请先选择要下移的书签或文件夹。"), level="warning")
             return
         parent = item.parent()
         if parent:
@@ -12661,12 +13281,12 @@ class BookmarkManagerDialog(QDialog):
                 self.refresh_main_window_bookmark_bar()
                 
                 debug_print("[BookmarkDrag] Bookmark structure updated and saved")
-                show_toast(self, "已保存", "书签已保存", level="success")
+                show_toast(self, tr("已保存"), tr("书签已保存"), level="success")
         except Exception as e:
             debug_print(f"[BookmarkDrag] Error updating structure: {e}")
             import traceback
             traceback.print_exc()
-            show_toast(self, "保存失败", f"拖拽保存失败: {e}", level="error")
+            show_toast(self, tr("保存失败"), tr("拖拽保存失败: {}").format(e), level="error")
     
     def _rebuild_bookmark_structure(self):
         """从树形控件重建书签数据结构"""
@@ -12694,7 +13314,7 @@ class BookmarkManagerDialog(QDialog):
             # 尝试从原始数据中获取节点
             original = original_nodes.get(node_id, {})
             
-            if node_type == '文件夹':
+            if node_type == tr('文件夹'):
                 node = {
                     'id': node_id,
                     'name': name,
@@ -12709,7 +13329,7 @@ class BookmarkManagerDialog(QDialog):
                     if child_node:
                         node['children'].append(child_node)
                 return node
-            elif node_type == '书签':
+            elif node_type == tr('书签'):
                 url = item.text(2)
                 return {
                     'id': node_id,
@@ -12732,7 +13352,7 @@ class BookmarkManagerDialog(QDialog):
     
     def __init__(self, bookmark_manager, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("书签管理")
+        self.setWindowTitle(tr("书签管理"))
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.resize(600, 500)
         self.bookmark_manager = bookmark_manager
@@ -12740,7 +13360,7 @@ class BookmarkManagerDialog(QDialog):
         
         # 使用标准树形控件（拖拽不自动保存）
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["名称", "类型", "路径"])
+        self.tree.setHeaderLabels([tr("名称"), tr("类型"), tr("路径")])
         self.tree.setColumnWidth(0, 250)  # 第一列宽一些
         
         # 启用拖拽
@@ -12753,7 +13373,7 @@ class BookmarkManagerDialog(QDialog):
         layout.addWidget(self.tree)
         
         # 添加拖拽提示
-        drag_hint = QLabel("💡 提示：可以拖动书签和文件夹调整顺序和层级，调整后点击【保存】按钮保存更改")
+        drag_hint = QLabel(tr("💡 提示：可以拖动书签和文件夹调整顺序和层级，调整后点击【保存】按钮保存更改"))
         drag_hint.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
         layout.addWidget(drag_hint)
         
@@ -12763,40 +13383,40 @@ class BookmarkManagerDialog(QDialog):
         # self.rename_btn = QPushButton("重命名")  # 已移除重命名按钮
         # self.rename_btn.clicked.connect(self.rename_item)
         # btn_layout.addWidget(self.rename_btn)
-        self.edit_btn = QPushButton("编辑")
+        self.edit_btn = QPushButton(tr("编辑"))
         self.edit_btn.clicked.connect(self.edit_item)
         btn_layout.addWidget(self.edit_btn)
-        self.delete_btn = QPushButton("删除")
+        self.delete_btn = QPushButton(tr("删除"))
         self.delete_btn.clicked.connect(self.delete_item)
         btn_layout.addWidget(self.delete_btn)
-        self.new_folder_btn = QPushButton("新建文件夹")
+        self.new_folder_btn = QPushButton(tr("新建文件夹"))
         self.new_folder_btn.clicked.connect(self.create_folder)
         btn_layout.addWidget(self.new_folder_btn)
-        self.up_btn = QPushButton("上移")
+        self.up_btn = QPushButton(tr("上移"))
         self.up_btn.clicked.connect(self.move_item_up)
         btn_layout.addWidget(self.up_btn)
-        self.down_btn = QPushButton("下移")
+        self.down_btn = QPushButton(tr("下移"))
         self.down_btn.clicked.connect(self.move_item_down)
         btn_layout.addWidget(self.down_btn)
         
         # 添加导入/导出按钮
-        self.export_btn = QPushButton("📤 导出")
-        self.export_btn.setToolTip("导出书签到JSON文件")
+        self.export_btn = QPushButton(tr("📤 导出"))
+        self.export_btn.setToolTip(tr("导出书签到JSON文件"))
         self.export_btn.clicked.connect(self.export_bookmarks)
         btn_layout.addWidget(self.export_btn)
         
-        self.import_btn = QPushButton("📥 导入")
-        self.import_btn.setToolTip("从JSON文件导入书签")
+        self.import_btn = QPushButton(tr("📥 导入"))
+        self.import_btn.setToolTip(tr("从JSON文件导入书签"))
         self.import_btn.clicked.connect(self.import_bookmarks)
         btn_layout.addWidget(self.import_btn)
         
         # 添加手动保存按钮
-        self.save_btn = QPushButton("💾 保存")
-        self.save_btn.setToolTip("保存当前书签顺序和层级")
+        self.save_btn = QPushButton(tr("💾 保存"))
+        self.save_btn.setToolTip(tr("保存当前书签顺序和层级"))
         self.save_btn.clicked.connect(self.manual_save)
         btn_layout.addWidget(self.save_btn)
         
-        close_btn = QPushButton("关闭")
+        close_btn = QPushButton(tr("关闭"))
         close_btn.clicked.connect(self.accept)
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
@@ -12806,18 +13426,18 @@ class BookmarkManagerDialog(QDialog):
         try:
             self.on_items_moved()
         except Exception as e:
-            show_toast(self, "保存失败", f"保存失败: {e}", level="error")
+            show_toast(self, tr("保存失败"), tr("保存失败: {}").format(e), level="error")
     
     def edit_item(self):
         item = self.tree.currentItem()
         if not item:
-            show_toast(self, "未选择", "请先选择要编辑的书签或文件夹。", level="warning")
+            show_toast(self, tr("未选择"), tr("请先选择要编辑的书签或文件夹。"), level="warning")
             return
         node_type = item.text(1)
         old_name = item.text(0).lstrip("📁 ").lstrip("📑 ")
         main_window = self.parent() if self.parent() and hasattr(self.parent(), 'populate_bookmark_bar_menu') else None
-        if node_type == '文件夹':
-            new_name, ok = QInputDialog.getText(self, "编辑文件夹", "请输入新名称：", text=old_name)
+        if node_type == tr('文件夹'):
+            new_name, ok = QInputDialog.getText(self, tr("编辑文件夹"), tr("请输入新名称："), text=old_name)
             if ok and new_name and new_name != old_name:
                 item.setText(0, f"📁 {new_name}")
                 self.update_name_in_bookmark_manager(item, new_name)
@@ -12825,10 +13445,10 @@ class BookmarkManagerDialog(QDialog):
                 self.populate_tree()
                 if main_window:
                     main_window.populate_bookmark_bar_menu()
-        elif node_type == '书签':
-            new_name, ok1 = QInputDialog.getText(self, "编辑书签", "请输入新名称：", text=old_name)
+        elif node_type == tr('书签'):
+            new_name, ok1 = QInputDialog.getText(self, tr("编辑书签"), tr("请输入新名称："), text=old_name)
             old_url = item.text(2)
-            new_url, ok2 = QInputDialog.getText(self, "编辑书签", "请输入新路径：", text=old_url)
+            new_url, ok2 = QInputDialog.getText(self, tr("编辑书签"), tr("请输入新路径："), text=old_url)
             if ok1 and new_name and (new_name != old_name or new_url != old_url) and ok2 and new_url:
                 item.setText(0, f"📑 {new_name}")
                 item.setText(2, new_url)
@@ -12861,11 +13481,11 @@ class BookmarkManagerDialog(QDialog):
     def delete_item(self):
         item = self.tree.currentItem()
         if not item:
-            show_toast(self, "未选择", "请先选择要删除的书签或文件夹。", level="warning")
+            show_toast(self, tr("未选择"), tr("请先选择要删除的书签或文件夹。"), level="warning")
             return
         node_id = item.data(0, 1)
         # 直接执行删除并给出提示，避免阻塞
-        show_toast(self, "已删除", "选中的书签/文件夹已删除", level="info")
+        show_toast(self, tr("已删除"), tr("选中的书签/文件夹已删除"), level="info")
         def delete_node(parent, node_list):
             for i, node in enumerate(node_list):
                 if isinstance(node, dict) and node.get('id') == node_id:
@@ -12893,7 +13513,7 @@ class BookmarkManagerDialog(QDialog):
             return
         def add_node(parent_item, node):
             if node.get('type') == 'folder':
-                item = QTreeWidgetItem([f"📁 {node.get('name', '')}", '文件夹', ''])
+                item = QTreeWidgetItem([f"📁 {node.get('name', '')}", tr('文件夹'), ''])
                 item.setData(0, 1, node.get('id'))
                 if parent_item:
                     parent_item.addChild(item)
@@ -12902,7 +13522,7 @@ class BookmarkManagerDialog(QDialog):
                 for child in node.get('children', []):
                     add_node(item, child)
             elif node.get('type') == 'url':
-                item = QTreeWidgetItem([f"📑 {node.get('name', '')}", '书签', node.get('url', '')])
+                item = QTreeWidgetItem([f"📑 {node.get('name', '')}", tr('书签'), node.get('url', '')])
                 item.setData(0, 1, node.get('id'))
                 if parent_item:
                     parent_item.addChild(item)
@@ -12915,10 +13535,10 @@ class BookmarkManagerDialog(QDialog):
     def rename_item(self):
         item = self.tree.currentItem()
         if not item:
-            show_toast(self, "未选择", "请先选择要重命名的书签或文件夹。", level="warning")
+            show_toast(self, tr("未选择"), tr("请先选择要重命名的书签或文件夹。"), level="warning")
             return
         old_name = item.text(0)
-        new_name, ok = QInputDialog.getText(self, "重命名", "请输入新名称：", text=old_name)
+        new_name, ok = QInputDialog.getText(self, tr("重命名"), tr("请输入新名称："), text=old_name)
         if ok and new_name and new_name != old_name:
             item.setText(0, new_name)
             # 实际数据同步
@@ -12948,12 +13568,12 @@ class BookmarkManagerDialog(QDialog):
     def create_folder(self):
         item = self.tree.currentItem()
         parent_id = None
-        if item and item.text(1) == '文件夹':
+        if item and item.text(1) == tr('文件夹'):
             parent_id = item.data(0, 1)
         else:
             # 默认加到bookmark_bar根
             parent_id = self.bookmark_manager.get_tree().get('bookmark_bar', {}).get('id')
-        folder_name, ok = QInputDialog.getText(self, "新建文件夹", "请输入文件夹名称：")
+        folder_name, ok = QInputDialog.getText(self, tr("新建文件夹"), tr("请输入文件夹名称："))
         if ok and folder_name:
             import time
             new_id = str(int(time.time() * 1000000))
@@ -12998,7 +13618,7 @@ class BookmarkManagerDialog(QDialog):
         # 打开保存文件对话框
         file_path, _ = QFileDialog.getSaveFileName(
             self,
-            "导出书签",
+            tr("导出书签"),
             default_name,
             "JSON Files (*.json);;All Files (*)"
         )
@@ -13008,10 +13628,10 @@ class BookmarkManagerDialog(QDialog):
                 # 复制当前的bookmarks.json到目标位置
                 bookmarks_path = get_app_data_path("bookmarks.json")
                 shutil.copy2(bookmarks_path, file_path)
-                show_toast(self, "导出成功", f"书签已成功导出到:\n{file_path}", level="success")
+                show_toast(self, tr("导出成功"), tr("书签已成功导出到:\n{}").format(file_path), level="success")
                 print(f"[Bookmark Export] Successfully exported to: {file_path}")
             except Exception as e:
-                show_toast(self, "导出失败", f"导出书签时出错:\n{str(e)}", level="error")
+                show_toast(self, tr("导出失败"), f"导出书签时出错:\n{str(e)}", level="error")
                 print(f"[Bookmark Export] Error: {e}")
     
     def import_bookmarks(self):
@@ -13022,7 +13642,7 @@ class BookmarkManagerDialog(QDialog):
         # 打开文件选择对话框
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "导入书签",
+            tr("导入书签"),
             "",
             "JSON Files (*.json);;All Files (*)"
         )
@@ -13041,11 +13661,11 @@ class BookmarkManagerDialog(QDialog):
             
             # 验证JSON格式
             if not isinstance(imported_data, dict) or 'bookmark_bar' not in imported_data:
-                show_toast(self, "格式错误", "导入的文件格式不正确，必须包含 'bookmark_bar' 节点", level="warning")
+                show_toast(self, tr("格式错误"), tr("导入的文件格式不正确，必须包含 'bookmark_bar' 节点"), level="warning")
                 return
             
             # 默认选择更安全的“合并”模式，避免阻塞确认
-            show_toast(self, "导入方式", "已自动选择合并模式，将导入内容追加到现有书签。", level="info")
+            show_toast(self, tr("导入方式"), tr("已自动选择合并模式，将导入内容追加到现有书签。"), level="info")
             # 合并模式：将导入的书签添加到现有书签的末尾
             current_tree = self.bookmark_manager.get_tree()
             imported_bar = imported_data.get('bookmark_bar', {})
@@ -13061,10 +13681,10 @@ class BookmarkManagerDialog(QDialog):
                 self.bookmark_manager.save_bookmarks(immediate=True)  # 立即保存
                 
                 count = len(imported_children)
-                show_toast(self, "导入成功", f"成功导入 {count} 个书签项", level="success")
+                show_toast(self, tr("导入成功"), tr("成功导入 {} 个书签项").format(count), level="success")
                 print(f"[Bookmark Import] Merged {count} items from: {file_path}")
             else:
-                show_toast(self, "提示", "导入的文件中没有书签内容", level="info")
+                show_toast(self, tr("提示"), tr("导入的文件中没有书签内容"), level="info")
             
             # 刷新书签管理对话框显示
             self.populate_tree()
@@ -13079,10 +13699,10 @@ class BookmarkManagerDialog(QDialog):
                     main_window.ensure_default_icons_on_bookmark_bar()
                 
         except json.JSONDecodeError:
-            show_toast(self, "格式错误", "导入的文件不是有效的JSON格式", level="error")
+            show_toast(self, tr("格式错误"), tr("导入的文件不是有效的JSON格式"), level="error")
             print(f"[Bookmark Import] Invalid JSON format: {file_path}")
         except Exception as e:
-            show_toast(self, "导入失败", f"导入书签时出错:\n{str(e)}", level="error")
+            show_toast(self, tr("导入失败"), f"导入书签时出错:\n{str(e)}", level="error")
             print(f"[Bookmark Import] Error: {e}")
 
 
