@@ -3803,11 +3803,17 @@ class FileExplorerTab(QWidget):
                     else:
                         debug_print(f"[DirPoll] Skipped polling for slow path: {current_path}")
                 self._consume_pending_refresh(fallback_reason="activate_tab")
+            # 标签激活时，若主同步未运行，启动保活轮询以捕获导航变化
+            if not (hasattr(self, '_path_sync_timer') and self._path_sync_timer and self._path_sync_timer.isActive()):
+                self._start_keepalive_sync()
         else:
             self._refresh_file_watch_paths(None)
             if hasattr(self, 'dir_poll_timer') and self.dir_poll_timer and self.dir_poll_timer.isActive():
                 self.dir_poll_timer.stop()
                 debug_print(f"[DirPoll] Suspended polling for background tab: {current_path}")
+            # 标签停用时，停止保活轮询
+            if hasattr(self, '_keepalive_sync_timer') and self._keepalive_sync_timer:
+                self._keepalive_sync_timer.stop()
 
     def is_auto_refresh_frozen(self):
         return bool(getattr(self, '_manual_refresh_frozen', False))
@@ -3959,6 +3965,9 @@ class FileExplorerTab(QWidget):
     def start_path_sync_timer(self, duration_ms=2000):
         """启动路径同步定时器，duration_ms 后自动停止（按需触发，减少持续COM调用）"""
         from PyQt5.QtCore import QTimer
+        # 主同步启动时暂停保活轮询，避免双重COM查询
+        if hasattr(self, '_keepalive_sync_timer') and self._keepalive_sync_timer and self._keepalive_sync_timer.isActive():
+            self._keepalive_sync_timer.stop()
         self._path_sync_stable_hits = 0
         self._path_sync_interval_ms = 120
         if not hasattr(self, '_path_sync_timer') or self._path_sync_timer is None:
@@ -3981,6 +3990,49 @@ class FileExplorerTab(QWidget):
             self._path_sync_timer.stop()
         self._path_sync_stable_hits = 0
         self._path_sync_interval_ms = 120
+        # 主同步结束后，启动低频保活轮询以兜底 NavigateComplete2 遗漏的用户导航
+        if getattr(self, '_refresh_active', False):
+            self._start_keepalive_sync()
+
+    def _start_keepalive_sync(self):
+        """启动低频保活轮询（每1500ms检测LocationURL变化，主同步未覆盖时兜底）"""
+        # 如果主同步正在运行，不启动保活（避免双重轮询）
+        if hasattr(self, '_path_sync_timer') and self._path_sync_timer and self._path_sync_timer.isActive():
+            return
+        if not hasattr(self, '_keepalive_sync_timer') or self._keepalive_sync_timer is None:
+            self._keepalive_sync_timer = QTimer(self)
+            self._keepalive_sync_timer.timeout.connect(self._keepalive_sync_check)
+        if not self._keepalive_sync_timer.isActive():
+            self._keepalive_sync_timer.start(1500)
+
+    def _keepalive_sync_check(self):
+        """保活检查：若检测到LocationURL与current_path不一致，重启主同步更新路径栏。"""
+        if not getattr(self, '_refresh_active', False):
+            if hasattr(self, '_keepalive_sync_timer') and self._keepalive_sync_timer:
+                self._keepalive_sync_timer.stop()
+            return
+        try:
+            url = self.explorer.property('LocationURL')
+            if url:
+                url_str = str(url)
+                local_path = None
+                if url_str.startswith('file:///'):
+                    from urllib.parse import unquote
+                    local_path = unquote(url_str[8:])
+                    if os.name == 'nt' and local_path.startswith('/'):
+                        local_path = local_path[1:]
+                    local_path = self._normalize_local_path(local_path)
+                elif url_str.startswith('file://') and not url_str.startswith('file:///'):
+                    from urllib.parse import unquote
+                    local_path = self._normalize_local_path('\\\\' + unquote(url_str[7:]).replace('/', '\\'))
+                current_path = self._normalize_local_path(getattr(self, 'current_path', ''))
+                if local_path and local_path != current_path:
+                    debug_print(f"[Keepalive] Navigation detected: {current_path!r} -> {local_path!r}, restarting sync")
+                    if hasattr(self, '_keepalive_sync_timer') and self._keepalive_sync_timer:
+                        self._keepalive_sync_timer.stop()
+                    self.start_path_sync_timer(duration_ms=3000)
+        except Exception as e:
+            debug_print(f"[Keepalive] ERROR: {e}")
 
     def sync_path_bar_with_explorer(self):
         # 通过QAxWidget的LocationURL属性获取当前路径
@@ -4297,7 +4349,7 @@ class FileExplorerTab(QWidget):
         # 捕获QAxWidget的NavigateComplete2事件（MetaCall备用通道，type=43）
         if e.type() == 43:  # QEvent.MetaCall
             if hasattr(e, 'arguments') and hasattr(e, 'signal'):
-                if e.signal == 'NavigateComplete2(IDispatch*, QVariant&)':
+                if 'NavigateComplete2' in str(e.signal):
                     url = str(e.arguments[1])
                     # 检查是否为控制面板及其子目录，若是则用原生窗口打开
                     if self._is_control_panel_path(url):
@@ -5042,6 +5094,7 @@ class FileExplorerTab(QWidget):
             'dir_poll_timer',
             '_path_sync_timer',
             '_path_sync_stop_timer',
+            '_keepalive_sync_timer',
         ):
             timer = getattr(self, timer_name, None)
             if timer:
