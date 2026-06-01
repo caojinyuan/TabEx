@@ -3642,6 +3642,12 @@ class SimplePathBar(QWidget):
             QTimer.singleShot(0, self._rebuild)
         super().changeEvent(event)
 
+    def showEvent(self, event):
+        """widget 变为可见时（tab 切换/窗口恢复）强制刷新面包屑"""
+        super().showEvent(event)
+        if not self._in_edit:
+            QTimer.singleShot(0, self._rebuild)
+
     def get_path_for_copy(self, separator='\\'):
         p = self._current_path
         if separator != '\\':
@@ -3652,6 +3658,11 @@ class SimplePathBar(QWidget):
 
     def _rebuild(self):
         """重建面包屑按钮列表。"""
+        parts = self._split_path(self._current_path)
+        # 路径为空时保留现有内容，避免显示空白
+        if not parts and self._crumb_row.count() > 0:
+            return
+
         # 清除旧控件
         while self._crumb_row.count():
             item = self._crumb_row.takeAt(0)
@@ -3660,7 +3671,6 @@ class SimplePathBar(QWidget):
                 w.hide()
                 w.deleteLater()
 
-        parts = self._split_path(self._current_path)
         for i, (label, full_path) in enumerate(parts):
             if i > 0:
                 sep = QLabel('›')
@@ -5777,46 +5787,56 @@ class FileExplorerTab(QWidget):
             return None
 
     def _get_ieb_selection_count(self):
-        """通过 IFolderView COM 接口获取 IExplorerBrowser 的选中项数量"""
+        """通过 IFolderView COM 接口获取 IExplorerBrowser 的选中项数量。
+        先获取 IShellView（已验证可用），再 QueryInterface 获取 IFolderView。"""
         try:
             from comtypes import GUID as _GUID
-            # IFolderView IID
-            iid_fv = _GUID("{CDE725B0-CCC9-4519-917E-325D72FAB4CE}")
-            ppv = self.explorer._browser.GetCurrentView(ctypes.byref(iid_fv))
-            iface_ptr = int(ppv) if ppv else 0
-            if not iface_ptr:
+            # 先获取 IShellView（已验证此路径可靠工作）
+            iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
+            ppv_sv = self.explorer._browser.GetCurrentView(ctypes.byref(iid_sv))
+            sv_ptr = int(ppv_sv) if ppv_sv else 0
+            if not sv_ptr:
                 return None
             try:
-                # IFolderView vtable:
-                # IUnknown: QI(0), AddRef(1), Release(2)
-                # IOleWindow: GetWindow(3), ContextSensitiveHelp(4)
-                # IShellView: ... (5-15)
-                # IFolderView: ... starts at different offset
-                # Actually IFolderView inherits from IUnknown directly:
-                # QI(0), AddRef(1), Release(2), GetCurrentViewMode(3),
-                # SetCurrentViewMode(4), GetFolder(5), Item(6), ItemCount(7), ...
                 _vp_size = ctypes.sizeof(ctypes.c_void_p)
-                vtable_ptr = ctypes.c_void_p.from_address(iface_ptr).value
-                # ItemCount is at vtable index 7
-                # HRESULT ItemCount(UINT uFlags, int *pcItems)
-                # uFlags: SVGIO_SELECTION = 0x1
-                fn_addr = ctypes.c_void_p.from_address(vtable_ptr + 7 * _vp_size).value
-                _IC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
-                                         ctypes.c_uint, ctypes.POINTER(ctypes.c_int))
-                item_count_fn = _IC(fn_addr)
-                count = ctypes.c_int(0)
-                hr = item_count_fn(iface_ptr, 0x1, ctypes.byref(count))  # SVGIO_SELECTION=1
-                if hr == 0:
-                    return count.value
+                # 通过 IShellView 的 QueryInterface 获取 IFolderView
+                iid_fv = _GUID("{CDE725B0-CCC9-4519-917E-325D72FAB4CE}")
+                vtable_ptr = ctypes.c_void_p.from_address(sv_ptr).value
+                qi_addr = ctypes.c_void_p.from_address(vtable_ptr).value  # QI at index 0
+                _QI = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                         ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p))
+                qi_fn = _QI(qi_addr)
+                fv_ptr = ctypes.c_void_p(0)
+                hr_qi = qi_fn(sv_ptr, ctypes.byref(iid_fv), ctypes.byref(fv_ptr))
+                if hr_qi != 0 or not fv_ptr.value:
+                    return None
+                try:
+                    # IFolderView vtable (inherits IUnknown directly):
+                    # QI(0), AddRef(1), Release(2), GetCurrentViewMode(3),
+                    # SetCurrentViewMode(4), GetFolder(5), Item(6), ItemCount(7)
+                    fv_vtable = ctypes.c_void_p.from_address(fv_ptr.value).value
+                    fn_addr = ctypes.c_void_p.from_address(fv_vtable + 7 * _vp_size).value
+                    _IC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                             ctypes.c_uint, ctypes.POINTER(ctypes.c_int))
+                    item_count_fn = _IC(fn_addr)
+                    count = ctypes.c_int(0)
+                    hr = item_count_fn(fv_ptr.value, 0x1, ctypes.byref(count))  # SVGIO_SELECTION=1
+                    if hr == 0:
+                        return count.value
+                finally:
+                    # Release IFolderView
+                    fv_vtable = ctypes.c_void_p.from_address(fv_ptr.value).value
+                    rel_addr = ctypes.c_void_p.from_address(fv_vtable + 2 * _vp_size).value
+                    _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                    _REL(rel_addr)(fv_ptr.value)
             finally:
-                # Release IFolderView
-                _vp_size = ctypes.sizeof(ctypes.c_void_p)
-                vtable_ptr = ctypes.c_void_p.from_address(iface_ptr).value
-                release_addr = ctypes.c_void_p.from_address(vtable_ptr + 2 * _vp_size).value
+                # Release IShellView
+                vtable_ptr = ctypes.c_void_p.from_address(sv_ptr).value
+                rel_addr = ctypes.c_void_p.from_address(vtable_ptr + 2 * _vp_size).value
                 _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
-                _REL(release_addr)(iface_ptr)
-        except Exception:
-            pass
+                _REL(rel_addr)(sv_ptr)
+        except Exception as e:
+            debug_print(f"[IEB] _get_ieb_selection_count failed: {e}")
         return None
 
     # --- Windows native helpers for listview hit-testing ---
@@ -5975,11 +5995,8 @@ class FileExplorerTab(QWidget):
                                         pass
 
                                 cnt = _self._get_selected_count_safe()
-                                if cnt is None:
-                                    # Cannot determine selection state → safe default: don't go up
-                                    debug_print("[DoubleClick/IEB] Cannot determine selection, skipping go_up")
-                                    return
-                                if int(cnt) > 0:
+                                if cnt is not None and int(cnt) > 0:
+                                    # 明确有选中项（点击了文件/文件夹）→ 不 go_up
                                     return
 
                                 debug_print("[DoubleClick/IEB] Blank area → go_up")
