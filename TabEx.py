@@ -703,7 +703,6 @@ SHORTCUT_POLL_INACTIVE_MS = 500  # 主窗口非激活时快捷键轮询频率
 SEARCH_RESULT_TYPE_COL_WIDTH = 90
 SEARCH_RESULT_DATE_COL_WIDTH = 155
 SEARCH_RESULT_SIZE_COL_WIDTH = 100
-DIR_TREE_COLUMN_WIDTH = 260
 STATUS_UPDATE_DEFER_MS = 80
 STATUS_TRACKING_INTERVAL_MS = 220
 STATUS_TRACKING_WINDOW_MS = 1400
@@ -1150,7 +1149,6 @@ def detect_notepad_plus_plus():
     return None
 
 # 搜索对话框
-from PyQt5.QtCore import pyqtSignal as _pyqtSignal
 class SearchDialog(QDialog):    
     def __init__(self, search_path, parent=None, search_history=None):
         super().__init__(parent)
@@ -2383,11 +2381,12 @@ import time
 import socket
 import threading
 import queue
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QTreeView, QFileSystemModel, QSplitter, QProgressBar, QCompleter, QFrame, QToolButton, QFileIconProvider)  # 添加QFrame
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QFileSystemModel, QSplitter, QProgressBar, QCompleter, QFrame, QToolButton, QFileIconProvider)  # 添加QFrame
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer, QThread, QMutex, QMimeData, QFileInfo, QEvent
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor, QDrag
-# from PyQt5.QtGui import QIcon  # unused
+import ctypes
+import ctypes.wintypes
 
 # 全局调试开关
 _DEBUG_MODE = False  # 生产环境关闭，避免性能损耗
@@ -2826,12 +2825,12 @@ def qt_message_handler(mode, context, message):
     # 只在调试模式下输出 Qt 警告
     if _DEBUG_MODE:
         # 如果是调试模式，输出所有消息
-        print(f"Qt Message: {message}")
+        debug_print(f"Qt Message: {message}")
     else:
         # 非调试模式下，只输出严重错误（Critical 和 Fatal）
         from PyQt5.QtCore import QtCriticalMsg, QtFatalMsg
         if mode in (QtCriticalMsg, QtFatalMsg):
-            print(f"Qt Error: {message}")
+            debug_print(f"Qt Error: {message}")
         # 其他消息（Debug, Warning, Info）都被过滤
 
 # Optional native hit-test support (Windows)
@@ -2867,7 +2866,7 @@ if HAS_PYWIN:
             wintypes.DWORD
         )
     except Exception as e:
-        print(f"Failed to setup Windows API monitoring: {e}")
+        debug_print(f"Failed to setup Windows API monitoring: {e}")
 
 class BreadcrumbPathBar(QWidget):
     """类似Windows资源管理器的面包屑路径栏，支持点击层级跳转"""
@@ -2974,7 +2973,35 @@ class BreadcrumbPathBar(QWidget):
         except Exception:
             pass
         super().resizeEvent(event)
-    
+
+    def changeEvent(self, event):
+        """窗口状态变化时（如从被遮挡恢复到前台），强制刷新面包屑显示"""
+        from PyQt5.QtCore import QEvent
+        if event.type() == QEvent.WindowActivate and not self.edit_mode:
+            # 窗口被激活（从后台回到前台）→ 刷新面包屑防止内容消失
+            QTimer.singleShot(0, self._repaint_after_activate)
+        super().changeEvent(event)
+
+    def _repaint_after_activate(self):
+        """窗口激活后强制重绘面包屑内容"""
+        if self.edit_mode:
+            return
+        if hasattr(self, 'breadcrumb_widget') and self.current_path:
+            # 检查面包屑子控件是否仍然可见且有内容
+            has_visible_child = False
+            for i in range(self.breadcrumb_layout.count()):
+                item = self.breadcrumb_layout.itemAt(i)
+                if item and item.widget() and item.widget().isVisible():
+                    has_visible_child = True
+                    break
+            if not has_visible_child:
+                # 面包屑内容丢失，重建
+                self.update_breadcrumbs()
+            # 强制重绘所有子控件
+            self.breadcrumb_widget.update()
+            self.breadcrumb_widget.repaint()
+            self.update()
+
     def setup_path_completer(self):
         """设置路径自动补全"""
         # 创建文件系统模型用于路径补全
@@ -3090,6 +3117,12 @@ class BreadcrumbPathBar(QWidget):
         if self.edit_mode or (hasattr(self, 'path_edit') and self.path_edit.isVisible()):
             debug_print(f"[PathBar] set_path: exit edit_mode. path={path}")
             self.edit_mode = False
+            # 移除应用级事件过滤器
+            from PyQt5.QtWidgets import QApplication
+            try:
+                QApplication.instance().removeEventFilter(self)
+            except Exception:
+                pass
         if hasattr(self, 'path_edit'):
             self.path_edit.hide()
         if hasattr(self, 'breadcrumb_widget'):
@@ -3413,8 +3446,6 @@ class BreadcrumbPathBar(QWidget):
         self.current_path = path
         self.update_breadcrumbs()  # 立即高亮当前层级，不等导航完成
         self.pathChanged.emit(path)
-        # 不在这里立即更新面包屑，等待navigate_to完成后会自动调用set_path更新
-        # self.update_breadcrumbs()  # 注释掉，避免竟态条件
     
     def enter_edit_mode(self):
         """进入编辑模式"""
@@ -3425,6 +3456,9 @@ class BreadcrumbPathBar(QWidget):
         self.path_edit.show()
         self.path_edit.setFocus()
         self.path_edit.selectAll()
+        # 安装应用级事件过滤器，监听点击外部区域时退出编辑模式
+        from PyQt5.QtWidgets import QApplication
+        QApplication.instance().installEventFilter(self)
     
     def exit_edit_mode(self):
         """退出编辑模式"""
@@ -3434,6 +3468,26 @@ class BreadcrumbPathBar(QWidget):
             self.path_edit.hide()
             self.breadcrumb_widget.show()
             self.update_breadcrumbs()
+        # 移除应用级事件过滤器
+        from PyQt5.QtWidgets import QApplication
+        try:
+            QApplication.instance().removeEventFilter(self)
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, event):
+        """应用级事件过滤器：检测点击路径栏外部时退出编辑模式"""
+        from PyQt5.QtCore import QEvent
+        if self.edit_mode and event.type() == QEvent.MouseButtonPress:
+            try:
+                global_pos = event.globalPos()
+                edit_rect = self.path_edit.rect()
+                local_pos = self.path_edit.mapFromGlobal(global_pos)
+                if not edit_rect.contains(local_pos):
+                    self.exit_edit_mode()
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
 
     def _on_path_edit_editing_finished(self):
         """path_edit.editingFinished 信号处理：延迟检查焦点，防止短暂焦点丢失误退出编辑模式"""
@@ -3468,6 +3522,217 @@ class BreadcrumbPathBar(QWidget):
             if child is None or child == self.breadcrumb_widget:
                 self.enter_edit_mode()
         super().mousePressEvent(event)
+
+
+class SimplePathBar(QWidget):
+    """Windows Explorer 风格面包屑地址栏。
+    - 普通模式：显示可点击的路径分段 (C: › project › EOL)，点击某段导航到该层
+    - 编辑模式：显示 QLineEdit，按 Enter 导航，按 Escape 取消
+    - 点击路径段之间的空白区域或调用 enter_edit_mode() 进入编辑模式
+    接口与 BreadcrumbPathBar 兼容：set_path / pathChanged /
+    enter_edit_mode / exit_edit_mode / get_path_for_copy
+    """
+    pathChanged = pyqtSignal(str)
+
+    _FONT   = "font-family: 'Segoe UI', 'Microsoft YaHei UI'; font-size: 15px;"
+    _S_BAR  = ("SimplePathBar { background: rgb(243,243,243); border-bottom: 1px solid #d6d6d6; }")
+    _S_BTN  = ("QPushButton { background: transparent; border: none; padding: 2px 6px;"
+               " font-family: 'Segoe UI', 'Microsoft YaHei UI'; font-size: 17px;"
+               " font-weight: 400; color: #0055cc; }"
+               "QPushButton:hover { background: #daeaf8; border-radius: 4px; }"
+               "QPushButton:pressed { background: #c2d8ef; border-radius: 4px; }")
+    _S_SEP  = ("QLabel { color: #a0a0a0; font-family: 'Segoe UI Symbol',"
+               " 'Segoe UI'; font-size: 12px; padding: 0 2px; background: transparent; }")
+    _S_EDIT = ("QLineEdit { background: white; border: 1px solid #0078d4; border-radius: 3px;"
+               " font-family: 'Segoe UI', 'Microsoft YaHei UI'; font-size: 15px;"
+               " color: #202020; padding: 1px 6px; selection-background-color: #0078d4; }")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._current_path = ''
+        self._in_edit = False
+        self.setFixedHeight(28)
+        self.setStyleSheet(self._S_BAR)
+
+        from PyQt5.QtWidgets import QStackedWidget
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._stack = QStackedWidget(self)
+        outer.addWidget(self._stack)
+
+        # ── 面包屑行 ──────────────────────────────────────────────────────
+        self._crumb_w = QWidget()
+        self._crumb_w.setStyleSheet("background: transparent;")
+        self._crumb_row = QHBoxLayout(self._crumb_w)
+        self._crumb_row.setContentsMargins(4, 0, 4, 0)
+        self._crumb_row.setSpacing(0)
+        self._crumb_row.addStretch()
+        self._stack.addWidget(self._crumb_w)
+
+        # ── 文本编辑行 ────────────────────────────────────────────────────
+        self._edit = QLineEdit(self)
+        self._edit.setStyleSheet(self._S_EDIT)
+        self._edit.setFrame(False)
+        self._edit.returnPressed.connect(self._commit_edit)
+        self._edit.installEventFilter(self)
+        self._stack.addWidget(self._edit)
+
+        self._stack.setCurrentIndex(0)
+
+        # 点击面包屑行空白处 → 编辑模式
+        self._crumb_w.mousePressEvent = self._on_crumb_click
+
+    # ── 公共 API ─────────────────────────────────────────────────────────────
+
+    def set_path(self, path):
+        new_path = path or ''
+        path_changed = (new_path != self._current_path)
+        self._current_path = new_path
+        if self._in_edit:
+            if path_changed:
+                # 路径已变化（用户通过 Explorer 导航了）→ 强制退出编辑模式并显示新路径
+                self.exit_edit_mode()
+            # 路径未变化时保持编辑模式不中断（用户可能在复制路径）
+        else:
+            self._rebuild()
+
+    def enter_edit_mode(self):
+        self._in_edit = True
+        self._edit.setText(self._current_path)
+        self._stack.setCurrentIndex(1)
+        self._edit.setFocus()
+        self._edit.selectAll()
+        # 安装应用级事件过滤器，监听点击外部区域时退出编辑模式
+        from PyQt5.QtWidgets import QApplication
+        QApplication.instance().installEventFilter(self)
+
+    def exit_edit_mode(self):
+        self._in_edit = False
+        self._stack.setCurrentIndex(0)
+        self._rebuild()
+        # 移除应用级事件过滤器
+        from PyQt5.QtWidgets import QApplication
+        try:
+            QApplication.instance().removeEventFilter(self)
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, event):
+        """应用级事件过滤器：检测点击路径栏外部时退出编辑模式"""
+        from PyQt5.QtCore import QEvent
+        if self._in_edit and event.type() == QEvent.MouseButtonPress:
+            # 检查点击是否在编辑框内部
+            try:
+                global_pos = event.globalPos()
+                edit_rect = self._edit.rect()
+                local_pos = self._edit.mapFromGlobal(global_pos)
+                if not edit_rect.contains(local_pos):
+                    # 点击在编辑框外部 → 退出编辑模式
+                    self.exit_edit_mode()
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
+
+    def changeEvent(self, event):
+        """窗口激活时强制刷新面包屑"""
+        from PyQt5.QtCore import QEvent
+        if event.type() == QEvent.WindowActivate and not self._in_edit:
+            QTimer.singleShot(0, self._rebuild)
+        super().changeEvent(event)
+
+    def get_path_for_copy(self, separator='\\'):
+        p = self._current_path
+        if separator != '\\':
+            p = p.replace('\\', separator)
+        return p
+
+    # ── 内部 ─────────────────────────────────────────────────────────────────
+
+    def _rebuild(self):
+        """重建面包屑按钮列表。"""
+        # 清除旧控件
+        while self._crumb_row.count():
+            item = self._crumb_row.takeAt(0)
+            w = item.widget()
+            if w:
+                w.hide()
+                w.deleteLater()
+
+        parts = self._split_path(self._current_path)
+        for i, (label, full_path) in enumerate(parts):
+            if i > 0:
+                sep = QLabel('›')
+                sep.setStyleSheet(self._S_SEP)
+                sep.setFixedWidth(12)
+                sep.setAlignment(Qt.AlignCenter)
+                self._crumb_row.addWidget(sep)
+            btn = QPushButton(label)
+            btn.setFlat(True)
+            btn.setStyleSheet(self._S_BTN)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.clicked.connect(lambda _=False, p=full_path: self.pathChanged.emit(p))
+            self._crumb_row.addWidget(btn)
+
+        self._crumb_row.addStretch()
+
+    def _split_path(self, path):
+        """将路径拆分为 [(显示名, 完整路径), …]。"""
+        if not path:
+            return []
+        if path.startswith('shell:') or '::' in path:
+            return [(path, path)]
+        norm = os.path.normpath(path)
+        parts = [p for p in norm.split(os.sep) if p]
+        if not parts:
+            return []
+        result = []
+        # 驱动器根，如 C:
+        current = parts[0] + os.sep
+        result.append((parts[0], current))
+        for part in parts[1:]:
+            current = os.path.join(current, part)
+            result.append((part, current))
+        return result
+
+    def _commit_edit(self):
+        path = self._edit.text().strip()
+        self.exit_edit_mode()
+        if path:
+            self.pathChanged.emit(path)
+
+    def _on_crumb_click(self, event):
+        from PyQt5.QtCore import Qt as _Qt
+        if event.button() == _Qt.LeftButton:
+            child = self._crumb_w.childAt(event.pos())
+            if child is None:          # 点中空白区域
+                self.enter_edit_mode()
+        QWidget.mousePressEvent(self._crumb_w, event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and not self._in_edit:
+            self.enter_edit_mode()
+        super().mousePressEvent(event)
+
+    def eventFilter(self, obj, event):
+        from PyQt5.QtCore import QEvent
+        if obj is self._edit and event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_Escape:
+                self.exit_edit_mode()
+                return True
+        # 应用级事件过滤：点击编辑框外部时退出编辑模式
+        if self._in_edit and event.type() == QEvent.MouseButtonPress:
+            try:
+                global_pos = event.globalPos()
+                edit_rect = self._edit.rect()
+                local_pos = self._edit.mapFromGlobal(global_pos)
+                if not edit_rect.contains(local_pos):
+                    self.exit_edit_mode()
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
 
 
 class ClickableLabel(QLabel):
@@ -3591,10 +3856,10 @@ class BookmarkManager:
                     return data['roots']
                 return data
             except Exception as e:
-                print(f"Failed to load bookmarks: {e}")
+                debug_print(f"Failed to load bookmarks: {e}")
                 return {}
         else:
-            print("No bookmark file found, starting with empty bookmarks")
+            debug_print("No bookmark file found, starting with empty bookmarks")
             return {}
 
     def save_bookmarks(self, immediate=False):
@@ -3607,7 +3872,7 @@ class BookmarkManager:
                 os.replace(tmp_path, self.config_file)  # 原子替换，防止断电损坏
                 self._pending_save = False
             except Exception as e:
-                print(f"Failed to save bookmarks: {e}")
+                debug_print(f"Failed to save bookmarks: {e}")
                 try:
                     os.remove(tmp_path)
                 except Exception:
@@ -3679,6 +3944,770 @@ class BookmarkManager:
             self.save_bookmarks()
             return True
         return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IExplorerBrowser-based file view
+# Hosts the real Windows Explorer shell component (IExplorerBrowser COM) which
+# supports TortoiseGit overlay icons – unlike Shell.Explorer (IE/WebBrowser
+# ActiveX) which does not load shell icon-overlay extensions.
+# ─────────────────────────────────────────────────────────────────────────────
+_COMTYPES_AVAILABLE = False
+try:
+    import comtypes
+    import comtypes.client
+    from comtypes import GUID, HRESULT, IUnknown, COMMETHOD
+    _COMTYPES_AVAILABLE = True
+except ImportError:
+    pass
+
+if _COMTYPES_AVAILABLE:
+    class _FOLDERSETTINGS(ctypes.Structure):
+        _fields_ = [("ViewMode", ctypes.c_uint), ("fFlags", ctypes.c_uint)]
+
+    class _IExplorerBrowserEvents(IUnknown):
+        _iid_ = GUID("{361BBDC7-E6EE-4E13-BE58-58E2240C810F}")
+        _methods_ = [
+            COMMETHOD([], HRESULT, 'OnNavigationPending',
+                      (['in'], ctypes.c_void_p, 'pidlFolder')),
+            COMMETHOD([], HRESULT, 'OnViewCreated',
+                      (['in'], ctypes.POINTER(IUnknown), 'psv')),
+            COMMETHOD([], HRESULT, 'OnNavigationComplete',
+                      (['in'], ctypes.c_void_p, 'pidlFolder')),
+            COMMETHOD([], HRESULT, 'OnNavigationFailed',
+                      (['in'], ctypes.c_void_p, 'pidlFolder')),
+        ]
+
+    class _IExplorerBrowser(IUnknown):
+        _iid_ = GUID("{DFD3B6B5-C10C-4BE9-85F6-A66969F402F6}")
+        _methods_ = [
+            COMMETHOD([], HRESULT, 'Initialize',
+                      (['in'], ctypes.wintypes.HWND, 'hwndParent'),
+                      (['in'], ctypes.POINTER(ctypes.wintypes.RECT), 'prc'),
+                      (['in'], ctypes.POINTER(_FOLDERSETTINGS), 'pfs')),
+            COMMETHOD([], HRESULT, 'Destroy'),
+            COMMETHOD([], HRESULT, 'SetRect',
+                      (['in'], ctypes.c_void_p, 'phdwp'),
+                      (['in'], ctypes.wintypes.RECT, 'rcBrowser')),
+            COMMETHOD([], HRESULT, 'SetPropertyBag',
+                      (['in'], ctypes.c_wchar_p, 'pszPropertyBag')),
+            COMMETHOD([], HRESULT, 'SetEmptyText',
+                      (['in'], ctypes.c_wchar_p, 'pszEmptyText')),
+            COMMETHOD([], HRESULT, 'SetFolderSettings',
+                      (['in'], ctypes.POINTER(_FOLDERSETTINGS), 'pfs')),
+            COMMETHOD([], HRESULT, 'Advise',
+                      (['in'], ctypes.POINTER(_IExplorerBrowserEvents), 'psbe'),
+                      (['out'], ctypes.POINTER(ctypes.c_ulong), 'pdwCookie')),
+            COMMETHOD([], HRESULT, 'Unadvise',
+                      (['in'], ctypes.c_ulong, 'dwCookie')),
+            COMMETHOD([], HRESULT, 'SetOptions',
+                      (['in'], ctypes.c_uint, 'dwFlag')),
+            COMMETHOD([], HRESULT, 'GetOptions',
+                      (['out'], ctypes.POINTER(ctypes.c_uint), 'pdwFlag')),
+            COMMETHOD([], HRESULT, 'BrowseToIDList',
+                      (['in'], ctypes.c_void_p, 'pidl'),
+                      (['in'], ctypes.c_uint, 'uFlags')),
+            COMMETHOD([], HRESULT, 'BrowseToObject',
+                      (['in'], ctypes.POINTER(IUnknown), 'punk'),
+                      (['in'], ctypes.c_uint, 'uFlags')),
+            COMMETHOD([], HRESULT, 'FillFromObject',
+                      (['in'], ctypes.POINTER(IUnknown), 'punk'),
+                      (['in'], ctypes.c_uint, 'dwFlags')),
+            COMMETHOD([], HRESULT, 'RemoveAll'),
+            COMMETHOD([], HRESULT, 'GetCurrentView',
+                      (['in'], ctypes.POINTER(GUID), 'riid'),
+                      (['out'], ctypes.POINTER(ctypes.c_void_p), 'ppv')),
+        ]
+
+    _CLSID_ExplorerBrowser = GUID("{71F96385-DDD6-48D3-A0C1-AE06E8B055FB}")
+
+    class _NavEventSink(comtypes.COMObject):
+        """IExplorerBrowserEvents sink – receives navigation-complete callbacks."""
+        _com_interfaces_ = [_IExplorerBrowserEvents]
+
+        def __init__(self, on_complete):
+            super().__init__()
+            self._on_complete = on_complete
+
+        def OnNavigationPending(self, pidlFolder):
+            return 0  # S_OK
+
+        def OnViewCreated(self, psv):
+            return 0  # S_OK
+
+        def OnNavigationComplete(self, pidlFolder):
+            try:
+                if pidlFolder and self._on_complete:
+                    _fn = ctypes.windll.shell32.SHGetPathFromIDListW
+                    _fn.restype  = ctypes.c_bool
+                    _fn.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+                    buf = ctypes.create_unicode_buffer(32768)
+                    if _fn(pidlFolder, buf):
+                        path = buf.value
+                        if path:
+                            self._on_complete(path)
+            except Exception:
+                pass
+            return 0  # S_OK
+
+        def OnNavigationFailed(self, pidlFolder):
+            return 0  # S_OK
+
+
+# ── TortoiseGit overlay fix ───────────────────────────────────────────────────
+# TortoiseOverlays.dll (the shim registered in HKLM ShellIconOverlayIdentifiers)
+# does NOT delegate IsMemberOf to TortoiseGitStub.dll in non-Explorer processes,
+# so SHELLDLL_DefView (inside IExplorerBrowser) never shows TortoiseGit overlays.
+#
+# Fix: add HKCU ShellIconOverlayIdentifiers entries pointing directly to the
+# TortoiseGit *stub* CLSIDs.  HKCU takes priority over HKLM, so SHELLDLL_DefView
+# will create the stub COM objects, call GetOverlayInfo (sets g_modifiedovlloaded
+# etc. in TortoiseGit.dll), and then IsMemberOf returns S_OK correctly.
+# Also set LoadDllOnlyInExplorer=0 so the stub loads TortoiseGit.dll.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# TortoiseGit stub CLSIDs (per-overlay CLSID → TortoiseGitStub.dll)
+_TORTOISE_STUB_OVERLAYS = {
+    '  Tortoise1Normal':      '{451C7E59-058F-450A-8C42-FE9A12A302FC}',
+    '  Tortoise2Modified':    '{8DA7CDCB-DC0B-4246-80BD-812E942734AF}',
+    '  Tortoise3Conflict':    '{475A024D-6157-4E03-8C61-D1FA9806415C}',
+    '  Tortoise4Locked':      '{4E453CBA-2AAB-465C-A01E-627A7BE9ED73}',
+    '  Tortoise5ReadOnly':    '{5F380D0B-EE64-479B-B2AD-EF437BF4B0A6}',
+    '  Tortoise6Deleted':     '{D69716CD-6993-4D0D-898F-5EBBC25C5D4D}',
+    '  Tortoise7Added':       '{A38915E4-A460-4143-8D6B-0B45564C6A00}',
+    '  Tortoise8Ignored':     '{1B94B098-57C6-4C39-9DC5-8EB00E423D3E}',
+    '  Tortoise9Unversioned': '{18BF1135-6EA2-405F-A71E-16EEE7F71F8B}',
+}
+_SIOM_KEY = r'SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'
+_TORTOISE_OVERLAYS_APPLIED = False
+
+
+def _tortoise_setup_overlays():
+    """Set HKCU ShellIconOverlayIdentifiers to use TortoiseGit stub CLSIDs.
+
+    Must be called BEFORE IExplorerBrowser is created so that SHELLDLL_DefView
+    initialises its ShellIconOverlayManager with the correct handlers.
+    """
+    global _TORTOISE_OVERLAYS_APPLIED
+    if _TORTOISE_OVERLAYS_APPLIED:
+        return
+    import winreg
+    # Only apply if TortoiseGit is actually installed
+    try:
+        clsid = list(_TORTOISE_STUB_OVERLAYS.values())[1]  # Modified handler
+        winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                       rf'SOFTWARE\Classes\CLSID\{clsid}',
+                       0, winreg.KEY_READ).Close()
+    except OSError:
+        return  # TortoiseGit not installed – nothing to do
+
+    # Allow TortoiseGit.dll to load in non-Explorer processes
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                               r'Software\TortoiseGit') as k:
+            winreg.SetValueEx(k, 'LoadDllOnlyInExplorer', 0,
+                              winreg.REG_DWORD, 0)
+    except Exception:
+        pass
+
+    # Write per-overlay HKCU entries (HKCU takes priority over HKLM)
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _SIOM_KEY) as base:
+            for name, clsid in _TORTOISE_STUB_OVERLAYS.items():
+                try:
+                    with winreg.CreateKey(base, name) as k:
+                        winreg.SetValueEx(k, '', 0, winreg.REG_SZ, clsid)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    _TORTOISE_OVERLAYS_APPLIED = True
+    debug_print("[TortoiseGit] HKCU overlay handlers set to stub CLSIDs")
+
+
+def _tortoise_cleanup_overlays():
+    """Remove HKCU ShellIconOverlayIdentifiers entries added by TabEx."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _SIOM_KEY,
+                             0, winreg.KEY_WRITE) as base:
+            for name in _TORTOISE_STUB_OVERLAYS:
+                try:
+                    winreg.DeleteKey(base, name)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r'Software\TortoiseGit',
+                             0, winreg.KEY_WRITE) as k:
+            winreg.DeleteValue(k, 'LoadDllOnlyInExplorer')
+    except Exception:
+        pass
+    debug_print("[TortoiseGit] HKCU overlay handlers cleaned up")
+
+
+# TortoiseGit overlay icon files (installed by TortoiseOverlays.dll)
+_TORTOISE_OVERLAY_ICON_DIR = (
+    r'C:\Program Files\Common Files\TortoiseOverlays\icons\XPStyle'
+)
+_TORTOISE_OVERLAY_ICON_MAP = {
+    1: 'NormalIcon.ico',
+    2: 'ModifiedIcon.ico',
+    3: 'ConflictIcon.ico',
+    4: 'LockedIcon.ico',
+    5: 'ReadOnlyIcon.ico',
+    6: 'DeletedIcon.ico',
+    7: 'AddedIcon.ico',
+    8: 'IgnoredIcon.ico',
+    9: 'UnversionedIcon.ico',
+}
+# Module-level reference to keep the ctypes callback alive (prevents GC)
+_TORTOISE_GETOVERLAYINFO_CALLBACK = None
+_TORTOISE_GETOVERLAYINFO_PATCHED  = False
+
+
+def _patch_stub_get_overlay_info():
+    """Patch TortoiseGitStub's shared GetOverlayInfo vtable slot.
+
+    TortoiseGit 2.18+ stub CLSIDs deliberately return S_OK from GetOverlayInfo
+    WITHOUT writing the icon path/index/flags, so SHELLDLL_DefView's
+    ShellIconOverlayManager never registers the overlay images.
+
+    This function replaces vtable[4] (GetOverlayInfo) in the shared vtable with
+    a Python callback that reads the overlay-type state from this+0x28 and
+    writes the correct .ico file path from TortoiseOverlays's icon folder.
+    IsMemberOf (vtable[3]) is left untouched – it already works correctly.
+
+    Must be called after COM is initialized and before SHELLDLL_DefView first
+    renders a directory (i.e. from _ensure_browser()).
+    """
+    global _TORTOISE_GETOVERLAYINFO_CALLBACK, _TORTOISE_GETOVERLAYINFO_PATCHED
+    if _TORTOISE_GETOVERLAYINFO_PATCHED:
+        return
+    if not os.path.isdir(_TORTOISE_OVERLAY_ICON_DIR):
+        debug_print("[TortoiseGit] Icon dir missing – skipping vtable patch")
+        return
+    try:
+        import ctypes
+        import comtypes.client
+        from comtypes import GUID, HRESULT, IUnknown, COMMETHOD
+
+        # ── Interface definition ──────────────────────────────────────────
+        _IID_ISIO = GUID('{0C6C4200-C589-11D0-999A-00C04FD655E1}')
+
+        class _ISIO_local(IUnknown):
+            _iid_ = _IID_ISIO
+            _methods_ = [
+                COMMETHOD([], HRESULT, 'IsMemberOf',
+                          (['in'], ctypes.c_wchar_p, 'p'),
+                          (['in'], ctypes.c_ulong,   'a')),
+                COMMETHOD([], HRESULT, 'GetOverlayInfo',
+                          (['in'], ctypes.c_wchar_p,               'pwszIconFile'),
+                          (['in'], ctypes.c_int,                   'cchMax'),
+                          (['out'], ctypes.POINTER(ctypes.c_int),   'pIndex'),
+                          (['out'], ctypes.POINTER(ctypes.c_ulong), 'pdwFlags')),
+                COMMETHOD([], HRESULT, 'GetPriority',
+                          (['out'], ctypes.POINTER(ctypes.c_int), 'p')),
+            ]
+
+        # Create a dummy stub object just to locate the shared vtable
+        _MODIFIED_STUB_CLSID = '{8DA7CDCB-DC0B-4246-80BD-812E942734AF}'
+        dummy = comtypes.client.CreateObject(
+            GUID(_MODIFIED_STUB_CLSID), interface=_ISIO_local
+        )
+        vtable_ptr = ctypes.cast(dummy, ctypes.POINTER(ctypes.c_void_p))[0]
+        # Address of the vtable[4] slot (8 bytes, 64-bit pointer)
+        slot4_addr = vtable_ptr + 4 * 8
+
+        # ── Replacement callback ──────────────────────────────────────────
+        # Signature matches the original COM method:
+        #   HRESULT __stdcall GetOverlayInfo(
+        #       void*  this,          ← rcx
+        #       void*  pwszIconFile,  ← rdx  (LPWSTR, pre-allocated buffer)
+        #       int    cchMax,        ← r8
+        #       int*   pIndex,        ← r9
+        #       DWORD* pdwFlags       ← [rsp+0x28]
+        #   )
+        _icon_dir  = _TORTOISE_OVERLAY_ICON_DIR
+        _icon_map  = _TORTOISE_OVERLAY_ICON_MAP
+
+        @ctypes.WINFUNCTYPE(ctypes.HRESULT,
+                            ctypes.c_void_p,  # this
+                            ctypes.c_void_p,  # pwszIconFile
+                            ctypes.c_int,     # cchMax
+                            ctypes.c_void_p,  # pIndex  (int*)
+                            ctypes.c_void_p)  # pdwFlags (DWORD*)
+        def _get_overlay_info_patch(this_ptr, icon_buf, cchMax, pindex, pdwflags):
+            # Initialise outputs to 0 / empty string (mirrors original prolog)
+            try:
+                if icon_buf:
+                    ctypes.c_wchar.from_address(icon_buf).value = '\0'
+                if pindex:
+                    ctypes.c_int.from_address(pindex).value = 0
+                if pdwflags:
+                    ctypes.c_uint32.from_address(pdwflags).value = 0
+                if not (this_ptr and icon_buf and pindex and pdwflags and cchMax > 0):
+                    return 0  # S_OK with empty
+                # Overlay type is stored at this+0x28 (confirmed: 1=Normal…9=Unversioned)
+                state = ctypes.c_uint32.from_address(this_ptr + 0x28).value
+                icon_name = _icon_map.get(state)
+                if not icon_name:
+                    return 0  # S_OK – unknown state, let SIOM skip
+                icon_path = _icon_dir + '\\' + icon_name
+                if cchMax > len(icon_path):
+                    encoded = (icon_path + '\0').encode('utf-16-le')
+                    ctypes.memmove(icon_buf, encoded, len(encoded))
+                    ctypes.c_uint32.from_address(pdwflags).value = 1  # ISIOI_ICONINDEX
+                    # pIndex stays 0 (first icon in the .ico file)
+            except Exception:
+                pass
+            return 0  # S_OK
+
+        # ── VirtualProtect + write new function pointer ───────────────────
+        PAGE_EXECUTE_READWRITE = 0x40
+        old_prot = ctypes.c_ulong(0)
+        # Set argtypes explicitly so Python handles the 64-bit LPVOID correctly
+        _VirtualProtect = ctypes.windll.kernel32.VirtualProtect
+        _VirtualProtect.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                     ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+        _VirtualProtect.restype  = ctypes.c_int
+        ok = _VirtualProtect(
+            slot4_addr, 8, PAGE_EXECUTE_READWRITE, ctypes.byref(old_prot)
+        )
+        if not ok:
+            debug_print("[TortoiseGit] VirtualProtect failed for vtable patch")
+            return
+        try:
+            new_fn_ptr = ctypes.cast(_get_overlay_info_patch, ctypes.c_void_p).value
+            ctypes.c_void_p.from_address(slot4_addr).value = new_fn_ptr
+        finally:
+            _VirtualProtect(slot4_addr, 8, old_prot, ctypes.byref(old_prot))
+
+        # Keep the callback alive so it isn't garbage-collected
+        _TORTOISE_GETOVERLAYINFO_CALLBACK = _get_overlay_info_patch
+        _TORTOISE_GETOVERLAYINFO_PATCHED  = True
+        debug_print("[TortoiseGit] GetOverlayInfo vtable patched – overlays enabled")
+
+    except Exception as e:
+        debug_print(f"[TortoiseGit] GetOverlayInfo patch error: {e}")
+
+
+# ── IExplorerBrowser 键盘消息过滤器 ──────────────────────────────────────────
+# Qt 的事件循环会把所有 WM_KEYDOWN/WM_KEYUP/WM_CHAR 消息转换成 QKeyEvent。
+# 但 IExplorerBrowser 的子窗口（SHELLDLL_DefView / SysListView32）是纯 Win32 控件，
+# 它们依赖直接收到 WM_KEYDOWN 来实现 Delete/Ctrl+C/V/X/F2 等功能。
+# QAbstractNativeEventFilter 安装在 QApplication 层，能拦截线程中所有 HWND 的消息。
+# 我们在此检测键盘消息是否发往 IExplorerBrowser 子窗口，如果是则手动 Dispatch，
+# 返回 True 告诉 Qt 跳过后续处理。
+
+from PyQt5.QtCore import QAbstractNativeEventFilter
+
+class _IEBKeyboardFilter(QAbstractNativeEventFilter):
+    """Application-level native event filter that forwards keyboard messages
+    to IExplorerBrowser child windows so that Delete, Ctrl+C/V/X, F2, etc. work."""
+
+    # TabEx 自有快捷键的 VK 码（Ctrl 组合）
+    _TABEX_CTRL_VKS = frozenset([
+        0x54,  # T (Ctrl+T new tab, Ctrl+Shift+T reopen)
+        0x57,  # W (Ctrl+W close tab)
+        0x46,  # F (Ctrl+F search)
+        0x47,  # G (Ctrl+G quick find)
+        0x44,  # D (Ctrl+D bookmark)
+        0x4C,  # L (Ctrl+L focus path bar)
+        0x09,  # Tab (Ctrl+Tab switch)
+    ])
+    # TabEx 自有快捷键的 VK 码（Alt 组合）
+    _TABEX_ALT_VKS = frozenset([
+        0x5A,  # Z (Alt+Z copy filename)
+        0x58,  # X (Alt+X copy path)
+        0x25,  # Left (Alt+Left back)
+        0x27,  # Right (Alt+Right forward)
+        0x26,  # Up (Alt+Up go up)
+    ])
+
+    def __init__(self):
+        super().__init__()
+        self._main_window = None
+        self._ieb_hwnds = set()  # 缓存 IExplorerBrowserWidget 的顶层 HWND
+        self._ieb_widgets = {}   # HWND → IExplorerBrowserWidget 实例映射
+        self._debug_first_key = True  # 首次键盘消息诊断
+        self._debug_first_call = True  # 首次调用诊断
+        # IShellView COM IID
+        self._IID_IShellView = None  # 延迟初始化（需要 comtypes）
+
+    def set_main_window(self, mw):
+        self._main_window = mw
+
+    def register_ieb_hwnd(self, hwnd, widget=None):
+        """注册 IExplorerBrowserWidget 的 winId，用于快速判断子窗口归属"""
+        if hwnd:
+            self._ieb_hwnds.add(hwnd)
+            if widget is not None:
+                self._ieb_widgets[hwnd] = widget
+            debug_print(f"[IEB KeyFilter] Registered HWND: 0x{hwnd:X}, total: {len(self._ieb_hwnds)}")
+
+    def unregister_ieb_hwnd(self, hwnd):
+        self._ieb_hwnds.discard(hwnd)
+        self._ieb_widgets.pop(hwnd, None)
+
+    def _find_owner_widget(self, hwnd):
+        """从目标 HWND 向上遍历找到拥有它的 IExplorerBrowserWidget"""
+        import ctypes
+        _GetParent = ctypes.windll.user32.GetParent
+        _GetParent.restype = ctypes.wintypes.HWND
+        h = hwnd
+        for _ in range(30):
+            if h in self._ieb_widgets:
+                return self._ieb_widgets[h]
+            h = _GetParent(h)
+            if not h:
+                break
+        return None
+
+    def _is_ieb_descendant(self, hwnd):
+        """判断 hwnd 是否是已注册的某个 IExplorerBrowserWidget 的后代窗口"""
+        import ctypes
+        _GetParent = ctypes.windll.user32.GetParent
+        _GetParent.restype = ctypes.wintypes.HWND  # 确保 64 位 HWND 不被截断
+        h = hwnd
+        for _ in range(30):
+            if h in self._ieb_hwnds:
+                return True
+            h = _GetParent(h)
+            if not h:
+                break
+        return False
+
+    # 自定义 MSG 结构体，避免依赖 wintypes.MSG 的字段名
+    class _MSG(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", ctypes.c_void_p),
+            ("message", ctypes.c_uint),
+            ("wParam", ctypes.c_size_t),   # WPARAM = UINT_PTR
+            ("lParam", ctypes.c_ssize_t),  # LPARAM = LONG_PTR
+            ("time", ctypes.c_uint),
+            ("pt_x", ctypes.c_long),
+            ("pt_y", ctypes.c_long),
+        ]
+
+    def nativeEventFilter(self, eventType, message):
+        try:
+            # 首次调用诊断 — 确认过滤器被 Qt 调用
+            if self._debug_first_call:
+                self._debug_first_call = False
+                debug_print(f"[IEB KeyFilter] Filter active! eventType={eventType} "
+                            f"ieb_hwnds={[hex(h) for h in self._ieb_hwnds]}")
+
+            if eventType not in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
+                return False, 0
+            if not self._ieb_hwnds:
+                return False, 0
+
+            import ctypes
+            from ctypes import cast, POINTER
+            msg = cast(int(message), POINTER(self._MSG)).contents
+
+            # 只处理键盘类消息
+            if msg.message not in (0x0100, 0x0101, 0x0102, 0x0104, 0x0105, 0x0106):
+                return False, 0
+
+            # 首次键盘消息诊断
+            if self._debug_first_key and msg.message == 0x0100:
+                self._debug_first_key = False
+                debug_print(f"[IEB KeyFilter] First WM_KEYDOWN: VK=0x{msg.wParam & 0xFF:02X} "
+                            f"target_hwnd=0x{msg.hwnd or 0:X} "
+                            f"registered={[hex(h) for h in self._ieb_hwnds]} "
+                            f"is_descendant={self._is_ieb_descendant(msg.hwnd) if msg.hwnd else False}")
+
+            # msg.hwnd 是消息的目标窗口；检查它是否属于 IExplorerBrowser
+            target_hwnd = msg.hwnd
+            if not target_hwnd or not self._is_ieb_descendant(target_hwnd):
+                return False, 0
+
+            # 对 WM_KEYDOWN / WM_SYSKEYDOWN，排除 TabEx 自有快捷键
+            if msg.message in (0x0100, 0x0104):
+                vk = msg.wParam & 0xFF
+                ctrl = (ctypes.windll.user32.GetKeyState(0x11) & 0x8000) != 0
+                alt  = (ctypes.windll.user32.GetKeyState(0x12) & 0x8000) != 0
+                if ctrl and not alt and vk in self._TABEX_CTRL_VKS:
+                    return False, 0  # 留给 TabEx _check_shortcuts
+                if alt and not ctrl and vk in self._TABEX_ALT_VKS:
+                    return False, 0
+                if not ctrl and not alt and vk == 0x74:  # F5
+                    return False, 0
+
+            # 通过 IShellView::TranslateAccelerator 转发键盘消息
+            # 这是 Shell 控件处理 Ctrl+C/V/X, Delete, F2 等的正确 COM 方式
+            widget = self._find_owner_widget(target_hwnd)
+            if widget and getattr(widget, '_browser', None):
+                try:
+                    if self._IID_IShellView is None:
+                        from comtypes import GUID as _GUID
+                        self._IID_IShellView = _GUID("{000214E3-0000-0000-C000-000000000046}")
+
+                    # comtypes 的 ['out'] 参数自动返回，不需要手动传
+                    ppv_result = widget._browser.GetCurrentView(
+                        ctypes.byref(self._IID_IShellView))
+                    # ppv_result 是 c_void_p 或整数
+                    iface_ptr = int(ppv_result) if ppv_result else 0
+                    if iface_ptr:
+                        try:
+                            # COM 对象布局: 对象地址 → vtable 指针 → 函数指针数组
+                            # IShellView vtable: [QI(0), AddRef(1), Release(2),
+                            #   GetWindow(3), ContextSensitiveHelp(4), TranslateAccelerator(5)]
+                            _vp_size = ctypes.sizeof(ctypes.c_void_p)
+                            vtable_ptr = ctypes.c_void_p.from_address(iface_ptr).value
+                            fn_addr = ctypes.c_void_p.from_address(vtable_ptr + 5 * _vp_size).value
+                            # TranslateAccelerator(IShellView* this, MSG* pmsg) → HRESULT
+                            _TA = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)
+                            translate_accel = _TA(fn_addr)
+                            # 构造 wintypes.MSG（保证内存布局与 Windows 一致）
+                            native_msg = ctypes.wintypes.MSG()
+                            native_msg.hWnd = target_hwnd
+                            native_msg.message = msg.message
+                            native_msg.wParam = msg.wParam
+                            native_msg.lParam = msg.lParam
+                            native_msg.time = msg.time
+                            native_msg.pt.x = msg.pt_x
+                            native_msg.pt.y = msg.pt_y
+                            ta_hr = translate_accel(iface_ptr, ctypes.byref(native_msg))
+                            if ta_hr == 0:  # S_OK — Shell 已处理
+                                return True, 0
+                        finally:
+                            # Release IShellView
+                            release_addr = ctypes.c_void_p.from_address(
+                                vtable_ptr + 2 * _vp_size).value
+                            _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                            _REL(release_addr)(iface_ptr)
+                except Exception as e:
+                    debug_print(f"[IEB KeyFilter] TranslateAccelerator failed: {e}")
+
+            # 回退：直接 Dispatch（处理 TranslateAccelerator 不支持的按键）
+            ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+            ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+            return True, 0
+
+        except Exception as e:
+            debug_print(f"[IEB KeyFilter] Exception: {e}")
+            return False, 0
+
+
+# 全局单例（在 main() 中安装）
+_ieb_keyboard_filter = _IEBKeyboardFilter()
+
+
+class IExplorerBrowserWidget(QWidget):
+    """
+    Qt widget that hosts IExplorerBrowser – the real Windows Explorer shell
+    component. Supports TortoiseGit overlay icons, unlike the legacy
+    Shell.Explorer (IE/WebBrowser ActiveX) control.
+
+    Provides a drop-in subset of the QAxWidget API used by FileExplorerTab:
+      dynamicCall('Navigate[2](...)', url)  – navigate to a URL or path
+      dynamicCall('Refresh()')              – refresh current view
+      property('LocationURL')               – current location as file:/// URL
+      NavigateComplete2 signal              – emitted on navigation complete
+      querySubObject(name)                  – returns None (graceful degradation)
+      clear()                               – destroy COM resources
+    """
+    # (pDisp, url) – matches QAxWidget's NavigateComplete2 signature
+    NavigateComplete2 = pyqtSignal(object, object)
+
+    # IExplorerBrowser option flags  (SDK shobjidl_core.h values)
+    _EBO_SHOWFRAMES  = 0x00000002  # 显示左侧导航窗格
+    _EBO_NOTRAVELLOG = 0x00000008  # 禁用前进/后退历史（避免与 TabEx 自身历史冲突）
+    _EBO_NOBORDER    = 0x00000040  # 隐藏导航工具栏（地址栏）
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._browser      = None
+        self._cookie       = ctypes.c_ulong(0)
+        self._nav_sink     = None
+        self._location_url = ''
+        self._pending_path = None
+        self._init_ok      = False
+        # Force native HWND creation; IExplorerBrowser::Initialize needs a real HWND
+        self.setAttribute(Qt.WA_NativeWindow, True)
+
+    # ── QAxWidget compatibility ───────────────────────────────────────────────
+
+    def property(self, name):  # noqa: A003
+        """Override QObject.property to expose LocationURL."""
+        if name == 'LocationURL':
+            return self._location_url
+        return super().property(name)
+
+    def dynamicCall(self, sig, *args):
+        """QAxWidget-compatible dispatch for Navigate / Refresh calls."""
+        s = sig.lower()
+        # Match only actual Navigate/Navigate2 calls, not NavigateComplete2 events
+        if s.startswith('navigate') or s.startswith('navigate2'):
+            url = str(args[0]) if args else ''
+            self._navigate_url(url)
+        elif 'refresh()' in s:
+            self._do_refresh()
+        # All other calls (Visible, ToolBar, Silent, NavigateComplete2 events…) are silently ignored
+
+    def querySubObject(self, _name, *_args):
+        """Returns None; selection info is not yet available via IExplorerBrowser."""
+        return None
+
+    def clear(self):
+        """QAxWidget compat: release COM resources."""
+        self.cleanup()
+
+    # ── Navigation helpers ────────────────────────────────────────────────────
+
+    def _navigate_url(self, url):
+        path = self._url_to_path(url)
+        if path:
+            self._navigate(path)
+
+    @staticmethod
+    def _url_to_path(url):
+        if not url:
+            return ''
+        url = str(url)
+        if url.startswith('file:///'):
+            from urllib.parse import unquote
+            p = unquote(url[8:]).replace('/', os.sep)
+            return p[1:] if p.startswith(os.sep) else p
+        if url.startswith('file://') and not url.startswith('file:///'):
+            from urllib.parse import unquote
+            return '\\\\' + unquote(url[7:]).replace('/', '\\')
+        return url  # local path or shell: path – pass through
+
+    def _navigate(self, path):
+        if not _COMTYPES_AVAILABLE:
+            return
+        if not self._ensure_browser():
+            self._pending_path = path
+            return
+        try:
+            _spdn = ctypes.windll.shell32.SHParseDisplayName
+            _spdn.restype  = ctypes.c_long   # HRESULT
+            _spdn.argtypes = [
+                ctypes.c_wchar_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_ulong,
+                ctypes.POINTER(ctypes.c_ulong),
+            ]
+            pidl  = ctypes.c_void_p(0)
+            sfgao = ctypes.c_ulong(0)
+            hr    = _spdn(path, None, ctypes.byref(pidl), 0, ctypes.byref(sfgao))
+            if hr == 0 and pidl.value:
+                try:
+                    self._browser.BrowseToIDList(pidl, 0)  # 0 = SBSP_ABSOLUTE
+                finally:
+                    ctypes.windll.ole32.CoTaskMemFree(pidl)
+            else:
+                debug_print(f"[IExplorerBrowser] SHParseDisplayName failed "
+                            f"hr=0x{hr & 0xFFFFFFFF:08x} for '{path}'")
+        except Exception as e:
+            debug_print(f"[IExplorerBrowser] _navigate error: {e}")
+
+    def _do_refresh(self):
+        if self._location_url:
+            self._navigate_url(self._location_url)
+
+    # ── IExplorerBrowser lifecycle ────────────────────────────────────────────
+
+    def _ensure_browser(self):
+        """Create/initialize IExplorerBrowser on first use."""
+        if self._init_ok:
+            return True
+        if not _COMTYPES_AVAILABLE:
+            return False
+        try:
+            hwnd = int(self.winId())
+            if not hwnd:
+                return False
+            # Enable TortoiseGit overlays in SHELLDLL_DefView:
+            # 1. Write HKCU entries pointing to stub CLSIDs (IsMemberOf works).
+            # 2. Patch the stub's shared GetOverlayInfo vtable slot so it
+            #    returns the actual .ico path (stub returns S_OK but empty
+            #    icon info by default in TortoiseGit 2.18+).
+            _tortoise_setup_overlays()
+            _patch_stub_get_overlay_info()
+            browser = comtypes.client.CreateObject(
+                _CLSID_ExplorerBrowser,
+                interface=_IExplorerBrowser,
+            )
+            w = max(self.width(),  100)
+            h = max(self.height(), 100)
+            rc = ctypes.wintypes.RECT(0, 0, w, h)
+            fs = _FOLDERSETTINGS(4, 0)  # ViewMode=FVM_DETAILS, fFlags=0
+            browser.Initialize(hwnd, ctypes.byref(rc), ctypes.byref(fs))
+            # 不设置 EBO_NOBORDER(0x40)，让 Shell 展示原生导航工具栏（地址栏 / 面包屑路径栏）
+            browser.SetOptions(self._EBO_SHOWFRAMES | self._EBO_NOTRAVELLOG)
+            sink   = _NavEventSink(self._on_nav_complete)
+            cookie = browser.Advise(sink)  # out-param returned by comtypes
+            self._browser  = browser
+            self._nav_sink = sink
+            self._cookie   = ctypes.c_ulong(cookie)
+            self._init_ok  = True
+            _ieb_keyboard_filter.register_ieb_hwnd(hwnd, widget=self)
+            debug_print("[IExplorerBrowser] Initialized successfully")
+            return True
+        except Exception as e:
+            debug_print(f"[IExplorerBrowser] Init failed: {e}")
+            return False
+
+    def _on_nav_complete(self, path):
+        """Called by _NavEventSink when navigation completes."""
+        norm = os.path.normpath(path)
+        url  = 'file:///' + norm.replace('\\', '/')
+        self._location_url = url
+        self.NavigateComplete2.emit(None, url)
+
+    # ── Qt event overrides ────────────────────────────────────────────────────
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._init_ok:
+            if self._ensure_browser() and self._pending_path:
+                path, self._pending_path = self._pending_path, None
+                self._navigate(path)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._browser:
+            try:
+                rc = ctypes.wintypes.RECT(0, 0, self.width(), self.height())
+                self._browser.SetRect(None, rc)
+            except Exception as e:
+                debug_print(f"[IExplorerBrowser] SetRect failed: {e}")
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+
+    def cleanup(self):
+        if self._browser is None:
+            return
+        try:
+            if self._cookie.value:
+                self._browser.Unadvise(self._cookie)
+        except Exception:
+            pass
+        try:
+            self._browser.Destroy()
+        except Exception:
+            pass
+        try:
+            hwnd = int(self.winId())
+            _ieb_keyboard_filter.unregister_ieb_hwnd(hwnd)
+        except Exception:
+            pass
+        self._browser  = None
+        self._nav_sink = None
+        self._init_ok  = False
+
+    def closeEvent(self, event):
+        self.cleanup()
+        super().closeEvent(event)
 
 
 class FileExplorerTab(QWidget):
@@ -4084,9 +5113,6 @@ class FileExplorerTab(QWidget):
                     # 只在非程序化导航时添加到历史记录
                     if not self._navigating_programmatically and hasattr(self, '_add_to_history'):
                         self._add_to_history(local_path)
-                    # 同步左侧目录树（仅在非导航状态下）
-                    if self.main_window and hasattr(self.main_window, 'expand_dir_tree_to_path'):
-                        self.main_window.expand_dir_tree_to_path(local_path)
                     # 导航完成后清理标志并恢复同步
                     if getattr(self, '_navigating_folder', False):
                         self._navigating_folder = False
@@ -4182,26 +5208,10 @@ class FileExplorerTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # 面包屑路径栏
-        self.path_bar = BreadcrumbPathBar(self)
-        # 允许路径栏在横向上被压缩（不限制最小宽度），以避免影响splitter拖动
-        try:
-            self.path_bar.setMinimumWidth(0)
-        except Exception:
-            pass
+        # 路径栏（极简单行输入框）
+        self.path_bar = SimplePathBar(self)
         self.path_bar.pathChanged.connect(self.on_path_bar_changed)
         layout.addWidget(self.path_bar)
-        
-        # 添加负间距，让分隔线靠近路径栏
-        layout.addSpacing(-10)
-        
-        # 添加分隔线
-        separator = QFrame()
-        separator.setFrameShape(QFrame.HLine)
-        separator.setFrameShadow(QFrame.Sunken)
-        separator.setStyleSheet("background-color: #d0d0d0;")
-        separator.setFixedHeight(1)
-        layout.addWidget(separator)
         
         # 加载指示器（初始隐藏）
         self.loading_bar = QProgressBar(self)
@@ -4212,13 +5222,21 @@ class FileExplorerTab(QWidget):
         self.loading_bar.hide()
         layout.addWidget(self.loading_bar)
 
-        # 嵌入Explorer控件 - 使用 Shell.Explorer（IE控件）
-        # 注意：Shell.Explorer 不支持 TortoiseGit 图标覆盖层
-        # ExplorerBrowser COM 接口过于复杂，无法通过 QAxWidget 简单集成
-        self.explorer = QAxWidget(self)
-        if not self.explorer.setControl("Shell.Explorer"):
-            raise RuntimeError("Shell.Explorer control initialization failed")
-        debug_print("[WindowsShellExplorer] Using Shell.Explorer (no TortoiseGit overlay support)")
+        # 优先使用 IExplorerBrowser（真实 Windows 资源管理器外壳，支持 TortoiseGit 图标覆盖）
+        # 回退到 Shell.Explorer（IE/WebBrowser ActiveX，不支持 TortoiseGit 图标覆盖）
+        _ieb_ok = False
+        if _COMTYPES_AVAILABLE:
+            try:
+                self.explorer = IExplorerBrowserWidget(self)
+                _ieb_ok = True
+                debug_print("[WindowsShellExplorer] Using IExplorerBrowser (TortoiseGit overlay supported)")
+            except Exception as _ieb_err:
+                debug_print(f"[WindowsShellExplorer] IExplorerBrowserWidget failed: {_ieb_err}")
+        if not _ieb_ok:
+            self.explorer = QAxWidget(self)
+            if not self.explorer.setControl("Shell.Explorer"):
+                raise RuntimeError("Shell.Explorer control initialization failed")
+            debug_print("[WindowsShellExplorer] Using Shell.Explorer (no TortoiseGit overlay support)")
         
         # 设置为NoFocus，防止QAxWidget拦截键盘事件
         self.explorer.setFocusPolicy(Qt.NoFocus)
@@ -4323,18 +5341,21 @@ class FileExplorerTab(QWidget):
                 local_path = self._normalize_local_path(local_path)
             if local_path is not None:
                 current = self._normalize_local_path(getattr(self, 'current_path', ''))
+                # 无条件更新路径栏（即使路径未变也刷新显示）
+                if hasattr(self, 'path_bar'):
+                    self.path_bar.set_path(local_path)
+                # 延迟安装/更新 IExplorerBrowser 双击钩子（SysListView32 在首次导航后才创建）
+                QTimer.singleShot(200, self._install_listview_dblclick_hook)
                 if local_path and local_path != current:
                     self.current_path = local_path
-                    if hasattr(self, 'path_bar'):
-                        self.path_bar.set_path(local_path)
                     self.update_tab_title()
                     self._schedule_status_update(track_selection=True)
                     if not getattr(self, '_navigating_programmatically', False) and hasattr(self, '_add_to_history'):
                         self._add_to_history(local_path)
-                    if self.main_window and hasattr(self.main_window, 'expand_dir_tree_to_path'):
-                        self.main_window.expand_dir_tree_to_path(local_path)
                     if getattr(self, '_navigating_folder', False):
                         self._navigating_folder = False
+                    # 记录导航时间戳，用于抑制 WH_MOUSE_LL 双击误判
+                    self._last_nav_complete_time = time.monotonic()
                     if self.main_window and hasattr(self.main_window, 'update_chat_context'):
                         try:
                             if self.main_window.get_current_tab_widget() is self:
@@ -4717,6 +5738,10 @@ class FileExplorerTab(QWidget):
     def _get_selected_count_safe(self):
         """安全地获取当前选中项数量，避免触发 ActiveX 属性不存在的警告"""
         try:
+            # IExplorerBrowser 模式：使用 IFolderView COM 接口
+            if isinstance(self.explorer, IExplorerBrowserWidget) and getattr(self.explorer, '_browser', None):
+                return self._get_ieb_selection_count()
+
             # 优先通过 Document 接口获取 SelectedItems（避免 WebBrowser 直接调用警告）
             doc = None
             try:
@@ -4751,6 +5776,49 @@ class FileExplorerTab(QWidget):
         except Exception:
             return None
 
+    def _get_ieb_selection_count(self):
+        """通过 IFolderView COM 接口获取 IExplorerBrowser 的选中项数量"""
+        try:
+            from comtypes import GUID as _GUID
+            # IFolderView IID
+            iid_fv = _GUID("{CDE725B0-CCC9-4519-917E-325D72FAB4CE}")
+            ppv = self.explorer._browser.GetCurrentView(ctypes.byref(iid_fv))
+            iface_ptr = int(ppv) if ppv else 0
+            if not iface_ptr:
+                return None
+            try:
+                # IFolderView vtable:
+                # IUnknown: QI(0), AddRef(1), Release(2)
+                # IOleWindow: GetWindow(3), ContextSensitiveHelp(4)
+                # IShellView: ... (5-15)
+                # IFolderView: ... starts at different offset
+                # Actually IFolderView inherits from IUnknown directly:
+                # QI(0), AddRef(1), Release(2), GetCurrentViewMode(3),
+                # SetCurrentViewMode(4), GetFolder(5), Item(6), ItemCount(7), ...
+                _vp_size = ctypes.sizeof(ctypes.c_void_p)
+                vtable_ptr = ctypes.c_void_p.from_address(iface_ptr).value
+                # ItemCount is at vtable index 7
+                # HRESULT ItemCount(UINT uFlags, int *pcItems)
+                # uFlags: SVGIO_SELECTION = 0x1
+                fn_addr = ctypes.c_void_p.from_address(vtable_ptr + 7 * _vp_size).value
+                _IC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                         ctypes.c_uint, ctypes.POINTER(ctypes.c_int))
+                item_count_fn = _IC(fn_addr)
+                count = ctypes.c_int(0)
+                hr = item_count_fn(iface_ptr, 0x1, ctypes.byref(count))  # SVGIO_SELECTION=1
+                if hr == 0:
+                    return count.value
+            finally:
+                # Release IFolderView
+                _vp_size = ctypes.sizeof(ctypes.c_void_p)
+                vtable_ptr = ctypes.c_void_p.from_address(iface_ptr).value
+                release_addr = ctypes.c_void_p.from_address(vtable_ptr + 2 * _vp_size).value
+                _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                _REL(release_addr)(iface_ptr)
+        except Exception:
+            pass
+        return None
+
     # --- Windows native helpers for listview hit-testing ---
     def _find_syslistview_hwnd(self):
         if not HAS_PYWIN:
@@ -4784,6 +5852,180 @@ class FileExplorerTab(QWidget):
             return result
 
         return find_in_tree(parent)
+
+    def _install_listview_dblclick_hook(self):
+        """Install a WH_MOUSE_LL (low-level) global mouse hook to detect
+        double-clicks inside IExplorerBrowser.
+
+        WH_MOUSE (local) fires *synchronously* inside COM STA message dispatch
+        and deadlocks when IExplorerBrowser pumps messages internally.
+        WH_MOUSE_LL (14) fires *asynchronously* via the posted message queue,
+        so it is safe regardless of COM state.
+        """
+        if not HAS_PYWIN:
+            return
+        if not isinstance(getattr(self, 'explorer', None), IExplorerBrowserWidget):
+            return  # QAxWidget: Qt event-filter is sufficient
+        if getattr(self, '_lv_hook_handle', None):
+            return  # already installed
+        if not getattr(self.explorer, '_init_ok', False):
+            return  # IExplorerBrowser not yet ready
+
+        _self = self
+
+        # ── ctypes struct for MSLLHOOKSTRUCT ───────────────────────────────
+        class _POINT(ctypes.Structure):
+            _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
+        class _MSLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [
+                ('pt',          _POINT),
+                ('mouseData',   ctypes.c_ulong),
+                ('flags',       ctypes.c_ulong),
+                ('time',        ctypes.c_ulong),   # tick count (GetTickCount units)
+                ('dwExtraInfo', ctypes.c_size_t),  # ULONG_PTR – pointer-sized
+            ]
+
+        _HOOKPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t,   # LRESULT (pointer-sized)
+            ctypes.c_int,       # nCode
+            ctypes.wintypes.WPARAM,
+            ctypes.wintypes.LPARAM,
+        )
+
+        # Track last left-button-down for double-click detection
+        # (WH_MOUSE_LL does NOT deliver WM_LBUTTONDBLCLK, only WM_LBUTTONDOWN)
+        WM_LBUTTONDOWN = 0x0201
+        _state = {'t': 0, 'x': -9999, 'y': -9999}
+
+        def _hook_proc(nCode, wParam, lParam):
+            if nCode >= 0 and wParam == WM_LBUTTONDOWN:
+                try:
+                    info = ctypes.cast(lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+                    px = int(info.pt.x)
+                    py = int(info.pt.y)
+                    t  = int(info.time)   # Windows tick count
+
+                    # 点击 explorer 区域内时，通知路径栏退出编辑模式
+                    try:
+                        from PyQt5.QtCore import QPoint
+                        pt_chk = _self.explorer.mapFromGlobal(QPoint(px, py))
+                        if _self.explorer.rect().contains(pt_chk):
+                            if hasattr(_self, 'path_bar') and getattr(_self.path_bar, '_in_edit', False):
+                                _self.path_bar.exit_edit_mode()
+                            elif hasattr(_self, 'path_bar') and getattr(_self.path_bar, 'edit_mode', False):
+                                _self.path_bar.exit_edit_mode()
+                    except Exception:
+                        pass
+
+                    dct = ctypes.windll.user32.GetDoubleClickTime()
+                    dt  = (t - _state['t']) & 0xFFFFFFFF  # handle 32-bit wrap
+
+                    is_dblclick = (
+                        _state['t'] != 0 and
+                        dt <= dct and
+                        abs(px - _state['x']) <= 4 and
+                        abs(py - _state['y']) <= 4
+                    )
+
+                    if is_dblclick:
+                        _state['t'] = 0  # reset so next click is fresh
+                        path_before = getattr(_self, 'current_path', None)
+
+                        def _check(_pb=path_before, _px=px, _py=py):
+                            try:
+                                # Bounds check: is click inside explorer widget?
+                                from PyQt5.QtCore import QPoint
+                                pt_local = _self.explorer.mapFromGlobal(QPoint(_px, _py))
+                                if not _self.explorer.rect().contains(pt_local):
+                                    return  # click was outside our explorer
+
+                                # Navigation guard: if NavigateComplete2 fired recently,
+                                # the LL hook arrived AFTER IEB already navigated → skip
+                                last_nav = getattr(_self, '_last_nav_complete_time', 0)
+                                if time.monotonic() - last_nav < 0.5:
+                                    return
+
+                                # Path-change guard: folder double-click navigates
+                                if getattr(_self, 'current_path', None) != _pb:
+                                    return
+
+                                # LVM_HITTEST: detect item vs. blank area
+                                lv = _self._find_syslistview_hwnd()
+                                if lv:
+                                    try:
+                                        cpt = win32gui.ScreenToClient(lv, (_px, _py))
+
+                                        class _PT(ctypes.Structure):
+                                            _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+                                        class _LVHI(ctypes.Structure):
+                                            _fields_ = [('pt', _PT), ('flags', ctypes.c_uint),
+                                                         ('iItem', ctypes.c_int), ('iSubItem', ctypes.c_int)]
+
+                                        hi = _LVHI()
+                                        hi.pt.x, hi.pt.y = int(cpt[0]), int(cpt[1])
+                                        res = ctypes.windll.user32.SendMessageW(
+                                            lv, 0x1012, 0, ctypes.byref(hi))  # LVM_HITTEST
+                                        if int(res) != -1:
+                                            # Click landed on a file/folder item
+                                            _self._suppress_auto_refresh = False
+                                            _self._resume_path_sync_after_navigation()
+                                            return
+                                    except Exception:
+                                        pass
+
+                                cnt = _self._get_selected_count_safe()
+                                if cnt is None:
+                                    # Cannot determine selection state → safe default: don't go up
+                                    debug_print("[DoubleClick/IEB] Cannot determine selection, skipping go_up")
+                                    return
+                                if int(cnt) > 0:
+                                    return
+
+                                debug_print("[DoubleClick/IEB] Blank area → go_up")
+                                _self.go_up(force=True)
+                            except Exception as _e:
+                                debug_print(f"[DoubleClick/IEB] check: {_e}")
+
+                        # 150 ms gives NavigateComplete2 time to fire (local folders ~50 ms)
+                        # while keeping the LVM_HITTEST as primary discriminator for files
+                        QTimer.singleShot(150, _check)
+                    else:
+                        _state['t'] = t
+                        _state['x'] = px
+                        _state['y'] = py
+                except Exception:
+                    pass
+
+            try:
+                hh = getattr(_self, '_lv_hook_handle', None) or 0
+                return ctypes.windll.user32.CallNextHookEx(hh, nCode, wParam, lParam)
+            except Exception:
+                return 0
+
+        cb = _HOOKPROC(_hook_proc)
+        # WH_MOUSE_LL = 14, dwThreadId must be 0 (global low-level hook)
+        handle = ctypes.windll.user32.SetWindowsHookExW(14, cb, None, 0)
+        if handle:
+            self._lv_hook_wndproc = cb      # prevent GC
+            self._lv_hook_handle  = handle
+            debug_print("[IEB] WH_MOUSE_LL hook installed")
+        else:
+            err = ctypes.windll.kernel32.GetLastError()
+            debug_print(f"[IEB] SetWindowsHookExW(WH_MOUSE_LL) failed err={err}")
+
+    def _uninstall_listview_dblclick_hook(self):
+        """Remove the WH_MOUSE_LL hook installed by _install_listview_dblclick_hook."""
+        handle = getattr(self, '_lv_hook_handle', None)
+        if handle:
+            try:
+                ctypes.windll.user32.UnhookWindowsHookEx(handle)
+                debug_print("[IEB] WH_MOUSE_LL hook removed")
+            except Exception as e:
+                debug_print(f"[IEB] UnhookWindowsHookEx error: {e}")
+            finally:
+                self._lv_hook_handle  = None
+                self._lv_hook_wndproc = None
 
     def _native_listview_hit_test(self, screen_x, screen_y):
         if not HAS_PYWIN:
@@ -4993,6 +6235,9 @@ class FileExplorerTab(QWidget):
         self._pending_double_click_timers = []
         # 双击事件唯一ID，用于区分不同的双击操作
         self._double_click_id = 0
+        # Win32 WH_MOUSE thread hook for IExplorerBrowser double-click detection
+        self._lv_hook_wndproc = None   # ctypes callback (must stay alive to prevent GC)
+        self._lv_hook_handle  = None   # HHOOK handle returned by SetWindowsHookExW
         self._is_cleaning_up = False
         
         # 文件系统监控（监控当前路径的变化）
@@ -5077,6 +6322,8 @@ class FileExplorerTab(QWidget):
         if self._is_cleaning_up:
             return
         self._is_cleaning_up = True
+        # Remove Win32 subclass hook before any other cleanup
+        self._uninstall_listview_dblclick_hook()
 
         if hasattr(self, '_pending_double_click_timers'):
             for timer in self._pending_double_click_timers:
@@ -5207,8 +6454,6 @@ class FileExplorerTab(QWidget):
             self._hide_loading_indicator()
             self.explorer.dynamicCall("Navigate(const QString&)", path)
             self.current_path = path
-            # shell 路径不做文件系统监控与轮询
-            # self._update_dir_polling(None)  # 已禁用目录轮询
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(path)
             self.update_tab_title()
@@ -5370,9 +6615,6 @@ class FileExplorerTab(QWidget):
         if getattr(self, '_navigating_folder', False):
             self._navigating_folder = False
         self._resume_path_sync_after_navigation()
-
-        # 不再启动目录轮询（QFileSystemWatcher已足够，轮询会造成不必要的刷新）
-        # self._update_dir_polling(path)  # 已禁用
 
         # 更新状态栏
         self.update_explorer_status()
@@ -5604,19 +6846,6 @@ class FileExplorerTab(QWidget):
         self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
         self.update_explorer_status()
 
-    def on_dir_model_directory_loaded(self, path):
-        """目录树模型加载完成时，若当前显示路径匹配，则触发一次刷新"""
-        try:
-            if not path or not self.current_path:
-                return
-            # QFileSystemModel 传入的 path 可能不带末尾分隔符，统一规范后比较
-            norm_loaded = os.path.abspath(path)
-            norm_current = os.path.abspath(self.current_path)
-            if norm_loaded == norm_current:
-                self._request_refresh(reason="dir_tree_loaded")
-        except Exception as e:
-            debug_print(f"[DirModel] directoryLoaded handler error: {e}")
-
     def _poll_directory_changes(self):
         """兜底轮询目录元数据，解决文件编辑后目录 watcher 不触发的问题"""
         # 如果设置了抑制标志，不触发刷新
@@ -5676,55 +6905,18 @@ class FileExplorerTab(QWidget):
             return None
 
     def update_explorer_status(self):
-        """更新嵌入 Explorer 下方状态栏"""
+        """更新嵌入 Explorer 下方状态栏（仅显示 Git 状态）"""
         if not hasattr(self, 'status_bar'):
             return
         path = getattr(self, 'current_path', None)
-        if not path:
-            self.status_bar.setText(tr("就绪"))
+        if not path or path.startswith('shell:') or '::' in path:
+            self.status_bar.setText('')
             return
 
-        # shell 路径直接展示提示
-        if path.startswith('shell:') or '::' in path:
-            self.status_bar.setText(f"{path}")
-            return
-
-        # 目录总项目数始终显示
-        total = self._count_dir_entries(path)
-        total_text = tr("（共 {} 项）").format(total) if total is not None else ""
-
-        # 统计选中项
-        selection = self._get_selection_entries_cached()
-        if selection is None:
-            text = tr("共 {} 项").format(total) if total is not None else tr("就绪")
-        elif len(selection) == 0:
-            text = tr("共 {} 项").format(total) if total is not None else tr("就绪")
-        else:
-            sel_count = len(selection)
-            # 选中状态
-            text = tr("已选 {} 项{}").format(sel_count, total_text)
-            metadata_limited = sel_count > STATUS_SELECTION_METADATA_LIMIT
-            if not metadata_limited and all(entry['is_file'] for entry in selection):
-                size_sum = sum(entry['size'] for entry in selection if entry['size'] is not None)
-                text += f"，总大小 {self._format_size(size_sum)}"
-            elif metadata_limited:
-                text += tr("，已省略大小统计")
-            if sel_count == 1:
-                entry = selection[0]
-                mtime = self._get_mtime(entry['path'])
-                if mtime:
-                    text += tr("，修改时间 {}").format(mtime)
-
-        # 附加 Git 状态摘要（仅读缓存，不阻塞 UI）
+        # 只显示 Git 状态摘要（仅读缓存，不阻塞 UI）
         cache = getattr(self, '_git_status_cache', None)
         git_summary = cache.get('result') if (cache and cache.get('path') == path) else None
-        if git_summary:
-            import html as _html
-            # 用 <span> 分隔符拼接，确保 QLabel 始终以富文本（HTML）模式渲染
-            html_text = _html.escape(text) + '<span style="color:#bbb">  │  </span>' + git_summary
-            self.status_bar.setText(html_text)
-        else:
-            self.status_bar.setText(text)
+        self.status_bar.setText(git_summary or '')
         # 异步刷新 Git 状态（后台线程）
         self._request_git_status_async(path)
 
@@ -6242,106 +7434,6 @@ class DragDropTabWidget(QTabWidget):
             event.ignore()
 
 
-
-# 自定义委托，用于在目录树中显示箭头
-from PyQt5.QtWidgets import QStyledItemDelegate
-from PyQt5.QtGui import QPainter, QColor, QPen, QFont
-from PyQt5.QtCore import Qt, QRect
-
-class TreeItemDelegate(QStyledItemDelegate):
-    """自定义目录树项委托，用于绘制展开/折叠箭头"""
-    def paint(self, painter, option, index):
-        # 先绘制默认内容
-        super().paint(painter, option, index)
-        
-        # 如果有子项，绘制箭头
-        if index.model().hasChildren(index):
-            painter.save()
-            
-            # 设置字体和颜色
-            font = QFont("Segoe UI", 10)
-            font.setBold(True)
-            painter.setFont(font)
-            painter.setPen(QColor("#505050"))
-            
-            # 计算箭头位置（在项目左侧）
-            arrow_rect = QRect(option.rect.left() - 16, option.rect.top(), 16, option.rect.height())
-            
-            # 根据展开状态选择箭头符号
-            tree_view = option.widget
-            if tree_view and isinstance(tree_view, QTreeView):
-                if tree_view.isExpanded(index):
-                    arrow = "˅"  # 展开 - 向下的尖角符号
-                else:
-                    arrow = "˃"  # 折叠 - 向右的尖角符号
-                
-                painter.drawText(arrow_rect, Qt.AlignCenter, arrow)
-            
-            painter.restore()
-
-# 自定义支持拖拽的目录树
-class DragDropTreeView(QTreeView):
-    """支持拖拽打开文件夹的自定义QTreeView"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self.setDragEnabled(True)  # 启用拖拽
-        self.setDragDropMode(QTreeView.DragDrop)  # 支持拖入和拖出
-        self.main_window = parent
-    
-    def dragEnterEvent(self, event):
-        """目录树拖拽进入事件"""
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-            debug_print("[DEBUG] DirTree: Drag enter accepted")
-        else:
-            event.ignore()
-    
-    def dragMoveEvent(self, event):
-        """目录树拖拽移动事件"""
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-    
-    def dropEvent(self, event):
-        """目录树拖拽释放事件"""
-        if event.mimeData().hasUrls():
-            urls = event.mimeData().urls()
-            debug_print(f"[DEBUG] DirTree: Drop event, urls count: {len(urls)}")
-            
-            for url in urls:
-                path = None
-                # 尝试获取本地文件路径
-                if url.isLocalFile():
-                    path = url.toLocalFile()
-                else:
-                    # 尝试从 URL 字符串中提取路径（支持网络路径）
-                    url_str = url.toString()
-                    if url_str.startswith('file:///'):
-                        from urllib.parse import unquote
-                        path = unquote(url_str[8:])
-                        if os.name == 'nt' and path.startswith('/'):
-                            path = path[1:]
-                    elif url_str.startswith('file://'):
-                        from urllib.parse import unquote
-                        # 网络路径 file://server/share
-                        path = '\\\\' + unquote(url_str[7:]).replace('/', '\\')
-                
-                if path and os.path.exists(path):
-                    debug_print(f"[DEBUG] DirTree: Processing dropped path: {path}")
-                    if os.path.isdir(path):
-                        # 如果是文件夹，打开新标签页
-                        if self.main_window and hasattr(self.main_window, 'add_new_tab'):
-                            self.main_window.add_new_tab(path)
-                    elif os.path.isfile(path):
-                        # 如果是文件，打开其所在文件夹
-                        folder = os.path.dirname(path)
-                        if self.main_window and hasattr(self.main_window, 'add_new_tab'):
-                            self.main_window.add_new_tab(folder)
-            event.acceptProposedAction()
-        else:
-            event.ignore()
 
 # 自定义MenuBar以支持右键菜单
 from PyQt5.QtWidgets import QMenuBar
@@ -8209,36 +9301,6 @@ class MainWindow(QMainWindow):
         """路径是否已在任一标签中打开。"""
         return self.find_tab_index_by_path(path) >= 0
     
-    def _on_splitter_moved(self, pos, index):
-        """当splitter移动时，保存目录树宽度（节流）"""
-        if hasattr(self, 'splitter'):
-            sizes = self.splitter.sizes()
-            if len(sizes) >= 2:
-                # 暂存宽度，使用定时器节流写入，减少频繁日志和重算
-                self._pending_dir_tree_width = sizes[0]
-                try:
-                    if not hasattr(self, '_splitter_save_timer') or self._splitter_save_timer is None:
-                        from PyQt5.QtCore import QTimer
-                        self._splitter_save_timer = QTimer(self)
-                        self._splitter_save_timer.setSingleShot(True)
-                        self._splitter_save_timer.setInterval(100)
-                        self._splitter_save_timer.timeout.connect(self._commit_splitter_size)
-                    # 重启定时器以合并连续的拖动事件
-                    self._splitter_save_timer.start()
-                except Exception:
-                    # 兜底：无定时器则直接保存
-                    self._saved_dir_tree_width = self._pending_dir_tree_width
-                    debug_print(f"[Splitter] Dir tree width saved: {self._saved_dir_tree_width}px")
-
-    def _commit_splitter_size(self):
-        """实际保存分割器左侧宽度并记录日志（被节流调用）"""
-        try:
-            if hasattr(self, '_pending_dir_tree_width'):
-                self._saved_dir_tree_width = self._pending_dir_tree_width
-                debug_print(f"[Splitter] Dir tree width saved: {self._saved_dir_tree_width}px")
-        except Exception:
-            pass
-
 
     def go_up_current_tab(self):
         current_tab = self.get_current_tab_widget()
@@ -8462,11 +9524,8 @@ class MainWindow(QMainWindow):
                 self.config.get("ai_chat", {}).get("panel_width", 360) * self.dpi_scale
             )
             sizes = self.splitter.sizes()
-            if len(sizes) >= 3:
-                self.splitter.setSizes([sizes[0], sizes[1], ai_panel_width])
-            elif len(sizes) == 2:
-                total = sum(sizes)
-                self.splitter.setSizes([sizes[0], total - ai_panel_width, ai_panel_width])
+            total = sum(sizes)
+            self.splitter.setSizes([total - ai_panel_width, ai_panel_width])
             # 更新当前目录提示
             self.update_chat_context()
             self.chat_panel.input_box.setFocus()
@@ -8516,12 +9575,6 @@ class MainWindow(QMainWindow):
             path = 'shell:MyComputerFolder'
             is_shell = True
         
-        # 保存当前splitter尺寸
-        saved_sizes = None
-        if hasattr(self, 'splitter'):
-            saved_sizes = self.splitter.sizes()
-            if len(saved_sizes) >= 2:
-                self._saved_dir_tree_width = saved_sizes[0]  # 更新保存的目录树宽度
 
         try:
             tab = FileExplorerTab(self, path, is_shell=is_shell, select_file=select_file)
@@ -8543,22 +9596,6 @@ class MainWindow(QMainWindow):
         
         self.tab_widget.setCurrentIndex(tab_index)
         
-        # 强制恢复目录树宽度，防止长路径标签页影响布局
-        if hasattr(self, '_saved_dir_tree_width') and hasattr(self, 'splitter'):
-            from PyQt5.QtCore import QTimer
-            # 延迟执行，确保布局已完成
-            def restore_width():
-                current_sizes = self.splitter.sizes()
-                if len(current_sizes) >= 2:
-                    # 保留 AI 聊天面板宽度（第3个控件），避免新建标签时面板被挤压关闭
-                    chat_width = current_sizes[2] if len(current_sizes) >= 3 else 0
-                    content_width = sum(current_sizes) - self._saved_dir_tree_width - chat_width
-                    new_sizes = [self._saved_dir_tree_width, max(content_width, 100)]
-                    if len(current_sizes) >= 3:
-                        new_sizes.append(chat_width)
-                    self.splitter.setSizes(new_sizes)
-                    debug_print(f"[Splitter] Restored dir tree width to {self._saved_dir_tree_width}px")
-            QTimer.singleShot(0, restore_width)
         
         # 更新导航按钮状态（确保新标签页的按钮状态正确）
         self.update_navigation_buttons()
@@ -8688,8 +9725,6 @@ class MainWindow(QMainWindow):
                     pass
                 # 统一通过内部方法更新窗口标题（可带“窗口恢复中”标记）
                 self._update_window_title(tab.current_path)
-                # 展开并选中左侧目录树到当前目录
-                self.expand_dir_tree_to_path(tab.current_path)
             # 更新导航按钮状态
             self.update_navigation_buttons()
             # 同步 AI 聊天面板的当前目录提示
@@ -8746,30 +9781,6 @@ class MainWindow(QMainWindow):
         # 设置标签文本省略模式 - 左边省略，保留右侧文件/文件夹名称
         self.tab_widget.tabBar().setElideMode(Qt.ElideLeft)
 
-    def expand_dir_tree_to_path(self, path):
-        # 展开并选中左侧目录树到指定路径
-        if not hasattr(self, 'dir_model') or not hasattr(self, 'dir_tree'):
-            return
-        if not path or not os.path.exists(path):
-            return
-        # 如果是网络路径，直接返回，不展开目录树
-        if path.startswith('\\\\'):
-            return
-        idx = self.dir_model.index(path)
-        if idx.isValid():
-            # 递归收集所有父索引
-            parents = []
-            parent = idx.parent()
-            while parent.isValid():
-                parents.append(parent)
-                parent = parent.parent()
-            # 先从根到叶子依次展开
-            for p in reversed(parents):
-                self.dir_tree.expand(p)
-            self.dir_tree.setCurrentIndex(idx)
-            # 让当前目录显示在目录树偏上位置
-            # QAbstractItemView.PositionAtTop = 0, PositionAtCenter = 1, PositionAtBottom = 2
-            self.dir_tree.scrollTo(idx, 1)  # 0=QAbstractItemView.PositionAtTop
 
     def dragEnterEvent(self, event):
         """主窗口拖拽进入事件"""
@@ -11464,119 +12475,8 @@ class MainWindow(QMainWindow):
                 background-color: #90a0b8;
             }
         """)
-        # 设置子控件的拉伸因子（左侧0，右侧1，右侧会占据剩余空间）
-        self.splitter.setStretchFactor(0, 0)
-        self.splitter.setStretchFactor(1, 1)
-        
-        # 保存目录树宽度，用于在添加新标签页时强制保持
-        self._saved_dir_tree_width = 240  # 初始宽度 (约占总宽度的 20%)
-        
-        # 监听splitter移动事件，保存用户设置的目录树宽度
-        self.splitter.splitterMoved.connect(self._on_splitter_moved)
-
-        # 左侧目录树（应用性能优化）
-        self.dir_model = QFileSystemModel()
-        # 性能优化：启用延迟加载和过滤器
-        self.dir_model.setFilter(QDir.Dirs | QDir.NoDotAndDotDot)  # 只显示文件夹
-        # 当目录模型加载完成时，如果正显示的路径有更新，主动刷新右侧Explorer
-        self.dir_model.directoryLoaded.connect(self.on_dir_model_directory_loaded)
-        # 设置根为计算机根目录（显示所有盘符）
-        root_path = QDir.rootPath()  # 通常为C:/
-        # 性能优化：在后台线程中加载文件系统
-        # setRootPath 本身是异步的，会在后台线程中填充
-        self.dir_model.setRootPath(root_path)
-        self.dir_tree = DragDropTreeView(self)
-        self.dir_tree.setModel(self.dir_model)
-        # 修复横向滚动条不显示问题：始终根据内容自动调整列宽
-        self.dir_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.dir_tree.header().setSectionResizeMode(0, QHeaderView.Fixed)
-        self.dir_tree.setColumnWidth(0, DIR_TREE_COLUMN_WIDTH)
-        self.dir_tree.setUniformRowHeights(True)
-        # 如果有多列，隐藏的不用管，显示的都设置为 ResizeToContents
-        # self.dir_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        # 性能优化：统一排序，减少渲染开销
-        self.dir_tree.setSortingEnabled(True)
-        self.dir_tree.sortByColumn(0, Qt.AscendingOrder)
-        # 设置缩进，为箭头留出空间
-        self.dir_tree.setIndentation(16)
-        # 不设置setRootIndex，或者设置为index("")，这样能显示所有盘符
-        # self.dir_tree.setRootIndex(self.dir_model.index(""))
-        self.dir_tree.setHeaderHidden(True)
-        self.dir_tree.setColumnHidden(1, True)
-        self.dir_tree.setColumnHidden(2, True)
-        self.dir_tree.setColumnHidden(3, True)
-        
-        # 设置自定义委托以显示箭头
-        self.dir_tree.setItemDelegate(TreeItemDelegate(self.dir_tree))
-        
-        # 设置目录树样式
-        self.dir_tree.setStyleSheet("""
-            QTreeView {
-                background-color: #f9f9f9;
-                border: none;
-                border-right: 1px solid #e5e5e5;
-                font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial, sans-serif;
-                font-size: 9pt;
-                outline: none;
-            }
-            QTreeView::item {
-                padding: 3px 6px;
-                border: none;
-                height: 24px;
-            }
-            QTreeView::item:hover {
-                background-color: #f3f3f3;
-                border-radius: 4px;
-            }
-            QTreeView::item:selected {
-                background-color: #e3f2fd;
-                color: #000;
-                border-radius: 4px;
-            }
-            QTreeView::item:selected:active {
-                background-color: #bbdefb;
-                border-radius: 4px;
-            }
-            QTreeView::branch:has-siblings:!adjoins-item {
-                border-image: none;
-            }
-            QTreeView::branch:has-siblings:adjoins-item {
-                border-image: none;
-            }
-            QTreeView::branch:!has-children:!has-siblings:adjoins-item {
-                border-image: none;
-            }
-            QTreeView::branch:has-children:!has-siblings:closed,
-            QTreeView::branch:closed:has-children:has-siblings {
-                border-image: none;
-                image: none;
-                background: transparent;
-            }
-            QTreeView::branch:open:has-children:!has-siblings,
-            QTreeView::branch:open:has-children:has-siblings {
-                border-image: none;
-                image: none;
-                background: transparent;
-            }
-        """)
-        # 移除最小宽度限制，允许完全隐藏（往左拖动时）
-        self.dir_tree.setMinimumWidth(0)
-        # 移除最大宽度限制，允许用户根据需要拖动到任意宽度
-        # self.dir_tree.setMaximumWidth(1800)  # 移除限制
-        # 设置目录树的大小策略：宽度固定（用户手动拖动），高度自适应
-        self.dir_tree.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        self.dir_tree.clicked.connect(self.on_dir_tree_clicked)
-        self.splitter.addWidget(self.dir_tree)
-        # 自动展开所有驱动器根节点（即“我的电脑”下所有盘符）
-        drives_parent = self.dir_model.index(root_path)
-        for i in range(self.dir_model.rowCount(drives_parent)):
-            idx = self.dir_model.index(i, 0, drives_parent)
-            path = self.dir_model.filePath(idx)
-            # 隐藏网络驱动器（UNC路径以\\开头）
-            if path.startswith('\\\\'):
-                self.dir_tree.setRowHidden(i, drives_parent, True)
-            else:
-                self.dir_tree.expand(idx)
+        # content_stack 占据剩余全部空间
+        self.splitter.setStretchFactor(0, 1)
 
         # 右侧标签页内容区域（使用 StackedWidget 独立显示，不依赖 tab_widget）
         from PyQt5.QtWidgets import QStackedWidget
@@ -11588,9 +12488,7 @@ class MainWindow(QMainWindow):
         
         self.splitter.addWidget(self.content_stack)
         
-        # 子控件添加完成后再设置 collapsible（必须在 addWidget 之后，否则 Qt 会报 index out of range）
-        self.splitter.setCollapsible(0, True)   # 索引0是左侧目录树，允许折叠
-        self.splitter.setCollapsible(1, False)  # 索引1是右侧标签页，不允许折叠
+        self.splitter.setCollapsible(0, False)  # content_stack 不允许折叠
 
         # 右侧 AI 聊天面板（默认隐藏，点击 🤖 按钮后显示）
         self.chat_panel = ChatPanel(self)
@@ -11602,18 +12500,14 @@ class MainWindow(QMainWindow):
         panel_visible = chat_config.get("panel_visible", False)
         self.chat_panel.setVisible(panel_visible)
         self.splitter.addWidget(self.chat_panel)
-        self.splitter.setCollapsible(2, True)  # 索引2是AI面板，允许折叠
+        self.splitter.setCollapsible(1, True)  # AI面板允许折叠
 
-        # 设置左侧目录树和右侧内容的初始宽度比例（左:右 = 2:8，符合 Windows 11 风格）
-        # 假设窗口总宽度1200px，左侧240px，右侧960px，根据DPI缩放
-        left_width = int(240 * self.dpi_scale)
-        # 如果AI面板打开，需要为其分配宽度
         if panel_visible:
-            right_width = int(960 * self.dpi_scale) - ai_panel_width
-            self.splitter.setSizes([left_width, right_width, ai_panel_width])
+            right_width = int(1200 * self.dpi_scale) - ai_panel_width
+            self.splitter.setSizes([right_width, ai_panel_width])
         else:
-            right_width = int(960 * self.dpi_scale)
-            self.splitter.setSizes([left_width, right_width])
+            right_width = int(1200 * self.dpi_scale)
+            self.splitter.setSizes([right_width, 0])
     
         # 将分割器添加到主容器
         main_layout.addWidget(self.splitter)
@@ -12223,32 +13117,6 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-    def on_dir_tree_clicked(self, index):
-        # 目录树点击，右侧当前标签页跳转
-        if not index.isValid():
-            return
-        path = self.dir_model.filePath(index)
-        current_tab = self.get_current_tab_widget()
-        if hasattr(current_tab, 'navigate_to'):
-            current_tab.navigate_to(path)
-
-    def on_dir_model_directory_loaded(self, path):
-        """目录树模型加载完成时，如果当前标签页正在显示该路径，则触发刷新"""
-        try:
-            tab = self.get_current_tab_widget()
-            if not tab or not getattr(tab, 'current_path', None):
-                return
-            if getattr(tab, '_suppress_auto_refresh', False) or getattr(tab, '_navigating_folder', False):
-                return
-            if hasattr(tab, '_refresh_active') and not getattr(tab, '_refresh_active', True):
-                return
-            norm_loaded = os.path.abspath(path) if path else None
-            norm_tab = os.path.abspath(tab.current_path) if tab.current_path else None
-            if norm_loaded and norm_tab and norm_loaded == norm_tab:
-                if hasattr(tab, '_schedule_refresh'):
-                    tab._schedule_refresh(reason="dir_tree_loaded")
-        except Exception as e:
-            debug_print(f"[DirModel] directoryLoaded handler error: {e}")
 
     def open_bookmark_url(self, url):
         # 支持 file:///、file://、shell: 路径和本地绝对路径
@@ -13456,9 +14324,6 @@ class BookmarkManagerDialog(QDialog):
         self.populate_tree()
 
         btn_layout = QHBoxLayout()
-        # self.rename_btn = QPushButton("重命名")  # 已移除重命名按钮
-        # self.rename_btn.clicked.connect(self.rename_item)
-        # btn_layout.addWidget(self.rename_btn)
         self.edit_btn = QPushButton(tr("编辑"))
         self.edit_btn.clicked.connect(self.edit_item)
         btn_layout.addWidget(self.edit_btn)
@@ -13808,7 +14673,14 @@ def main():
     # 支持命令行参数：打开指定路径
     import sys
     import os
-    
+
+    # Set HKCU ShellIconOverlayIdentifiers to stub CLSIDs BEFORE any shell/COM
+    # initialization in this process.  The Shell's overlay manager (SIOM) is a
+    # per-process singleton; it reads the registry only once at creation time.
+    # Calling this here – before QApplication and before any SHGetFileInfo or
+    # IExplorerBrowser call – guarantees SHELLDLL_DefView picks up the entries.
+    _tortoise_setup_overlays()
+
     path_to_open = None
     if len(sys.argv) > 1:
         path = sys.argv[1]
@@ -13855,6 +14727,9 @@ def main():
     # 安装自定义 Qt 消息处理器，过滤 QAxBase 等警告
     from PyQt5.QtCore import qInstallMessageHandler
     qInstallMessageHandler(qt_message_handler)
+
+    # 安装 IExplorerBrowser 键盘消息过滤器
+    app.installNativeEventFilter(_ieb_keyboard_filter)
     
     # 图标将在 MainWindow.__init__ 中生成并设置，确保 Qt 完全初始化后执行
     
@@ -13879,7 +14754,11 @@ def main():
     
     # 确保启动时阴影状态正确（最大化时无阴影）
     window._update_window_shadow()
-    
+
+    # Register cleanup for TortoiseGit HKCU overlay entries
+    import atexit
+    atexit.register(_tortoise_cleanup_overlays)
+
     sys.exit(app.exec_())
 
 if __name__ == "__main__":

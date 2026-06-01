@@ -39,6 +39,13 @@
 
 ## 🆕 最近更新
 
+### v3.36 (2026-06-01)
+- **IExplorerBrowser 键盘快捷键修复**：Delete / Ctrl+C / Ctrl+V / F2 等快捷键在 IExplorerBrowser 模式下恢复正常（通过 IShellView::TranslateAccelerator 转发）
+- **双击误触 go_up 修复**：双击文件夹不再误触返回上级（NavigateComplete2 时间戳守卫）；双击文件不再误触返回上级（IFolderView COM 接口检测选中状态）
+- **路径栏编辑模式修复**：点击 IExplorerBrowser 区域（选中文件等）后路径栏自动退出编辑模式；导航到新目录时路径栏强制退出编辑模式并显示新路径；在编辑框内操作（选中文本、复制）不会被打断
+- **路径栏内容恢复**：窗口被其他程序遮挡后恢复前台时，面包屑内容自动重绘
+- **代码清理**：移除未使用的 `_pyqtSignal` 导入、死注释代码；统一 `print()` 为 `debug_print()`
+
 ### v3.35.1 (2026-05-30)
 - **路径栏稳定性修复**：修复 `resizeEvent` 中重入守卫激活时 `_is_navigation_update` 被误重置导致偶发路径栏不刷新的竞态；同步定时器（路径未变时）改为轻量 `repaint()` 而非全量重建，减少控件析构开销；修复 MetaCall 事件通道中 `local_path` 未规范化的问题
 
