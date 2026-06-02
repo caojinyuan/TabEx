@@ -3150,6 +3150,8 @@ class BreadcrumbPathBar(QWidget):
         self._flush_path_bar_display(norm_path)
         QTimer.singleShot(0, lambda expected_path=norm_path: self._flush_path_bar_display(expected_path))
         QTimer.singleShot(50, lambda expected_path=norm_path: self._flush_path_bar_display(expected_path))
+        # Extra flush to catch late layout interference from IShellView::Refresh()
+        QTimer.singleShot(350, lambda expected_path=norm_path: self._flush_path_bar_display(expected_path))
 
     def _flush_path_bar_display(self, expected_path=None):
         """确保路径栏在导航时序竞争下也能及时恢复显示。"""
@@ -3200,6 +3202,11 @@ class BreadcrumbPathBar(QWidget):
     def _on_resize_timer_timeout(self):
         """_resize_timer 到期：重建面包屑并强制刷新视觉"""
         if self.edit_mode:
+            return
+        # 如果宽度不合理（IShellView::Refresh 等可能短暂清零），延迟重试
+        if hasattr(self, 'breadcrumb_widget') and self.breadcrumb_widget.width() < 50 and self.current_path:
+            if getattr(self, '_resize_timer', None):
+                self._resize_timer.start()  # 50ms 后再试
             return
         self.update_breadcrumbs()  # 内部已调用 activate()，无需再次调用，避免触发多余 resizeEvent
         if hasattr(self, 'breadcrumb_widget'):
