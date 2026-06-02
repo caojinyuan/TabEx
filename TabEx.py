@@ -3524,6 +3524,31 @@ class BreadcrumbPathBar(QWidget):
         super().mousePressEvent(event)
 
 
+class _CrumbDragFilter(QObject):
+    """事件过滤器：为 SimplePathBar 面包屑按钮提供拖拽功能，可拖到标签栏打开新tab。"""
+
+    def eventFilter(self, obj, event):
+        from PyQt5.QtCore import QEvent, QPoint, QUrl, QMimeData
+        t = event.type()
+        if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            obj._drag_start = event.pos()
+            return False  # 不拦截，让 clicked 正常工作
+        elif t == QEvent.MouseMove and obj._drag_start is not None:
+            if (event.pos() - obj._drag_start).manhattanLength() >= QApplication.startDragDistance():
+                # 开始拖拽
+                drag = QDrag(obj)
+                mime = QMimeData()
+                mime.setUrls([QUrl.fromLocalFile(obj._crumb_path)])
+                mime.setText(obj._crumb_path)
+                drag.setMimeData(mime)
+                drag.exec_(Qt.CopyAction | Qt.MoveAction)
+                obj._drag_start = None
+                return True
+        elif t == QEvent.MouseButtonRelease:
+            obj._drag_start = None
+        return False
+
+
 class SimplePathBar(QWidget):
     """Windows Explorer 风格面包屑地址栏。
     - 普通模式：显示可点击的路径分段 (C: › project › EOL)，点击某段导航到该层
@@ -3534,24 +3559,26 @@ class SimplePathBar(QWidget):
     """
     pathChanged = pyqtSignal(str)
 
-    _FONT   = "font-family: 'Segoe UI', 'Microsoft YaHei UI'; font-size: 15px;"
-    _S_BAR  = ("SimplePathBar { background: rgb(243,243,243); border-bottom: 1px solid #d6d6d6; }")
-    _S_BTN  = ("QPushButton { background: transparent; border: none; padding: 2px 6px;"
-               " font-family: 'Segoe UI', 'Microsoft YaHei UI'; font-size: 17px;"
-               " font-weight: 400; color: #0055cc; }"
-               "QPushButton:hover { background: #daeaf8; border-radius: 4px; }"
-               "QPushButton:pressed { background: #c2d8ef; border-radius: 4px; }")
-    _S_SEP  = ("QLabel { color: #a0a0a0; font-family: 'Segoe UI Symbol',"
-               " 'Segoe UI'; font-size: 12px; padding: 0 2px; background: transparent; }")
-    _S_EDIT = ("QLineEdit { background: white; border: 1px solid #0078d4; border-radius: 3px;"
-               " font-family: 'Segoe UI', 'Microsoft YaHei UI'; font-size: 15px;"
-               " color: #202020; padding: 1px 6px; selection-background-color: #0078d4; }")
+    _FONT   = "font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif; font-size: 11pt;"
+    _S_BAR  = ("SimplePathBar { background: transparent; border: none; }")
+    _S_BTN  = ("QPushButton { background: transparent; border: none; padding: 1px 2px;"
+               " font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif; font-size: 11pt;"
+               " font-weight: 500; color: #003d7a; margin: 0 2px; border-radius: 2px; }"
+               "QPushButton:hover { background: #cce5ff; text-decoration: underline; }"
+               "QPushButton:pressed { background: #99ccff; }")
+    _S_SEP  = ("QLabel { color: #888; font-size: 11pt;"
+               " padding: 0; margin: 0 2px; background: transparent; }")
+    _S_EDIT = ("QLineEdit { background: white; border: 1px solid #ccc; border-radius: 3px;"
+               " font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif; font-size: 10pt;"
+               " color: #202020; padding: 2px 6px; selection-background-color: #0078d4; }")
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_path = ''
+        self._last_built_path = ''
         self._in_edit = False
-        self.setFixedHeight(28)
+        self.setFixedHeight(30)
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(self._S_BAR)
 
         from PyQt5.QtWidgets import QStackedWidget
@@ -3566,7 +3593,7 @@ class SimplePathBar(QWidget):
         self._crumb_w = QWidget()
         self._crumb_w.setStyleSheet("background: transparent;")
         self._crumb_row = QHBoxLayout(self._crumb_w)
-        self._crumb_row.setContentsMargins(4, 0, 4, 0)
+        self._crumb_row.setContentsMargins(2, 0, 2, 0)
         self._crumb_row.setSpacing(0)
         self._crumb_row.addStretch()
         self._stack.addWidget(self._crumb_w)
@@ -3583,6 +3610,9 @@ class SimplePathBar(QWidget):
 
         # 点击面包屑行空白处 → 编辑模式
         self._crumb_w.mousePressEvent = self._on_crumb_click
+
+        # 面包屑按钮拖拽事件过滤器
+        self._crumb_drag_filter = _CrumbDragFilter(self)
 
     # ── 公共 API ─────────────────────────────────────────────────────────────
 
@@ -3611,6 +3641,7 @@ class SimplePathBar(QWidget):
     def exit_edit_mode(self):
         self._in_edit = False
         self._stack.setCurrentIndex(0)
+        self._last_built_path = ''  # 强制重建
         self._rebuild()
         # 移除应用级事件过滤器
         from PyQt5.QtWidgets import QApplication
@@ -3639,14 +3670,9 @@ class SimplePathBar(QWidget):
         """窗口激活时强制刷新面包屑"""
         from PyQt5.QtCore import QEvent
         if event.type() == QEvent.WindowActivate and not self._in_edit:
-            QTimer.singleShot(0, self._rebuild)
+            # 仅重绘，不重建（_rebuild 由 set_path 负责）
+            self.update()
         super().changeEvent(event)
-
-    def showEvent(self, event):
-        """widget 变为可见时（tab 切换/窗口恢复）强制刷新面包屑"""
-        super().showEvent(event)
-        if not self._in_edit:
-            QTimer.singleShot(0, self._rebuild)
 
     def get_path_for_copy(self, separator='\\'):
         p = self._current_path
@@ -3663,6 +3689,12 @@ class SimplePathBar(QWidget):
         if not parts and self._crumb_row.count() > 0:
             return
 
+        # 内容未变化时仅重绘，避免频繁销毁/重建控件
+        if self._last_built_path == self._current_path and self._crumb_row.count() > 1:
+            self._crumb_w.update()
+            return
+        self._last_built_path = self._current_path
+
         # 清除旧控件
         while self._crumb_row.count():
             item = self._crumb_row.takeAt(0)
@@ -3673,9 +3705,9 @@ class SimplePathBar(QWidget):
 
         for i, (label, full_path) in enumerate(parts):
             if i > 0:
-                sep = QLabel('›')
+                sep = QLabel('>')
                 sep.setStyleSheet(self._S_SEP)
-                sep.setFixedWidth(12)
+                sep.setFixedWidth(14)
                 sep.setAlignment(Qt.AlignCenter)
                 self._crumb_row.addWidget(sep)
             btn = QPushButton(label)
@@ -3684,6 +3716,10 @@ class SimplePathBar(QWidget):
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFocusPolicy(Qt.NoFocus)
             btn.clicked.connect(lambda _=False, p=full_path: self.pathChanged.emit(p))
+            # 拖拽支持：面包屑可拖拽到标签栏打开新tab
+            btn._crumb_path = full_path
+            btn._drag_start = None
+            btn.installEventFilter(self._crumb_drag_filter)
             self._crumb_row.addWidget(btn)
 
         self._crumb_row.addStretch()
@@ -4553,10 +4589,13 @@ class IExplorerBrowserWidget(QWidget):
     def dynamicCall(self, sig, *args):
         """QAxWidget-compatible dispatch for Navigate / Refresh calls."""
         s = sig.lower()
-        # Match only actual Navigate/Navigate2 calls, not NavigateComplete2 events
-        if s.startswith('navigate') or s.startswith('navigate2'):
+        # Match only actual Navigate/Navigate2 calls, skip event signatures
+        # (NavigateComplete2, BeforeNavigate2, etc.)
+        if (s.startswith('navigate') or s.startswith('navigate2')) and \
+           'complete' not in s and 'before' not in s:
             url = str(args[0]) if args else ''
-            self._navigate_url(url)
+            if url and url != 'None':
+                self._navigate_url(url)
         elif 'refresh()' in s:
             self._do_refresh()
         # All other calls (Visible, ToolBar, Silent, NavigateComplete2 events…) are silently ignored
@@ -4721,6 +4760,10 @@ class IExplorerBrowserWidget(QWidget):
 
 
 class FileExplorerTab(QWidget):
+    # Singleton WH_MOUSE_LL hook for double-click detection (shared across all IEB tabs)
+    _global_mouse_hook_handle = None
+    _global_mouse_hook_cb = None
+
     def _force_remove_watcher(self, path):
         """强制移除watcher路径，防止事件风暴"""
         try:
@@ -5839,6 +5882,106 @@ class FileExplorerTab(QWidget):
             debug_print(f"[IEB] _get_ieb_selection_count failed: {e}")
         return None
 
+    def _get_ieb_selected_paths(self):
+        """通过 IFolderView::Items(SVGIO_SELECTION) 获取 IExplorerBrowser 选中文件路径列表。"""
+        paths = []
+        try:
+            from comtypes import GUID as _GUID
+            _vp_size = ctypes.sizeof(ctypes.c_void_p)
+            # 获取 IShellView
+            iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
+            ppv_sv = self.explorer._browser.GetCurrentView(ctypes.byref(iid_sv))
+            sv_ptr = int(ppv_sv) if ppv_sv else 0
+            if not sv_ptr:
+                return paths
+            try:
+                # QI for IFolderView
+                iid_fv = _GUID("{CDE725B0-CCC9-4519-917E-325D72FAB4CE}")
+                vtable_ptr = ctypes.c_void_p.from_address(sv_ptr).value
+                qi_addr = ctypes.c_void_p.from_address(vtable_ptr).value
+                _QI = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                         ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p))
+                qi_fn = _QI(qi_addr)
+                fv_ptr = ctypes.c_void_p(0)
+                hr_qi = qi_fn(sv_ptr, ctypes.byref(iid_fv), ctypes.byref(fv_ptr))
+                if hr_qi != 0 or not fv_ptr.value:
+                    return paths
+                try:
+                    fv_vtable = ctypes.c_void_p.from_address(fv_ptr.value).value
+                    # IFolderView::Items at vtable index 8
+                    # HRESULT Items(UINT uFlags, REFIID riid, void** ppv)
+                    iid_sia = _GUID("{B63EA76D-1F85-456F-A19C-48159EFA858B}")  # IShellItemArray
+                    fn_addr = ctypes.c_void_p.from_address(fv_vtable + 8 * _vp_size).value
+                    _ITEMS = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                                ctypes.c_uint, ctypes.POINTER(_GUID),
+                                                ctypes.POINTER(ctypes.c_void_p))
+                    items_fn = _ITEMS(fn_addr)
+                    sia_ptr = ctypes.c_void_p(0)
+                    hr = items_fn(fv_ptr.value, 0x1, ctypes.byref(iid_sia), ctypes.byref(sia_ptr))
+                    if hr != 0 or not sia_ptr.value:
+                        return paths
+                    try:
+                        # IShellItemArray::GetCount at vtable index 7
+                        sia_vtable = ctypes.c_void_p.from_address(sia_ptr.value).value
+                        gc_addr = ctypes.c_void_p.from_address(sia_vtable + 7 * _vp_size).value
+                        _GC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                                  ctypes.POINTER(ctypes.c_uint))
+                        gc_fn = _GC(gc_addr)
+                        count = ctypes.c_uint(0)
+                        hr = gc_fn(sia_ptr.value, ctypes.byref(count))
+                        if hr != 0 or count.value == 0:
+                            return paths
+                        # IShellItemArray::GetItemAt at vtable index 8
+                        gia_addr = ctypes.c_void_p.from_address(sia_vtable + 8 * _vp_size).value
+                        _GIA = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                                   ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))
+                        gia_fn = _GIA(gia_addr)
+                        for i in range(count.value):
+                            si_ptr = ctypes.c_void_p(0)
+                            hr = gia_fn(sia_ptr.value, i, ctypes.byref(si_ptr))
+                            if hr != 0 or not si_ptr.value:
+                                continue
+                            try:
+                                # IShellItem::GetDisplayName at vtable index 5
+                                # SIGDN_FILESYSPATH = 0x80058000
+                                si_vtable = ctypes.c_void_p.from_address(si_ptr.value).value
+                                gdn_addr = ctypes.c_void_p.from_address(si_vtable + 5 * _vp_size).value
+                                _GDN = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                                          ctypes.c_uint, ctypes.POINTER(ctypes.c_wchar_p))
+                                gdn_fn = _GDN(gdn_addr)
+                                name_ptr = ctypes.c_wchar_p()
+                                hr = gdn_fn(si_ptr.value, 0x80058000, ctypes.byref(name_ptr))
+                                if hr == 0 and name_ptr.value:
+                                    paths.append(name_ptr.value)
+                                    ctypes.windll.ole32.CoTaskMemFree(name_ptr)
+                            finally:
+                                # Release IShellItem
+                                si_vt = ctypes.c_void_p.from_address(si_ptr.value).value
+                                rel_addr = ctypes.c_void_p.from_address(si_vt + 2 * _vp_size).value
+                                _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                                _REL(rel_addr)(si_ptr.value)
+                    finally:
+                        # Release IShellItemArray
+                        sia_vt = ctypes.c_void_p.from_address(sia_ptr.value).value
+                        rel_addr = ctypes.c_void_p.from_address(sia_vt + 2 * _vp_size).value
+                        _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                        _REL(rel_addr)(sia_ptr.value)
+                finally:
+                    # Release IFolderView
+                    fv_vt = ctypes.c_void_p.from_address(fv_ptr.value).value
+                    rel_addr = ctypes.c_void_p.from_address(fv_vt + 2 * _vp_size).value
+                    _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                    _REL(rel_addr)(fv_ptr.value)
+            finally:
+                # Release IShellView
+                vtable_ptr = ctypes.c_void_p.from_address(sv_ptr).value
+                rel_addr = ctypes.c_void_p.from_address(vtable_ptr + 2 * _vp_size).value
+                _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                _REL(rel_addr)(sv_ptr)
+        except Exception as e:
+            debug_print(f"[IEB] _get_ieb_selected_paths failed: {e}")
+        return paths
+
     # --- Windows native helpers for listview hit-testing ---
     def _find_syslistview_hwnd(self):
         if not HAS_PYWIN:
@@ -5874,26 +6017,24 @@ class FileExplorerTab(QWidget):
         return find_in_tree(parent)
 
     def _install_listview_dblclick_hook(self):
-        """Install a WH_MOUSE_LL (low-level) global mouse hook to detect
-        double-clicks inside IExplorerBrowser.
+        """Install a single process-wide WH_MOUSE_LL hook (singleton) for
+        double-click detection across all IExplorerBrowser tabs.
 
-        WH_MOUSE (local) fires *synchronously* inside COM STA message dispatch
-        and deadlocks when IExplorerBrowser pumps messages internally.
-        WH_MOUSE_LL (14) fires *asynchronously* via the posted message queue,
-        so it is safe regardless of COM state.
+        Only one hook exists; it dispatches to the current active tab.
         """
         if not HAS_PYWIN:
             return
         if not isinstance(getattr(self, 'explorer', None), IExplorerBrowserWidget):
-            return  # QAxWidget: Qt event-filter is sufficient
-        if getattr(self, '_lv_hook_handle', None):
-            return  # already installed
+            return
         if not getattr(self.explorer, '_init_ok', False):
-            return  # IExplorerBrowser not yet ready
+            return
 
-        _self = self
+        # Singleton: if a global hook already exists, skip
+        if getattr(FileExplorerTab, '_global_mouse_hook_handle', None):
+            return
 
-        # ── ctypes struct for MSLLHOOKSTRUCT ───────────────────────────────
+        _self_ref = self  # only used to locate main_window
+
         class _POINT(ctypes.Structure):
             _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
 
@@ -5902,21 +6043,31 @@ class FileExplorerTab(QWidget):
                 ('pt',          _POINT),
                 ('mouseData',   ctypes.c_ulong),
                 ('flags',       ctypes.c_ulong),
-                ('time',        ctypes.c_ulong),   # tick count (GetTickCount units)
-                ('dwExtraInfo', ctypes.c_size_t),  # ULONG_PTR – pointer-sized
+                ('time',        ctypes.c_ulong),
+                ('dwExtraInfo', ctypes.c_size_t),
             ]
 
         _HOOKPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_ssize_t,   # LRESULT (pointer-sized)
-            ctypes.c_int,       # nCode
+            ctypes.c_ssize_t,
+            ctypes.c_int,
             ctypes.wintypes.WPARAM,
             ctypes.wintypes.LPARAM,
         )
 
-        # Track last left-button-down for double-click detection
-        # (WH_MOUSE_LL does NOT deliver WM_LBUTTONDBLCLK, only WM_LBUTTONDOWN)
         WM_LBUTTONDOWN = 0x0201
         _state = {'t': 0, 'x': -9999, 'y': -9999}
+
+        def _get_current_tab():
+            """获取当前活跃的 FileExplorerTab（IEB 模式）"""
+            try:
+                mw = getattr(_self_ref, 'main_window', None)
+                if mw and hasattr(mw, 'get_current_tab_widget'):
+                    tab = mw.get_current_tab_widget()
+                    if tab and isinstance(getattr(tab, 'explorer', None), IExplorerBrowserWidget):
+                        return tab
+            except Exception:
+                pass
+            return None
 
         def _hook_proc(nCode, wParam, lParam):
             if nCode >= 0 and wParam == WM_LBUTTONDOWN:
@@ -5924,22 +6075,24 @@ class FileExplorerTab(QWidget):
                     info = ctypes.cast(lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
                     px = int(info.pt.x)
                     py = int(info.pt.y)
-                    t  = int(info.time)   # Windows tick count
+                    t  = int(info.time)
 
                     # 点击 explorer 区域内时，通知路径栏退出编辑模式
                     try:
                         from PyQt5.QtCore import QPoint
-                        pt_chk = _self.explorer.mapFromGlobal(QPoint(px, py))
-                        if _self.explorer.rect().contains(pt_chk):
-                            if hasattr(_self, 'path_bar') and getattr(_self.path_bar, '_in_edit', False):
-                                _self.path_bar.exit_edit_mode()
-                            elif hasattr(_self, 'path_bar') and getattr(_self.path_bar, 'edit_mode', False):
-                                _self.path_bar.exit_edit_mode()
+                        tab = _get_current_tab()
+                        if tab:
+                            pt_chk = tab.explorer.mapFromGlobal(QPoint(px, py))
+                            if tab.explorer.rect().contains(pt_chk):
+                                if hasattr(tab, 'path_bar') and getattr(tab.path_bar, '_in_edit', False):
+                                    tab.path_bar.exit_edit_mode()
+                                elif hasattr(tab, 'path_bar') and getattr(tab.path_bar, 'edit_mode', False):
+                                    tab.path_bar.exit_edit_mode()
                     except Exception:
                         pass
 
                     dct = ctypes.windll.user32.GetDoubleClickTime()
-                    dt  = (t - _state['t']) & 0xFFFFFFFF  # handle 32-bit wrap
+                    dt  = (t - _state['t']) & 0xFFFFFFFF
 
                     is_dblclick = (
                         _state['t'] != 0 and
@@ -5949,29 +6102,27 @@ class FileExplorerTab(QWidget):
                     )
 
                     if is_dblclick:
-                        _state['t'] = 0  # reset so next click is fresh
-                        path_before = getattr(_self, 'current_path', None)
+                        _state['t'] = 0
 
-                        def _check(_pb=path_before, _px=px, _py=py):
+                        def _check(_px=px, _py=py):
                             try:
-                                # Bounds check: is click inside explorer widget?
-                                from PyQt5.QtCore import QPoint
-                                pt_local = _self.explorer.mapFromGlobal(QPoint(_px, _py))
-                                if not _self.explorer.rect().contains(pt_local):
-                                    return  # click was outside our explorer
+                                tab = _get_current_tab()
+                                if not tab:
+                                    return
 
-                                # Navigation guard: if NavigateComplete2 fired recently,
-                                # the LL hook arrived AFTER IEB already navigated → skip
-                                last_nav = getattr(_self, '_last_nav_complete_time', 0)
+                                # Bounds check
+                                from PyQt5.QtCore import QPoint
+                                pt_local = tab.explorer.mapFromGlobal(QPoint(_px, _py))
+                                if not tab.explorer.rect().contains(pt_local):
+                                    return
+
+                                # Navigation guard
+                                last_nav = getattr(tab, '_last_nav_complete_time', 0)
                                 if time.monotonic() - last_nav < 0.5:
                                     return
 
-                                # Path-change guard: folder double-click navigates
-                                if getattr(_self, 'current_path', None) != _pb:
-                                    return
-
-                                # LVM_HITTEST: detect item vs. blank area
-                                lv = _self._find_syslistview_hwnd()
+                                # LVM_HITTEST
+                                lv = tab._find_syslistview_hwnd()
                                 if lv:
                                     try:
                                         cpt = win32gui.ScreenToClient(lv, (_px, _py))
@@ -5985,27 +6136,23 @@ class FileExplorerTab(QWidget):
                                         hi = _LVHI()
                                         hi.pt.x, hi.pt.y = int(cpt[0]), int(cpt[1])
                                         res = ctypes.windll.user32.SendMessageW(
-                                            lv, 0x1012, 0, ctypes.byref(hi))  # LVM_HITTEST
+                                            lv, 0x1012, 0, ctypes.byref(hi))
                                         if int(res) != -1:
-                                            # Click landed on a file/folder item
-                                            _self._suppress_auto_refresh = False
-                                            _self._resume_path_sync_after_navigation()
+                                            tab._suppress_auto_refresh = False
+                                            tab._resume_path_sync_after_navigation()
                                             return
                                     except Exception:
                                         pass
 
-                                cnt = _self._get_selected_count_safe()
+                                cnt = tab._get_selected_count_safe()
                                 if cnt is not None and int(cnt) > 0:
-                                    # 明确有选中项（点击了文件/文件夹）→ 不 go_up
                                     return
 
                                 debug_print("[DoubleClick/IEB] Blank area → go_up")
-                                _self.go_up(force=True)
+                                tab.go_up(force=True)
                             except Exception as _e:
                                 debug_print(f"[DoubleClick/IEB] check: {_e}")
 
-                        # 150 ms gives NavigateComplete2 time to fire (local folders ~50 ms)
-                        # while keeping the LVM_HITTEST as primary discriminator for files
                         QTimer.singleShot(150, _check)
                     else:
                         _state['t'] = t
@@ -6015,34 +6162,44 @@ class FileExplorerTab(QWidget):
                     pass
 
             try:
-                hh = getattr(_self, '_lv_hook_handle', None) or 0
+                hh = getattr(FileExplorerTab, '_global_mouse_hook_handle', None) or 0
                 return ctypes.windll.user32.CallNextHookEx(hh, nCode, wParam, lParam)
             except Exception:
                 return 0
 
         cb = _HOOKPROC(_hook_proc)
-        # WH_MOUSE_LL = 14, dwThreadId must be 0 (global low-level hook)
         handle = ctypes.windll.user32.SetWindowsHookExW(14, cb, None, 0)
         if handle:
-            self._lv_hook_wndproc = cb      # prevent GC
-            self._lv_hook_handle  = handle
-            debug_print("[IEB] WH_MOUSE_LL hook installed")
+            FileExplorerTab._global_mouse_hook_cb     = cb       # prevent GC
+            FileExplorerTab._global_mouse_hook_handle = handle
+            self._lv_hook_handle = handle  # backward compat for logs
+            debug_print("[IEB] WH_MOUSE_LL hook installed (singleton)")
         else:
             err = ctypes.windll.kernel32.GetLastError()
             debug_print(f"[IEB] SetWindowsHookExW(WH_MOUSE_LL) failed err={err}")
 
     def _uninstall_listview_dblclick_hook(self):
-        """Remove the WH_MOUSE_LL hook installed by _install_listview_dblclick_hook."""
-        handle = getattr(self, '_lv_hook_handle', None)
-        if handle:
-            try:
-                ctypes.windll.user32.UnhookWindowsHookEx(handle)
-                debug_print("[IEB] WH_MOUSE_LL hook removed")
-            except Exception as e:
-                debug_print(f"[IEB] UnhookWindowsHookEx error: {e}")
-            finally:
-                self._lv_hook_handle  = None
-                self._lv_hook_wndproc = None
+        """Remove the singleton WH_MOUSE_LL hook only when the app is closing."""
+        self._lv_hook_handle = None
+        # Only actually unhook when the MainWindow is closing (no more tabs)
+        handle = getattr(FileExplorerTab, '_global_mouse_hook_handle', None)
+        if not handle:
+            return
+        # Check if any other IEB tab still exists
+        mw = getattr(self, 'main_window', None)
+        if mw and hasattr(mw, 'content_stack'):
+            for i in range(mw.content_stack.count()):
+                w = mw.content_stack.widget(i)
+                if w is not self and isinstance(getattr(w, 'explorer', None), IExplorerBrowserWidget):
+                    return  # other IEB tabs still alive, keep hook
+        try:
+            ctypes.windll.user32.UnhookWindowsHookEx(handle)
+            debug_print("[IEB] WH_MOUSE_LL hook removed (singleton)")
+        except Exception as e:
+            debug_print(f"[IEB] UnhookWindowsHookEx error: {e}")
+        finally:
+            FileExplorerTab._global_mouse_hook_handle = None
+            FileExplorerTab._global_mouse_hook_cb = None
 
     def _native_listview_hit_test(self, screen_x, screen_y):
         if not HAS_PYWIN:
@@ -6417,10 +6574,16 @@ class FileExplorerTab(QWidget):
         """获取选中的文件名列表（仅文件名，含后缀）"""
         filenames = []
         try:
-            # 通过Document接口获取SelectedItems
+            # IExplorerBrowser 模式：通过 COM 接口直接获取选中路径
+            if isinstance(self.explorer, IExplorerBrowserWidget):
+                paths = self._get_ieb_selected_paths()
+                for p in paths:
+                    if p:
+                        filenames.append(os.path.basename(str(p)))
+                return filenames
+            # 旧 QAxWidget 模式：通过Document接口获取SelectedItems
             doc = self.explorer.querySubObject('Document')
             if doc:
-                # 获取选中项集合
                 selected = doc.querySubObject('SelectedItems()')
                 if selected:
                     count = selected.dynamicCall('Count()')
@@ -6431,7 +6594,6 @@ class FileExplorerTab(QWidget):
                                 name = item.dynamicCall('Name()')
                                 if name:
                                     filenames.append(str(name))
-                                    debug_print(f"[get_selected_filenames] Found: {name}")
         except Exception as e:
             debug_print(f"[get_selected_filenames] Error: {e}")
         return filenames
@@ -6745,7 +6907,7 @@ class FileExplorerTab(QWidget):
                 self.main_window.update_navigation_buttons()
     
     def on_directory_changed(self, path):
-        """文件系统监控：目录内容发生变化（带防抖）"""
+        """文件系统监控：目录内容发生变化（带防抖+风暴检测）"""
         import time, os
         current_time = time.time() * 1000  # 转为毫秒
         self._invalidate_entry_count_cache(path)
@@ -6754,12 +6916,22 @@ class FileExplorerTab(QWidget):
             debug_print(f"[FileWatcher] Directory not exist, remove watcher: {path}")
             self._force_remove_watcher(path)
             return
+
+        # ── 风暴计数：记录短时间内收到的事件数 ──
+        storm_times = getattr(self, '_watcher_storm_times', [])
+        storm_times = [t for t in storm_times if current_time - t < 10000]  # 10s 窗口
+        storm_times.append(current_time)
+        self._watcher_storm_times = storm_times
+        is_storm = len(storm_times) > 5  # 10s 内超过 5 个事件视为风暴
+
         if hasattr(self, '_last_watcher_event'):
             last_time = self._last_watcher_event.get(path, 0)
             time_since_last = current_time - last_time
             if path == getattr(self, 'current_path', None) and self.refresh_timer.isActive():
                 return
-            if time_since_last < self._watcher_debounce_ms:
+            # 风暴期间使用更长的防抖时间（5s），正常情况 3s
+            debounce = 5000 if is_storm else self._watcher_debounce_ms
+            if time_since_last < debounce:
                 return
             self._last_watcher_event[path] = current_time
             if len(self._last_watcher_event) > 10:
@@ -6776,8 +6948,7 @@ class FileExplorerTab(QWidget):
                     return
                 if path == getattr(self, 'current_path', None):
                     self._last_dir_snapshot = current_snapshot
-        debug_print(f"[FileWatcher] Directory changed: {path}")
-        debug_print(f"[FileWatcher] Now watching: {self.file_watcher.directories()}")
+        debug_print(f"[FileWatcher] Directory changed: {path} (storm={is_storm})")
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
             return
@@ -6816,25 +6987,25 @@ class FileExplorerTab(QWidget):
             self.refresh_timer.start(delay_ms)
     
     def delayed_refresh(self):
-        """延迟刷新：避免频繁刷新"""
+        """延迟刷新：避免频繁刷新。风暴期间跳过或进一步延后。"""
         import time
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
             return
         now_ms = time.time() * 1000
-        # 风暴检测：5s 内超过 3 次刷新，暂停 5s
-        burst_suppressed_until = getattr(self, '_refresh_burst_suppressed_until', 0)
-        if now_ms < burst_suppressed_until:
-            debug_print(f"[AutoRefresh] Burst suppressed, skipping refresh")
+
+        # 风暴检测：如果仍在风暴中且距上次刷新太近，重新延后
+        storm_times = getattr(self, '_watcher_storm_times', [])
+        storm_count = sum(1 for t in storm_times if now_ms - t < 10000)
+        is_storm = storm_count > 5
+        last_refresh_ms = float(getattr(self, '_last_refresh_ts_ms', 0) or 0)
+        if is_storm and last_refresh_ms > 0 and (now_ms - last_refresh_ms) < 8000:
+            # 风暴中两次刷新间隔不到 8s，重新延后
+            remain = int(8000 - (now_ms - last_refresh_ms))
+            self.refresh_timer.start(remain)
+            debug_print(f"[AutoRefresh] Storm active, deferring refresh by {remain}ms")
             return
-        burst_times = getattr(self, '_refresh_burst_times', [])
-        burst_times = [t for t in burst_times if now_ms - t < 5000]
-        burst_times.append(now_ms)
-        self._refresh_burst_times = burst_times
-        if len(burst_times) > 3:
-            self._refresh_burst_suppressed_until = now_ms + 5000
-            debug_print(f"[AutoRefresh] Refresh burst detected ({len(burst_times)} in 5s), suppressing for 5s")
-            return
+
         if getattr(self, '_manual_refresh_frozen', False):
             debug_print(f"[AutoRefresh] Manually frozen, skipping refresh execution")
             return
@@ -6844,7 +7015,6 @@ class FileExplorerTab(QWidget):
         debug_print(f"[FileWatcher] Auto-refreshing: {self.current_path}")
         if hasattr(self, 'explorer') and self.current_path:
             try:
-                # 优先原地刷新，失败时再回退到重新导航当前路径
                 try:
                     self.explorer.dynamicCall('Refresh()')
                 except Exception:
@@ -6859,19 +7029,37 @@ class FileExplorerTab(QWidget):
                 debug_print(f"[FileWatcher] Refresh completed")
             except Exception as e:
                 debug_print(f"[FileWatcher] Refresh error: {e}")
-        # 刷新后更新状态栏
-        self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
-        self.update_explorer_status()
+        # 刷新后更新快照（风暴时延迟执行，避免阻塞 UI）
+        if is_storm:
+            QTimer.singleShot(500, self._deferred_post_refresh_snapshot)
+        else:
+            self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
+            self.update_explorer_status()
+
+    def _deferred_post_refresh_snapshot(self):
+        """延迟更新快照，避免风暴期间连续 scandir 阻塞 UI"""
+        try:
+            self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
+            self.update_explorer_status()
+        except Exception:
+            pass
 
     def _poll_directory_changes(self):
         """兜底轮询目录元数据，解决文件编辑后目录 watcher 不触发的问题"""
         # 如果设置了抑制标志，不触发刷新
         if getattr(self, '_suppress_auto_refresh', False):
-            debug_print(f"[DirPoll] Auto-refresh suppressed during navigation")
             return
         if not getattr(self, '_refresh_active', True):
             return
-            
+
+        # 风暴期间跳过轮询（watcher 已在处理，避免额外 scandir 阻塞）
+        import time
+        now_ms = time.time() * 1000
+        storm_times = getattr(self, '_watcher_storm_times', [])
+        storm_count = sum(1 for t in storm_times if now_ms - t < 10000)
+        if storm_count > 5:
+            return
+
         path = self.current_path
         if not path or not os.path.isdir(path):
             return
@@ -9667,13 +9855,13 @@ class MainWindow(QMainWindow):
             tab.is_pinned = False
             self.save_pinned_tabs()
         if self.tab_widget.count() > 1:
-            self.tab_widget.removeTab(index)
-            # 同时从 content_stack 移除
+            # 先从 content_stack 移除（这样 on_tab_changed 触发时两者已同步）
             if hasattr(self, 'content_stack') and index < self.content_stack.count():
                 widget = self.content_stack.widget(index)
                 self.content_stack.removeWidget(widget)
                 if widget:
                     widget.deleteLater()
+            self.tab_widget.removeTab(index)
             self._schedule_session_snapshot()
         else:
             self.close()
@@ -12144,11 +12332,21 @@ class MainWindow(QMainWindow):
             if self.config.get("enable_cache_tabs", True):
                 cached_tabs = self._collect_cached_tabs()
 
+            new_active = self._get_last_active_tab_path()
+
+            # 快照内容无变化时跳过写盘，避免无意义IO和日志刷屏
+            # 使用 JSON 签名比较，避免 list/dict 对象引用差异导致误判
+            import json as _json
+            _sig = _json.dumps(cached_tabs, sort_keys=True, ensure_ascii=False) + '|' + new_active
+            if _sig == getattr(self, '_last_snapshot_sig', ''):
+                return
+            self._last_snapshot_sig = _sig
+
             self.config["cached_tabs"] = cached_tabs
-            self.config["last_active_tab_path"] = self._get_last_active_tab_path()
+            self.config["last_active_tab_path"] = new_active
             self.save_config(immediate=immediate)
             debug_print(
-                f"[App] 会话快照已更新: tabs={len(cached_tabs)}, active='{self.config.get('last_active_tab_path', '')}'"
+                f"[App] 会话快照已更新: tabs={len(cached_tabs)}, active='{new_active}'"
             )
         except Exception as e:
             print(f"Error saving session snapshot: {e}")

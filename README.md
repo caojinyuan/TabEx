@@ -39,6 +39,12 @@
 
 ## 🆕 最近更新
 
+### v3.37 (2026-06-02)
+- **双击空白返回上级 - 全标签页修复**：将 WH_MOUSE_LL 钩子从 per-tab 改为进程级单例架构，彻底修复"只有最后创建的标签页双击空白才能返回上级"问题
+- **Alt+Z 复制文件名修复**：IExplorerBrowser 模式下 Alt+Z 现在通过 IFolderView → IShellItemArray COM 接口正确获取选中文件名，不再错误复制完整路径
+- **关闭标签页崩溃修复**：修复关闭标签页时 content_stack/tab_widget 顺序不一致导致 on_tab_changed 访问已释放控件的崩溃
+- **文件删除后刷新优化**：增加 FileWatcher 风暴检测系统（10 秒内 >5 次事件触发风暴模式），防止批量删除时 UI 卡顿或假死
+
 ### v3.36 (2026-06-01)
 - **IExplorerBrowser 键盘快捷键修复**：Delete / Ctrl+C / Ctrl+V / F2 等快捷键在 IExplorerBrowser 模式下恢复正常（通过 IShellView::TranslateAccelerator 转发）
 - **双击误触 go_up 修复**：双击文件夹不再误触返回上级（NavigateComplete2 时间戳守卫）；双击文件不再误触返回上级（IFolderView COM 接口检测选中状态）
