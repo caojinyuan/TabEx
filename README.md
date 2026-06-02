@@ -39,6 +39,9 @@
 
 ## 🆕 最近更新
 
+### v3.39 (2026-06-02)
+- **路径栏稳定性修复**：修复 IShellView::Refresh() 在所有后台标签页同时触发导致全部路径栏清空的问题。改为仅对当前可见标签页执行 Refresh，后台标签延迟到切换时再刷新；同时修复面包屑宽度<50 时无限重试的死循环
+
 ### v3.38 (2026-06-02)
 - **TortoiseGit Overlay 图标修复**：IExplorerBrowser 中 TortoiseGit 的文件状态 overlay 图标（已修改、已提交等）现在正确显示。通过 SHGetFileInfo 预加载 overlay 到系统图标列表 + IShellView::Refresh() 刷新视图实现
 - **启动速度优化**：修复标题栏快捷方式区域在启动时同步调用 SHGetFileInfo 获取 .exe 图标导致的严重卡顿（每个超时约 3 秒）。改用 ExtractIconExW 直接读取 PE 资源 + 延迟 1.5 秒加载，窗口秒开

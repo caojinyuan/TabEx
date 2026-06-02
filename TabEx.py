@@ -3203,11 +3203,14 @@ class BreadcrumbPathBar(QWidget):
         """_resize_timer 到期：重建面包屑并强制刷新视觉"""
         if self.edit_mode:
             return
-        # 如果宽度不合理（IShellView::Refresh 等可能短暂清零），延迟重试
+        # 如果宽度不合理（IShellView::Refresh 等可能短暂清零），延迟重试（最多 5 次）
         if hasattr(self, 'breadcrumb_widget') and self.breadcrumb_widget.width() < 50 and self.current_path:
-            if getattr(self, '_resize_timer', None):
+            retries = getattr(self, '_resize_retry_count', 0)
+            if retries < 5 and getattr(self, '_resize_timer', None):
+                self._resize_retry_count = retries + 1
                 self._resize_timer.start()  # 50ms 后再试
-            return
+                return
+        self._resize_retry_count = 0
         self.update_breadcrumbs()  # 内部已调用 activate()，无需再次调用，避免触发多余 resizeEvent
         if hasattr(self, 'breadcrumb_widget'):
             try:
@@ -4655,8 +4658,14 @@ class IExplorerBrowserWidget(QWidget):
 
     def _do_first_overlay_refresh(self):
         """One-time refresh to ensure overlays render after first navigation."""
+        # Only refresh if this widget is currently visible on screen.
+        # Background tabs get refreshed in showEvent when they become active.
+        if not self.isVisible():
+            self._overlay_refresh_done = False  # allow showEvent to trigger it
+            return
         if not getattr(self, '_overlay_refreshing', False):
             self._overlay_refreshing = True
+            self._overlay_visible_refreshed = True
             try:
                 self._refresh_shell_view()
             finally:
@@ -4683,43 +4692,6 @@ class IExplorerBrowserWidget(QWidget):
 
     def _clear_overlay_refreshing(self):
         self._overlay_refreshing = False
-
-    def _refresh_shell_view(self):
-        """Call IShellView::Refresh() to force the DefView to re-render items."""
-        if not self._browser:
-            return
-        try:
-            from comtypes import GUID as _GUID
-            iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
-            ppv_result = self._browser.GetCurrentView(ctypes.byref(iid_sv))
-            iface_ptr = int(ppv_result) if ppv_result else 0
-            if not iface_ptr:
-                return
-            try:
-                # IShellView vtable layout (inherits IOleWindow):
-                # [QI(0), AddRef(1), Release(2), GetWindow(3),
-                #  ContextSensitiveHelp(4), TranslateAccelerator(5),
-                #  EnableModeless(6), UIActivate(7), Refresh(8), ...]
-                _vp_size = ctypes.sizeof(ctypes.c_void_p)
-                vtable_ptr = ctypes.c_void_p.from_address(iface_ptr).value
-                # Refresh is at vtable index 8
-                fn_addr = ctypes.c_void_p.from_address(
-                    vtable_ptr + 8 * _vp_size).value
-                # IShellView::Refresh(this) → HRESULT
-                _REFRESH = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
-                refresh_fn = _REFRESH(fn_addr)
-                hr = refresh_fn(iface_ptr)
-                debug_print(f"[TortoiseGit] IShellView::Refresh() → hr=0x{hr & 0xFFFFFFFF:08X}")
-            finally:
-                # Release the IShellView
-                _vp_size = ctypes.sizeof(ctypes.c_void_p)
-                vtable_ptr = ctypes.c_void_p.from_address(iface_ptr).value
-                release_addr = ctypes.c_void_p.from_address(
-                    vtable_ptr + 2 * _vp_size).value
-                _RELEASE = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
-                _RELEASE(release_addr)(iface_ptr)
-        except Exception as e:
-            debug_print(f"[TortoiseGit] _refresh_shell_view error: {e}")
 
     def _refresh_shell_view(self):
         """Call IShellView::Refresh() to force the DefView to re-render items."""
