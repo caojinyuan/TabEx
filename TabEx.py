@@ -5185,6 +5185,10 @@ class FileExplorerTab(QWidget):
                     # NavigateComplete2 信号会在导航真正完成后更新路径。
                     if getattr(self, '_suppress_auto_refresh', False):
                         return
+                    # 窗口恢复后树面板自动展开的虚假导航，抑制
+                    restore_guard = getattr(self, '_restore_guard_until', 0)
+                    if restore_guard and time.monotonic() < restore_guard:
+                        return
                     self._path_sync_stable_hits = 0
                     self._path_sync_interval_ms = 120
                     if hasattr(self, '_path_sync_timer') and self._path_sync_timer and self._path_sync_timer.interval() != self._path_sync_interval_ms:
@@ -5425,6 +5429,18 @@ class FileExplorerTab(QWidget):
                 local_path = self._normalize_local_path(local_path)
             if local_path is not None:
                 current = self._normalize_local_path(getattr(self, 'current_path', ''))
+                # 抑制窗口恢复后 IEB 树面板自动展开导致的虚假导航
+                # （树面板可能自动展开到之前记忆的子目录，导致 NavigateComplete2 连续触发错误路径）
+                restore_guard = getattr(self, '_restore_guard_until', 0)
+                if (restore_guard and time.monotonic() < restore_guard and
+                        local_path != current and current and
+                        not current.startswith('shell:')):
+                    # 虚假导航：忽略并强制 IEB 回到正确路径
+                    debug_print(f"[NavigateComplete2] Suppressed spurious post-restore nav: {local_path}")
+                    if hasattr(self, 'explorer') and hasattr(self.explorer, '_navigate'):
+                        self._restore_guard_until = 0  # 防止无限循环
+                        self.explorer._navigate(current)
+                    return
                 # 无条件更新路径栏（即使路径未变也刷新显示）
                 if hasattr(self, 'path_bar'):
                     self.path_bar.set_path(local_path)
@@ -9581,6 +9597,12 @@ class MainWindow(QMainWindow):
         current_index = self.tab_widget.currentIndex()
         return self.get_tab_widget(current_index)
 
+    def _set_restore_nav_guard(self):
+        """窗口从最小化恢复时，设置 guard 抑制 IEB 树面板自动展开的虚假导航"""
+        tab = self.get_current_tab_widget()
+        if tab:
+            tab._restore_guard_until = time.monotonic() + 2.0
+
     def _normalize_path_for_compare(self, path):
         """将路径标准化用于比较（Windows 不区分大小写）。"""
         if not path:
@@ -11083,6 +11105,9 @@ class MainWindow(QMainWindow):
                             self.showMinimized()
                             return True, 0
                         # 如果已经最小化，返回 False 让系统执行默认恢复
+                        # 设置 restore guard：抑制 IEB 树面板自动展开导致的虚假导航
+                        else:
+                            self._set_restore_nav_guard()
                     elif command == SC_MINIMIZE:
                         # 某些系统/场景下，任务栏二次点击会发 SC_MINIMIZE
                         # 主动处理以保证行为一致
