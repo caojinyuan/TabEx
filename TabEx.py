@@ -4101,244 +4101,164 @@ if _COMTYPES_AVAILABLE:
 
 
 # ── TortoiseGit overlay fix ───────────────────────────────────────────────────
-# TortoiseOverlays.dll (the shim registered in HKLM ShellIconOverlayIdentifiers)
-# does NOT delegate IsMemberOf to TortoiseGitStub.dll in non-Explorer processes,
-# so SHELLDLL_DefView (inside IExplorerBrowser) never shows TortoiseGit overlays.
+# TortoiseOverlays.dll (registered in HKLM ShellIconOverlayIdentifiers) provides
+# GetOverlayInfo correctly (icon paths) but its IsMemberOf returns S_FALSE in
+# non-Explorer processes (process name check).
 #
-# Fix: add HKCU ShellIconOverlayIdentifiers entries pointing directly to the
-# TortoiseGit *stub* CLSIDs.  HKCU takes priority over HKLM, so SHELLDLL_DefView
-# will create the stub COM objects, call GetOverlayInfo (sets g_modifiedovlloaded
-# etc. in TortoiseGit.dll), and then IsMemberOf returns S_OK correctly.
-# Also set LoadDllOnlyInExplorer=0 so the stub loads TortoiseGit.dll.
+# Fix: Patch TortoiseOverlays' IsMemberOf vtable[3] in our process to delegate
+# to TortoiseGitStub's IsMemberOf (which works in any process).
+# TortoiseOverlays type stored at this+0x08 (0=Normal..8=Unversioned).
+# TortoiseGitStub type stored at this+0x28 (1=Normal..9=Unversioned).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# TortoiseGit stub CLSIDs (per-overlay CLSID → TortoiseGitStub.dll)
-_TORTOISE_STUB_OVERLAYS = {
-    '  Tortoise1Normal':      '{451C7E59-058F-450A-8C42-FE9A12A302FC}',
-    '  Tortoise2Modified':    '{8DA7CDCB-DC0B-4246-80BD-812E942734AF}',
-    '  Tortoise3Conflict':    '{475A024D-6157-4E03-8C61-D1FA9806415C}',
-    '  Tortoise4Locked':      '{4E453CBA-2AAB-465C-A01E-627A7BE9ED73}',
-    '  Tortoise5ReadOnly':    '{5F380D0B-EE64-479B-B2AD-EF437BF4B0A6}',
-    '  Tortoise6Deleted':     '{D69716CD-6993-4D0D-898F-5EBBC25C5D4D}',
-    '  Tortoise7Added':       '{A38915E4-A460-4143-8D6B-0B45564C6A00}',
-    '  Tortoise8Ignored':     '{1B94B098-57C6-4C39-9DC5-8EB00E423D3E}',
-    '  Tortoise9Unversioned': '{18BF1135-6EA2-405F-A71E-16EEE7F71F8B}',
-}
-_SIOM_KEY = r'SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'
-_TORTOISE_OVERLAYS_APPLIED = False
+# TortoiseOverlays CLSIDs (from HKLM, shared vtable in TortoiseOverlays64.dll)
+_TORTOISE_OVERLAYS_CLSIDS = [
+    '{C5994560-53D9-4125-87C9-F193FC689CB2}',  # Normal (type=0)
+    '{C5994561-53D9-4125-87C9-F193FC689CB2}',  # Modified (type=1)
+    '{C5994562-53D9-4125-87C9-F193FC689CB2}',  # Conflict (type=2)
+    '{C5994563-53D9-4125-87C9-F193FC689CB2}',  # Locked (type=3)
+    '{C5994564-53D9-4125-87C9-F193FC689CB2}',  # ReadOnly (type=4)
+    '{C5994565-53D9-4125-87C9-F193FC689CB2}',  # Deleted (type=5)
+    '{C5994566-53D9-4125-87C9-F193FC689CB2}',  # Added (type=6)
+    '{C5994567-53D9-4125-87C9-F193FC689CB2}',  # Ignored (type=7)
+    '{C5994568-53D9-4125-87C9-F193FC689CB2}',  # Unversioned (type=8)
+]
+
+# TortoiseGitStub CLSIDs (IsMemberOf works in any process)
+_TORTOISE_OVERLAY_PATCHED = False
 
 
-def _tortoise_setup_overlays():
-    """Set HKCU ShellIconOverlayIdentifiers to use TortoiseGit stub CLSIDs.
+def _patch_tortoise_overlays():
+    """Pre-load TortoiseGit overlay icons into the process system image list.
 
-    Must be called BEFORE IExplorerBrowser is created so that SHELLDLL_DefView
-    initialises its ShellIconOverlayManager with the correct handlers.
+    In non-explorer.exe processes, TortoiseOverlays' IsMemberOf returns S_FALSE,
+    but the shell's per-user overlay CACHE (populated by explorer.exe) still
+    provides correct overlay indices via IShellIconOverlay::GetOverlayIndex.
+
+    The issue is that the overlay ICONS are not loaded into our process's
+    system image list until something triggers them. We call SHGetFileInfo
+    with SHGFI_OVERLAYINDEX which forces the shell to lazily load the
+    overlay handler's icon (via GetOverlayInfo, which works in any process).
+
+    Once loaded, the shell view (DefView/ItemsView) can render overlays.
     """
-    global _TORTOISE_OVERLAYS_APPLIED
-    if _TORTOISE_OVERLAYS_APPLIED:
+    global _TORTOISE_OVERLAY_PATCHED
+    if _TORTOISE_OVERLAY_PATCHED:
         return
-    import winreg
-    # Only apply if TortoiseGit is actually installed
-    try:
-        clsid = list(_TORTOISE_STUB_OVERLAYS.values())[1]  # Modified handler
-        winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                       rf'SOFTWARE\Classes\CLSID\{clsid}',
-                       0, winreg.KEY_READ).Close()
-    except OSError:
-        return  # TortoiseGit not installed – nothing to do
 
-    # Allow TortoiseGit.dll to load in non-Explorer processes
-    try:
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
-                               r'Software\TortoiseGit') as k:
-            winreg.SetValueEx(k, 'LoadDllOnlyInExplorer', 0,
-                              winreg.REG_DWORD, 0)
-    except Exception:
-        pass
-
-    # Write per-overlay HKCU entries (HKCU takes priority over HKLM)
-    try:
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _SIOM_KEY) as base:
-            for name, clsid in _TORTOISE_STUB_OVERLAYS.items():
-                try:
-                    with winreg.CreateKey(base, name) as k:
-                        winreg.SetValueEx(k, '', 0, winreg.REG_SZ, clsid)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    _TORTOISE_OVERLAYS_APPLIED = True
-    debug_print("[TortoiseGit] HKCU overlay handlers set to stub CLSIDs")
-
-
-def _tortoise_cleanup_overlays():
-    """Remove HKCU ShellIconOverlayIdentifiers entries added by TabEx."""
-    import winreg
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _SIOM_KEY,
-                             0, winreg.KEY_WRITE) as base:
-            for name in _TORTOISE_STUB_OVERLAYS:
-                try:
-                    winreg.DeleteKey(base, name)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r'Software\TortoiseGit',
-                             0, winreg.KEY_WRITE) as k:
-            winreg.DeleteValue(k, 'LoadDllOnlyInExplorer')
-    except Exception:
-        pass
-    debug_print("[TortoiseGit] HKCU overlay handlers cleaned up")
-
-
-# TortoiseGit overlay icon files (installed by TortoiseOverlays.dll)
-_TORTOISE_OVERLAY_ICON_DIR = (
-    r'C:\Program Files\Common Files\TortoiseOverlays\icons\XPStyle'
-)
-_TORTOISE_OVERLAY_ICON_MAP = {
-    1: 'NormalIcon.ico',
-    2: 'ModifiedIcon.ico',
-    3: 'ConflictIcon.ico',
-    4: 'LockedIcon.ico',
-    5: 'ReadOnlyIcon.ico',
-    6: 'DeletedIcon.ico',
-    7: 'AddedIcon.ico',
-    8: 'IgnoredIcon.ico',
-    9: 'UnversionedIcon.ico',
-}
-# Module-level reference to keep the ctypes callback alive (prevents GC)
-_TORTOISE_GETOVERLAYINFO_CALLBACK = None
-_TORTOISE_GETOVERLAYINFO_PATCHED  = False
-
-
-def _patch_stub_get_overlay_info():
-    """Patch TortoiseGitStub's shared GetOverlayInfo vtable slot.
-
-    TortoiseGit 2.18+ stub CLSIDs deliberately return S_OK from GetOverlayInfo
-    WITHOUT writing the icon path/index/flags, so SHELLDLL_DefView's
-    ShellIconOverlayManager never registers the overlay images.
-
-    This function replaces vtable[4] (GetOverlayInfo) in the shared vtable with
-    a Python callback that reads the overlay-type state from this+0x28 and
-    writes the correct .ico file path from TortoiseOverlays's icon folder.
-    IsMemberOf (vtable[3]) is left untouched – it already works correctly.
-
-    Must be called after COM is initialized and before SHELLDLL_DefView first
-    renders a directory (i.e. from _ensure_browser()).
-    """
-    global _TORTOISE_GETOVERLAYINFO_CALLBACK, _TORTOISE_GETOVERLAYINFO_PATCHED
-    if _TORTOISE_GETOVERLAYINFO_PATCHED:
-        return
-    if not os.path.isdir(_TORTOISE_OVERLAY_ICON_DIR):
-        debug_print("[TortoiseGit] Icon dir missing – skipping vtable patch")
-        return
     try:
         import ctypes
-        import comtypes.client
-        from comtypes import GUID, HRESULT, IUnknown, COMMETHOD
+        import ctypes.wintypes
+        import winreg
 
-        # ── Interface definition ──────────────────────────────────────────
-        _IID_ISIO = GUID('{0C6C4200-C589-11D0-999A-00C04FD655E1}')
-
-        class _ISIO_local(IUnknown):
-            _iid_ = _IID_ISIO
-            _methods_ = [
-                COMMETHOD([], HRESULT, 'IsMemberOf',
-                          (['in'], ctypes.c_wchar_p, 'p'),
-                          (['in'], ctypes.c_ulong,   'a')),
-                COMMETHOD([], HRESULT, 'GetOverlayInfo',
-                          (['in'], ctypes.c_wchar_p,               'pwszIconFile'),
-                          (['in'], ctypes.c_int,                   'cchMax'),
-                          (['out'], ctypes.POINTER(ctypes.c_int),   'pIndex'),
-                          (['out'], ctypes.POINTER(ctypes.c_ulong), 'pdwFlags')),
-                COMMETHOD([], HRESULT, 'GetPriority',
-                          (['out'], ctypes.POINTER(ctypes.c_int), 'p')),
-            ]
-
-        # Create a dummy stub object just to locate the shared vtable
-        _MODIFIED_STUB_CLSID = '{8DA7CDCB-DC0B-4246-80BD-812E942734AF}'
-        dummy = comtypes.client.CreateObject(
-            GUID(_MODIFIED_STUB_CLSID), interface=_ISIO_local
-        )
-        vtable_ptr = ctypes.cast(dummy, ctypes.POINTER(ctypes.c_void_p))[0]
-        # Address of the vtable[4] slot (8 bytes, 64-bit pointer)
-        slot4_addr = vtable_ptr + 4 * 8
-
-        # ── Replacement callback ──────────────────────────────────────────
-        # Signature matches the original COM method:
-        #   HRESULT __stdcall GetOverlayInfo(
-        #       void*  this,          ← rcx
-        #       void*  pwszIconFile,  ← rdx  (LPWSTR, pre-allocated buffer)
-        #       int    cchMax,        ← r8
-        #       int*   pIndex,        ← r9
-        #       DWORD* pdwFlags       ← [rsp+0x28]
-        #   )
-        _icon_dir  = _TORTOISE_OVERLAY_ICON_DIR
-        _icon_map  = _TORTOISE_OVERLAY_ICON_MAP
-
-        @ctypes.WINFUNCTYPE(ctypes.HRESULT,
-                            ctypes.c_void_p,  # this
-                            ctypes.c_void_p,  # pwszIconFile
-                            ctypes.c_int,     # cchMax
-                            ctypes.c_void_p,  # pIndex  (int*)
-                            ctypes.c_void_p)  # pdwFlags (DWORD*)
-        def _get_overlay_info_patch(this_ptr, icon_buf, cchMax, pindex, pdwflags):
-            # Initialise outputs to 0 / empty string (mirrors original prolog)
-            try:
-                if icon_buf:
-                    ctypes.c_wchar.from_address(icon_buf).value = '\0'
-                if pindex:
-                    ctypes.c_int.from_address(pindex).value = 0
-                if pdwflags:
-                    ctypes.c_uint32.from_address(pdwflags).value = 0
-                if not (this_ptr and icon_buf and pindex and pdwflags and cchMax > 0):
-                    return 0  # S_OK with empty
-                # Overlay type is stored at this+0x28 (confirmed: 1=Normal…9=Unversioned)
-                state = ctypes.c_uint32.from_address(this_ptr + 0x28).value
-                icon_name = _icon_map.get(state)
-                if not icon_name:
-                    return 0  # S_OK – unknown state, let SIOM skip
-                icon_path = _icon_dir + '\\' + icon_name
-                if cchMax > len(icon_path):
-                    encoded = (icon_path + '\0').encode('utf-16-le')
-                    ctypes.memmove(icon_buf, encoded, len(encoded))
-                    ctypes.c_uint32.from_address(pdwflags).value = 1  # ISIOI_ICONINDEX
-                    # pIndex stays 0 (first icon in the .ico file)
-            except Exception:
-                pass
-            return 0  # S_OK
-
-        # ── VirtualProtect + write new function pointer ───────────────────
-        PAGE_EXECUTE_READWRITE = 0x40
-        old_prot = ctypes.c_ulong(0)
-        # Set argtypes explicitly so Python handles the 64-bit LPVOID correctly
-        _VirtualProtect = ctypes.windll.kernel32.VirtualProtect
-        _VirtualProtect.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
-                                     ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
-        _VirtualProtect.restype  = ctypes.c_int
-        ok = _VirtualProtect(
-            slot4_addr, 8, PAGE_EXECUTE_READWRITE, ctypes.byref(old_prot)
-        )
-        if not ok:
-            debug_print("[TortoiseGit] VirtualProtect failed for vtable patch")
-            return
+        # Check TortoiseOverlays is installed
         try:
-            new_fn_ptr = ctypes.cast(_get_overlay_info_patch, ctypes.c_void_p).value
-            ctypes.c_void_p.from_address(slot4_addr).value = new_fn_ptr
-        finally:
-            _VirtualProtect(slot4_addr, 8, old_prot, ctypes.byref(old_prot))
+            winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           rf'SOFTWARE\Classes\CLSID\{_TORTOISE_OVERLAYS_CLSIDS[0]}',
+                           0, winreg.KEY_READ).Close()
+        except OSError:
+            return  # TortoiseOverlays not installed
 
-        # Keep the callback alive so it isn't garbage-collected
-        _TORTOISE_GETOVERLAYINFO_CALLBACK = _get_overlay_info_patch
-        _TORTOISE_GETOVERLAYINFO_PATCHED  = True
-        debug_print("[TortoiseGit] GetOverlayInfo vtable patched – overlays enabled")
+        _TORTOISE_OVERLAY_PATCHED = True
+        print("[TortoiseGit] Overlay icon pre-load enabled "
+              "(will trigger on first navigation)")
 
     except Exception as e:
-        debug_print(f"[TortoiseGit] GetOverlayInfo patch error: {e}")
+        print(f"[TortoiseGit] Overlay init error: {e}")
+
+# Cache of directories already preloaded (overlay icons persist in system image list)
+_OVERLAY_PRELOADED_DIRS = set()
+
+
+def _preload_overlay_icons(directory_path):
+    """Force-load overlay icons into the system image list by calling
+    SHGetFileInfo(SHGFI_OVERLAYINDEX) on files in the given directory.
+
+    This triggers the shell to lazily load overlay icons from handlers
+    whose GetOverlayInfo works (TortoiseOverlays provides correct icons).
+    The overlay INDEX comes from the cross-process shell cache (populated
+    by explorer.exe), so TortoiseOverlays' IsMemberOf doesn't need to work.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        class _SHFILEINFOW(ctypes.Structure):
+            _fields_ = [
+                ('hIcon', ctypes.wintypes.HICON),
+                ('iIcon', ctypes.c_int),
+                ('dwAttributes', ctypes.wintypes.DWORD),
+                ('szDisplayName', ctypes.c_wchar * 260),
+                ('szTypeName', ctypes.c_wchar * 80),
+            ]
+
+        _SHGetFileInfoW = ctypes.windll.shell32.SHGetFileInfoW
+        _SHGetFileInfoW.argtypes = [ctypes.c_wchar_p, ctypes.wintypes.DWORD,
+                                    ctypes.POINTER(_SHFILEINFOW), ctypes.c_uint,
+                                    ctypes.c_uint]
+        _SHGetFileInfoW.restype = ctypes.c_void_p
+
+        _DestroyIcon = ctypes.windll.user32.DestroyIcon
+
+        # SHGFI_ICON=0x100, SHGFI_SMALLICON=0x1, SHGFI_OVERLAYINDEX=0x40
+        FLAGS = 0x100 | 0x1 | 0x40
+
+        loaded_overlays = set()
+
+        # Query the directory itself first
+        sfi = _SHFILEINFOW()
+        _SHGetFileInfoW(directory_path, 0, ctypes.byref(sfi),
+                        ctypes.sizeof(sfi), FLAGS)
+        if sfi.hIcon:
+            _DestroyIcon(sfi.hIcon)
+        ovl = (sfi.iIcon >> 24) & 0xFF
+        if ovl:
+            loaded_overlays.add(ovl)
+
+        # Query a few files to trigger overlay icon loading.
+        # Once a TortoiseGit overlay (index > 4) is found, we can stop -
+        # the overlay slot is process-global and applies to all files.
+        MAX_FILES = 3
+        count = 0
+        found_git_overlay = any(o > 4 for o in loaded_overlays)
+        try:
+            for entry in os.scandir(directory_path):
+                if found_git_overlay or count >= MAX_FILES:
+                    break
+                # Skip .exe/.msi/.dll - SHGetFileInfo can be very slow for these
+                if entry.name.lower().endswith(('.exe', '.msi', '.dll')):
+                    continue
+                sfi2 = _SHFILEINFOW()
+                _SHGetFileInfoW(entry.path, 0, ctypes.byref(sfi2),
+                                ctypes.sizeof(sfi2), FLAGS)
+                if sfi2.hIcon:
+                    _DestroyIcon(sfi2.hIcon)
+                ovl2 = (sfi2.iIcon >> 24) & 0xFF
+                if ovl2:
+                    loaded_overlays.add(ovl2)
+                    if ovl2 > 4:
+                        found_git_overlay = True
+                count += 1
+        except OSError:
+            pass
+
+        if loaded_overlays:
+            debug_print(f"[TortoiseGit] Pre-loaded overlay icons: "
+                        f"{sorted(loaded_overlays)} ({count} files scanned)")
+            # Mark directory as preloaded (overlay icons are process-global)
+            _OVERLAY_PRELOADED_DIRS.add(directory_path)
+
+    except Exception:
+        pass
+
+
+# ── Early overlay initialization ─────────────────────────────────────────────
+# Must run BEFORE IExplorerBrowser creates its shell view (which triggers SIOM).
+if _COMTYPES_AVAILABLE and HAS_PYWIN:
+    try:
+        _patch_tortoise_overlays()
+    except Exception as _e:
+        print(f"[TortoiseGit] Early init error: {_e}")
 
 
 # ── IExplorerBrowser 键盘消息过滤器 ──────────────────────────────────────────
@@ -4636,6 +4556,11 @@ class IExplorerBrowserWidget(QWidget):
             self._pending_path = path
             return
         try:
+            # Pre-load overlay icons BEFORE navigation so DefView has them
+            # when it first renders (skip if already cached for this dir)
+            if _TORTOISE_OVERLAY_PATCHED and path not in _OVERLAY_PRELOADED_DIRS:
+                _preload_overlay_icons(path)
+
             _spdn = ctypes.windll.shell32.SHParseDisplayName
             _spdn.restype  = ctypes.c_long   # HRESULT
             _spdn.argtypes = [
@@ -4675,13 +4600,8 @@ class IExplorerBrowserWidget(QWidget):
             hwnd = int(self.winId())
             if not hwnd:
                 return False
-            # Enable TortoiseGit overlays in SHELLDLL_DefView:
-            # 1. Write HKCU entries pointing to stub CLSIDs (IsMemberOf works).
-            # 2. Patch the stub's shared GetOverlayInfo vtable slot so it
-            #    returns the actual .ico path (stub returns S_OK but empty
-            #    icon info by default in TortoiseGit 2.18+).
-            _tortoise_setup_overlays()
-            _patch_stub_get_overlay_info()
+            # TortoiseGit overlay icons are pre-loaded on navigation via
+            # _preload_overlay_icons(). No patching needed here.
             browser = comtypes.client.CreateObject(
                 _CLSID_ExplorerBrowser,
                 interface=_IExplorerBrowser,
@@ -4691,7 +4611,7 @@ class IExplorerBrowserWidget(QWidget):
             rc = ctypes.wintypes.RECT(0, 0, w, h)
             fs = _FOLDERSETTINGS(4, 0)  # ViewMode=FVM_DETAILS, fFlags=0
             browser.Initialize(hwnd, ctypes.byref(rc), ctypes.byref(fs))
-            # 不设置 EBO_NOBORDER(0x40)，让 Shell 展示原生导航工具栏（地址栏 / 面包屑路径栏）
+            # EBO_SHOWFRAMES: 显示左侧导航窗格（目录树）
             browser.SetOptions(self._EBO_SHOWFRAMES | self._EBO_NOTRAVELLOG)
             sink   = _NavEventSink(self._on_nav_complete)
             cookie = browser.Advise(sink)  # out-param returned by comtypes
@@ -4712,6 +4632,124 @@ class IExplorerBrowserWidget(QWidget):
         url  = 'file:///' + norm.replace('\\', '/')
         self._location_url = url
         self.NavigateComplete2.emit(None, url)
+        # Force shell to re-evaluate icon overlays for this directory
+        # Skip if this navigation was triggered by our own Refresh()
+        if not getattr(self, '_overlay_refreshing', False):
+            self._notify_overlay_refresh(norm)
+
+    def _notify_overlay_refresh(self, path):
+        """Refresh overlay rendering after navigation if needed."""
+        if not _TORTOISE_OVERLAY_PATCHED:
+            return
+        # Pre-nav preload already loaded icons; just refresh the view once
+        if not getattr(self, '_overlay_refresh_done', False):
+            self._overlay_refresh_done = True
+            QTimer.singleShot(600, self._do_first_overlay_refresh)
+
+    def _do_first_overlay_refresh(self):
+        """One-time refresh to ensure overlays render after first navigation."""
+        if not getattr(self, '_overlay_refreshing', False):
+            self._overlay_refreshing = True
+            try:
+                self._refresh_shell_view()
+            finally:
+                QTimer.singleShot(500, self._clear_overlay_refreshing)
+
+    def _do_overlay_notify(self, path):
+        """Pre-load overlay icons then refresh shell view to render overlays."""
+        if path in _OVERLAY_PRELOADED_DIRS:
+            return
+        try:
+            # Pre-load overlay icons from shell cache into system image list
+            _preload_overlay_icons(path)
+            # IShellView::Refresh() forces DefView to re-render with overlays
+            # Guard against re-entrancy (Refresh triggers NavigateComplete2)
+            self._overlay_refreshing = True
+            self._overlay_visible_refreshed = True
+            try:
+                self._refresh_shell_view()
+            finally:
+                # Clear flag after a short delay to allow the nav-complete to fire
+                QTimer.singleShot(500, self._clear_overlay_refreshing)
+        except Exception as e:
+            debug_print(f"[TortoiseGit] overlay notify error: {e}")
+
+    def _clear_overlay_refreshing(self):
+        self._overlay_refreshing = False
+
+    def _refresh_shell_view(self):
+        """Call IShellView::Refresh() to force the DefView to re-render items."""
+        if not self._browser:
+            return
+        try:
+            from comtypes import GUID as _GUID
+            iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
+            ppv_result = self._browser.GetCurrentView(ctypes.byref(iid_sv))
+            iface_ptr = int(ppv_result) if ppv_result else 0
+            if not iface_ptr:
+                return
+            try:
+                # IShellView vtable layout (inherits IOleWindow):
+                # [QI(0), AddRef(1), Release(2), GetWindow(3),
+                #  ContextSensitiveHelp(4), TranslateAccelerator(5),
+                #  EnableModeless(6), UIActivate(7), Refresh(8), ...]
+                _vp_size = ctypes.sizeof(ctypes.c_void_p)
+                vtable_ptr = ctypes.c_void_p.from_address(iface_ptr).value
+                # Refresh is at vtable index 8
+                fn_addr = ctypes.c_void_p.from_address(
+                    vtable_ptr + 8 * _vp_size).value
+                # IShellView::Refresh(this) → HRESULT
+                _REFRESH = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
+                refresh_fn = _REFRESH(fn_addr)
+                hr = refresh_fn(iface_ptr)
+                debug_print(f"[TortoiseGit] IShellView::Refresh() → hr=0x{hr & 0xFFFFFFFF:08X}")
+            finally:
+                # Release the IShellView
+                _vp_size = ctypes.sizeof(ctypes.c_void_p)
+                vtable_ptr = ctypes.c_void_p.from_address(iface_ptr).value
+                release_addr = ctypes.c_void_p.from_address(
+                    vtable_ptr + 2 * _vp_size).value
+                _RELEASE = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                _RELEASE(release_addr)(iface_ptr)
+        except Exception as e:
+            debug_print(f"[TortoiseGit] _refresh_shell_view error: {e}")
+
+    def _refresh_shell_view(self):
+        """Call IShellView::Refresh() to force the DefView to re-render items."""
+        if not self._browser:
+            return
+        try:
+            from comtypes import GUID as _GUID
+            iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
+            ppv_result = self._browser.GetCurrentView(ctypes.byref(iid_sv))
+            iface_ptr = int(ppv_result) if ppv_result else 0
+            if not iface_ptr:
+                return
+            try:
+                # IShellView vtable layout (inherits IOleWindow):
+                # [QI(0), AddRef(1), Release(2), GetWindow(3),
+                #  ContextSensitiveHelp(4), TranslateAccelerator(5),
+                #  EnableModeless(6), UIActivate(7), Refresh(8), ...]
+                _vp_size = ctypes.sizeof(ctypes.c_void_p)
+                vtable_ptr = ctypes.c_void_p.from_address(iface_ptr).value
+                # Refresh is at vtable index 8
+                fn_addr = ctypes.c_void_p.from_address(
+                    vtable_ptr + 8 * _vp_size).value
+                # IShellView::Refresh(this) → HRESULT
+                _REFRESH = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
+                refresh_fn = _REFRESH(fn_addr)
+                hr = refresh_fn(iface_ptr)
+                debug_print(f"[TortoiseGit] IShellView::Refresh() → hr=0x{hr & 0xFFFFFFFF:08X}")
+            finally:
+                # Release the IShellView
+                _vp_size = ctypes.sizeof(ctypes.c_void_p)
+                vtable_ptr = ctypes.c_void_p.from_address(iface_ptr).value
+                release_addr = ctypes.c_void_p.from_address(
+                    vtable_ptr + 2 * _vp_size).value
+                _RELEASE = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                _RELEASE(release_addr)(iface_ptr)
+        except Exception as e:
+            debug_print(f"[TortoiseGit] _refresh_shell_view error: {e}")
 
     # ── Qt event overrides ────────────────────────────────────────────────────
 
@@ -4721,6 +4759,20 @@ class IExplorerBrowserWidget(QWidget):
             if self._ensure_browser() and self._pending_path:
                 path, self._pending_path = self._pending_path, None
                 self._navigate(path)
+        elif self._browser and _TORTOISE_OVERLAY_PATCHED:
+            # Tab became visible: ensure overlays are rendered
+            # Refresh is needed because IShellView::Refresh on hidden views is a no-op
+            url = getattr(self, '_location_url', '')
+            if url and url.startswith('file:'):
+                norm = self._url_to_path(url)
+                if norm:
+                    if norm not in _OVERLAY_PRELOADED_DIRS:
+                        # Not yet preloaded - do full preload + refresh
+                        QTimer.singleShot(300, lambda p=norm: self._do_overlay_notify(p))
+                    elif not getattr(self, '_overlay_visible_refreshed', False):
+                        # Already preloaded but never refreshed while visible
+                        self._overlay_visible_refreshed = True
+                        QTimer.singleShot(200, self._refresh_shell_view)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -9101,6 +9153,7 @@ class TitleShortcutBar(QWidget):
         self._icon_size = icon_size
         self._button_size = button_size
         self._paths = []
+        self._icon_cache = {}  # path → QIcon (avoids re-calling SHGetFileInfo)
         self._icon_provider = QFileIconProvider()
         self._drag_start_pos = None
         self._drag_source_index = -1
@@ -9265,6 +9318,14 @@ class TitleShortcutBar(QWidget):
             return QIcon()
 
         lower_path = path.lower()
+
+        # For .exe files, use ExtractIconEx (fast, no shell timeout)
+        if lower_path.endswith('.exe') and os.name == 'nt':
+            icon = self._extract_icon_fast(path)
+            if icon and not icon.isNull():
+                return icon
+            return self._icon_provider.icon(QFileInfo(path))
+
         if lower_path.endswith('.lnk') and os.name == 'nt':
             try:
                 from win32com.client import Dispatch
@@ -9277,20 +9338,61 @@ class TitleShortcutBar(QWidget):
                     icon_path = icon_location.split(',', 1)[0].strip().strip('"')
                     icon_path = os.path.expandvars(icon_path)
                     if os.path.exists(icon_path):
-                        icon = self._icon_provider.icon(QFileInfo(icon_path))
+                        icon = self._extract_icon_fast(icon_path) if icon_path.lower().endswith('.exe') else None
+                        if not icon or icon.isNull():
+                            icon = self._icon_provider.icon(QFileInfo(icon_path))
                         if not icon.isNull():
                             return icon
 
                 target_path = getattr(shortcut, 'Targetpath', '') or getattr(shortcut, 'TargetPath', '') or ''
                 target_path = os.path.expandvars(str(target_path).strip().strip('"'))
                 if target_path and os.path.exists(target_path):
-                    icon = self._icon_provider.icon(QFileInfo(target_path))
+                    icon = self._extract_icon_fast(target_path) if target_path.lower().endswith('.exe') else None
+                    if not icon or icon.isNull():
+                        icon = self._icon_provider.icon(QFileInfo(target_path))
                     if not icon.isNull():
                         return icon
             except Exception:
                 pass
 
         return self._icon_provider.icon(QFileInfo(path))
+
+    @staticmethod
+    def _extract_icon_fast(exe_path):
+        """Extract icon from .exe using ExtractIconExW (fast, no shell timeout)."""
+        try:
+            import ctypes
+            import ctypes.wintypes
+            from PyQt5.QtGui import QPixmap
+            from PyQt5.QtWinExtras import QtWin
+
+            _ExtractIconExW = ctypes.windll.shell32.ExtractIconExW
+            _ExtractIconExW.argtypes = [ctypes.c_wchar_p, ctypes.c_int,
+                                        ctypes.POINTER(ctypes.wintypes.HICON),
+                                        ctypes.POINTER(ctypes.wintypes.HICON),
+                                        ctypes.c_uint]
+            _ExtractIconExW.restype = ctypes.c_uint
+            _DestroyIcon = ctypes.windll.user32.DestroyIcon
+
+            hicon_large = ctypes.wintypes.HICON()
+            hicon_small = ctypes.wintypes.HICON()
+            count = _ExtractIconExW(exe_path, 0,
+                                    ctypes.byref(hicon_large),
+                                    ctypes.byref(hicon_small), 1)
+            if count and hicon_large.value:
+                try:
+                    pixmap = QtWin.fromHICON(hicon_large.value)
+                    if not pixmap.isNull():
+                        return QIcon(pixmap)
+                finally:
+                    _DestroyIcon(hicon_large)
+                    if hicon_small.value:
+                        _DestroyIcon(hicon_small)
+            elif hicon_small.value:
+                _DestroyIcon(hicon_small)
+        except Exception:
+            pass
+        return None
 
     def _rebuild_buttons(self):
         while self._layout.count() > 0:
@@ -9318,11 +9420,17 @@ class TitleShortcutBar(QWidget):
             icon_px = max(12, min(self._icon_size + 1, self._button_size - 4))
             btn.setIconSize(QSize(icon_px, icon_px))
             btn.setToolTip(f"{os.path.basename(path)}\n{path}\n左键启动应用/快捷方式，右键移除，拖拽可排序")
-            icon = self._resolve_shortcut_icon(path)
-            if not icon.isNull():
-                btn.setIcon(icon)
+            # Use cached icon or defer loading to avoid SHGetFileInfo blocking startup
+            cached_icon = self._icon_cache.get(path)
+            if cached_icon is not None:
+                if not cached_icon.isNull():
+                    btn.setIcon(cached_icon)
+                else:
+                    btn.setText("↗")
             else:
-                btn.setText("↗")
+                btn.setText("…")
+                # Defer icon loading well after startup to avoid SHGetFileInfo blocking
+                QTimer.singleShot(1500, lambda b=btn, p=path: self._load_icon_deferred(b, p))
             btn.setStyleSheet(
                 "QToolButton { background: transparent; border: none; border-radius: 4px; padding: 0px; margin: 0px; }"
                 "QToolButton:hover { background: #e0e0e0; }"
@@ -9335,6 +9443,21 @@ class TitleShortcutBar(QWidget):
             btn.customContextMenuRequested.connect(lambda pos, b=btn: self._show_context_menu_for_button(b, pos))
             btn.clicked.connect(lambda _checked=False, p=path: self.shortcutClicked.emit(p))
             self._layout.addWidget(btn)
+
+    def _load_icon_deferred(self, btn, path):
+        """Load shortcut icon asynchronously and update button."""
+        try:
+            if not btn or not btn.isVisible():
+                return
+            icon = self._resolve_shortcut_icon(path)
+            self._icon_cache[path] = icon
+            if not icon.isNull():
+                btn.setIcon(icon)
+                btn.setText("")
+            else:
+                btn.setText("↗")
+        except RuntimeError:
+            pass  # Button already deleted
 
     def _show_context_menu_for_button(self, btn, pos):
         path = btn.property("shortcut_path")
@@ -14889,12 +15012,8 @@ def main():
     import sys
     import os
 
-    # Set HKCU ShellIconOverlayIdentifiers to stub CLSIDs BEFORE any shell/COM
-    # initialization in this process.  The Shell's overlay manager (SIOM) is a
-    # per-process singleton; it reads the registry only once at creation time.
-    # Calling this here – before QApplication and before any SHGetFileInfo or
-    # IExplorerBrowser call – guarantees SHELLDLL_DefView picks up the entries.
-    _tortoise_setup_overlays()
+    # TortoiseOverlays IsMemberOf vtable patch is applied at module load time
+    # (see early init block near _patch_tortoise_overlays). No registry changes needed.
 
     path_to_open = None
     if len(sys.argv) > 1:
@@ -14970,9 +15089,7 @@ def main():
     # 确保启动时阴影状态正确（最大化时无阴影）
     window._update_window_shadow()
 
-    # Register cleanup for TortoiseGit HKCU overlay entries
-    import atexit
-    atexit.register(_tortoise_cleanup_overlays)
+    # No HKCU cleanup needed – overlay fix is vtable-only (process-local).
 
     sys.exit(app.exec_())
 

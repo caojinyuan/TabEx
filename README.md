@@ -39,24 +39,15 @@
 
 ## 🆕 最近更新
 
+### v3.38 (2026-06-02)
+- **TortoiseGit Overlay 图标修复**：IExplorerBrowser 中 TortoiseGit 的文件状态 overlay 图标（已修改、已提交等）现在正确显示。通过 SHGetFileInfo 预加载 overlay 到系统图标列表 + IShellView::Refresh() 刷新视图实现
+- **启动速度优化**：修复标题栏快捷方式区域在启动时同步调用 SHGetFileInfo 获取 .exe 图标导致的严重卡顿（每个超时约 3 秒）。改用 ExtractIconExW 直接读取 PE 资源 + 延迟 1.5 秒加载，窗口秒开
+
 ### v3.37 (2026-06-02)
 - **双击空白返回上级 - 全标签页修复**：将 WH_MOUSE_LL 钩子从 per-tab 改为进程级单例架构，彻底修复"只有最后创建的标签页双击空白才能返回上级"问题
 - **Alt+Z 复制文件名修复**：IExplorerBrowser 模式下 Alt+Z 现在通过 IFolderView → IShellItemArray COM 接口正确获取选中文件名，不再错误复制完整路径
 - **关闭标签页崩溃修复**：修复关闭标签页时 content_stack/tab_widget 顺序不一致导致 on_tab_changed 访问已释放控件的崩溃
 - **文件删除后刷新优化**：增加 FileWatcher 风暴检测系统（10 秒内 >5 次事件触发风暴模式），防止批量删除时 UI 卡顿或假死
-
-### v3.36 (2026-06-01)
-- **IExplorerBrowser 键盘快捷键修复**：Delete / Ctrl+C / Ctrl+V / F2 等快捷键在 IExplorerBrowser 模式下恢复正常（通过 IShellView::TranslateAccelerator 转发）
-- **双击误触 go_up 修复**：双击文件夹不再误触返回上级（NavigateComplete2 时间戳守卫）；双击文件不再误触返回上级（IFolderView COM 接口检测选中状态）
-- **路径栏编辑模式修复**：点击 IExplorerBrowser 区域（选中文件等）后路径栏自动退出编辑模式；导航到新目录时路径栏强制退出编辑模式并显示新路径；在编辑框内操作（选中文本、复制）不会被打断
-- **路径栏内容恢复**：窗口被其他程序遮挡后恢复前台时，面包屑内容自动重绘
-- **代码清理**：移除未使用的 `_pyqtSignal` 导入、死注释代码；统一 `print()` 为 `debug_print()`
-
-### v3.35.1 (2026-05-30)
-- **路径栏稳定性修复**：修复 `resizeEvent` 中重入守卫激活时 `_is_navigation_update` 被误重置导致偶发路径栏不刷新的竞态；同步定时器（路径未变时）改为轻量 `repaint()` 而非全量重建，减少控件析构开销；修复 MetaCall 事件通道中 `local_path` 未规范化的问题
-
-### v3.35 (2026-05-29)
-- **中英文双语 i18n**：所有界面文字支持中/英双语切换；在"设置"对话框底部"语言 / Language"下拉框中选择，确认后立即生效（部分静态文字重启后完全生效）
 
 ---
 
