@@ -8044,6 +8044,7 @@ class TitleShortcutBar(QWidget):
         if not path:
             return
         menu = QMenu(self)
+        menu.setStyleSheet("QMenu::item:selected { background: #d0d0d0; color: black; }")
         remove_action = menu.addAction(tr("移除该快捷方式"))
         action = menu.exec_(btn.mapToGlobal(pos))
         if action == remove_action:
