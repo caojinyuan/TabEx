@@ -4025,6 +4025,14 @@ class FileExplorerTab(QWidget):
                 elif url_str.startswith('file://') and not url_str.startswith('file:///'):
                     from urllib.parse import unquote
                     local_path = self._normalize_local_path('\\\\' + unquote(url_str[7:]).replace('/', '\\'))
+                elif '::' in url_str:
+                    # 尝试从 CLSID URL 中提取盘符路径
+                    import re
+                    drive_match = re.search(r'([A-Za-z]:\\[^"]*)', url_str.replace('/', '\\'))
+                    if not drive_match:
+                        drive_match = re.search(r'([A-Za-z]:/[^"]*)', url_str)
+                    if drive_match:
+                        local_path = self._normalize_local_path(drive_match.group(1))
                 current_path = self._normalize_local_path(getattr(self, 'current_path', ''))
                 if local_path and local_path != current_path:
                     debug_print(f"[Keepalive] Navigation detected: {current_path!r} -> {local_path!r}, restarting sync")
@@ -4060,9 +4068,17 @@ class FileExplorerTab(QWidget):
                     local_path = self._normalize_local_path(local_path)
                 # 处理 shell: 特殊路径
                 elif url_str.startswith('shell:') or '::' in url_str:
-                    # Shell特殊文件夹，通常以 shell: 或包含 CLSID (::)
-                    # 这些路径我们已经在 current_path 中维护，无需更新
-                    return
+                    # 尝试从 CLSID URL 中提取盘符路径（如 ::{...}\X:\）
+                    import re
+                    drive_match = re.search(r'([A-Za-z]:\\[^"]*)', url_str.replace('/', '\\'))
+                    if not drive_match:
+                        drive_match = re.search(r'([A-Za-z]:/[^"]*)', url_str)
+                    if drive_match:
+                        local_path = self._normalize_local_path(drive_match.group(1))
+                        debug_print(f"[PathSync] Extracted drive path from CLSID URL: {local_path}")
+                    else:
+                        # 纯 shell: 路径，无法提取盘符，不更新
+                        return
                 
                 current_path = self._normalize_local_path(self.current_path)
 
@@ -4321,6 +4337,15 @@ class FileExplorerTab(QWidget):
                 from urllib.parse import unquote
                 local_path = '\\\\' + unquote(url[7:]).replace('/', '\\')
                 local_path = self._normalize_local_path(local_path)
+            # 处理 CLSID 路径（如 ::{20D04FE0-...}\X:\）：尝试提取盘符路径
+            if local_path is None and '::' in url:
+                import re
+                drive_match = re.search(r'([A-Za-z]:\\[^"]*)', url.replace('/', '\\'))
+                if not drive_match:
+                    drive_match = re.search(r'([A-Za-z]:/[^"]*)', url)
+                if drive_match:
+                    local_path = self._normalize_local_path(drive_match.group(1))
+                    debug_print(f"[NavigateComplete2] Extracted drive path from CLSID URL: {local_path}")
             if local_path is not None:
                 current = self._normalize_local_path(getattr(self, 'current_path', ''))
                 if local_path and local_path != current:
