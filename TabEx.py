@@ -3629,16 +3629,19 @@ class SimplePathBar(QWidget):
     def set_path(self, path):
         new_path = path or ''
         path_changed = (new_path != self._current_path)
+        debug_print(f"[SimplePathBar] set_path: new='{new_path}', old='{self._current_path}', changed={path_changed}, in_edit={self._in_edit}, stack_idx={self._stack.currentIndex()}, crumb_count={self._crumb_row.count()}")
         self._current_path = new_path
         if self._in_edit:
             if path_changed:
                 # 路径已变化（用户通过 Explorer 导航了）→ 强制退出编辑模式并显示新路径
+                debug_print(f"[SimplePathBar] set_path: path changed while editing, exit edit mode")
                 self.exit_edit_mode()
             # 路径未变化时保持编辑模式不中断（用户可能在复制路径）
         else:
             self._rebuild()
 
     def enter_edit_mode(self):
+        debug_print(f"[SimplePathBar] enter_edit_mode: path='{self._current_path}', stack_idx={self._stack.currentIndex()}")
         self._in_edit = True
         self._edit.setText(self._current_path)
         self._stack.setCurrentIndex(1)
@@ -3649,6 +3652,9 @@ class SimplePathBar(QWidget):
         QApplication.instance().installEventFilter(self)
 
     def exit_edit_mode(self):
+        import traceback
+        caller = ''.join(traceback.format_stack(limit=3)[:-1]).strip()
+        debug_print(f"[SimplePathBar] exit_edit_mode: path='{self._current_path}', was_in_edit={self._in_edit}, caller={caller[-200:]}")
         self._in_edit = False
         self._stack.setCurrentIndex(0)
         self._last_built_path = ''  # 强制重建
@@ -3660,28 +3666,19 @@ class SimplePathBar(QWidget):
         except Exception:
             pass
 
-    def eventFilter(self, obj, event):
-        """应用级事件过滤器：检测点击路径栏外部时退出编辑模式"""
-        from PyQt5.QtCore import QEvent
-        if self._in_edit and event.type() == QEvent.MouseButtonPress:
-            # 检查点击是否在编辑框内部
-            try:
-                global_pos = event.globalPos()
-                edit_rect = self._edit.rect()
-                local_pos = self._edit.mapFromGlobal(global_pos)
-                if not edit_rect.contains(local_pos):
-                    # 点击在编辑框外部 → 退出编辑模式
-                    self.exit_edit_mode()
-            except Exception:
-                pass
-        return super().eventFilter(obj, event)
-
     def changeEvent(self, event):
         """窗口激活时强制刷新面包屑"""
         from PyQt5.QtCore import QEvent
         if event.type() == QEvent.WindowActivate and not self._in_edit:
-            # 仅重绘，不重建（_rebuild 由 set_path 负责）
-            self.update()
+            debug_print(f"[SimplePathBar] changeEvent(WindowActivate): path='{self._current_path}', crumb_count={self._crumb_row.count()}, stack_idx={self._stack.currentIndex()}")
+            # 如果面包屑控件都不可见了，强制重建
+            crumb_count = self._crumb_row.count()
+            if crumb_count <= 1 and self._current_path:
+                debug_print(f"[SimplePathBar] changeEvent: crumbs lost, forcing rebuild")
+                self._last_built_path = ''
+                self._rebuild()
+            else:
+                self.update()
         super().changeEvent(event)
 
     def get_path_for_copy(self, separator='\\'):
@@ -3695,14 +3692,27 @@ class SimplePathBar(QWidget):
     def _rebuild(self):
         """重建面包屑按钮列表。"""
         parts = self._split_path(self._current_path)
+        crumb_count = self._crumb_row.count()
         # 路径为空时保留现有内容，避免显示空白
-        if not parts and self._crumb_row.count() > 0:
+        if not parts and crumb_count > 0:
+            debug_print(f"[SimplePathBar] _rebuild: empty path, keep existing {crumb_count} widgets")
             return
 
         # 内容未变化时仅重绘，避免频繁销毁/重建控件
-        if self._last_built_path == self._current_path and self._crumb_row.count() > 1:
-            self._crumb_w.update()
-            return
+        if self._last_built_path == self._current_path and crumb_count > 1:
+            # 验证现有控件是否真的可见且有内容
+            has_visible = any(
+                self._crumb_row.itemAt(i).widget() and self._crumb_row.itemAt(i).widget().isVisible()
+                for i in range(crumb_count)
+                if self._crumb_row.itemAt(i) and self._crumb_row.itemAt(i).widget()
+            )
+            if has_visible:
+                self._crumb_w.update()
+                return
+            else:
+                debug_print(f"[SimplePathBar] _rebuild: path unchanged but widgets invisible! forcing rebuild. path='{self._current_path}', count={crumb_count}")
+        else:
+            debug_print(f"[SimplePathBar] _rebuild: rebuilding. path='{self._current_path}', last='{self._last_built_path}', count={crumb_count}, parts={len(parts)}")
         self._last_built_path = self._current_path
 
         # 清除旧控件
@@ -3772,10 +3782,24 @@ class SimplePathBar(QWidget):
             self.enter_edit_mode()
         super().mousePressEvent(event)
 
+    def resizeEvent(self, event):
+        """检测路径栏被resize为极小宽度的异常情况"""
+        new_w = event.size().width()
+        old_w = event.oldSize().width() if event.oldSize().isValid() else -1
+        if new_w < 50 and self._current_path:
+            debug_print(f"[SimplePathBar] resizeEvent: WARNING width shrunk to {new_w} (was {old_w}), path='{self._current_path}'")
+        elif old_w >= 0 and old_w < 50 and new_w >= 50 and self._current_path:
+            # 从极小宽度恢复 → 强制重建面包屑
+            debug_print(f"[SimplePathBar] resizeEvent: recovered from {old_w} to {new_w}, forcing rebuild")
+            self._last_built_path = ''
+            self._rebuild()
+        super().resizeEvent(event)
+
     def eventFilter(self, obj, event):
         from PyQt5.QtCore import QEvent
         if obj is self._edit and event.type() == QEvent.KeyPress:
             if event.key() == Qt.Key_Escape:
+                debug_print(f"[SimplePathBar] eventFilter: Escape pressed, exit edit mode")
                 self.exit_edit_mode()
                 return True
         # 应用级事件过滤：点击编辑框外部时退出编辑模式
@@ -3785,7 +3809,13 @@ class SimplePathBar(QWidget):
                 edit_rect = self._edit.rect()
                 local_pos = self._edit.mapFromGlobal(global_pos)
                 if not edit_rect.contains(local_pos):
-                    self.exit_edit_mode()
+                    # 额外检查：点击是否在整个 SimplePathBar 区域内（如果在路径栏区域内不退出）
+                    bar_local = self.mapFromGlobal(global_pos)
+                    if self.rect().contains(bar_local):
+                        debug_print(f"[SimplePathBar] eventFilter: click inside path bar area but outside edit, ignoring exit")
+                    else:
+                        debug_print(f"[SimplePathBar] eventFilter: click outside path bar, exit edit mode. global_pos={global_pos.x()},{global_pos.y()}")
+                        self.exit_edit_mode()
             except Exception:
                 pass
         return super().eventFilter(obj, event)
@@ -9459,6 +9489,31 @@ class TitleShortcutBar(QWidget):
         if not path:
             return
         menu = QMenu(self)
+        menu.setStyleSheet(
+            """
+            QMenu {
+                background-color: #ffffff;
+                border: 1px solid #c7c7c7;
+                border-radius: 6px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 24px 6px 12px;
+                background: transparent;
+                border-radius: 4px;
+                color: #303030;
+                margin: 2px 4px;
+            }
+            QMenu::item:selected {
+                background: #3f5f7a;
+                color: #f6f8fa;
+            }
+            QMenu::item:pressed {
+                background: #324c62;
+                color: #ffffff;
+            }
+            """
+        )
         remove_action = menu.addAction(tr("移除该快捷方式"))
         action = menu.exec_(btn.mapToGlobal(pos))
         if action == remove_action:

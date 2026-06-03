@@ -39,6 +39,12 @@
 
 ## 🆕 最近更新
 
+### v3.41 (2026-06-03)
+- **路径栏内容消失问题诊断与修复**：SimplePathBar 增加完整诊断日志（`[SimplePathBar]` 前缀），覆盖 set_path / enter_edit_mode / exit_edit_mode / _rebuild / resizeEvent / changeEvent / eventFilter 全链路，便于定位路径栏偶发空白的根因
+- **路径栏编辑模式点击复制修复**：修复在编辑模式下点击路径栏内部（非编辑框区域）会误退出编辑模式导致无法选择/复制路径文本的问题
+- **路径栏面包屑自愈机制**：_rebuild 优化跳过逻辑增加 widget 可见性验证，防止路径未变但控件已不可见时永远恢复不了；窗口激活时若面包屑丢失则强制重建；宽度从极小恢复时自动重建
+- **标题栏快捷方式右键菜单样式优化**：移除快捷方式的右键菜单选中态改为深色背景 + 浅色文字，解决原来选中时字体和背景都偏淡看不清的问题
+
 ### v3.40 (2026-06-02)
 - **窗口恢复后路径栏/状态栏不更新修复**：修复窗口从最小化恢复时 IExplorerBrowser 树面板自动展开到记忆子目录，导致 NavigateComplete2 连续触发错误路径覆盖路径栏和 Git 状态栏的问题。添加 restore guard 机制抑制虚假导航并强制 IEB 回到正确路径
 
@@ -48,12 +54,6 @@
 ### v3.38 (2026-06-02)
 - **TortoiseGit Overlay 图标修复**：IExplorerBrowser 中 TortoiseGit 的文件状态 overlay 图标（已修改、已提交等）现在正确显示。通过 SHGetFileInfo 预加载 overlay 到系统图标列表 + IShellView::Refresh() 刷新视图实现
 - **启动速度优化**：修复标题栏快捷方式区域在启动时同步调用 SHGetFileInfo 获取 .exe 图标导致的严重卡顿（每个超时约 3 秒）。改用 ExtractIconExW 直接读取 PE 资源 + 延迟 1.5 秒加载，窗口秒开
-
-### v3.37 (2026-06-02)
-- **双击空白返回上级 - 全标签页修复**：将 WH_MOUSE_LL 钩子从 per-tab 改为进程级单例架构，彻底修复"只有最后创建的标签页双击空白才能返回上级"问题
-- **Alt+Z 复制文件名修复**：IExplorerBrowser 模式下 Alt+Z 现在通过 IFolderView → IShellItemArray COM 接口正确获取选中文件名，不再错误复制完整路径
-- **关闭标签页崩溃修复**：修复关闭标签页时 content_stack/tab_widget 顺序不一致导致 on_tab_changed 访问已释放控件的崩溃
-- **文件删除后刷新优化**：增加 FileWatcher 风暴检测系统（10 秒内 >5 次事件触发风暴模式），防止批量删除时 UI 卡顿或假死
 
 ---
 
