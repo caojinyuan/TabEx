@@ -4633,10 +4633,13 @@ class FileExplorerTab(QWidget):
             tr('开机启动项'): 'shell:Startup',
             tr('启动文件夹'): 'shell:Startup',
             'Startup': 'shell:Startup',
+            'OneDrive': 'shell:OneDrive',
+            'onedrive': 'shell:OneDrive',
         }
         # shell:Startup 等特殊路径，自动解析为真实系统路径
         shell_path_map = {
             'shell:Startup': lambda: os.path.join(os.environ.get('APPDATA', ''), r'Microsoft\Windows\Start Menu\Programs\Startup'),
+            'shell:OneDrive': lambda: os.environ.get('OneDrive', ''),
         }
 
         if path in special_map:
@@ -4664,6 +4667,16 @@ class FileExplorerTab(QWidget):
                     self.navigate_to(real_path)
                 else:
                     show_toast(self, tr("路径错误"), tr("启动文件夹不存在: {}").format(real_path), level="warning")
+                    if hasattr(self, 'current_path') and self.current_path:
+                        self.path_bar.set_path(self.current_path)
+                return
+            # shell:OneDrive 解析为真实路径
+            if path.lower() == 'shell:onedrive' and 'shell:OneDrive' in shell_path_map:
+                real_path = shell_path_map['shell:OneDrive']()
+                if real_path and os.path.exists(real_path):
+                    self.navigate_to(real_path)
+                else:
+                    show_toast(self, tr("路径错误"), tr("未找到 OneDrive 文件夹"), level="warning")
                     if hasattr(self, 'current_path') and self.current_path:
                         self.path_bar.set_path(self.current_path)
                 return
@@ -5204,6 +5217,12 @@ class FileExplorerTab(QWidget):
 
         # 支持本地路径和shell特殊路径
         if is_shell:
+            # shell:OneDrive 解析为真实路径（Shell.Explorer无法正确显示内容）
+            if path.lower() == 'shell:onedrive':
+                onedrive_path = os.environ.get('OneDrive', '')
+                if onedrive_path and os.path.exists(onedrive_path):
+                    self.navigate_to(onedrive_path, is_shell=False, add_to_history=add_to_history, skip_async_check=True)
+                    return
             self._hide_loading_indicator()
             self.explorer.dynamicCall("Navigate(const QString&)", path)
             self.current_path = path
@@ -12280,7 +12299,15 @@ class MainWindow(QMainWindow):
             else:
                 show_toast(self, tr("路径错误"), tr("路径不存在: {}").format(local_path), level="warning")
         elif url.startswith('shell:'):
-            self.add_new_tab(url, is_shell=True)
+            # shell:OneDrive 解析为真实路径（避免Shell.Explorer无法正确显示内容）
+            if url.lower() == 'shell:onedrive':
+                onedrive_path = os.environ.get('OneDrive', '')
+                if onedrive_path and os.path.exists(onedrive_path):
+                    self.add_new_tab(onedrive_path)
+                else:
+                    show_toast(self, tr("路径错误"), tr("未找到 OneDrive 文件夹"), level="warning")
+            else:
+                self.add_new_tab(url, is_shell=True)
         elif os.path.isabs(url) and os.path.exists(url):
             self.add_new_tab(url)
         else:
