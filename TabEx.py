@@ -2517,10 +2517,17 @@ def launch_shell_tool(tool_name, cwd=None):
         if not cwd or not os.path.isdir(cwd):
             raise FileNotFoundError(tr("当前路径无效，无法启动终端"))
 
+    # 使用 CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
+    # 确保启动的终端/程序在 TabEx 退出后仍然存活
+    # 注意：CREATE_NEW_CONSOLE 和 DETACHED_PROCESS 互斥，终端需要 console 所以不用 DETACHED
+    _DETACH_CONSOLE = (getattr(subprocess, 'CREATE_NEW_CONSOLE', 0x00000010)
+                       | _NEW_PROCESS_GROUP | _BREAKAWAY_FROM_JOB)
+
     if tool_name == 'cmd':
         return subprocess.Popen(
             ['cmd.exe', '/K', 'cd', '/d', cwd],
-            creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
+            creationflags=_DETACH_CONSOLE,
+            close_fds=True,
             cwd=cwd,
         )
 
@@ -2528,7 +2535,8 @@ def launch_shell_tool(tool_name, cwd=None):
         escaped_dir = cwd.replace("'", "''")
         return subprocess.Popen(
             ['powershell.exe', '-NoExit', '-Command', f"Set-Location -LiteralPath '{escaped_dir}'"],
-            creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
+            creationflags=_DETACH_CONSOLE,
+            close_fds=True,
             cwd=cwd,
         )
 
@@ -2539,20 +2547,12 @@ def launch_shell_tool(tool_name, cwd=None):
         git_bash_exe = os.path.join(git_root, 'git-bash.exe')
         if not os.path.exists(git_bash_exe):
             raise FileNotFoundError(tr("未找到可用的 Git Bash 可执行文件"))
-        return subprocess.Popen([
-            'cmd.exe',
-            '/c',
-            'start',
-            '',
-            '/D',
-            cwd,
-            git_bash_exe,
-        ])
+        return launch_detached([git_bash_exe, f'--cd={cwd}'], cwd=cwd)
 
     if tool_name == 'calculator':
         if os.name != 'nt':
             raise OSError(tr("当前系统不支持打开计算器"))
-        return subprocess.Popen(['calc.exe'])
+        return launch_detached(['calc.exe'])
 
     raise ValueError(f"Unsupported tool: {tool_name}")
 
@@ -3655,6 +3655,8 @@ class SimplePathBar(QWidget):
         import traceback
         caller = ''.join(traceback.format_stack(limit=3)[:-1]).strip()
         debug_print(f"[SimplePathBar] exit_edit_mode: path='{self._current_path}', was_in_edit={self._in_edit}, caller={caller[-200:]}")
+        if not self._in_edit:
+            return  # 已经不在编辑模式，无需重建
         self._in_edit = False
         self._stack.setCurrentIndex(0)
         self._last_built_path = ''  # 强制重建
@@ -3700,19 +3702,9 @@ class SimplePathBar(QWidget):
 
         # 内容未变化时仅重绘，避免频繁销毁/重建控件
         if self._last_built_path == self._current_path and crumb_count > 1:
-            # 验证现有控件是否真的可见且有内容
-            has_visible = any(
-                self._crumb_row.itemAt(i).widget() and self._crumb_row.itemAt(i).widget().isVisible()
-                for i in range(crumb_count)
-                if self._crumb_row.itemAt(i) and self._crumb_row.itemAt(i).widget()
-            )
-            if has_visible:
-                self._crumb_w.update()
-                return
-            else:
-                debug_print(f"[SimplePathBar] _rebuild: path unchanged but widgets invisible! forcing rebuild. path='{self._current_path}', count={crumb_count}")
-        else:
-            debug_print(f"[SimplePathBar] _rebuild: rebuilding. path='{self._current_path}', last='{self._last_built_path}', count={crumb_count}, parts={len(parts)}")
+            self._crumb_w.update()
+            return
+        debug_print(f"[SimplePathBar] _rebuild: rebuilding. path='{self._current_path}', last='{self._last_built_path}', count={crumb_count}, parts={len(parts)}")
         self._last_built_path = self._current_path
 
         # 清除旧控件
@@ -3729,13 +3721,18 @@ class SimplePathBar(QWidget):
                 sep.setStyleSheet(self._S_SEP)
                 sep.setFixedWidth(14)
                 sep.setAlignment(Qt.AlignCenter)
+                sep.setAttribute(Qt.WA_TransparentForMouseEvents, True)
                 self._crumb_row.addWidget(sep)
             btn = QPushButton(label)
             btn.setFlat(True)
             btn.setStyleSheet(self._S_BTN)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFocusPolicy(Qt.NoFocus)
-            btn.clicked.connect(lambda _=False, p=full_path: self.pathChanged.emit(p))
+            # 最后一级(当前目录)点击时进入编辑模式，而非发出无效的pathChanged
+            if full_path == self._current_path:
+                btn.clicked.connect(lambda _=False: self.enter_edit_mode())
+            else:
+                btn.clicked.connect(lambda _=False, p=full_path: self.pathChanged.emit(p))
             # 拖拽支持：面包屑可拖拽到标签栏打开新tab
             btn._crumb_path = full_path
             btn._drag_start = None
@@ -3775,12 +3772,8 @@ class SimplePathBar(QWidget):
             child = self._crumb_w.childAt(event.pos())
             if child is None:          # 点中空白区域
                 self.enter_edit_mode()
-        QWidget.mousePressEvent(self._crumb_w, event)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and not self._in_edit:
-            self.enter_edit_mode()
-        super().mousePressEvent(event)
+        # 接受事件，阻止传播到父级 SimplePathBar 触发误操作
+        event.accept()
 
     def resizeEvent(self, event):
         """检测路径栏被resize为极小宽度的异常情况"""
@@ -5506,7 +5499,7 @@ class FileExplorerTab(QWidget):
                     if self._is_control_panel_path(url):
                         try:
                             import subprocess
-                            subprocess.Popen(['explorer.exe', url])
+                            launch_detached(['explorer.exe', url])
                             show_toast(self, tr("已打开"), tr("控制面板已在新窗口打开"), level="info", duration=2000)
                         except Exception as ex:
                             show_toast(self, tr("错误"), tr("无法打开控制面板: {}").format(ex), level="error")
@@ -6684,7 +6677,7 @@ class FileExplorerTab(QWidget):
         if self._is_control_panel_path(path):
             try:
                 import subprocess
-                subprocess.Popen(['explorer.exe', path])
+                launch_detached(['explorer.exe', path])
                 show_toast(self, tr("已打开"), tr("控制面板已在新窗口打开"), level="info", duration=2000)
             except Exception as e:
                 show_toast(self, tr("错误"), tr("无法打开控制面板: {}").format(e), level="error")
@@ -8962,7 +8955,7 @@ class ChatPanel(QWidget):
                         ):
                             notes.append(tr("⏸ 已取消运行脚本: {}").format(script))
                             continue
-                        subprocess.Popen(script, shell=True, cwd=os.path.dirname(script))
+                        launch_detached(script if isinstance(script, list) else [script], cwd=os.path.dirname(script))
                         notes.append(tr("✅ 已启动脚本: {}").format(script))
                     except Exception as e:
                         notes.append(tr("❌ 运行脚本失败: {}（{}）").format(script, e))
@@ -9872,7 +9865,7 @@ class MainWindow(QMainWindow):
             display_name = os.path.splitext(os.path.basename(path))[0] or os.path.basename(path)
             lower_path = path.lower()
             if os.name == 'nt' and lower_path.endswith('.ps1'):
-                subprocess.Popen([
+                launch_detached([
                     'powershell.exe',
                     '-ExecutionPolicy',
                     'Bypass',
@@ -9880,7 +9873,7 @@ class MainWindow(QMainWindow):
                     path,
                 ], cwd=os.path.dirname(path) or None)
             elif os.name == 'nt' and lower_path.endswith(('.bat', '.cmd')):
-                subprocess.Popen(['cmd.exe', '/c', 'start', '', path], cwd=os.path.dirname(path) or None)
+                launch_detached(['cmd.exe', '/c', 'start', '', path], cwd=os.path.dirname(path) or None)
             elif os.name == 'nt':
                 os.startfile(path)
             else:
@@ -9966,7 +9959,7 @@ class MainWindow(QMainWindow):
             debug_print(f"[MainWindow] Failed to create embedded explorer tab for '{path}': {e}")
             try:
                 if path:
-                    subprocess.Popen(['explorer.exe', path])
+                    launch_detached(['explorer.exe', path])
             except Exception as open_error:
                 debug_print(f"[MainWindow] Fallback explorer launch failed for '{path}': {open_error}")
             show_toast(self, tr("打开失败"), tr("无法嵌入该窗口，已尝试用系统资源管理器打开。\n{}").format(e), level="error", duration=3500)

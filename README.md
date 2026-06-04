@@ -15,7 +15,7 @@
 - ✅ **AI 助手侧边栏** - 可选启用的右侧聊天面板，支持目录操作、文件读写、脚本执行和安全确认
 - ✅ **高 DPI 自适应** - 自动检测屏幕 DPI 并动态缩放 UI，高分屏显示清晰
 - ✅ **标签页固定** - 固定常用文件夹，开机自动恢复
-- ✅ **TortoiseGit 集成** - 标题栏快捷按钮，一键打开 Log/Commit/Git Bash（需安装 TortoiseGit 或 Git for Windows）
+- ✅ **TortoiseGit 集成** - 标题栏快捷按钮，一键打开 Log/Commit/Git Bash（需安装 TortoiseGit 或 Git for Windows），支持变更文件图标修改功能
 - ✅ **标题栏启动区** - 支持拖入应用、快捷方式或脚本（`.lnk/.exe/.bat/.cmd/.ps1`），一键启动、右键删除、拖拽排序（最多 20 个），并尽量解析目标程序图标避免快捷方式箭头覆盖
 - ✅ **标题栏工具按钮** - 一键在当前标签页路径打开 cmd、PowerShell、Git Bash，或快速打开计算器
 - ✅ **会话恢复** - 关闭时自动缓存标签，启动时智能恢复工作环境，支持窗口恢复提示
@@ -39,21 +39,15 @@
 
 ## 🆕 最近更新
 
+### v3.42 (2026-06-04)
+- **路径栏点击最后一级进入编辑模式**：修复点击当前目录名（面包屑最后一段）无反应的问题，现在点击最后一级会直接进入编辑模式，方便复制/修改路径
+- **启动的外部程序不再随 TabEx 关闭而终止**：标题栏快捷方式（`.lnk/.exe/.bat/.cmd/.ps1`）、终端（cmd/PowerShell/Git Bash）、计算器等所有由 TabEx 启动的程序，在 TabEx 退出后仍然独立存活，不再被 Windows Job Object 连带杀死
+
 ### v3.41 (2026-06-03)
 - **路径栏内容消失问题诊断与修复**：SimplePathBar 增加完整诊断日志（`[SimplePathBar]` 前缀），覆盖 set_path / enter_edit_mode / exit_edit_mode / _rebuild / resizeEvent / changeEvent / eventFilter 全链路，便于定位路径栏偶发空白的根因
 - **路径栏编辑模式点击复制修复**：修复在编辑模式下点击路径栏内部（非编辑框区域）会误退出编辑模式导致无法选择/复制路径文本的问题
 - **路径栏面包屑自愈机制**：_rebuild 优化跳过逻辑增加 widget 可见性验证，防止路径未变但控件已不可见时永远恢复不了；窗口激活时若面包屑丢失则强制重建；宽度从极小恢复时自动重建
 - **标题栏快捷方式右键菜单样式优化**：移除快捷方式的右键菜单选中态改为深色背景 + 浅色文字，解决原来选中时字体和背景都偏淡看不清的问题
-
-### v3.40 (2026-06-02)
-- **窗口恢复后路径栏/状态栏不更新修复**：修复窗口从最小化恢复时 IExplorerBrowser 树面板自动展开到记忆子目录，导致 NavigateComplete2 连续触发错误路径覆盖路径栏和 Git 状态栏的问题。添加 restore guard 机制抑制虚假导航并强制 IEB 回到正确路径
-
-### v3.39 (2026-06-02)
-- **路径栏稳定性修复**：修复 IShellView::Refresh() 在所有后台标签页同时触发导致全部路径栏清空的问题。改为仅对当前可见标签页执行 Refresh，后台标签延迟到切换时再刷新；同时修复面包屑宽度<50 时无限重试的死循环
-
-### v3.38 (2026-06-02)
-- **TortoiseGit Overlay 图标修复**：IExplorerBrowser 中 TortoiseGit 的文件状态 overlay 图标（已修改、已提交等）现在正确显示。通过 SHGetFileInfo 预加载 overlay 到系统图标列表 + IShellView::Refresh() 刷新视图实现
-- **启动速度优化**：修复标题栏快捷方式区域在启动时同步调用 SHGetFileInfo 获取 .exe 图标导致的严重卡顿（每个超时约 3 秒）。改用 ExtractIconExW 直接读取 PE 资源 + 延迟 1.5 秒加载，窗口秒开
 
 ---
 
@@ -206,7 +200,7 @@ Remove-Item build, dist -Recurse -Force -ErrorAction SilentlyContinue
 ### 项目文件说明
 - `TabEx.py` - 主程序入口
 - `requirements.txt` - Python 依赖列表
-- `config.json` / `config - 副本.json` - 应用配置示例
+- `config.json` - 应用配置示例
 - `bookmarks.json` - 书签数据
 - `0_install_requirements.bat` - 依赖安装脚本
 - `1_TabEx.bat` - 源码运行脚本
