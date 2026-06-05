@@ -1148,6 +1148,51 @@ def detect_notepad_plus_plus():
             return path
     return None
 
+
+def format_file_size(size_bytes):
+    """将字节数格式化为带单位的人类可读字符串。"""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    if size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+
+
+def is_text_file(file_path, sample_size=1024):
+    """智能检测文件是否为文本文件（读取前N字节检测）。
+
+    模块级实现：避免在每次搜索时重新定义闭包，且可独立复用/测试。
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            sample = f.read(sample_size)
+            if not sample:
+                return True  # 空文件视为文本文件
+
+            # UTF-16/UTF-32 BOM 视为文本，避免被 NULL 字节规则误判
+            if sample.startswith((b'\xff\xfe', b'\xfe\xff', b'\xff\xfe\x00\x00', b'\x00\x00\xfe\xff')):
+                return True
+
+            # NULL 字节几乎总是二进制特征
+            if b'\x00' in sample:
+                return False
+
+            # 仅统计 ASCII 控制字符（排除 \t\n\r），避免把 UTF-8 非 ASCII 文本误判为二进制
+            control_count = 0
+            for byte in sample:
+                if byte < 9 or (13 < byte < 32):
+                    control_count += 1
+
+            # 控制字符占比过高，判定为二进制
+            if control_count / len(sample) > 0.1:
+                return False
+
+            return True
+    except Exception:
+        return False  # 无法读取则视为二进制
+
 # 搜索对话框
 class SearchDialog(QDialog):    
     def __init__(self, search_path, parent=None, search_history=None):
@@ -1338,6 +1383,12 @@ class SearchDialog(QDialog):
         if self.ui_update_timer:
             self.ui_update_timer.stop()
 
+        # 等待后台搜索线程优雅退出，避免关闭后仍占用磁盘IO
+        search_thread = getattr(self, 'search_thread', None)
+        if (search_thread and search_thread.is_alive()
+                and search_thread is not threading.current_thread()):
+            search_thread.join(timeout=2.0)
+
         self._drain_result_queue()
 
         if hasattr(self, 'result_model') and self.result_model:
@@ -1415,7 +1466,7 @@ class SearchDialog(QDialog):
                     elif item['type'] == 'enable_sorting':
                         # 搜索完成后启用排序
                         self.result_list.setSortingEnabled(True)
-                except:
+                except Exception:
                     break  # 队列为空
             
             # 批量添加结果到表格（性能优化）
@@ -1750,14 +1801,7 @@ class SearchDialog(QDialog):
                                 size_bytes = stat_info.st_size
                                 sort_date_ts = stat_info.st_mtime
                                 sort_size_bytes = size_bytes
-                                if size_bytes < 1024:
-                                    size_str = f"{size_bytes} B"
-                                elif size_bytes < 1024 * 1024:
-                                    size_str = f"{size_bytes / 1024:.1f} KB"
-                                elif size_bytes < 1024 * 1024 * 1024:
-                                    size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
-                                else:
-                                    size_str = f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+                                size_str = format_file_size(size_bytes)
                             except Exception:
                                 mtime = "-"
                                 size_str = "-"
@@ -1775,7 +1819,7 @@ class SearchDialog(QDialog):
                         if len(batch_items) >= batch_size:
                             self.add_search_results_batch(batch_items, timeout=0.5)
                             batch_items = []
-                    except:
+                    except Exception:
                         pass
 
                 if batch_items:
@@ -1868,36 +1912,6 @@ class SearchDialog(QDialog):
             'rb', 'swift', 'kt', 'm', 'mm', 'vue', 'svelte', 'dockerfile', 'gitignore', 'arxml', 'xdm'
         }
         
-        def is_text_file(file_path, sample_size=1024):
-            """智能检测文件是否为文本文件（读取前N字节检测）"""
-            try:
-                with open(file_path, 'rb') as f:
-                    sample = f.read(sample_size)
-                    if not sample:
-                        return True  # 空文件视为文本文件
-
-                    # UTF-16/UTF-32 BOM 视为文本，避免被 NULL 字节规则误判
-                    if sample.startswith((b'\xff\xfe', b'\xfe\xff', b'\xff\xfe\x00\x00', b'\x00\x00\xfe\xff')):
-                        return True
-
-                    # NULL 字节几乎总是二进制特征
-                    if b'\x00' in sample:
-                        return False
-
-                    # 仅统计 ASCII 控制字符（排除 \t\n\r），避免把 UTF-8 非 ASCII 文本误判为二进制
-                    control_count = 0
-                    for byte in sample:
-                        if byte < 9 or (13 < byte < 32):
-                            control_count += 1
-
-                    # 控制字符占比过高，判定为二进制
-                    if control_count / len(sample) > 0.1:
-                        return False
-
-                    return True
-            except:
-                return False  # 无法读取则视为二进制
-        
         # 对于文件内容搜索，使用编译的正则表达式可能更快（可选优化）
         # 但Python的内置字符串搜索已经很快，这里保持简单
         
@@ -1959,7 +1973,7 @@ class SearchDialog(QDialog):
                                     mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
                                     size_str = "-"  # 文件夹不显示大小
                                     sort_date_ts = stat_info.st_mtime
-                                except:
+                                except Exception:
                                     mtime = "-"
                                     size_str = "-"
                                     sort_date_ts = None
@@ -2029,7 +2043,7 @@ class SearchDialog(QDialog):
                         try:
                             self.result_queue.put({'type': 'status', 'text': status_text}, timeout=0.1)
                             last_status_update_ms = int(time.time() * 1000)
-                        except:
+                        except Exception:
                             pass  # 超时后继续搜索
                     
                     file_path = os.path.join(root, filename)
@@ -2048,14 +2062,21 @@ class SearchDialog(QDialog):
                             skipped_binary_files += 1
                             continue
 
-                        # 2. 文本白名单直接通过；其余文件走探测
+                        # 2. 预取文件大小：空文件不可能命中关键词，直接跳过；同时复用size避免重复stat
+                        try:
+                            file_size = os.path.getsize(file_path)
+                        except OSError:
+                            continue
+                        if file_size == 0:
+                            continue
+
+                        # 3. 文本白名单直接通过；其余文件走探测
                         if file_ext not in text_file_extensions and not is_text_file(file_path):
                             skipped_binary_files += 1
                             continue
                         
                         try:
-                            # 获取文件大小
-                            file_size = os.path.getsize(file_path)
+                            # 文件大小已在上方预取（file_size）
 
                             # 分块读取与单文件扫描上限
                             chunk_size = CONTENT_SEARCH_CHUNK_SIZE
@@ -2176,15 +2197,8 @@ class SearchDialog(QDialog):
                                 sort_date_ts = stat_info.st_mtime
                                 sort_size_bytes = size_bytes
                                 # 格式化大小
-                                if size_bytes < 1024:
-                                    size_str = f"{size_bytes} B"
-                                elif size_bytes < 1024 * 1024:
-                                    size_str = f"{size_bytes / 1024:.1f} KB"
-                                elif size_bytes < 1024 * 1024 * 1024:
-                                    size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
-                                else:
-                                    size_str = f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
-                            except:
+                                size_str = format_file_size(size_bytes)
+                            except Exception:
                                 mtime = "-"
                                 size_str = "-"
                         
@@ -2248,7 +2262,7 @@ class SearchDialog(QDialog):
             self.result_queue.put({'type': 'button', 'button': 'stop', 'enabled': False}, timeout=1)
             # 搜索完成后启用排序
             self.result_queue.put({'type': 'enable_sorting'}, timeout=1)
-        except:
+        except Exception:
             debug_print(tr('[Search] ⚠️ 队列满，最终状态更新失败'))
         
         debug_print(tr('[Search] UI更新已调度（使用队列）'))
@@ -2867,671 +2881,6 @@ if HAS_PYWIN:
         )
     except Exception as e:
         debug_print(f"Failed to setup Windows API monitoring: {e}")
-
-class BreadcrumbPathBar(QWidget):
-    """类似Windows资源管理器的面包屑路径栏，支持点击层级跳转"""
-    pathChanged = pyqtSignal(str)  # 当路径改变时发出信号
-    def get_path_for_copy(self, separator=None):
-        """返回当前路径，始终按设置分隔符格式化，无论原始格式。编辑模式下对QLineEdit内容也做替换。"""
-        # 优先取编辑框内容（如果在编辑模式）
-        if getattr(self, 'edit_mode', False) and hasattr(self, 'path_edit') and self.path_edit.isVisible():
-            path = self.path_edit.text()
-        else:
-            path = self.current_path
-        if not path:
-            return ""
-        if separator is None:
-            separator = "\\" if os.name == 'nt' else "/"
-        if separator == "/":
-            return path.replace("\\", "/").replace("/", "/")
-        else:
-            return path.replace("/", "\\").replace("\\", "\\")
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.current_path = ""
-        self.edit_mode = False
-        # 绑定resize节流定时器，避免拖动卡顿
-        try:
-            from PyQt5.QtCore import QTimer
-            self._resize_timer = QTimer(self)
-            self._resize_timer.setSingleShot(True)
-            self._resize_timer.setInterval(50)  # 减少到50ms以加快响应
-            self._resize_timer.timeout.connect(self._on_resize_timer_timeout)
-        except Exception:
-            self._resize_timer = None
-        # 标志：导航触发的更新（跳过节流），vs resize触发的更新（使用节流）
-        self._is_navigation_update = False
-        self.init_ui()
-    
-    def init_ui(self):
-        self.layout = QHBoxLayout(self)
-        self.layout.setContentsMargins(2, 0, 2, 0)
-        self.layout.setSpacing(0)
-        
-        # 路径编辑框（编辑模式时显示）
-        self.path_edit = QLineEdit(self)
-        path_edit_height = int(26 * getattr(self, 'parent_window', self).dpi_scale if hasattr(getattr(self, 'parent_window', self), 'dpi_scale') else 26)
-        self.path_edit.setFixedHeight(path_edit_height)
-        self.path_edit.setStyleSheet("QLineEdit { font-size: 10pt; padding: 2px; border: 1px solid #ccc; }")
-        self.path_edit.hide()
-        self.path_edit.returnPressed.connect(self.on_edit_finished)
-        # editingFinished 改用延迟检查，防止定时器刷新等短暂焦点丢失误退出编辑模式
-        self.path_edit.editingFinished.connect(self._on_path_edit_editing_finished)
-        
-        # 设置路径自动补全
-        self.setup_path_completer()
-        
-        # 面包屑容器（显示模式时显示）
-        self.breadcrumb_widget = QWidget(self)
-        self.breadcrumb_widget.setStyleSheet("QWidget { background: transparent; }")
-        # 设置最小宽度为0，允许完全缩小
-        self.breadcrumb_widget.setMinimumWidth(0)
-        # 设置大小策略：宽度不强制扩展，允许压缩
-        self.breadcrumb_widget.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-        
-        self.breadcrumb_layout = QHBoxLayout(self.breadcrumb_widget)
-        self.breadcrumb_layout.setContentsMargins(0, 0, 0, 0)
-        self.breadcrumb_layout.setSpacing(0)
-        self.breadcrumb_layout.addStretch(1)
-        
-        self.layout.addWidget(self.breadcrumb_widget)
-        self.layout.addWidget(self.path_edit)
-        
-        # 设置整体样式
-        self.setStyleSheet("""
-            BreadcrumbPathBar {
-                background: transparent;
-                border: none;
-            }
-        """)
-        self.setFixedHeight(int(36 * getattr(self, 'parent_window', self).dpi_scale if hasattr(getattr(self, 'parent_window', self), 'dpi_scale') else 36))
-        # 设置大小策略：宽度不强制扩展，高度固定；允许被压缩，避免影响左侧目录树
-        self.setMinimumWidth(0)
-        self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-
-    def resizeEvent(self, event):
-        """当路径栏宽度变化时，节流更新面包屑，减少重绘卡顿"""
-        try:
-            if not self.edit_mode:  # 编辑模式不重建面包屑，防止干扰 path_edit
-                # 只在非导航更新时进行节流，导航时立即更新
-                if self._is_navigation_update:
-                    if not getattr(self, '_in_update_breadcrumbs', False):
-                        # 重入守卫未激活：立即重建面包屑
-                        self.update_breadcrumbs()
-                        self._is_navigation_update = False
-                    else:
-                        # 重入守卫激活中（update_breadcrumbs 正在执行）：
-                        # 不重置标志，启动短延迟定时器，确保守卫释放后还能刷新
-                        if getattr(self, '_resize_timer', None):
-                            self._resize_timer.start()
-                elif getattr(self, '_resize_timer', None):
-                    # Resize事件使用节流定时器，合并连续events
-                    self._resize_timer.start()
-                else:
-                    self.update_breadcrumbs()
-        except Exception:
-            pass
-        super().resizeEvent(event)
-
-    def changeEvent(self, event):
-        """窗口状态变化时（如从被遮挡恢复到前台），强制刷新面包屑显示"""
-        from PyQt5.QtCore import QEvent
-        if event.type() == QEvent.WindowActivate and not self.edit_mode:
-            # 窗口被激活（从后台回到前台）→ 刷新面包屑防止内容消失
-            QTimer.singleShot(0, self._repaint_after_activate)
-        super().changeEvent(event)
-
-    def _repaint_after_activate(self):
-        """窗口激活后强制重绘面包屑内容"""
-        if self.edit_mode:
-            return
-        if hasattr(self, 'breadcrumb_widget') and self.current_path:
-            # 检查面包屑子控件是否仍然可见且有内容
-            has_visible_child = False
-            for i in range(self.breadcrumb_layout.count()):
-                item = self.breadcrumb_layout.itemAt(i)
-                if item and item.widget() and item.widget().isVisible():
-                    has_visible_child = True
-                    break
-            if not has_visible_child:
-                # 面包屑内容丢失，重建
-                self.update_breadcrumbs()
-            # 强制重绘所有子控件
-            self.breadcrumb_widget.update()
-            self.breadcrumb_widget.repaint()
-            self.update()
-
-    def setup_path_completer(self):
-        """设置路径自动补全"""
-        # 创建文件系统模型用于路径补全
-        self.completer_model = QFileSystemModel()
-        self.completer_model.setRootPath("")  # 设置为空以显示所有驱动器
-        self.completer_model.setFilter(QDir.Drives | QDir.AllDirs | QDir.NoDotAndDotDot)
-        
-        # 创建补全器
-        self.completer = QCompleter(self.completer_model, self)
-        self.completer.setCaseSensitivity(Qt.CaseInsensitive)  # 不区分大小写
-        self.completer.setCompletionMode(QCompleter.PopupCompletion)  # 弹出补全列表
-        self.completer.setMaxVisibleItems(10)  # 最多显示10个补全项
-        
-        # 设置补全器的弹出窗口样式
-        popup = self.completer.popup()
-        popup.setStyleSheet("""
-            QListView {
-                font-size: 11pt;
-                border: 1px solid #ccc;
-                background-color: white;
-                selection-background-color: #0078d7;
-                selection-color: white;
-            }
-        """)
-        
-        # 节流定时器：避免每次按键都触发 setRootPath（会扫目录，拖慢输入体验）
-        self._completer_timer = QTimer(self)
-        self._completer_timer.setSingleShot(True)
-        self._completer_timer.setInterval(300)
-        self._completer_timer.timeout.connect(self._do_update_completer_prefix)
-        self._completer_pending_text = ""
-        self._completer_last_parent = ""
-
-        # 连接信号以动态更新补全
-        self.path_edit.textChanged.connect(self.update_completer_prefix)
-        
-        # 将补全器设置到输入框
-        self.path_edit.setCompleter(self.completer)
-        
-        debug_print("[PathCompleter] Path auto-completion initialized")
-    
-    def update_completer_prefix(self, text):
-        """动态更新补全前缀（节流版，避免每次按键都扫目录）"""
-        self._completer_pending_text = text
-        if hasattr(self, '_completer_timer'):
-            self._completer_timer.start()  # 重置300ms计时
-
-    def _do_update_completer_prefix(self):
-        """节流后实际执行补全根路径更新"""
-        text = getattr(self, '_completer_pending_text', '')
-        if not text:
-            return
-        # 特殊命令不需要补全
-        if text.startswith('shell:') or text in ['cmd', tr('回收站'), tr('此电脑'), tr('我的电脑'), '桌面', tr('网络')]:
-            return
-        # 标准化路径分隔符
-        normalized_path = text.replace('/', '\\') if os.name == 'nt' else text
-        parent_dir = os.path.dirname(normalized_path)
-        # 与上次相同则跳过，避免重复扫目录
-        if not parent_dir or parent_dir == getattr(self, '_completer_last_parent', ''):
-            return
-        if os.path.exists(parent_dir):
-            self._completer_last_parent = parent_dir
-            self.completer_model.setRootPath(parent_dir)
-            debug_print(f"[PathCompleter] Updated root path to: {parent_dir}")
-    
-    def set_path(self, path):
-        """设置并显示路径，始终按全局设置分隔符存储和显示"""
-        debug_print(f"[PathBar] set_path called: path={path}, edit_mode={self.edit_mode}, current_path={getattr(self, 'current_path', None)}")
-        if not path:
-            return
-        # 优先从主窗口(MainWindow)获取config
-        separator = "/"
-        mainwin = None
-        p = self.parent()
-        # 向上查找MainWindow
-        for _ in range(5):
-            if p is None:
-                break
-            if hasattr(p, 'config') and hasattr(p, 'copy_selected_filename'):
-                mainwin = p
-                break
-            if hasattr(p, 'parent'):
-                p = p.parent()
-            else:
-                break
-        if mainwin and hasattr(mainwin, 'config'):
-            separator = mainwin.config.get("breadcrumb_copy_separator", "/")
-        # 统一替换为设置的分隔符
-        if separator == "/":
-            norm_path = path.replace("\\", "/").replace("/", "/")
-        else:
-            norm_path = path.replace("/", "\\").replace("\\", "\\")
-        old_path = self.current_path
-        self.current_path = norm_path
-        path_changed = (norm_path != old_path)
-        # 用户正在地址栏输入时（且路径未变化），不要被后台同步打断。
-        # 注意：不检查 hasFocus()——焦点可能尚未稳定（enter_edit_mode 刚调用 setFocus），
-        # 用焦点丢失判断应由 _check_exit_edit_mode_by_focus 来处理，而不是 set_path 强制退出。
-        if (self.edit_mode and
-            hasattr(self, 'path_edit') and
-            self.path_edit.isVisible() and
-            not path_changed):
-            debug_print(f"[PathBar] set_path: in edit_mode, skip update. path={path}")
-            return
-        # 无论当前状态如何，都同步编辑框文本并恢复显示模式，避免地址栏偶发空白。
-        if hasattr(self, 'path_edit'):
-            try:
-                self.path_edit.blockSignals(True)
-                self.path_edit.setText(norm_path)
-            finally:
-                self.path_edit.blockSignals(False)
-        if self.edit_mode or (hasattr(self, 'path_edit') and self.path_edit.isVisible()):
-            debug_print(f"[PathBar] set_path: exit edit_mode. path={path}")
-            self.edit_mode = False
-            # 移除应用级事件过滤器
-            from PyQt5.QtWidgets import QApplication
-            try:
-                QApplication.instance().removeEventFilter(self)
-            except Exception:
-                pass
-        if hasattr(self, 'path_edit'):
-            self.path_edit.hide()
-        if hasattr(self, 'breadcrumb_widget'):
-            self.breadcrumb_widget.show()
-        # 标记这是来自导航的更新（需要立即刷新，不节流）
-        self._is_navigation_update = True
-        debug_print(f"[PathBar] set_path: update_breadcrumbs, path={path}, edit_mode={self.edit_mode}")
-        # 输出控件状态
-        pe_text = self.path_edit.text() if hasattr(self, 'path_edit') else None
-        bw_visible = self.breadcrumb_widget.isVisible() if hasattr(self, 'breadcrumb_widget') else None
-        bw_width = self.breadcrumb_widget.width() if hasattr(self, 'breadcrumb_widget') else None
-        debug_print(f"[PathBar] set_path: path_edit.text={pe_text}, breadcrumb_widget.visible={bw_visible}, breadcrumb_widget.width={bw_width}")
-        # 先更新面包屑 widget，再激活布局，最后才 repaint（顺序必须正确）
-        self.update_breadcrumbs()
-        # 激活布局：确保新 widget 已获得正确的几何信息，再触发 repaint
-        if hasattr(self, 'breadcrumb_layout'):
-            self.breadcrumb_layout.invalidate()
-            self.breadcrumb_layout.activate()
-        if hasattr(self, 'breadcrumb_widget'):
-            self.breadcrumb_widget.updateGeometry()
-            self.breadcrumb_widget.update()
-            self.breadcrumb_widget.repaint()
-        self.update()
-        self.repaint()
-        self._flush_path_bar_display(norm_path)
-        QTimer.singleShot(0, lambda expected_path=norm_path: self._flush_path_bar_display(expected_path))
-        QTimer.singleShot(50, lambda expected_path=norm_path: self._flush_path_bar_display(expected_path))
-        # Extra flush to catch late layout interference from IShellView::Refresh()
-        QTimer.singleShot(350, lambda expected_path=norm_path: self._flush_path_bar_display(expected_path))
-
-    def _flush_path_bar_display(self, expected_path=None):
-        """确保路径栏在导航时序竞争下也能及时恢复显示。"""
-        # 关闭标签页时，Qt 会先销毁子控件（C++ 对象），
-        # 但队列中的 singleShot 定时器仍会触发——此时访问已删除对象会崩溃。
-        # 在入口检测存活性，已销毁则直接忽略。
-        try:
-            _ = self.isWidgetType()  # 任意 C++ 属性访问；若 self 已销毁则抛 RuntimeError
-        except RuntimeError:
-            return
-        current_path = getattr(self, 'current_path', '')
-        if expected_path and current_path != expected_path:
-            return
-        if self.edit_mode:
-            # 编辑模式中不干扰 path_edit，避免定时器强制显示面包屑覆盖输入框
-            return
-        if hasattr(self, 'path_edit'):
-            try:
-                self.path_edit.blockSignals(True)
-                self.path_edit.setText(current_path)
-            except RuntimeError:
-                return  # path_edit C++ 对象已销毁
-            finally:
-                try:
-                    self.path_edit.blockSignals(False)
-                except RuntimeError:
-                    pass
-        if hasattr(self, 'breadcrumb_layout'):
-            try:
-                self.breadcrumb_layout.activate()
-            except RuntimeError:
-                return
-        if hasattr(self, 'breadcrumb_widget'):
-            try:
-                self.breadcrumb_widget.show()
-                self.breadcrumb_widget.updateGeometry()
-                self.breadcrumb_widget.update()
-                self.breadcrumb_widget.repaint()
-            except RuntimeError:
-                return
-        try:
-            self.updateGeometry()
-            self.update()
-            self.repaint()
-        except RuntimeError:
-            pass
-    
-    def _on_resize_timer_timeout(self):
-        """_resize_timer 到期：重建面包屑并强制刷新视觉"""
-        if self.edit_mode:
-            return
-        # 如果宽度不合理（IShellView::Refresh 等可能短暂清零），延迟重试（最多 5 次）
-        if hasattr(self, 'breadcrumb_widget') and self.breadcrumb_widget.width() < 50 and self.current_path:
-            retries = getattr(self, '_resize_retry_count', 0)
-            if retries < 5 and getattr(self, '_resize_timer', None):
-                self._resize_retry_count = retries + 1
-                self._resize_timer.start()  # 50ms 后再试
-                return
-        self._resize_retry_count = 0
-        self.update_breadcrumbs()  # 内部已调用 activate()，无需再次调用，避免触发多余 resizeEvent
-        if hasattr(self, 'breadcrumb_widget'):
-            try:
-                self.breadcrumb_widget.repaint()
-            except RuntimeError:
-                return
-        try:
-            self.repaint()
-        except RuntimeError:
-            pass
-
-    def update_breadcrumbs(self):
-        """更新面包屑显示"""
-        # 重入守卫：防止 activate() 触发 resizeEvent 再次进入本函数造成无限循环
-        if getattr(self, '_in_update_breadcrumbs', False):
-            return
-        self._in_update_breadcrumbs = True
-        try:
-            self._update_breadcrumbs_impl()
-        finally:
-            self._in_update_breadcrumbs = False
-
-    def _update_breadcrumbs_impl(self):
-        """update_breadcrumbs 的实际实现（由重入守卫包裹）"""
-        debug_print(f"[PathBar] update_breadcrumbs: current_path={getattr(self, 'current_path', None)}, edit_mode={self.edit_mode}")
-        # 如果处于编辑模式，则不更新面包屑显示（只显示编辑框）
-        if self.edit_mode:
-            debug_print(f"[PathBar] update_breadcrumbs: in edit_mode, skip.")
-            return
-        
-        # 清空现有的面包屑：takeAt 后必须 setParent(None) 彻底脱离父级，
-        # 否则旧 widget 仍是 breadcrumb_widget 的 child，干扰 repaint。
-        while self.breadcrumb_layout.count() > 1:  # 保留最后的stretch
-            item = self.breadcrumb_layout.takeAt(0)
-            if item.widget():
-                w = item.widget()
-                w.hide()
-                w.setParent(None)  # 彻底脱离 breadcrumb_widget 的子级层次
-                w.deleteLater()
-        
-        if not self.current_path:
-            return
-        
-        # 处理特殊路径
-        if self.current_path.startswith('shell:'):
-            # shell路径直接显示为一个标签
-            label = ClickableLabel(self.current_path, self.current_path)
-            label.clicked.connect(self.on_segment_clicked)
-            self.breadcrumb_layout.insertWidget(0, label)
-            label.show()
-            self.breadcrumb_layout.invalidate()
-            self.breadcrumb_layout.activate()
-            return
-        
-        # 分割路径
-        parts = []
-        if os.name == 'nt':
-            # Windows路径
-            path = self.current_path.replace('/', '\\')
-            
-            # 检查是否是网络路径（UNC路径）
-            is_unc = path.startswith('\\\\')
-            
-            segments = path.split('\\')
-            
-            # 构建累积路径
-            accumulated = ""
-            segment_index = 0
-            for i, segment in enumerate(segments):
-                if not segment:
-                    continue
-                
-                if is_unc and segment_index == 0:
-                    # UNC路径的服务器名
-                    accumulated = '\\\\' + segment
-                    parts.append((segment, accumulated))
-                    segment_index += 1
-                elif is_unc and segment_index == 1:
-                    # UNC路径的共享名
-                    accumulated += '\\' + segment
-                    parts.append((segment, accumulated))
-                    segment_index += 1
-                elif i == 0 and ':' in segment:
-                    # 盘符
-                    accumulated = segment + '\\'
-                    parts.append((segment, accumulated))
-                    segment_index += 1
-                else:
-                    if accumulated and not accumulated.endswith('\\'):
-                        accumulated += '\\'
-                    accumulated += segment
-                    parts.append((segment, accumulated))
-                    segment_index += 1
-        else:
-            # Unix路径
-            segments = self.current_path.split('/')
-            accumulated = ""
-            for segment in segments:
-                if not segment:
-                    continue
-                accumulated += '/' + segment
-                parts.append((segment, accumulated))
-        
-        # 动态根据可用宽度决定显示方式
-        # 先尝试完整显示，如果空间不足则逐步省略
-        self._create_breadcrumb_widgets(parts)
-        # 重建后激活布局，使新 widget 获得正确几何信息
-        self.breadcrumb_layout.invalidate()
-        self.breadcrumb_layout.activate()
-        self.breadcrumb_widget.updateGeometry()
-        debug_print(f"[PathBar] update_breadcrumbs: done, layout_count={self.breadcrumb_layout.count()}")
-        # 确保视觉刷新（无论由哪个调用路径触发，包括 _resize_timer）
-        if not self.edit_mode:
-            self.breadcrumb_widget.update()
-            self.update()
-    
-    def _create_breadcrumb_widgets(self, parts):
-        """创建面包屑widget，如果空间不足则显示省略版本"""
-        # 获取可用宽度
-        available_width = self.breadcrumb_widget.width() - 20  # 留一些边距
-        
-        # 如果宽度还没确定（初始化时），使用默认策略
-        if available_width < 100:
-            available_width = 800  # 假设一个合理的默认宽度
-        
-        # 计算完整路径需要的宽度
-        from PyQt5.QtGui import QFontMetrics
-        font_metrics = QFontMetrics(self.font())
-        
-        # 计算所有分段的总宽度
-        total_width = 0
-        for i, (name, _) in enumerate(parts):
-            total_width += font_metrics.horizontalAdvance(name) + 20  # 20是padding
-            if i < len(parts) - 1:
-                total_width += font_metrics.horizontalAdvance(">") + 10  # 分隔符
-        
-        # 如果完整显示能放下，就完整显示
-        if total_width <= available_width or len(parts) <= 3:
-            visible_parts = parts
-            show_ellipsis = False
-            insert_ellipsis_at = -1
-        else:
-            # 空间不足，显示省略版本：前2级 + ... + 后面尽可能多的级
-            num_start = 2
-            
-            # 计算前2级和省略号需要的宽度
-            start_width = 0
-            for i in range(min(num_start, len(parts))):
-                start_width += font_metrics.horizontalAdvance(parts[i][0]) + 20
-                start_width += font_metrics.horizontalAdvance(">") + 10  # 分隔符
-            
-            # 省略号的宽度
-            ellipsis_width = font_metrics.horizontalAdvance("...") + 20
-            ellipsis_width += font_metrics.horizontalAdvance(">") + 10  # 分隔符
-            
-            # 计算剩余可用宽度
-            remaining_width = available_width - start_width - ellipsis_width
-            
-            # 从后往前计算能放下多少级
-            num_end = 0
-            end_width = 0
-            for i in range(len(parts) - 1, num_start - 1, -1):
-                segment_width = font_metrics.horizontalAdvance(parts[i][0]) + 20
-                if i > num_start:  # 不是第一个后面的元素，需要加分隔符
-                    segment_width += font_metrics.horizontalAdvance(">") + 10
-                
-                if end_width + segment_width <= remaining_width:
-                    end_width += segment_width
-                    num_end += 1
-                else:
-                    break
-            
-            # 至少显示最后1级
-            if num_end == 0:
-                num_end = 1
-            
-            if num_start + num_end >= len(parts):
-                # 所有内容都能显示，不需要省略
-                visible_parts = parts
-                show_ellipsis = False
-                insert_ellipsis_at = -1
-            else:
-                visible_parts = parts[:num_start] + parts[-num_end:]
-                show_ellipsis = True
-                insert_ellipsis_at = num_start
-        
-        # 创建面包屑标签
-        widget_index = 0
-        # 计算缩放后的最小宽度，避免完全压缩不可见
-        try:
-            from PyQt5.QtWidgets import QApplication
-            dpi = QApplication.primaryScreen().logicalDotsPerInch()
-            scale = dpi / 96.0
-        except Exception:
-            scale = 1.0
-        min_label_w = int(40 * scale)
-        min_sep_w = int(8 * scale)
-        min_ellipsis_w = int(20 * scale)
-        for i, (name, full_path) in enumerate(visible_parts):
-            # 如果需要在这个位置插入省略号
-            if show_ellipsis and i == insert_ellipsis_at:
-                ellipsis = QLabel("...")
-                ellipsis.setStyleSheet("QLabel { color: #888; font-size: 11pt; padding: 0; margin: 0 2px; }")
-                # 允许在横向上被压缩，但保留最小可见宽度
-                ellipsis.setMinimumWidth(min_ellipsis_w)
-                ellipsis.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-                ellipsis.setToolTip(self.current_path)  # 鼠标悬停显示完整路径
-                self.breadcrumb_layout.insertWidget(widget_index, ellipsis)
-                ellipsis.show()
-                widget_index += 1
-                
-                # 添加分隔符
-                separator = QLabel(">")
-                separator.setStyleSheet("QLabel { color: #888; font-size: 11pt; padding: 0; margin: 0 2px; }")
-                separator.setMinimumWidth(min_sep_w)
-                separator.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-                self.breadcrumb_layout.insertWidget(widget_index, separator)
-                separator.show()
-                widget_index += 1
-            
-            # 创建可点击的标签
-            label = ClickableLabel(name, full_path)
-            # 允许横向压缩，但保留最小可见宽度；内部自动使用省略显示
-            label.setMinimumWidth(min_label_w)
-            label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-            label.clicked.connect(self.on_segment_clicked)
-            self.breadcrumb_layout.insertWidget(widget_index, label)
-            label.show()
-            widget_index += 1
-            
-            # 添加分隔符（除了最后一个）
-            if i < len(visible_parts) - 1:
-                separator = QLabel(">")
-                separator.setStyleSheet("QLabel { color: #888; font-size: 11pt; padding: 0; margin: 0 2px; }")
-                separator.setMinimumWidth(min_sep_w)
-                separator.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-                self.breadcrumb_layout.insertWidget(widget_index, separator)
-                separator.show()
-                widget_index += 1
-    
-    def on_segment_clicked(self, path):
-        """点击某个层级时触发"""
-        self.current_path = path
-        self.update_breadcrumbs()  # 立即高亮当前层级，不等导航完成
-        self.pathChanged.emit(path)
-    
-    def enter_edit_mode(self):
-        """进入编辑模式"""
-        debug_print(f"[PathBar] enter_edit_mode: current_path={getattr(self, 'current_path', None)}")
-        self.edit_mode = True
-        self.breadcrumb_widget.hide()
-        self.path_edit.setText(self.current_path)
-        self.path_edit.show()
-        self.path_edit.setFocus()
-        self.path_edit.selectAll()
-        # 安装应用级事件过滤器，监听点击外部区域时退出编辑模式
-        from PyQt5.QtWidgets import QApplication
-        QApplication.instance().installEventFilter(self)
-    
-    def exit_edit_mode(self):
-        """退出编辑模式"""
-        debug_print(f"[PathBar] exit_edit_mode: current_path={getattr(self, 'current_path', None)}, edit_mode={self.edit_mode}")
-        if self.edit_mode:
-            self.edit_mode = False
-            self.path_edit.hide()
-            self.breadcrumb_widget.show()
-            self.update_breadcrumbs()
-        # 移除应用级事件过滤器
-        from PyQt5.QtWidgets import QApplication
-        try:
-            QApplication.instance().removeEventFilter(self)
-        except Exception:
-            pass
-
-    def eventFilter(self, obj, event):
-        """应用级事件过滤器：检测点击路径栏外部时退出编辑模式"""
-        from PyQt5.QtCore import QEvent
-        if self.edit_mode and event.type() == QEvent.MouseButtonPress:
-            try:
-                global_pos = event.globalPos()
-                edit_rect = self.path_edit.rect()
-                local_pos = self.path_edit.mapFromGlobal(global_pos)
-                if not edit_rect.contains(local_pos):
-                    self.exit_edit_mode()
-            except Exception:
-                pass
-        return super().eventFilter(obj, event)
-
-    def _on_path_edit_editing_finished(self):
-        """path_edit.editingFinished 信号处理：延迟检查焦点，防止短暂焦点丢失误退出编辑模式"""
-        QTimer.singleShot(0, self._check_exit_edit_mode_by_focus)
-
-    def _check_exit_edit_mode_by_focus(self):
-        """检查 path_edit 是否真的失去焦点，若已失焦则退出编辑模式"""
-        if self.edit_mode and hasattr(self, 'path_edit') and not self.path_edit.hasFocus():
-            self.exit_edit_mode()
-
-    def on_edit_finished(self):
-        """编辑完成时触发"""
-        new_path = self.path_edit.text().strip()
-        debug_print(f"[PathBar] on_edit_finished: new_path={new_path}, current_path={getattr(self, 'current_path', None)}")
-        if new_path and new_path != self.current_path:
-            # 先发出信号，如果导航失败，在 FileExplorerTab 中会恢复路径
-            self.pathChanged.emit(new_path)
-        else:
-            # 如果路径未改变或为空，直接退出编辑模式（保持当前路径）
-            self.exit_edit_mode()
-    
-    def mouseDoubleClickEvent(self, event: QMouseEvent):
-        """双击进入编辑模式"""
-        self.enter_edit_mode()
-        super().mouseDoubleClickEvent(event)
-    
-    def mousePressEvent(self, event: QMouseEvent):
-        """单击也可以进入编辑模式（点击空白处）"""
-        if event.button() == Qt.LeftButton:
-            # 检查是否点击在面包屑标签上
-            child = self.childAt(event.pos())
-            if child is None or child == self.breadcrumb_widget:
-                self.enter_edit_mode()
-        super().mousePressEvent(event)
 
 
 class _CrumbDragFilter(QObject):
@@ -5147,6 +4496,16 @@ class FileExplorerTab(QWidget):
             if hasattr(self, '_keepalive_sync_timer') and self._keepalive_sync_timer:
                 self._keepalive_sync_timer.stop()
             return
+        # 窗口最小化时跳过COM轮询：用户无法在内嵌shell视图中导航，
+        # 持续读取 LocationURL 只会触发后台 shell worker 线程 churn（见 runtime_health.log）。
+        # 仅在确定最小化时跳过；定时器继续运行，恢复窗口后自动重新轮询，无需重启逻辑。
+        mw = getattr(self, 'main_window', None)
+        if mw is not None:
+            try:
+                if mw.windowState() & Qt.WindowMinimized:
+                    return
+            except Exception:
+                pass
         try:
             url = self.explorer.property('LocationURL')
             if url:
@@ -5161,6 +4520,14 @@ class FileExplorerTab(QWidget):
                 elif url_str.startswith('file://') and not url_str.startswith('file:///'):
                     from urllib.parse import unquote
                     local_path = self._normalize_local_path('\\\\' + unquote(url_str[7:]).replace('/', '\\'))
+                elif '::' in url_str:
+                    # 尝试从 CLSID URL 中提取盘符路径（如映射网络驱动器 ::{...}\X:\）
+                    import re
+                    drive_match = re.search(r'([A-Za-z]:\\[^"]*)', url_str.replace('/', '\\'))
+                    if not drive_match:
+                        drive_match = re.search(r'([A-Za-z]:/[^"]*)', url_str)
+                    if drive_match:
+                        local_path = self._normalize_local_path(drive_match.group(1))
                 current_path = self._normalize_local_path(getattr(self, 'current_path', ''))
                 if local_path and local_path != current_path:
                     debug_print(f"[Keepalive] Navigation detected: {current_path!r} -> {local_path!r}, restarting sync")
@@ -5196,9 +4563,17 @@ class FileExplorerTab(QWidget):
                     local_path = self._normalize_local_path(local_path)
                 # 处理 shell: 特殊路径
                 elif url_str.startswith('shell:') or '::' in url_str:
-                    # Shell特殊文件夹，通常以 shell: 或包含 CLSID (::)
-                    # 这些路径我们已经在 current_path 中维护，无需更新
-                    return
+                    # 尝试从 CLSID URL 中提取盘符路径（如映射网络驱动器 ::{...}\X:\）
+                    import re
+                    drive_match = re.search(r'([A-Za-z]:\\[^"]*)', url_str.replace('/', '\\'))
+                    if not drive_match:
+                        drive_match = re.search(r'([A-Za-z]:/[^"]*)', url_str)
+                    if drive_match:
+                        local_path = self._normalize_local_path(drive_match.group(1))
+                        debug_print(f"[PathSync] Extracted drive path from CLSID URL: {local_path}")
+                    else:
+                        # 纯 shell: 路径，无法提取盘符，不更新
+                        return
                 
                 current_path = self._normalize_local_path(self.current_path)
 
@@ -5450,6 +4825,15 @@ class FileExplorerTab(QWidget):
                 from urllib.parse import unquote
                 local_path = '\\\\' + unquote(url[7:]).replace('/', '\\')
                 local_path = self._normalize_local_path(local_path)
+            # 处理 CLSID 路径（如 ::{20D04FE0-...}\X:\）：尝试提取盘符路径
+            if local_path is None and '::' in url:
+                import re
+                drive_match = re.search(r'([A-Za-z]:\\[^"]*)', url.replace('/', '\\'))
+                if not drive_match:
+                    drive_match = re.search(r'([A-Za-z]:/[^"]*)', url)
+                if drive_match:
+                    local_path = self._normalize_local_path(drive_match.group(1))
+                    debug_print(f"[NavigateComplete2] Extracted drive path from CLSID URL: {local_path}")
             if local_path is not None:
                 current = self._normalize_local_path(getattr(self, 'current_path', ''))
                 # 抑制窗口恢复后 IEB 树面板自动展开导致的虚假导航
@@ -5777,10 +5161,13 @@ class FileExplorerTab(QWidget):
             tr('开机启动项'): 'shell:Startup',
             tr('启动文件夹'): 'shell:Startup',
             'Startup': 'shell:Startup',
+            'OneDrive': 'shell:OneDrive',
+            'onedrive': 'shell:OneDrive',
         }
         # shell:Startup 等特殊路径，自动解析为真实系统路径
         shell_path_map = {
             'shell:Startup': lambda: os.path.join(os.environ.get('APPDATA', ''), r'Microsoft\Windows\Start Menu\Programs\Startup'),
+            'shell:OneDrive': lambda: os.environ.get('OneDrive', ''),
         }
 
         if path in special_map:
@@ -5808,6 +5195,16 @@ class FileExplorerTab(QWidget):
                     self.navigate_to(real_path)
                 else:
                     show_toast(self, tr("路径错误"), tr("启动文件夹不存在: {}").format(real_path), level="warning")
+                    if hasattr(self, 'current_path') and self.current_path:
+                        self.path_bar.set_path(self.current_path)
+                return
+            # shell:OneDrive 解析为真实路径
+            if path.lower() == 'shell:onedrive' and 'shell:OneDrive' in shell_path_map:
+                real_path = shell_path_map['shell:OneDrive']()
+                if real_path and os.path.exists(real_path):
+                    self.navigate_to(real_path)
+                else:
+                    show_toast(self, tr("路径错误"), tr("未找到 OneDrive 文件夹"), level="warning")
                     if hasattr(self, 'current_path') and self.current_path:
                         self.path_bar.set_path(self.current_path)
                 return
@@ -6700,6 +6097,12 @@ class FileExplorerTab(QWidget):
 
         # 支持本地路径和shell特殊路径
         if is_shell:
+            # shell:OneDrive 解析为真实路径（Shell.Explorer无法正确显示内容）
+            if path.lower() == 'shell:onedrive':
+                onedrive_path = os.environ.get('OneDrive', '')
+                if onedrive_path and os.path.exists(onedrive_path):
+                    self.navigate_to(onedrive_path, is_shell=False, add_to_history=add_to_history, skip_async_check=True)
+                    return
             self._hide_loading_indicator()
             self.explorer.dynamicCall("Navigate(const QString&)", path)
             self.current_path = path
@@ -9013,7 +8416,8 @@ class ChatPanel(QWidget):
                 try:
                     enc = 'utf-8'
                     try:
-                        open(path, 'r', encoding='utf-8').read(1)
+                        with open(path, 'r', encoding='utf-8') as _probe_f:
+                            _probe_f.read(1)
                     except UnicodeDecodeError:
                         enc = 'gbk'
                     file_size = os.path.getsize(path)
@@ -13537,7 +12941,15 @@ class MainWindow(QMainWindow):
             else:
                 show_toast(self, tr("路径错误"), tr("路径不存在: {}").format(local_path), level="warning")
         elif url.startswith('shell:'):
-            self.add_new_tab(url, is_shell=True)
+            # shell:OneDrive 解析为真实路径（避免Shell.Explorer无法正确显示内容）
+            if url.lower() == 'shell:onedrive':
+                onedrive_path = os.environ.get('OneDrive', '')
+                if onedrive_path and os.path.exists(onedrive_path):
+                    self.add_new_tab(onedrive_path)
+                else:
+                    show_toast(self, tr("路径错误"), tr("未找到 OneDrive 文件夹"), level="warning")
+            else:
+                self.add_new_tab(url, is_shell=True)
         elif os.path.isabs(url) and os.path.exists(url):
             self.add_new_tab(url)
         else:
