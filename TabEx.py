@@ -11946,6 +11946,9 @@ class MainWindow(QMainWindow):
                 "children": []
             }
         bar = tree['bookmark_bar']
+        # 去重：同一 shell 特殊文件夹的中英文重复书签，按当前语言只保留一种
+        if self._dedup_shell_bookmarks(bar):
+            bm.save_bookmarks()
         if 'children' not in bar or not bar['children']:
             # 添加常用项目
             import time
@@ -11962,10 +11965,74 @@ class MainWindow(QMainWindow):
                 }
             bar['children'] = [
                 make_bm(tr("此电脑"), "shell:MyComputerFolder", "🖥️"),
-                make_bm("桌面", "shell:Desktop", "🗔"),
+                make_bm(tr("桌面"), "shell:Desktop", "🗔"),
                 make_bm(tr("回收站"), "shell:RecycleBinFolder", "🗑️"),
             ]
             bm.save_bookmarks()
+
+    def _dedup_shell_bookmarks(self, bar):
+        """去除书签栏中指向同一 shell 特殊文件夹的中英文重复项。
+
+        对已知的 shell 特殊文件夹（此电脑/回收站/桌面），若存在多条指向同一
+        URL 的书签，则按当前语言设置只保留一种命名（语言匹配优先，否则保留首项）。
+        返回 True 表示发生了修改。
+        """
+        children = bar.get('children')
+        if not isinstance(children, list):
+            return False
+        # shell 特殊文件夹 URL（小写）-> 中文基础名（英文名由 tr() 推导）
+        special = {
+            'shell:mycomputerfolder': '此电脑',
+            'shell:recyclebinfolder': '回收站',
+            'shell:desktop': '桌面',
+        }
+        prefer_en = (_app_language == 'en')
+
+        def _matches_lang(node, zh):
+            name = str(node.get('name', ''))
+            en = tr(zh)
+            if prefer_en and en != zh:
+                return en in name
+            return zh in name
+
+        # 第一遍：为每个重复 URL 选出要保留的书签
+        keepers = {}        # key -> node
+        keeper_matched = {}  # key -> bool（保留项是否语言匹配）
+        for node in children:
+            if not (isinstance(node, dict) and node.get('type') == 'url'):
+                continue
+            key = str(node.get('url', '')).lower()
+            zh = special.get(key)
+            if zh is None:
+                continue
+            matched = _matches_lang(node, zh)
+            if key not in keepers:
+                keepers[key] = node
+                keeper_matched[key] = matched
+            elif matched and not keeper_matched[key]:
+                keepers[key] = node
+                keeper_matched[key] = True
+
+        # 第二遍：重建列表，每个特殊 URL 只保留选中的那一条
+        new_children = []
+        emitted = set()
+        changed = False
+        for node in children:
+            if isinstance(node, dict) and node.get('type') == 'url':
+                key = str(node.get('url', '')).lower()
+                if key in special:
+                    if key in emitted:
+                        changed = True
+                        continue
+                    emitted.add(key)
+                    if keepers[key] is not node:
+                        changed = True
+                    new_children.append(keepers[key])
+                    continue
+            new_children.append(node)
+        if changed:
+            bar['children'] = new_children
+        return changed
 
     def _setup_window_shadow(self):
         """设置窗口阴影效果"""
