@@ -5449,6 +5449,142 @@ class FileExplorerTab(QWidget):
             debug_print(f"[IEB] _get_ieb_selected_paths failed: {e}")
         return paths
 
+    def _select_ieb_item_by_name(self, filename):
+        """通过 IFolderView 直接选中 IExplorerBrowser 当前视图中的项目。"""
+        try:
+            if not filename:
+                return False
+            if not isinstance(self.explorer, IExplorerBrowserWidget) or not getattr(self.explorer, '_browser', None):
+                return False
+
+            from comtypes import GUID as _GUID
+
+            _vp_size = ctypes.sizeof(ctypes.c_void_p)
+            iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
+            ppv_sv = self.explorer._browser.GetCurrentView(ctypes.byref(iid_sv))
+            sv_ptr = int(ppv_sv) if ppv_sv else 0
+            if not sv_ptr:
+                debug_print("[IEB Select] IShellView unavailable")
+                return False
+
+            def _release_interface(ptr_value):
+                if not ptr_value:
+                    return
+                vt = ctypes.c_void_p.from_address(ptr_value).value
+                rel_addr = ctypes.c_void_p.from_address(vt + 2 * _vp_size).value
+                _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                _REL(rel_addr)(ptr_value)
+
+            def _get_display_name(si_ptr_value, sigdn):
+                si_vtable = ctypes.c_void_p.from_address(si_ptr_value).value
+                gdn_addr = ctypes.c_void_p.from_address(si_vtable + 5 * _vp_size).value
+                _GDN = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                          ctypes.c_uint, ctypes.POINTER(ctypes.c_wchar_p))
+                gdn_fn = _GDN(gdn_addr)
+                name_ptr = ctypes.c_wchar_p()
+                hr = gdn_fn(si_ptr_value, sigdn, ctypes.byref(name_ptr))
+                if hr == 0 and name_ptr.value:
+                    value = name_ptr.value
+                    ctypes.windll.ole32.CoTaskMemFree(name_ptr)
+                    return value
+                return None
+
+            try:
+                iid_fv = _GUID("{CDE725B0-CCC9-4519-917E-325D72FAB4CE}")
+                vtable_ptr = ctypes.c_void_p.from_address(sv_ptr).value
+                qi_addr = ctypes.c_void_p.from_address(vtable_ptr).value
+                _QI = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                         ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p))
+                qi_fn = _QI(qi_addr)
+                fv_ptr = ctypes.c_void_p(0)
+                hr_qi = qi_fn(sv_ptr, ctypes.byref(iid_fv), ctypes.byref(fv_ptr))
+                if hr_qi != 0 or not fv_ptr.value:
+                    debug_print(f"[IEB Select] QI IFolderView failed: hr=0x{hr_qi & 0xFFFFFFFF:08X}")
+                    return False
+
+                try:
+                    fv_vtable = ctypes.c_void_p.from_address(fv_ptr.value).value
+
+                    iid_sia = _GUID("{B63EA76D-1F85-456F-A19C-48159EFA858B}")
+                    items_addr = ctypes.c_void_p.from_address(fv_vtable + 8 * _vp_size).value
+                    _ITEMS = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                                ctypes.c_uint, ctypes.POINTER(_GUID),
+                                                ctypes.POINTER(ctypes.c_void_p))
+                    items_fn = _ITEMS(items_addr)
+                    sia_ptr = ctypes.c_void_p(0)
+                    hr_items = items_fn(fv_ptr.value, 0x2, ctypes.byref(iid_sia), ctypes.byref(sia_ptr))
+                    if hr_items != 0 or not sia_ptr.value:
+                        debug_print(f"[IEB Select] Items(SVGIO_ALLVIEW) failed: hr=0x{hr_items & 0xFFFFFFFF:08X}")
+                        return False
+
+                    try:
+                        sia_vtable = ctypes.c_void_p.from_address(sia_ptr.value).value
+                        gc_addr = ctypes.c_void_p.from_address(sia_vtable + 7 * _vp_size).value
+                        _GC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                                  ctypes.POINTER(ctypes.c_uint))
+                        gc_fn = _GC(gc_addr)
+                        count = ctypes.c_uint(0)
+                        hr_count = gc_fn(sia_ptr.value, ctypes.byref(count))
+                        if hr_count != 0 or count.value == 0:
+                            debug_print(f"[IEB Select] View items unavailable: hr=0x{hr_count & 0xFFFFFFFF:08X}, count={count.value}")
+                            return False
+
+                        gia_addr = ctypes.c_void_p.from_address(sia_vtable + 8 * _vp_size).value
+                        _GIA = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                                   ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))
+                        gia_fn = _GIA(gia_addr)
+
+                        target_index = -1
+                        filename_cf = filename.casefold()
+                        for i in range(count.value):
+                            si_ptr = ctypes.c_void_p(0)
+                            hr_item = gia_fn(sia_ptr.value, i, ctypes.byref(si_ptr))
+                            if hr_item != 0 or not si_ptr.value:
+                                continue
+                            try:
+                                item_name = _get_display_name(si_ptr.value, 0)
+                                if not item_name:
+                                    item_path = _get_display_name(si_ptr.value, 0x80058000)
+                                    item_name = os.path.basename(item_path) if item_path else None
+                                if item_name and item_name.casefold() == filename_cf:
+                                    target_index = i
+                                    break
+                            finally:
+                                _release_interface(si_ptr.value)
+
+                        if target_index < 0:
+                            debug_print(f"[IEB Select] Target not found in current view: {filename}")
+                            return False
+
+                        select_addr = ctypes.c_void_p.from_address(fv_vtable + 15 * _vp_size).value
+                        _SELECT = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                                     ctypes.c_int, ctypes.c_uint)
+                        select_fn = _SELECT(select_addr)
+                        svsi_flags = 0x1 | 0x4 | 0x8 | 0x10
+                        hr_select = select_fn(fv_ptr.value, target_index, svsi_flags)
+                        if hr_select != 0:
+                            debug_print(f"[IEB Select] SelectItem failed: hr=0x{hr_select & 0xFFFFFFFF:08X}, index={target_index}")
+                            return False
+
+                        self.activateWindow()
+                        self.raise_()
+                        if hasattr(self, 'explorer') and self.explorer:
+                            self.explorer.setFocus(Qt.OtherFocusReason)
+
+                        debug_print(f"[IEB Select] Successfully selected item via IFolderView: {filename}")
+                        self._suppress_auto_refresh = False
+                        self.start_path_sync_timer(duration_ms=8000)
+                        return True
+                    finally:
+                        _release_interface(sia_ptr.value)
+                finally:
+                    _release_interface(fv_ptr.value)
+            finally:
+                _release_interface(sv_ptr)
+        except Exception as e:
+            debug_print(f"[IEB Select] Failed to select item '{filename}': {e}")
+        return False
+
     # --- Windows native helpers for listview hit-testing ---
     def _find_syslistview_hwnd(self):
         if not HAS_PYWIN:
@@ -6849,6 +6985,9 @@ class FileExplorerTab(QWidget):
             if not os.path.exists(full_path):
                 debug_print(f"[SelectFile] File not found: {full_path}")
                 return False
+
+            if self._select_ieb_item_by_name(filename):
+                return True
             
             # 使用Windows API选中文件（通过查找ListView控件并发送消息）
             try:
