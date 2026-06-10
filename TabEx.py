@@ -3051,7 +3051,9 @@ class SimplePathBar(QWidget):
 
         # 内容未变化时仅重绘，避免频繁销毁/重建控件
         if self._last_built_path == self._current_path and crumb_count > 1:
-            self._crumb_w.update()
+            # 强制重算几何：避免上次重建时布局未激活导致按钮几何为0
+            # （表现为路径栏“不刷新且点击无响应”，需 resize 才恢复）
+            self._force_relayout(reason="unchanged")
             return
         debug_print(f"[SimplePathBar] _rebuild: rebuilding. path='{self._current_path}', last='{self._last_built_path}', count={crumb_count}, parts={len(parts)}")
         self._last_built_path = self._current_path
@@ -3072,6 +3074,7 @@ class SimplePathBar(QWidget):
                 sep.setAlignment(Qt.AlignCenter)
                 sep.setAttribute(Qt.WA_TransparentForMouseEvents, True)
                 self._crumb_row.addWidget(sep)
+                sep.show()  # 显式 show，避免父控件处于瞬时隐藏态时新控件不自动显示
             btn = QPushButton(label)
             btn.setFlat(True)
             btn.setStyleSheet(self._S_BTN)
@@ -3087,8 +3090,50 @@ class SimplePathBar(QWidget):
             btn._drag_start = None
             btn.installEventFilter(self._crumb_drag_filter)
             self._crumb_row.addWidget(btn)
+            btn.show()  # 显式 show，确保按钮可见且可点击
 
         self._crumb_row.addStretch()
+
+        # 立即激活布局并重算几何，避免偶发“按钮几何为0/路径栏未刷新且点击无响应，
+        # 需手动改变窗口大小才恢复”的问题。
+        self._force_relayout(reason="rebuild")
+        # 关键：deleteLater 是异步的，旧控件在下一轮事件循环才真正销毁；
+        # 必须在那之后再做一次自上而下的强制重排（等价于一次 resize），
+        # 否则布局有时停留在按钮几何为0的状态，直到用户手动改变窗口大小。
+        QTimer.singleShot(0, lambda: self._force_relayout(reason="deferred"))
+
+    def _force_relayout(self, reason=""):
+        """自上而下强制重排面包屑布局，修复偶发按钮几何为0需 resize 才恢复的问题。"""
+        try:
+            self._crumb_row.invalidate()   # 标记布局为脏，确保 activate() 不被当成 no-op
+            self._crumb_row.activate()
+            self._crumb_w.updateGeometry()
+            # 向上传播到外层 QStackedWidget / QVBoxLayout，触发 _crumb_w 自身的重新 setGeometry
+            self.updateGeometry()
+            lay = self.layout()
+            if lay is not None:
+                lay.invalidate()
+                lay.activate()
+            self._crumb_w.update()
+            self.update()
+            # 诊断日志：打印 _crumb_w 可见性与首个按钮几何，便于确认是否仍为0
+            try:
+                first_btn = None
+                for idx in range(self._crumb_row.count()):
+                    w = self._crumb_row.itemAt(idx).widget()
+                    if isinstance(w, QPushButton):
+                        first_btn = w
+                        break
+                cw_sz = self._crumb_w.size()
+                btn_geo = first_btn.geometry() if first_btn is not None else None
+                btn_vis = first_btn.isVisible() if first_btn is not None else None
+                debug_print(f"[SimplePathBar] _force_relayout({reason}): crumb_w visible={self._crumb_w.isVisible()}, "
+                            f"size={cw_sz.width()}x{cw_sz.height()}, stack_idx={self._stack.currentIndex()}, "
+                            f"first_btn visible={btn_vis}, geo={btn_geo}")
+            except Exception:
+                pass
+        except Exception as e:
+            debug_print(f"[SimplePathBar] _force_relayout({reason}) ERROR: {e}")
 
     def _split_path(self, path):
         """将路径拆分为 [(显示名, 完整路径), …]。"""
@@ -4530,7 +4575,18 @@ class FileExplorerTab(QWidget):
                         local_path = self._normalize_local_path(drive_match.group(1))
                 current_path = self._normalize_local_path(getattr(self, 'current_path', ''))
                 if local_path and local_path != current_path:
-                    debug_print(f"[Keepalive] Navigation detected: {current_path!r} -> {local_path!r}, restarting sync")
+                    debug_print(f"[Keepalive] Navigation detected: {current_path!r} -> {local_path!r}, updating path bar")
+                    # 保活轮询仅在无程序化导航（主同步定时器停止）时运行，
+                    # 因此此处检测到的差异必为真实用户导航（如双击进入子目录）。
+                    # 直接更新路径栏，绕过 _suppress_auto_refresh 门控，
+                    # 避免 NavigateComplete2 偶发遗漏时路径栏长时间停留在旧路径。
+                    self.current_path = local_path
+                    if hasattr(self, 'path_bar') and self.path_bar:
+                        self.path_bar.set_path(local_path)
+                    self.update_tab_title()
+                    self._schedule_status_update(track_selection=True)
+                    if not getattr(self, '_navigating_programmatically', False) and hasattr(self, '_add_to_history'):
+                        self._add_to_history(local_path)
                     if hasattr(self, '_keepalive_sync_timer') and self._keepalive_sync_timer:
                         self._keepalive_sync_timer.stop()
                     self.start_path_sync_timer(duration_ms=3000)
@@ -4609,13 +4665,13 @@ class FileExplorerTab(QWidget):
                     # 优化：若面包屑已存在，只做 repaint 而非全量重建，减少控件析构/创建开销。
                     if hasattr(self, 'path_bar'):
                         pb = self.path_bar
-                        _has_crumbs = (hasattr(pb, 'breadcrumb_layout') and
-                                       pb.breadcrumb_layout.count() > 1 and
-                                       not pb.edit_mode)
+                        _has_crumbs = (hasattr(pb, '_crumb_row') and
+                                       pb._crumb_row.count() > 1 and
+                                       not getattr(pb, '_in_edit', False))
                         if _has_crumbs:
                             try:
-                                pb.breadcrumb_widget.update()
-                                pb.breadcrumb_widget.repaint()
+                                pb._crumb_w.update()
+                                pb._crumb_w.repaint()
                                 pb.update()
                                 pb.repaint()
                             except Exception:
@@ -4740,6 +4796,12 @@ class FileExplorerTab(QWidget):
         self.status_bar.setStyleSheet(
             "QLabel { padding: 2px 8px; background: white; border-top: 1px solid #e0e0e0; font-size: 12px; color: #444; }"
         )
+        # 支持在状态栏上按住拖动整个软件窗口
+        self._status_drag_pos = None
+        self.status_bar.setCursor(Qt.SizeAllCursor)
+        self.status_bar.mousePressEvent = self._status_bar_mouse_press
+        self.status_bar.mouseMoveEvent = self._status_bar_mouse_move
+        self.status_bar.mouseReleaseEvent = self._status_bar_mouse_release
         layout.addWidget(self.status_bar)
         
         # 异步加载相关
@@ -5946,6 +6008,40 @@ class FileExplorerTab(QWidget):
 
     def blank_double_click(self, event):
         self.go_up(force=True)
+
+    def _status_bar_mouse_press(self, event):
+        """在状态栏按下左键时，开始拖动整个软件窗口。"""
+        if event.button() == Qt.LeftButton:
+            win = self.window()
+            # 优先使用系统原生窗口移动（Qt 5.15+，最大化等情况处理更可靠）
+            handle = win.windowHandle()
+            if handle is not None and hasattr(handle, 'startSystemMove'):
+                try:
+                    if handle.startSystemMove():
+                        self._status_drag_pos = None
+                        event.accept()
+                        return
+                except Exception:
+                    pass
+            self._status_drag_pos = event.globalPos() - win.frameGeometry().topLeft()
+            event.accept()
+            return
+        QLabel.mousePressEvent(self.status_bar, event)
+
+    def _status_bar_mouse_move(self, event):
+        """拖动状态栏时移动整个软件窗口。"""
+        if event.buttons() == Qt.LeftButton and self._status_drag_pos is not None:
+            win = self.window()
+            if not win.isMaximized():
+                win.move(event.globalPos() - self._status_drag_pos)
+            event.accept()
+            return
+        QLabel.mouseMoveEvent(self.status_bar, event)
+
+    def _status_bar_mouse_release(self, event):
+        """结束状态栏拖动。"""
+        self._status_drag_pos = None
+        QLabel.mouseReleaseEvent(self.status_bar, event)
 
     # 移除 on_document_complete 和 eventFilter 相关内容
 
