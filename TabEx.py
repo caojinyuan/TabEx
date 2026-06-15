@@ -24,6 +24,13 @@ def tr(zh_text):
 _LANG_EN = {
     # ── Common buttons / actions ──────────────────────────────────────────
     "关闭": "Close",
+    "后退": "Back",
+    "前进": "Forward",
+    "关闭标签页": "Close Tab",
+    "新建标签页": "New Tab",
+    "上级目录": "Parent Folder",
+    "恢复关闭的标签页": "Reopen Closed Tab",
+    "刷新": "Refresh",
     "确定": "OK",
     "取消": "Cancel",
     "删除": "Delete",
@@ -213,6 +220,10 @@ _LANG_EN = {
     "标签页设置": "Tab Settings",
     "关闭时缓存当前标签页，下次启动时恢复": "Cache tabs on close, restore on next launch",
     "关闭软件时保存非固定标签，下次启动时自动恢复（不包括固定标签）": "Save non-pinned tabs on close; restore at next launch",
+    "鼠标手势设置": "Mouse Gestures",
+    "启用鼠标手势（按住右键画线）": "Enable mouse gestures (hold right button and draw)",
+    "在文件区域按住鼠标右键画线即可触发导航操作；关闭后右键恢复为普通右键菜单": "Hold the right mouse button in the file area and draw to trigger navigation; disabling restores the normal right-click menu",
+    "← 向左：后退\n→ 向右：前进\n↓ 向下：关闭当前标签页\n↑ 向上：打开新标签页\n↑↓ 上下：刷新\n↓↑ 下上：返回上级目录\n↓→ 下右：恢复关闭的标签页": "← Left: Back\n→ Right: Forward\n↓ Down: Close current tab\n↑ Up: Open new tab\n↑↓ Up-Down: Refresh\n↓↑ Down-Up: Go to parent folder\n↓→ Down-Right: Reopen closed tab",
     "开机启动设置": "Auto-start",
     "开机自动启动 TabExplorer": "Auto-start TabExplorer at login",
     "在 Windows 启动时自动运行 TabExplorer.exe": "Run TabExplorer.exe automatically at Windows startup",
@@ -238,6 +249,11 @@ _LANG_EN = {
     "Alt+Z - 复制选中文件名（含后缀）": "Alt+Z - Copy File Name (with ext)",
     "Alt+X - 复制文件路径\\文件名": "Alt+X - Copy File Path",
     "💡 提示：取消勾选可禁用对应的快捷键": "💡 Tip: Uncheck to disable a shortcut",
+    "常规": "General",
+    "手势与快捷键": "Gestures & Hotkeys",
+    "工具集成": "Tools",
+    "AI 助手": "AI Assistant",
+    "高级": "Advanced",
     "AI 助手设置": "AI Assistant Settings",
     "启用 AI 助手（显示标题栏机器人按钮🤖）": "Enable AI Assistant (show 🤖 button in title bar)",
     "── 请选择预设服务商 ──": "── Select AI Provider ──",
@@ -2710,6 +2726,115 @@ def show_toast(parent, title, message, level="info", duration=5000):
     toast = ToastMessage(anchor, title, message, level=level, duration=duration)
     _active_toasts.append(toast)
     toast.show()
+
+
+class GestureOverlay(QWidget):
+    """鼠标手势可视化覆盖层（类似 Mouse Gestures）。
+
+    - 全屏透明、鼠标穿透、始终置顶。
+    - 拖拽时绘制跟随光标的轨迹线。
+    - 实时显示当前识别到的方向箭头 + 动作名称浮窗。
+    坐标统一使用全局屏幕坐标（与 WH_MOUSE_LL 钩子一致）。
+    """
+
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+            | Qt.WindowTransparentForInput | Qt.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._points = []      # 全局坐标点列表 [QPoint, ...]
+        self._arrow = ""       # 当前方向箭头
+        self._label = ""       # 当前方向动作名
+
+    def start(self):
+        """开始一次手势：铺满虚拟桌面并清空轨迹。"""
+        try:
+            vg = QApplication.primaryScreen().virtualGeometry()
+            self.setGeometry(vg)
+        except Exception:
+            self.setGeometry(QApplication.primaryScreen().geometry())
+        self._points = []
+        self._arrow = ""
+        self._label = ""
+        self.show()
+        self.raise_()
+
+    def add_point(self, gx, gy):
+        from PyQt5.QtCore import QPoint
+        self._points.append(QPoint(int(gx), int(gy)))
+        self.update()
+
+    def set_hint(self, arrow, label):
+        if arrow != self._arrow or label != self._label:
+            self._arrow = arrow
+            self._label = label
+            self.update()
+
+    def finish(self):
+        self.hide()
+        self._points = []
+        self._arrow = ""
+        self._label = ""
+
+    def paintEvent(self, event):
+        if not self._points:
+            return
+        from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QFontMetrics
+        from PyQt5.QtCore import QRect
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        try:
+            scale = max(1.0, self.logicalDpiX() / 96.0)
+        except Exception:
+            scale = 1.0
+        origin = self.geometry().topLeft()
+
+        # ── 轨迹线 ───────────────────────────────────────────────
+        pen = QPen(QColor(0, 200, 120, 230))  # 半透明绿色
+        pen.setWidth(max(3, int(4 * scale)))
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        prev = None
+        for p in self._points:
+            lp = p - origin
+            if prev is not None:
+                painter.drawLine(prev, lp)
+            prev = lp
+
+        # ── 实时方向提示浮窗 ─────────────────────────────────────
+        if self._arrow:
+            text = (f"{self._arrow}  {self._label}").strip()
+            font = QFont()
+            font.setPointSizeF(max(12.0, 15.0 * scale))
+            font.setBold(True)
+            painter.setFont(font)
+            fm = QFontMetrics(font)
+            tw = fm.boundingRect(text).width()
+            th = fm.height()
+            pad = int(12 * scale)
+            last = self._points[-1] - origin
+            bx = last.x() + int(24 * scale)
+            by = last.y() + int(24 * scale)
+            rect = QRect(bx, by, tw + pad * 2, th + pad * 2)
+            if rect.right() > self.width():
+                rect.moveRight(self.width() - int(8 * scale))
+            if rect.bottom() > self.height():
+                rect.moveBottom(self.height() - int(8 * scale))
+            if rect.left() < 0:
+                rect.moveLeft(int(8 * scale))
+            if rect.top() < 0:
+                rect.moveTop(int(8 * scale))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 180))
+            painter.drawRoundedRect(rect, int(8 * scale), int(8 * scale))
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(rect, Qt.AlignCenter, text)
+
 
 # ==================== 异步文件夹大小检查线程 ====================
 class GitStatusWorker(QThread):
@@ -5720,7 +5845,36 @@ class FileExplorerTab(QWidget):
         )
 
         WM_LBUTTONDOWN = 0x0201
+        WM_MOUSEMOVE   = 0x0200
+        WM_RBUTTONDOWN = 0x0204
+        WM_RBUTTONUP   = 0x0205
+        _GESTURE_MARKER    = 0x47455354  # 'GEST'：标记本程序合成的右键事件，避免被本钩子再次拦截
+        _GESTURE_THRESHOLD = 30          # 触发鼠标手势的最小位移（像素）
         _state = {'t': 0, 'x': -9999, 'y': -9999}
+        # 鼠标手势（类似 Mouse Gestures）：按住右键画线，支持多笔画序列
+        #   ←后退 / →前进 / ↓关闭标签 / ↑新建标签
+        #   ↑↓刷新 / ↓↑上级目录 / ↓→恢复关闭的标签页
+        _gesture = {'active': False, 'sx': 0, 'sy': 0, 'cx': 0, 'cy': 0,
+                    'ax': 0, 'ay': 0, 'seq': []}
+        _STROKE_THRESHOLD = 36  # 单笔画方向判定的最小位移（像素）
+        _ARROW = {'left': '←', 'right': '→', 'up': '↑', 'down': '↓'}
+        # 手势序列 → (动作键, 动作名)
+        _GESTURE_TABLE = {
+            ('left',):           ('back',    tr('后退')),
+            ('right',):          ('forward', tr('前进')),
+            ('down',):           ('close',   tr('关闭标签页')),
+            ('up',):             ('new',     tr('新建标签页')),
+            ('up', 'down'):      ('refresh', tr('刷新')),
+            ('down', 'up'):      ('up_dir',  tr('上级目录')),
+            ('down', 'right'):   ('reopen',  tr('恢复关闭的标签页')),
+        }
+
+        def _seq_arrows(seq):
+            return ''.join(_ARROW.get(d, '') for d in seq)
+
+        def _lookup_gesture(seq):
+            """返回 (动作键, 动作名)；未匹配返回 (None, '')。"""
+            return _GESTURE_TABLE.get(tuple(seq), (None, ''))
 
         def _get_current_tab():
             """获取当前活跃的 FileExplorerTab（IEB 模式）"""
@@ -5734,7 +5888,149 @@ class FileExplorerTab(QWidget):
                 pass
             return None
 
+        def _gestures_enabled():
+            """鼠标手势是否启用（config.json: enable_mouse_gestures，默认开启）"""
+            try:
+                mw = getattr(_self_ref, 'main_window', None)
+                if mw and hasattr(mw, 'config'):
+                    return bool(mw.config.get('enable_mouse_gestures', True))
+            except Exception:
+                pass
+            return True
+
+        def _cursor_over_current_explorer(px, py):
+            """光标是否位于当前标签的资源管理器区域内，且本程序窗口为前台。
+
+            仅在满足条件时才接管右键，避免影响其他程序或非文件区域的右键菜单。
+            """
+            try:
+                tab = _get_current_tab()
+                if not tab:
+                    return False
+                mw = getattr(tab, 'main_window', None)
+                # 仅当本程序为前台窗口时接管右键
+                try:
+                    fg = ctypes.windll.user32.GetForegroundWindow()
+                    if mw is not None and int(fg) != int(mw.winId()):
+                        return False
+                except Exception:
+                    pass
+                from PyQt5.QtCore import QPoint
+                pt_local = tab.explorer.mapFromGlobal(QPoint(px, py))
+                return tab.explorer.rect().contains(pt_local)
+            except Exception:
+                return False
+
+        def _run_gesture_action(action):
+            """在主线程执行手势对应的操作"""
+            try:
+                mw = getattr(_self_ref, 'main_window', None)
+                tab = _get_current_tab()
+                if tab is not None:
+                    mw = getattr(tab, 'main_window', None) or mw
+                if not mw:
+                    return
+                if action == 'back':
+                    mw.go_back_current_tab()
+                elif action == 'forward':
+                    mw.go_forward_current_tab()
+                elif action == 'close':
+                    mw.close_current_tab()
+                elif action == 'new':
+                    mw.add_new_tab()
+                elif action == 'refresh':
+                    mw.refresh_current_tab()
+                elif action == 'up_dir':
+                    mw.go_up_current_tab()
+                elif action == 'reopen':
+                    mw.reopen_closed_tab()
+            except Exception as _e:
+                debug_print(f"[Gesture] action error: {_e}")
+
+        def _synth_right_click():
+            """合成一次真实右键点击以弹出系统右键菜单（带标记，避免被本钩子再次拦截）"""
+            try:
+                MOUSEEVENTF_RIGHTDOWN = 0x0008
+                MOUSEEVENTF_RIGHTUP   = 0x0010
+                ctypes.windll.user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, _GESTURE_MARKER)
+                ctypes.windll.user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, _GESTURE_MARKER)
+            except Exception as _e:
+                debug_print(f"[Gesture] synth right click error: {_e}")
+
+        def _get_overlay():
+            """获取/懒创建 MainWindow 上的手势覆盖层单例。"""
+            try:
+                mw = getattr(_self_ref, 'main_window', None)
+                tab = _get_current_tab()
+                if tab is not None:
+                    mw = getattr(tab, 'main_window', None) or mw
+                if mw is None:
+                    return None
+                ov = getattr(mw, '_gesture_overlay', None)
+                if ov is None:
+                    ov = GestureOverlay()
+                    mw._gesture_overlay = ov
+                return ov
+            except Exception:
+                return None
+
         def _hook_proc(nCode, wParam, lParam):
+            # ── 鼠标手势处理（右键画线）─────────────────────────────────
+            if nCode >= 0:
+                try:
+                    g_info = ctypes.cast(lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+                    if int(g_info.dwExtraInfo) == _GESTURE_MARKER:
+                        pass  # 本程序合成的事件：直接放行
+                    elif wParam == WM_RBUTTONDOWN and _gestures_enabled():
+                        gx, gy = int(g_info.pt.x), int(g_info.pt.y)
+                        if _cursor_over_current_explorer(gx, gy):
+                            _gesture['active'] = True
+                            _gesture['sx'], _gesture['sy'] = gx, gy
+                            _gesture['cx'], _gesture['cy'] = gx, gy
+                            _gesture['ax'], _gesture['ay'] = gx, gy
+                            _gesture['seq'] = []
+                            ov = _get_overlay()
+                            if ov is not None:
+                                ov.start()
+                                ov.add_point(gx, gy)
+                            return 1  # 吞掉按下，松开时再决定执行手势或弹出菜单
+                    elif wParam == WM_MOUSEMOVE and _gesture['active']:
+                        nx, ny = int(g_info.pt.x), int(g_info.pt.y)
+                        _gesture['cx'], _gesture['cy'] = nx, ny
+                        # 多笔画方向识别：相对当前笔画锚点的位移超过阈值则提交一个方向
+                        adx = nx - _gesture['ax']
+                        ady = ny - _gesture['ay']
+                        if max(abs(adx), abs(ady)) >= _STROKE_THRESHOLD:
+                            if abs(adx) >= abs(ady):
+                                d = 'right' if adx > 0 else 'left'
+                            else:
+                                d = 'down' if ady > 0 else 'up'
+                            seq = _gesture['seq']
+                            if not seq or seq[-1] != d:
+                                seq.append(d)
+                            _gesture['ax'], _gesture['ay'] = nx, ny
+                        ov = _get_overlay()
+                        if ov is not None:
+                            ov.add_point(nx, ny)
+                            _action, _label = _lookup_gesture(_gesture['seq'])
+                            ov.set_hint(_seq_arrows(_gesture['seq']) if _label else '', _label)
+                    elif wParam == WM_RBUTTONUP and _gesture['active']:
+                        _gesture['active'] = False
+                        ov = _get_overlay()
+                        if ov is not None:
+                            ov.finish()
+                        action, label = _lookup_gesture(_gesture['seq'])
+                        if action:
+                            debug_print(f"[Gesture] {_seq_arrows(_gesture['seq'])} → {action}")
+                            QTimer.singleShot(0, lambda a=action: _run_gesture_action(a))
+                        else:
+                            # 未识别为有效手势 → 合成真实右键以弹出菜单
+                            QTimer.singleShot(0, _synth_right_click)
+                        _gesture['seq'] = []
+                        return 1  # 吞掉这次松开（已执行手势或即将合成右键）
+                except Exception:
+                    pass
+
             if nCode >= 0 and wParam == WM_LBUTTONDOWN:
                 try:
                     info = ctypes.cast(lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
@@ -6538,13 +6834,33 @@ class FileExplorerTab(QWidget):
         QTimer.singleShot(3000, lambda: setattr(self, '_suppress_auto_refresh', False))
     
     def _show_loading_indicator(self):
-        """显示加载指示器"""
+        """显示加载指示器（延迟显示）。
+
+        快速导航（绝大多数情况）会在 hide 前取消该定时器，因此进度条不会出现，
+        避免路径栏下方进度条一闪而过导致顶部区域"变高又恢复"的布局抖动。
+        """
+        if not hasattr(self, 'loading_bar'):
+            return
+        from PyQt5.QtCore import QTimer
+        timer = getattr(self, '_loading_show_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._do_show_loading_indicator)
+            self._loading_show_timer = timer
+        # 250ms 内完成的导航不显示进度条，消除闪烁
+        timer.start(250)
+
+    def _do_show_loading_indicator(self):
         if hasattr(self, 'loading_bar'):
             self.loading_bar.show()
             debug_print("[AsyncLoad] Loading indicator shown")
-    
+
     def _hide_loading_indicator(self):
         """隐藏加载指示器"""
+        timer = getattr(self, '_loading_show_timer', None)
+        if timer is not None:
+            timer.stop()
         if hasattr(self, 'loading_bar'):
             self.loading_bar.hide()
             debug_print("[AsyncLoad] Loading indicator hidden")
@@ -11347,6 +11663,7 @@ class MainWindow(QMainWindow):
             self.config["enable_tortoisegit_buttons"] = dlg.tortoisegit_buttons_cb.isChecked()
             self.config["preferred_terminal_tool"] = normalize_terminal_tool_name(dlg.preferred_terminal_combo.currentData())
             self.config["enable_title_shortcuts"] = dlg.title_shortcuts_cb.isChecked()
+            self.config["enable_mouse_gestures"] = dlg.mouse_gestures_cb.isChecked()
 
             # 更新全局调试开关
             set_debug_mode(self.config["debug_mode"])
@@ -11802,6 +12119,7 @@ class MainWindow(QMainWindow):
             "preferred_terminal_tool": "cmd",  # 默认终端类型
             "enable_title_shortcuts": True,  # 默认启用标题栏快捷方式区域
             "title_shortcuts": [],  # 标题栏快捷方式（.lnk/.exe/.bat/.cmd/.ps1 路径）
+            "enable_mouse_gestures": True,  # 默认启用鼠标手势（右键画线导航）
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -13542,19 +13860,34 @@ class SettingsDialog(QDialog):
         # 设置为不可调边框的对话框
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         # 宽度固定，高度按内容自动计算
-        self.setFixedWidth(820)
+        self.setFixedWidth(700)
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(12)
-        
-        # 创建内容布局（左右两列）
-        content_layout = QHBoxLayout()
-        content_layout.setSpacing(12)
-        
-        left_col = QVBoxLayout()
-        left_col.setSpacing(6)
-        right_col = QVBoxLayout()
-        right_col.setSpacing(6)
+
+        # 按类型分页：常规 / 手势与快捷键 / 工具集成 / AI 助手 / 高级
+        from PyQt5.QtWidgets import QTabWidget, QWidget
+        self.settings_tabs = QTabWidget(self)
+
+        general_page = QWidget()
+        general_layout = QVBoxLayout(general_page)
+        general_layout.setSpacing(6)
+
+        input_page = QWidget()
+        input_layout = QVBoxLayout(input_page)
+        input_layout.setSpacing(6)
+
+        tools_page = QWidget()
+        tools_page_layout = QVBoxLayout(tools_page)
+        tools_page_layout.setSpacing(6)
+
+        ai_page = QWidget()
+        ai_page_layout = QVBoxLayout(ai_page)
+        ai_page_layout.setSpacing(6)
+
+        advanced_page = QWidget()
+        advanced_layout = QVBoxLayout(advanced_page)
+        advanced_layout.setSpacing(6)
 
         # 紧凑化所有GroupBox和控件的布局
         def compact_groupbox(groupbox):
@@ -13586,7 +13919,7 @@ class SettingsDialog(QDialog):
         for i in range(pathbar_layout.count()):
             w = pathbar_layout.itemAt(i).widget()
             if w: compact_widget(w)
-        left_col.addWidget(pathbar_group)
+        general_layout.addWidget(pathbar_group)
 
         # Explorer监听设置组
         monitor_group = QGroupBox(tr("Explorer监听设置"))
@@ -13618,7 +13951,7 @@ class SettingsDialog(QDialog):
                     if w: compact_widget(w)
             elif item.widget():
                 compact_widget(item.widget())
-        left_col.addWidget(monitor_group)
+        general_layout.addWidget(monitor_group)
 
         # 调试设置组
         debug_group = QGroupBox(tr("调试设置"))
@@ -13671,7 +14004,7 @@ class SettingsDialog(QDialog):
                     if w: compact_widget(w)
             elif item.widget():
                 compact_widget(item.widget())
-        left_col.addWidget(debug_group)
+        advanced_layout.addWidget(debug_group)
 
         # 标签页设置组
         tabs_group = QGroupBox(tr("标签页设置"))
@@ -13686,7 +14019,29 @@ class SettingsDialog(QDialog):
         for i in range(tabs_layout.count()):
             w = tabs_layout.itemAt(i).widget()
             if w: compact_widget(w)
-        right_col.addWidget(tabs_group)
+        general_layout.addWidget(tabs_group)
+
+        # 鼠标手势设置组
+        gesture_group = QGroupBox(tr("鼠标手势设置"))
+        gesture_layout = QVBoxLayout()
+        self.mouse_gestures_cb = QCheckBox(tr("启用鼠标手势（按住右键画线）"), self)
+        self.mouse_gestures_cb.setChecked(config.get("enable_mouse_gestures", True))
+        self.mouse_gestures_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.mouse_gestures_cb.setToolTip(tr("在文件区域按住鼠标右键画线即可触发导航操作；关闭后右键恢复为普通右键菜单"))
+        gesture_layout.addWidget(self.mouse_gestures_cb)
+        gesture_help = QLabel(
+            tr("← 向左：后退\n→ 向右：前进\n↓ 向下：关闭当前标签页\n↑ 向上：打开新标签页\n↑↓ 上下：刷新\n↓↑ 下上：返回上级目录\n↓→ 下右：恢复关闭的标签页")
+        )
+        gesture_help.setStyleSheet(
+            "QLabel { color: #555; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }"
+        )
+        gesture_layout.addWidget(gesture_help)
+        gesture_group.setLayout(gesture_layout)
+        compact_groupbox(gesture_group)
+        for i in range(gesture_layout.count()):
+            w = gesture_layout.itemAt(i).widget()
+            if w: compact_widget(w)
+        input_layout.addWidget(gesture_group)
 
         # 开机启动设置组
         startup_group = QGroupBox(tr("开机启动设置"))
@@ -13701,7 +14056,7 @@ class SettingsDialog(QDialog):
         for i in range(startup_layout.count()):
             w = startup_layout.itemAt(i).widget()
             if w: compact_widget(w)
-        right_col.addWidget(startup_group)
+        general_layout.addWidget(startup_group)
 
         # Git 工具设置组
         git_group = QGroupBox(tr("Git 工具设置"))
@@ -13735,7 +14090,7 @@ class SettingsDialog(QDialog):
                     if w: compact_widget(w)
             elif item.widget():
                 compact_widget(item.widget())
-        right_col.addWidget(git_group)
+        tools_page_layout.addWidget(git_group)
 
         # 快捷方式设置组（右侧独立分组）
         shortcuts_group = QGroupBox(tr("快捷方式设置"))
@@ -13750,7 +14105,7 @@ class SettingsDialog(QDialog):
         for i in range(shortcuts_layout.count()):
             w = shortcuts_layout.itemAt(i).widget()
             if w: compact_widget(w)
-        right_col.addWidget(shortcuts_group)
+        tools_page_layout.addWidget(shortcuts_group)
 
         # 快捷键设置组
         hotkey_group = QGroupBox(tr("快捷键设置"))
@@ -13801,10 +14156,8 @@ class SettingsDialog(QDialog):
         for i in range(hotkey_layout.count()):
             w = hotkey_layout.itemAt(i).widget()
             if w: compact_widget(w)
-        # 右侧放快捷键设置组
-        right_col.addWidget(hotkey_group)
-        # 右侧添加弹性空间，使快捷键组底部与左侧对齐
-        right_col.addStretch(1)
+        # 手势与快捷键页放快捷键设置组
+        input_layout.addWidget(hotkey_group)
 
             # AI 助手设置组
         ai_group = QGroupBox(tr("AI 助手设置"))
@@ -13944,15 +14297,25 @@ class SettingsDialog(QDialog):
         ai_layout.addLayout(panel_w_row)
         ai_group.setLayout(ai_layout)
         compact_groupbox(ai_group)
-        left_col.addWidget(ai_group)
-    
-    # 添加左右两列到内容布局
-        content_layout.addLayout(left_col, 3)
-        content_layout.addLayout(right_col, 2)
-        
+        ai_page_layout.addWidget(ai_group)
+
+        # 各页末尾加弹性空间
+        general_layout.addStretch(1)
+        input_layout.addStretch(1)
+        tools_page_layout.addStretch(1)
+        ai_page_layout.addStretch(1)
+        advanced_layout.addStretch(1)
+
+        # 组装分页
+        self.settings_tabs.addTab(general_page, tr("常规"))
+        self.settings_tabs.addTab(input_page, tr("手势与快捷键"))
+        self.settings_tabs.addTab(tools_page, tr("工具集成"))
+        self.settings_tabs.addTab(ai_page, tr("AI 助手"))
+        self.settings_tabs.addTab(advanced_page, tr("高级"))
+
         # 创建主垂直布局，放置内容和底部区域
         main_vertical_layout = QVBoxLayout()
-        main_vertical_layout.addLayout(content_layout, 1)
+        main_vertical_layout.addWidget(self.settings_tabs, 1)
         
         # 底部区域（横跨整个宽度）
         bottom_layout = QVBoxLayout()
