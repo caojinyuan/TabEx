@@ -4488,6 +4488,19 @@ class FileExplorerTab(QWidget):
             self._consume_pending_refresh(fallback_reason="manual_unfreeze")
         return self._manual_refresh_frozen
 
+    def _arm_selection_guard(self, seconds=6.0):
+        """Ctrl+G 选中后，开启一段时间的选中保护窗口，期间抑制自动刷新。"""
+        try:
+            self._selection_guard_until = time.monotonic() + float(seconds)
+        except Exception:
+            self._selection_guard_until = 0.0
+
+    def _selection_guard_active(self):
+        try:
+            return time.monotonic() < float(getattr(self, '_selection_guard_until', 0) or 0)
+        except Exception:
+            return False
+
     def _request_refresh(self, reason="manual"):
         """统一记录刷新请求，当前标签可见时立即调度，不可见时延后到激活后消费。"""
         self._refresh_pending = True
@@ -4495,6 +4508,9 @@ class FileExplorerTab(QWidget):
 
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[AutoRefresh] Suppressed during navigation (reason={reason})")
+            return False
+        if self._selection_guard_active():
+            debug_print(f"[AutoRefresh] Suppressed during selection guard (reason={reason})")
             return False
         if getattr(self, '_manual_refresh_frozen', False):
             debug_print(f"[AutoRefresh] Manually frozen (reason={reason})")
@@ -5707,7 +5723,12 @@ class FileExplorerTab(QWidget):
                                                 ctypes.POINTER(ctypes.c_void_p))
                     items_fn = _ITEMS(items_addr)
                     sia_ptr = ctypes.c_void_p(0)
-                    hr_items = items_fn(fv_ptr.value, 0x2, ctypes.byref(iid_sia), ctypes.byref(sia_ptr))
+                    # SVGIO_ALLVIEW(0x2) | SVGIO_FLAG_VIEWORDER(0x80000000)：
+                    # 必须带 VIEWORDER，使枚举顺序与 IFolderView::SelectItem(iItem) 的
+                    # 视图索引一致；否则匹配到的索引会指向显示顺序中的另一个文件，
+                    # 表现为“定位到了但选中了错误的文件”。
+                    SVGIO_ALLVIEW_VIEWORDER = 0x2 | 0x80000000
+                    hr_items = items_fn(fv_ptr.value, SVGIO_ALLVIEW_VIEWORDER, ctypes.byref(iid_sia), ctypes.byref(sia_ptr))
                     if hr_items != 0 or not sia_ptr.value:
                         debug_print(f"[IEB Select] Items(SVGIO_ALLVIEW) failed: hr=0x{hr_items & 0xFFFFFFFF:08X}")
                         return False
@@ -5768,6 +5789,7 @@ class FileExplorerTab(QWidget):
 
                         debug_print(f"[IEB Select] Successfully selected item via IFolderView: {filename}")
                         self._suppress_auto_refresh = False
+                        self._arm_selection_guard()
                         self.start_path_sync_timer(duration_ms=8000)
                         return True
                     finally:
@@ -6441,6 +6463,10 @@ class FileExplorerTab(QWidget):
         self._refresh_pending = False
         self._refresh_pending_reason = None
         self._manual_refresh_frozen = False
+        # Ctrl+G 选中保护：选中文件后短时间内抑制自动刷新，避免后台目录变动触发的
+        # Refresh()（完整重导航）立即清掉刚设置的选中项，导致“跳转选中总是失败”。
+        # 注意：仅抑制自动刷新，不影响路径同步（回车进入子目录仍能更新地址栏）。
+        self._selection_guard_until = 0.0
         self._entry_count_cache = {'path': None, 'count': None, 'ts_ms': 0}
         self._selection_cache = {'path': None, 'entries': None, 'ts_ms': 0}
         self._status_tracking_deadline_ms = 0
@@ -7039,6 +7065,9 @@ class FileExplorerTab(QWidget):
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
             return
+        if self._selection_guard_active():
+            debug_print(f"[FileWatcher] Auto-refresh suppressed during selection guard")
+            return
         now_ms = time.time() * 1000
 
         # 风暴检测：如果仍在风暴中且距上次刷新太近，重新延后
@@ -7095,6 +7124,8 @@ class FileExplorerTab(QWidget):
         """兜底轮询目录元数据，解决文件编辑后目录 watcher 不触发的问题"""
         # 如果设置了抑制标志，不触发刷新
         if getattr(self, '_suppress_auto_refresh', False):
+            return
+        if self._selection_guard_active():
             return
         if not getattr(self, '_refresh_active', True):
             return
@@ -7546,6 +7577,7 @@ class FileExplorerTab(QWidget):
                                             # NavigateComplete2 信号在某些环境下不可用，
                                             # 通过启动路径同步定时器来兜底捕获导航变化。
                                             self._suppress_auto_refresh = False
+                                            self._arm_selection_guard()
                                             self.start_path_sync_timer(duration_ms=8000)
                                             return True
                     except Exception as e:
