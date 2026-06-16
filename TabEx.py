@@ -3239,6 +3239,13 @@ class SimplePathBar(QWidget):
             if lay is not None:
                 lay.invalidate()
                 lay.activate()
+            # 关键修复：双击进入子目录时 QStackedWidget 始终停在面包屑页（不发生页切换），
+            # invalidate()/activate() 在 Qt 认为容器尺寸未变时可能不会真正重排子按钮，
+            # 导致路径栏停留旧布局、需手动 resize 才恢复。这里显式让布局在容器矩形内
+            # 立即重排（等价于一次 resize 内部的 setGeometry），强制同步重新摆放所有按钮。
+            crumb_rect = self._crumb_w.rect()
+            if crumb_rect.width() > 1 and crumb_rect.height() > 1:
+                self._crumb_row.setGeometry(crumb_rect)
             self._crumb_w.update()
             self.update()
             # 诊断日志：打印 _crumb_w 可见性与首个按钮几何，便于确认是否仍为0
@@ -4881,13 +4888,14 @@ class FileExplorerTab(QWidget):
         layout.addWidget(self.path_bar)
         
         # 加载指示器（初始隐藏）
+        # 注意：改为悬浮覆盖层，不加入垂直布局，避免显示/隐藏时顶部区域高度跳动
+        # （以前进度条占用布局高度，show 时路径栏下方多出 20px，看起来像路径栏“变两倍高又恢复”）
         self.loading_bar = QProgressBar(self)
         self.loading_bar.setMaximum(0)  # 不确定进度模式
         self.loading_bar.setTextVisible(True)
         self.loading_bar.setFormat(tr("正在加载大文件夹..."))
-        self.loading_bar.setMaximumHeight(20)
+        self.loading_bar.setFixedHeight(20)
         self.loading_bar.hide()
-        layout.addWidget(self.loading_bar)
 
         # 优先使用 IExplorerBrowser（真实 Windows 资源管理器外壳，支持 TortoiseGit 图标覆盖）
         # 回退到 Shell.Explorer（IE/WebBrowser ActiveX，不支持 TortoiseGit 图标覆盖）
@@ -6851,9 +6859,27 @@ class FileExplorerTab(QWidget):
         # 250ms 内完成的导航不显示进度条，消除闪烁
         timer.start(250)
 
+    def _position_loading_bar(self):
+        """将悬浮加载进度条定位到文件区域顶部（路径栏正下方），覆盖在 explorer 之上。"""
+        if not hasattr(self, 'loading_bar'):
+            return
+        try:
+            top = self.path_bar.height() if hasattr(self, 'path_bar') else 30
+            self.loading_bar.setGeometry(0, top, self.width(), 20)
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 悬浮加载进度条不在布局中，需随窗口尺寸变化手动跟随宽度
+        if getattr(self, 'loading_bar', None) is not None and self.loading_bar.isVisible():
+            self._position_loading_bar()
+
     def _do_show_loading_indicator(self):
         if hasattr(self, 'loading_bar'):
+            self._position_loading_bar()
             self.loading_bar.show()
+            self.loading_bar.raise_()
             debug_print("[AsyncLoad] Loading indicator shown")
 
     def _hide_loading_indicator(self):
