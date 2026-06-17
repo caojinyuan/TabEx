@@ -1214,8 +1214,15 @@ class SearchDialog(QDialog):
     def __init__(self, search_path, parent=None, search_history=None):
         super().__init__(parent)
         self.setWindowTitle(tr("搜索 - {}").format(search_path))
-        # 设置为可调整大小的对话框
-        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        # 设置为可调整大小，并显示最小化/最大化按钮
+        self.setWindowFlags(
+            Qt.Dialog
+            | Qt.WindowTitleHint
+            | Qt.WindowCloseButtonHint
+            | Qt.WindowMinimizeButtonHint
+            | Qt.WindowMaximizeButtonHint
+            | Qt.WindowSystemMenuHint
+        )
         # 关闭时立即销毁 C++ 对象（释放所有 Qt 子控件占用的内存）
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.resize(800, 500)  # 初始大小，但允许调整
@@ -3060,6 +3067,7 @@ class SimplePathBar(QWidget):
         super().__init__(parent)
         self._current_path = ''
         self._last_built_path = ''
+        self._last_build_was_hidden = False
         self._in_edit = False
         self.setFixedHeight(30)
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -3079,7 +3087,6 @@ class SimplePathBar(QWidget):
         self._crumb_row = QHBoxLayout(self._crumb_w)
         self._crumb_row.setContentsMargins(2, 0, 2, 0)
         self._crumb_row.setSpacing(0)
-        self._crumb_row.addStretch()
         self._stack.addWidget(self._crumb_w)
 
         # ── 文本编辑行 ────────────────────────────────────────────────────
@@ -3176,12 +3183,20 @@ class SimplePathBar(QWidget):
 
         # 内容未变化时仅重绘，避免频繁销毁/重建控件
         if self._last_built_path == self._current_path and crumb_count > 1:
-            # 强制重算几何：避免上次重建时布局未激活导致按钮几何为0
-            # （表现为路径栏“不刷新且点击无响应”，需 resize 才恢复）
-            self._force_relayout(reason="unchanged")
-            return
+            # 如果上次真正构建发生在隐藏态（如软件启动时后台恢复的标签页），
+            # 当时算出的折叠结果不可信。首次变为可见后，即使路径未变也需要
+            # 重新按真实可见宽度评估一次；否则只会 relayout 旧结果，导致第一次打开仍折叠。
+            if self._last_build_was_hidden and self._is_fully_visible_for_build():
+                debug_print(f"[SimplePathBar] _rebuild: unchanged path but previous build was hidden, forcing first visible rebuild")
+                self._last_built_path = ''
+            else:
+                # 强制重算几何：避免上次重建时布局未激活导致按钮几何为0
+                # （表现为路径栏“不刷新且点击无响应”，需 resize 才恢复）
+                self._force_relayout(reason="unchanged")
+                return
         debug_print(f"[SimplePathBar] _rebuild: rebuilding. path='{self._current_path}', last='{self._last_built_path}', count={crumb_count}, parts={len(parts)}")
         self._last_built_path = self._current_path
+        self._last_build_was_hidden = not self._is_fully_visible_for_build()
 
         # 清除旧控件
         while self._crumb_row.count():
@@ -3191,22 +3206,22 @@ class SimplePathBar(QWidget):
                 w.hide()
                 w.deleteLater()
 
-        for i, (label, full_path) in enumerate(parts):
+        # Explorer 风格：优先保留右端（当前目录），左侧折叠为 ...，
+        # 并对过长目录名做中间省略，避免“路径已更新但最后一级被挤出可视区”。
+        display_parts = self._choose_display_parts(parts)
+        left_collapsed = len(display_parts) < len(parts)
+
+        if left_collapsed:
+            self._crumb_row.addWidget(self._create_ellipsis_label())
+            self._add_separator_widget()
+
+        for i, (label, full_path) in enumerate(display_parts):
             if i > 0:
-                sep = QLabel('>')
-                sep.setStyleSheet(self._S_SEP)
-                sep.setFixedWidth(14)
-                sep.setAlignment(Qt.AlignCenter)
-                sep.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-                self._crumb_row.addWidget(sep)
-                sep.show()  # 显式 show，避免父控件处于瞬时隐藏态时新控件不自动显示
-            btn = QPushButton(label)
-            btn.setFlat(True)
-            btn.setStyleSheet(self._S_BTN)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFocusPolicy(Qt.NoFocus)
+                self._add_separator_widget()
+            is_current = (full_path == self._current_path)
+            btn = self._create_crumb_button(label, full_path, is_current=is_current)
             # 最后一级(当前目录)点击时进入编辑模式，而非发出无效的pathChanged
-            if full_path == self._current_path:
+            if is_current:
                 btn.clicked.connect(lambda _=False: self.enter_edit_mode())
             else:
                 btn.clicked.connect(lambda _=False, p=full_path: self.pathChanged.emit(p))
@@ -3217,6 +3232,7 @@ class SimplePathBar(QWidget):
             self._crumb_row.addWidget(btn)
             btn.show()  # 显式 show，确保按钮可见且可点击
 
+        # 恢复靠左显示：尾部放弹性空白。
         self._crumb_row.addStretch()
 
         # 立即激活布局并重算几何，避免偶发“按钮几何为0/路径栏未刷新且点击无响应，
@@ -3226,6 +3242,111 @@ class SimplePathBar(QWidget):
         # 必须在那之后再做一次自上而下的强制重排（等价于一次 resize），
         # 否则布局有时停留在按钮几何为0的状态，直到用户手动改变窗口大小。
         QTimer.singleShot(0, lambda: self._force_relayout(reason="deferred"))
+
+    def _create_crumb_button(self, label, full_path, is_current=False):
+        btn = QPushButton(self._elide_crumb_text(label, is_current=is_current))
+        btn.setFlat(True)
+        btn.setStyleSheet(self._S_BTN)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFocusPolicy(Qt.NoFocus)
+        btn.setToolTip(label)
+        btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        return btn
+
+    def _is_fully_visible_for_build(self):
+        try:
+            return bool(self.isVisible() and self._crumb_w.isVisible())
+        except Exception:
+            return False
+
+    def _create_ellipsis_label(self):
+        lbl = QLabel('...')
+        lbl.setStyleSheet(self._S_SEP)
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        lbl.setToolTip(self._current_path)
+        lbl.show()
+        return lbl
+
+    def _add_separator_widget(self):
+        sep = QLabel('>')
+        sep.setStyleSheet(self._S_SEP)
+        sep.setFixedWidth(14)
+        sep.setAlignment(Qt.AlignCenter)
+        sep.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._crumb_row.addWidget(sep)
+        sep.show()
+
+    def _elide_crumb_text(self, text, is_current=False):
+        try:
+            fm = self.fontMetrics()
+            # 当前目录尽量完整保留；中间层更积极省略。
+            limit = 240 if is_current else 140
+            return fm.elidedText(str(text), Qt.ElideMiddle, limit)
+        except Exception:
+            return text
+
+    def _choose_display_parts(self, parts):
+        """根据可用宽度选择要显示的路径尾部，优先显示当前目录。"""
+        try:
+            if not parts:
+                return []
+            if len(parts) <= 2:
+                return parts
+
+            fm = self.fontMetrics()
+            avail = max(120, int(self._crumb_w.width() or self.width() or 0) - 12)
+            sep_w = 18
+            ellipsis_w = max(24, fm.horizontalAdvance('...') + 8)
+
+            def part_width(label, is_current=False):
+                shown = self._elide_crumb_text(label, is_current=is_current)
+                return max(24, fm.horizontalAdvance(shown) + 16)
+
+            def total_parts_width(items):
+                total = 0
+                for idx, (label, _full_path) in enumerate(items):
+                    total += part_width(label, is_current=(idx == len(items) - 1))
+                    if idx > 0:
+                        total += sep_w
+                return total
+
+            # 先判断完整路径是否本来就放得下。之前的增量算法在尝试从右向左保留时，
+            # 会过早为左侧 "..." 预留宽度，导致“其实足够宽却被折叠”。
+            if total_parts_width(parts) <= avail:
+                return parts
+
+            # 从最后一级开始向左保留，确保当前目录优先可见。
+            selected_rev = []
+            used = 0
+            for rev_idx, (label, full_path) in enumerate(reversed(parts)):
+                is_current = (rev_idx == 0)
+                w = part_width(label, is_current=is_current)
+                extra = w if not selected_rev else (sep_w + w)
+                if selected_rev and used + extra + ellipsis_w > avail:
+                    break
+                if not selected_rev and w > avail:
+                    selected_rev.append((label, full_path))
+                    used = min(w, avail)
+                    break
+                selected_rev.append((label, full_path))
+                used += extra
+
+            selected = list(reversed(selected_rev))
+            if len(selected) == len(parts):
+                return parts
+
+            # 若仍有空间，尽量把根目录也保留在 ... 后面，提升定位感。
+            root = parts[0]
+            if selected and selected[0][1] != root[1]:
+                root_w = part_width(root[0], is_current=False)
+                needed = used + ellipsis_w + sep_w + root_w + sep_w
+                if needed <= avail:
+                    return [root] + selected
+
+            return selected
+        except Exception:
+            return parts
 
     def _force_relayout(self, reason=""):
         """自上而下强制重排面包屑布局，修复偶发按钮几何为0需 resize 才恢复的问题。"""
