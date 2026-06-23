@@ -196,6 +196,8 @@ _LANG_EN = {
     "取消": "Cancel",
     "文件夹": "Folder",
     "文件": "File",
+    "切换到同级文件夹": "Switch to sibling folder",
+    "无子文件夹": "No subfolders",
     # ── SettingsDialog ────────────────────────────────────────────────────
     "路径栏分隔符设置": "Path Bar Separator",
     "路径栏拷贝分隔符:": "Copy Separator:",
@@ -3059,6 +3061,11 @@ class SimplePathBar(QWidget):
                "QPushButton:pressed { background: #99ccff; }")
     _S_SEP  = ("QLabel { color: #888; font-size: 11pt;"
                " padding: 0; margin: 0 2px; background: transparent; }")
+    _S_SEPBTN = ("QToolButton { color: #888; font-size: 12pt; border: none;"
+                 " background: transparent; padding: 0; margin: 0 1px; }"
+                 "QToolButton:hover { background: #cce5ff; color: #003d7a; border-radius: 2px; }"
+                 "QToolButton:pressed { background: #99ccff; }"
+                 "QToolButton::menu-indicator { image: none; width: 0; }")
     _S_EDIT = ("QLineEdit { background: white; border: 1px solid #ccc; border-radius: 3px;"
                " font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif; font-size: 10pt;"
                " color: #202020; padding: 2px 6px; selection-background-color: #0078d4; }")
@@ -3069,6 +3076,7 @@ class SimplePathBar(QWidget):
         self._last_built_path = ''
         self._last_build_was_hidden = False
         self._in_edit = False
+        self._completer = None  # 编辑模式路径自动补全（首次进入编辑时惰性创建）
         self.setFixedHeight(30)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(self._S_BAR)
@@ -3123,6 +3131,7 @@ class SimplePathBar(QWidget):
 
     def enter_edit_mode(self):
         debug_print(f"[SimplePathBar] enter_edit_mode: path='{self._current_path}', stack_idx={self._stack.currentIndex()}")
+        self._ensure_completer()
         self._in_edit = True
         self._edit.setText(self._current_path)
         self._stack.setCurrentIndex(1)
@@ -3170,6 +3179,58 @@ class SimplePathBar(QWidget):
             p = p.replace('\\', separator)
         return p
 
+    def _ensure_completer(self):
+        """惰性创建路径自动补全器（仅补全目录，类似 Explorer 地址栏）。
+        QCompleter 对 QFileSystemModel 有内置的路径拆分支持，能逐级补全 D:\\a\\b。"""
+        if self._completer is not None:
+            return  # 已创建或已尝试失败
+        try:
+            from PyQt5.QtWidgets import QCompleter, QFileSystemModel
+            model = QFileSystemModel(self)
+            model.setRootPath('')
+            model.setFilter(QDir.Dirs | QDir.NoDotAndDotDot | QDir.Drives)
+            comp = QCompleter(model, self)
+            comp.setCaseSensitivity(Qt.CaseInsensitive)
+            comp.setCompletionMode(QCompleter.PopupCompletion)
+            self._edit.setCompleter(comp)
+            self._completer = comp
+        except Exception as e:
+            debug_print(f"[SimplePathBar] completer init failed: {e}")
+            self._completer = False  # 标记已尝试，不重试
+
+    # ── 布局自愈 ──────────────────────────────────────────
+    def _first_crumb_button(self):
+        for idx in range(self._crumb_row.count()):
+            w = self._crumb_row.itemAt(idx).widget()
+            if isinstance(w, QPushButton):
+                return w
+        return None
+
+    def _schedule_heal(self, attempt=0):
+        QTimer.singleShot(30 + attempt * 45, lambda: self._verify_and_heal_layout(attempt))
+
+    def _verify_and_heal_layout(self, attempt=0):
+        """校验面包屑按钮是否获得了有效几何；若仍“卡死”（几何为0）则强制重排，
+        并带退避重试，直到容器获得有效宽度、按钮几何非0。这是“必须手动
+        resize 才刷新路径栏”问题的安全网。"""
+        try:
+            if self._in_edit or not self._current_path:
+                return
+            # 路径已被新的 set_path 取代，放弃本轮（新一轮 heal 会接管）
+            if self._last_built_path != self._current_path:
+                return
+            btn = self._first_crumb_button()
+            if btn is None:
+                return
+            healthy = (btn.width() > 0 and self._crumb_w.width() > 1 and btn.isVisible())
+            if healthy:
+                return
+            self._force_relayout(reason=f"heal#{attempt}")
+            if attempt < 8:
+                self._schedule_heal(attempt + 1)
+        except Exception as e:
+            debug_print(f"[SimplePathBar] _verify_and_heal_layout error: {e}")
+
     # ── 内部 ─────────────────────────────────────────────────────────────────
 
     def _rebuild(self):
@@ -3213,11 +3274,14 @@ class SimplePathBar(QWidget):
 
         if left_collapsed:
             self._crumb_row.addWidget(self._create_ellipsis_label())
-            self._add_separator_widget()
+            # 折叠区后的分隔符：下拉列出首个显示段的同级文件夹
+            _first_parent = os.path.dirname(display_parts[0][1]) if display_parts else None
+            self._add_separator_widget(_first_parent)
 
         for i, (label, full_path) in enumerate(display_parts):
             if i > 0:
-                self._add_separator_widget()
+                # 分隔符下拉列出左侧段的子文件夹（即当前段的同级），点击可快速切换
+                self._add_separator_widget(display_parts[i - 1][1])
             is_current = (full_path == self._current_path)
             btn = self._create_crumb_button(label, full_path, is_current=is_current)
             # 最后一级(当前目录)点击时进入编辑模式，而非发出无效的pathChanged
@@ -3242,6 +3306,10 @@ class SimplePathBar(QWidget):
         # 必须在那之后再做一次自上而下的强制重排（等价于一次 resize），
         # 否则布局有时停留在按钮几何为0的状态，直到用户手动改变窗口大小。
         QTimer.singleShot(0, lambda: self._force_relayout(reason="deferred"))
+        # 自愈：上面两次重排若发生在容器尚未获得有效宽度时（标签切换/隐藏态/布局竞态）
+        # 会落空，表现为“切换目录后路径栏不刷新、点击无响应，必须缩放窗口才恢复”。
+        # 这里启动带退避的校验循环，等容器获得有效宽度后再次强制重排，直到按钮几何非0。
+        self._schedule_heal()
 
     def _create_crumb_button(self, label, full_path, is_current=False):
         btn = QPushButton(self._elide_crumb_text(label, is_current=is_current))
@@ -3268,14 +3336,61 @@ class SimplePathBar(QWidget):
         lbl.show()
         return lbl
 
-    def _add_separator_widget(self):
-        sep = QLabel('>')
-        sep.setStyleSheet(self._S_SEP)
-        sep.setFixedWidth(14)
-        sep.setAlignment(Qt.AlignCenter)
-        sep.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+    def _add_separator_widget(self, parent_path=None):
+        """添加路径段分隔符。当 parent_path 为有效目录时，分隔符可点击，
+        弹出该目录下的子文件夹列表，实现 Explorer 风格的同级快速切换。"""
+        sep = QToolButton()
+        sep.setText('\u203a')  # ›
+        sep.setFixedWidth(16)
+        sep.setFocusPolicy(Qt.NoFocus)
+        sep.setAutoRaise(True)
+        sep.setStyleSheet(self._S_SEPBTN)
+        if parent_path and os.path.isdir(parent_path):
+            sep.setCursor(Qt.PointingHandCursor)
+            sep.setToolTip(tr("切换到同级文件夹"))
+            sep.clicked.connect(lambda _=False, p=parent_path: self._show_sibling_menu(p))
+        else:
+            sep.setEnabled(False)
+            sep.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self._crumb_row.addWidget(sep)
         sep.show()
+
+    def _show_sibling_menu(self, parent_path):
+        """弹出 parent_path 下的子文件夹菜单，选择后导航到该文件夹。"""
+        try:
+            from PyQt5.QtGui import QCursor
+            entries = []
+            try:
+                with os.scandir(parent_path) as it:
+                    for e in it:
+                        try:
+                            if e.is_dir():
+                                entries.append(e.name)
+                        except Exception:
+                            pass
+            except Exception as e:
+                debug_print(f"[SimplePathBar] sibling scandir error: {e}")
+                return
+            entries.sort(key=lambda s: s.lower())
+            menu = QMenu(self)
+            if not entries:
+                act = menu.addAction(tr("无子文件夹"))
+                act.setEnabled(False)
+            else:
+                cur_norm = os.path.normcase(os.path.normpath(self._current_path or ''))
+                for name in entries[:300]:
+                    full = os.path.join(parent_path, name)
+                    act = menu.addAction(name)
+                    try:
+                        full_norm = os.path.normcase(os.path.normpath(full))
+                        if cur_norm == full_norm or cur_norm.startswith(full_norm + os.sep):
+                            f = act.font(); f.setBold(True); act.setFont(f)
+                    except Exception:
+                        pass
+                    act.triggered.connect(lambda _=False, p=full: self.pathChanged.emit(p))
+            menu.exec_(QCursor.pos())
+        except Exception as e:
+            debug_print(f"[SimplePathBar] sibling menu error: {e}")
 
     def _elide_crumb_text(self, text, is_current=False):
         try:
@@ -3445,6 +3560,9 @@ class SimplePathBar(QWidget):
         # 应用级事件过滤：点击编辑框外部时退出编辑模式
         if self._in_edit and event.type() == QEvent.MouseButtonPress:
             try:
+                # 自动补全下拉框可见时，点击下拉项不应退出编辑模式
+                if self._completer and self._completer.popup() and self._completer.popup().isVisible():
+                    return super().eventFilter(obj, event)
                 global_pos = event.globalPos()
                 edit_rect = self._edit.rect()
                 local_pos = self._edit.mapFromGlobal(global_pos)
