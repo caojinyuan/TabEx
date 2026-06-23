@@ -1715,7 +1715,8 @@ class SearchDialog(QDialog):
             cmd.append(search_pattern)
             
             # 执行Everything搜索
-            debug_print(f"[Everything] Executing: {' '.join(cmd)}")
+            if _DEBUG_MODE:
+                debug_print(f"[Everything] Executing: {' '.join(cmd)}")
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -2422,7 +2423,7 @@ import threading
 import queue
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QFileSystemModel, QSplitter, QProgressBar, QCompleter, QFrame, QToolButton, QFileIconProvider)  # 添加QFrame
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer, QThread, QMutex, QMimeData, QFileInfo, QEvent
+from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer, QThread, QMutex, QMimeData, QFileInfo, QEvent, QPoint
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor, QDrag
 import ctypes
 import ctypes.wintypes
@@ -2440,6 +2441,20 @@ def debug_print(*args, **kwargs):
                 print(*args, **kwargs)
         else:
             print(*args, **kwargs)
+
+
+def dbg_exc(where=""):
+    """在调试模式下记录当前正在处理的异常（含类型与消息），生产环境为零开销空操作。
+    用于替代关键路径上原本静默吞掉异常的 `except ...: pass`，提升可诊断性而不影响行为。"""
+    if not _DEBUG_MODE:
+        return
+    try:
+        import sys as _sys
+        exc = _sys.exc_info()[1]
+        if exc is not None:
+            debug_print(f"[swallowed]{(' ' + where) if where else ''}: {type(exc).__name__}: {exc}")
+    except Exception:
+        pass
 
 
 def set_explorer_monitor_debug(enabled):
@@ -3021,7 +3036,6 @@ class _CrumbDragFilter(QObject):
     """事件过滤器：为 SimplePathBar 面包屑按钮提供拖拽功能，可拖到标签栏打开新tab。"""
 
     def eventFilter(self, obj, event):
-        from PyQt5.QtCore import QEvent, QPoint, QUrl, QMimeData
         t = event.type()
         if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
             obj._drag_start = event.pos()
@@ -3138,13 +3152,13 @@ class SimplePathBar(QWidget):
         self._edit.setFocus()
         self._edit.selectAll()
         # 安装应用级事件过滤器，监听点击外部区域时退出编辑模式
-        from PyQt5.QtWidgets import QApplication
         QApplication.instance().installEventFilter(self)
 
     def exit_edit_mode(self):
-        import traceback
-        caller = ''.join(traceback.format_stack(limit=3)[:-1]).strip()
-        debug_print(f"[SimplePathBar] exit_edit_mode: path='{self._current_path}', was_in_edit={self._in_edit}, caller={caller[-200:]}")
+        if _DEBUG_MODE:
+            import traceback
+            caller = ''.join(traceback.format_stack(limit=3)[:-1]).strip()
+            debug_print(f"[SimplePathBar] exit_edit_mode: path='{self._current_path}', was_in_edit={self._in_edit}, caller={caller[-200:]}")
         if not self._in_edit:
             return  # 已经不在编辑模式，无需重建
         self._in_edit = False
@@ -3152,7 +3166,6 @@ class SimplePathBar(QWidget):
         self._last_built_path = ''  # 强制重建
         self._rebuild()
         # 移除应用级事件过滤器
-        from PyQt5.QtWidgets import QApplication
         try:
             QApplication.instance().removeEventFilter(self)
         except Exception:
@@ -3160,7 +3173,6 @@ class SimplePathBar(QWidget):
 
     def changeEvent(self, event):
         """窗口激活时强制刷新面包屑"""
-        from PyQt5.QtCore import QEvent
         if event.type() == QEvent.WindowActivate and not self._in_edit:
             debug_print(f"[SimplePathBar] changeEvent(WindowActivate): path='{self._current_path}', crumb_count={self._crumb_row.count()}, stack_idx={self._stack.currentIndex()}")
             # 如果面包屑控件都不可见了，强制重建
@@ -3484,22 +3496,25 @@ class SimplePathBar(QWidget):
                 self._crumb_row.setGeometry(crumb_rect)
             self._crumb_w.update()
             self.update()
-            # 诊断日志：打印 _crumb_w 可见性与首个按钮几何，便于确认是否仍为0
-            try:
-                first_btn = None
-                for idx in range(self._crumb_row.count()):
-                    w = self._crumb_row.itemAt(idx).widget()
-                    if isinstance(w, QPushButton):
-                        first_btn = w
-                        break
-                cw_sz = self._crumb_w.size()
-                btn_geo = first_btn.geometry() if first_btn is not None else None
-                btn_vis = first_btn.isVisible() if first_btn is not None else None
-                debug_print(f"[SimplePathBar] _force_relayout({reason}): crumb_w visible={self._crumb_w.isVisible()}, "
-                            f"size={cw_sz.width()}x{cw_sz.height()}, stack_idx={self._stack.currentIndex()}, "
-                            f"first_btn visible={btn_vis}, geo={btn_geo}")
-            except Exception:
-                pass
+            # 诊断日志：打印 _crumb_w 可见性与首个按钮几何，便于确认是否仍为0。
+            # 该诊断会遍历面包屑并构造几何字符串，且 _force_relayout 在自愈循环中
+            # 可能每次导航运行多达 8 次，故仅在调试模式下执行。
+            if _DEBUG_MODE:
+                try:
+                    first_btn = None
+                    for idx in range(self._crumb_row.count()):
+                        w = self._crumb_row.itemAt(idx).widget()
+                        if isinstance(w, QPushButton):
+                            first_btn = w
+                            break
+                    cw_sz = self._crumb_w.size()
+                    btn_geo = first_btn.geometry() if first_btn is not None else None
+                    btn_vis = first_btn.isVisible() if first_btn is not None else None
+                    debug_print(f"[SimplePathBar] _force_relayout({reason}): crumb_w visible={self._crumb_w.isVisible()}, "
+                                f"size={cw_sz.width()}x{cw_sz.height()}, stack_idx={self._stack.currentIndex()}, "
+                                f"first_btn visible={btn_vis}, geo={btn_geo}")
+                except Exception:
+                    pass
         except Exception as e:
             debug_print(f"[SimplePathBar] _force_relayout({reason}) ERROR: {e}")
 
@@ -3529,8 +3544,7 @@ class SimplePathBar(QWidget):
             self.pathChanged.emit(path)
 
     def _on_crumb_click(self, event):
-        from PyQt5.QtCore import Qt as _Qt
-        if event.button() == _Qt.LeftButton:
+        if event.button() == Qt.LeftButton:
             child = self._crumb_w.childAt(event.pos())
             if child is None:          # 点中空白区域
                 self.enter_edit_mode()
@@ -3551,7 +3565,6 @@ class SimplePathBar(QWidget):
         super().resizeEvent(event)
 
     def eventFilter(self, obj, event):
-        from PyQt5.QtCore import QEvent
         if obj is self._edit and event.type() == QEvent.KeyPress:
             if event.key() == Qt.Key_Escape:
                 debug_print(f"[SimplePathBar] eventFilter: Escape pressed, exit edit mode")
@@ -4559,16 +4572,16 @@ class IExplorerBrowserWidget(QWidget):
             if self._cookie.value:
                 self._browser.Unadvise(self._cookie)
         except Exception:
-            pass
+            dbg_exc("IExplorerBrowser.Unadvise")
         try:
             self._browser.Destroy()
         except Exception:
-            pass
+            dbg_exc("IExplorerBrowser.Destroy")
         try:
             hwnd = int(self.winId())
             _ieb_keyboard_filter.unregister_ieb_hwnd(hwnd)
         except Exception:
-            pass
+            dbg_exc("IExplorerBrowser.unregister_hwnd")
         self._browser  = None
         self._nav_sink = None
         self._init_ok  = False
@@ -4715,6 +4728,13 @@ class FileExplorerTab(QWidget):
             # 标签停用时，停止保活轮询
             if hasattr(self, '_keepalive_sync_timer') and self._keepalive_sync_timer:
                 self._keepalive_sync_timer.stop()
+            # 若标签在导航过程中被切到后台，立即停止瞬时路径同步轮询，
+            # 避免后台标签继续以 120~360ms 高频跨进程读取 COM LocationURL
+            # （否则需等到下一次 tick 才自停，确保“仅活动标签轮询”）。
+            if hasattr(self, '_path_sync_timer') and self._path_sync_timer and self._path_sync_timer.isActive():
+                self._path_sync_timer.stop()
+            if hasattr(self, '_path_sync_stop_timer') and self._path_sync_stop_timer and self._path_sync_stop_timer.isActive():
+                self._path_sync_stop_timer.stop()
 
     def is_auto_refresh_frozen(self):
         return bool(getattr(self, '_manual_refresh_frozen', False))
@@ -7060,7 +7080,7 @@ class FileExplorerTab(QWidget):
             # 尝试使用Navigate2获得更好的刷新效果
             self.explorer.dynamicCall("Navigate2(QVariant,QVariant,QVariant,QVariant,QVariant)", 
                                      url, 0, "", None, None)
-        except:
+        except Exception:
             # 回退到普通Navigate
             self.explorer.dynamicCall("Navigate(const QString&)", url)
         
@@ -12355,7 +12375,12 @@ class MainWindow(QMainWindow):
         # 性能优化：延迟加载非关键功能（100ms后加载）
         QTimer.singleShot(100, self._delayed_initialization)
 
-        # 生成并设置 TE 窗口图标
+        # 生成并设置 TE 窗口图标：延迟到事件循环启动后执行，
+        # 避免 9 张抗锯齿图标（256→16px）的渲染阻塞首帧显示，加快启动感知速度。
+        QTimer.singleShot(0, self._setup_window_icon)
+
+    def _setup_window_icon(self):
+        """生成并设置 TE 窗口图标（延迟执行，不阻塞启动首帧）。"""
         try:
             from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QIcon
             
@@ -12928,7 +12953,7 @@ class MainWindow(QMainWindow):
                             ctypes.byref(wintypes.DWORD(DWMWCP_ROUND)),
                             ctypes.sizeof(wintypes.DWORD)
                         )
-                    except:
+                    except Exception:
                         pass  # Windows 10 不支持此属性，忽略错误
                     
                     # 添加可见边框和可调整大小的样式（WS_THICKFRAME/WS_SIZEBOX）
@@ -13487,7 +13512,7 @@ class MainWindow(QMainWindow):
                     if class_name in ("CabinetWClass", "ExploreWClass"):
                         if win32gui.IsWindowVisible(hwnd):
                             self.known_explorer_windows.add(hwnd)
-                except:
+                except Exception:
                     pass
                 return True
             
@@ -13515,7 +13540,7 @@ class MainWindow(QMainWindow):
                         if class_name in ("CabinetWClass", "ExploreWClass"):
                             if win32gui.IsWindowVisible(hwnd):
                                 current_explorer_windows.add(hwnd)
-                    except:
+                    except Exception:
                         pass
                     return True
                 
@@ -13559,7 +13584,7 @@ class MainWindow(QMainWindow):
                             if parent == self.monitor_our_window:
                                 debug_print(f"[Explorer Monitor] Skipping child window")
                                 continue
-                        except:
+                        except Exception:
                             pass
                         
                         debug_print(f"[Explorer Monitor] New Explorer window detected: {hwnd} - {title}")
@@ -13632,7 +13657,7 @@ class MainWindow(QMainWindow):
                                 try:
                                     location_name = window.LocationName
                                     debug_print(f"[Explorer Monitor] LocationName: {location_name}")
-                                except:
+                                except Exception:
                                     pass
                                 
                                 # 获取当前路径
@@ -13698,7 +13723,7 @@ class MainWindow(QMainWindow):
                                                               tr('设备管理器'), 'Device Manager', tr('网络和共享中心'), 'Network and Sharing Center']:
                                             debug_print(f"[Explorer Monitor] Control Panel item detected by LocationName")
                                             return 'shell:ControlPanelFolder'
-                                    except:
+                                    except Exception:
                                         pass
                                     
                                     # 如果都失败了，返回用户主目录
@@ -13820,7 +13845,7 @@ class MainWindow(QMainWindow):
                 if hasattr(tab, 'explorer'):
                     try:
                         tab.explorer.clear()
-                    except:
+                    except Exception:
                         pass
         except Exception as e:
             print(f"Error stopping timers: {e}")
