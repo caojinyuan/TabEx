@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.52"
+APP_VERSION = "3.53"
 
 
 # TabEx i18n module
@@ -11559,12 +11559,20 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event):
         """窗口状态变化事件"""
         if event.type() == event.WindowStateChange:
+            was_minimized = bool(event.oldState() & Qt.WindowMinimized)
+            now_minimized = bool(self.windowState() & Qt.WindowMinimized)
             # 保存最后的非最小化状态，用于任务栏点击判断
-            if not (self.windowState() & Qt.WindowMinimized):
+            if not now_minimized:
                 self._last_active_state = self.windowState()
             
             # 根据窗口状态切换阴影显示
             self._update_window_shadow()
+
+            # 从最小化恢复：延迟到窗口几何稳定后，重新武装当前标签的刷新与路径同步，
+            # 并强制重建路径栏。安全网，针对“最小化期间/某个瞬态停掉刷新后无人重启，
+            # 表现为路径栏不更新、文件夹不自动刷新，需手动 resize 才恢复”的偶发问题。
+            if was_minimized and not now_minimized:
+                QTimer.singleShot(0, lambda: self._reactivate_current_tab_refresh(rebuild_pathbar=True))
         
         super().changeEvent(event)
     
@@ -11581,6 +11589,8 @@ class MainWindow(QMainWindow):
             else:
                 # 首次激活，标记定时器已设置
                 self._activation_timer = True
+            # 安全网：窗口重新激活时，若当前标签刷新被瞬态停掉则重新武装（健康时为空操作）
+            self._reactivate_current_tab_refresh(rebuild_pathbar=False)
         
         return super().event(event)
     
@@ -11588,6 +11598,51 @@ class MainWindow(QMainWindow):
         """检查是否是任务栏点击（通过短时间内重复激活判断）"""
         # 这个方法可以进一步优化，目前主要依赖 nativeEvent 的实现
         pass
+
+    def _reactivate_current_tab_refresh(self, rebuild_pathbar=False):
+        """窗口恢复/重新激活时的刷新自愈安全网。
+
+        根因：set_refresh_active(True)（武装目录轮询/保活路径同步/消费待刷新）仅在
+        on_tab_changed 与 close_tab 被调用，没有任何路径在窗口恢复/激活时重新武装当前
+        标签。若可见标签的刷新定时器被某个瞬态停掉而标签索引未变化，就会出现“路径栏不
+        更新、文件夹不刷新，需手动 resize/切标签才恢复”。此方法把该手动恢复自动化。
+
+        健康时（刷新仍在运行）为空操作；仅在检测到确实失活时才重新武装并补一次刷新。
+        """
+        try:
+            tab = self.get_current_tab_widget()
+            if not tab:
+                return
+            current_path = getattr(tab, 'current_path', '') or ''
+            is_slow = False
+            try:
+                is_slow = bool(tab._is_slow_path(current_path)) if current_path else False
+            except Exception:
+                is_slow = False
+            poll = getattr(tab, 'dir_poll_timer', None)
+            # 仅在真正失活时才重新武装：标签自认后台，或普通路径的目录轮询已停。
+            # 慢速路径（OneDrive/网络）本就不启动目录轮询，不应误判为失活。
+            needs_rearm = (
+                not getattr(tab, '_refresh_active', False)
+                or (poll is not None and not poll.isActive() and not is_slow)
+            )
+            if needs_rearm and hasattr(tab, 'set_refresh_active'):
+                tab.set_refresh_active(True)
+                if hasattr(tab, '_request_refresh'):
+                    tab._request_refresh(reason="window_reactivate")
+                debug_print("[Reactivate] Re-armed current tab refresh after window activation")
+
+            if rebuild_pathbar:
+                pb = getattr(tab, 'path_bar', None)
+                if pb and current_path:
+                    try:
+                        if not getattr(pb, '_in_edit', False):
+                            pb._last_built_path = ''  # 强制完整重建，按当前可见宽度评估
+                            pb.set_path(current_path)
+                    except Exception:
+                        pass
+        except Exception as e:
+            debug_print(f"[Reactivate] failed: {e}")
     
     def setup_shortcuts(self):
         """设置全局快捷键（现在使用轮询方式，不再使用QShortcut）"""
