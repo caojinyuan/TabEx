@@ -2,7 +2,11 @@
 chcp 65001 > nul
 setlocal enabledelayedexpansion
 
-set VERSION=2.4
+REM 从 TabEx.py 解析版本号（单一来源 APP_VERSION），避免多处版本不一致
+set VERSION=
+for /f "tokens=3 delims= " %%v in ('findstr /b /c:"APP_VERSION = " TabEx.py') do set VERSION=%%v
+set VERSION=%VERSION:"=%
+if "%VERSION%"=="" set VERSION=unknown
 
 echo ======================================
 echo TabExplorer v%VERSION% 打包工具
@@ -105,7 +109,7 @@ if exist TabExplorer.exe (
 )
 echo.
 echo 注意事项：
-echo 1. bookmarks.json 和 pinned_tabs.json 会自动在exe同目录创建
+echo 1. config.json 和 bookmarks.json 会自动在exe同目录创建
 echo 2. 首次运行时会自动创建这些配置文件
 echo 3. 如需发布，建议配合 README.md 一起打包
 echo.

@@ -40,6 +40,12 @@
 
 ## 🆕 最近更新
 
+### v3.52 (2026-06-26)
+- **稳定性：资源快照日得自动轮转**：`runtime_health.log` 原为纯追加写入、无上限，长期启用可能持续增长。新增 1MB 轮转（超限即转存为 `.1`），最多占用约 2MB
+- **维护性：版本号单一来源**：新增 `APP_VERSION` 常量，窗口标题与打包脚本统一引用；打包时 `2_build_exe.bat` 自动从源码解析版本号，避免多处不一致
+- **修复：依赖安装脚本**：`0_install_requirements.bat` 移除无效的 `pip install pythonw`（非真实包）与未使用的 `PyQtWebEngine`（约 100MB 无用下载），改为统一按 `requirements.txt` 安装并加入错误检查
+- **文档：修正过时信息**：清理 README 中指向不存在文件的链接与说明；修正打包脚本中过时的 `pinned_tabs.json` 提示；`.gitignore` 移除陈旧条目
+
 ### v3.51 (2026-06-26)
 - **稳定性：修复高 CPU 负载下卡顿/卡死**：根因是主线程上同步、无超时的跨进程 COM 调用 `LocationURL`（由路径同步 120~360ms、保活 1500ms 反复轮询）在 CPU 饱和时延迟飙升、阻塞事件循环，堆积的定时器事件爆发触发形成“死亡螺旋”导致彻底卡死。新增三层抗高负载保护：①计时读取（单次 COM 调用 ≥180ms 即判定高负载并进入 3 秒退避）；②退避窗口内跳过 COM 读取、拉长轮询间隔给 UI 线程喘息（路径仍由导航完成信号兜底更新）；③挂钟防抖（最小 50ms 真实间隔）吸收卡顿后的爆发式触发。正常导航不受影响
 
@@ -172,13 +178,7 @@
 
 ---
 
-## 📝 更多文档
-
-- [Everything 集成详细说明](EVERYTHING_INTEGRATION.md)
-
----
-
-## 🐛 问题反馈
+##  问题反馈
 
 如遇问题，请在 [Issues](../../issues) 页面反馈。若问题与长时间运行、卡顿或异常退出相关，建议同时：
 - 开启 `设置 → 调试设置 → 启用调试输出`
@@ -200,14 +200,13 @@ Remove-Item build, dist -Recurse -Force -ErrorAction SilentlyContinue
 
 ### 项目文件说明
 - `TabEx.py` - 主程序入口
-- `requirements.txt` - Python 依赖列表
-- `config.json` - 应用配置示例
-- `bookmarks.json` - 书签数据
+- `requirements.txt` - Python 运行依赖列表
 - `0_install_requirements.bat` - 依赖安装脚本
 - `1_TabEx.bat` - 源码运行脚本
 - `2_build_exe.bat` - PyInstaller 打包脚本
-- `generate_icon.py` - 图标生成脚本
-- `clear_icon_cache.bat` - Windows 图标缓存清理脚本（仅 Windows）
+- `generate_icon.py` - 图标生成脚本（需要 Pillow：`pip install pillow`）
+
+> `config.json`、`bookmarks.json`、`chat_history.json`、`runtime_health.log` 均为运行时自动生成的本地数据文件，已在 `.gitignore` 中忽略，不随仓库分发。
 
 
 

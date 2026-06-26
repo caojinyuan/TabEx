@@ -4,6 +4,10 @@ from collections import OrderedDict
 import hashlib
 import os
 
+# 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
+# 修改版本时只改这一行；2_build_exe.bat 会自动解析。
+APP_VERSION = "3.52"
+
 
 # TabEx i18n module
 # Usage: tr("中文") returns English when language is "en", else returns the Chinese original.
@@ -700,12 +704,14 @@ HOUSEKEEPING_GC_EVERY_N = 3  # 每 N 次清理执行一次 gc.collect()
 SESSION_SNAPSHOT_INTERVAL_MS = 15000  # 崩溃恢复兜底：定期写入当前会话快照
 SESSION_SNAPSHOT_DEBOUNCE_MS = 1200  # 标签/路径变化后的会话快照防抖时间
 SESSION_SNAPSHOT_MIN_INTERVAL_MS = 8000  # 事件驱动快照最小间隔，防止 DirPoll/FileWatcher 高频触发写盘
+MAX_HEALTH_LOG_BYTES = 1024 * 1024  # runtime_health.log 超过此大小即轮转为 .1，避免长期运行无限增长
 APP_INTERNAL_CHANGE_FILENAMES = {
     'config.json',
     'config.json.tmp',
     'bookmarks.json',
     'chat_history.json',
     'runtime_health.log',
+    'runtime_health.log.1',
 }
 
 # 大文件夹异步加载配置
@@ -10246,7 +10252,7 @@ class MainWindow(QMainWindow):
         """根据当前状态更新窗口标题和自定义标题栏文本。
         当处于恢复状态时，在标题中附加“窗口恢复中”。
         """
-        base_title = "TabExplorer"
+        base_title = f"TabExplorer v{APP_VERSION}"
         # 更新自定义标题栏文本
         if hasattr(self, 'title_label'):
             if self.is_restoring:
@@ -12726,7 +12732,19 @@ class MainWindow(QMainWindow):
                 f" shortcuts_tracked={len(getattr(self, '_last_keys_state', {}) or {})}"
                 f"{thread_detail}"
             )
-            with open(get_app_data_path('runtime_health.log'), 'a', encoding='utf-8') as f:
+            log_path = get_app_data_path('runtime_health.log')
+            try:
+                if os.path.exists(log_path) and os.path.getsize(log_path) > MAX_HEALTH_LOG_BYTES:
+                    backup = log_path + '.1'
+                    try:
+                        if os.path.exists(backup):
+                            os.remove(backup)
+                    except Exception:
+                        pass
+                    os.replace(log_path, backup)
+            except Exception:
+                pass
+            with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(line + "\n")
         except Exception as e:
             debug_print(f"[Housekeeping] resource snapshot failed: {e}")
