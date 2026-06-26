@@ -718,6 +718,12 @@ STATUS_SELECTION_CACHE_TTL_MS = 400  # 选中项状态缓存，降低频繁 COM/
 STATUS_SELECTION_METADATA_LIMIT = 20  # 多选超过阈值时跳过逐项大小统计
 SHORTCUT_POLL_ACTIVE_MS = 160  # 主窗口激活时快捷键轮询频率
 SHORTCUT_POLL_INACTIVE_MS = 500  # 主窗口非激活时快捷键轮询频率
+# ── 主线程 COM 轮询抗高负载保护 ───────────────────────────────────────────────
+# LocationURL 是同步跨进程 COM 调用，无超时。CPU 饱和时其延迟会飙升，阻塞 UI 线程，
+# 且卡顿时 Qt 定时器事件堆积、线程一空就爆发式触发，形成无法恢复的“死亡螺旋”。
+COM_POLL_SLOW_MS = 180        # 单次 LocationURL 调用超过此耗时即判定系统高负载
+COM_POLL_STRESS_BACKOFF_MS = 3000  # 高负载期间将 COM 轮询间隔退避到此值，给 UI 线程喘息
+COM_POLL_MIN_GAP_MS = 50      # 挂钟防抖：两次实际轮询的最小真实间隔，吸收卡顿后的爆发触发
 SEARCH_RESULT_TYPE_COL_WIDTH = 90
 SEARCH_RESULT_DATE_COL_WIDTH = 155
 SEARCH_RESULT_SIZE_COL_WIDTH = 100
@@ -4931,6 +4937,37 @@ class FileExplorerTab(QWidget):
         if getattr(self, '_refresh_active', False):
             self._start_keepalive_sync()
 
+    def _read_location_url_timed(self):
+        """读取 LocationURL（同步跨进程 COM），并测量耗时以检测系统高负载。
+
+        返回读取到的 URL；若本次调用耗时超过 COM_POLL_SLOW_MS，则设置高负载退避截止
+        时间戳 self._com_stress_until，供轮询函数据此拉长间隔，打断 CPU 高时的死亡螺旋。
+        """
+        start = time.perf_counter()
+        url = self.explorer.property('LocationURL')
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if elapsed_ms >= COM_POLL_SLOW_MS:
+            self._com_stress_until = time.monotonic() + (COM_POLL_STRESS_BACKOFF_MS / 1000.0)
+            debug_print(f"[PathSync] Slow LocationURL read {elapsed_ms:.0f}ms -> backoff "
+                        f"{COM_POLL_STRESS_BACKOFF_MS}ms")
+        return url
+
+    def _com_under_stress(self):
+        """当前是否处于 COM 高负载退避窗口内。"""
+        return time.monotonic() < getattr(self, '_com_stress_until', 0.0)
+
+    def _poll_burst_guard(self):
+        """挂钟防抖：吸收 UI 线程卡顿后堆积的爆发式定时器触发。
+
+        若距上次实际轮询的真实时间间隔小于 COM_POLL_MIN_GAP_MS，返回 True 表示应跳过本次，
+        避免连续多次慢 COM 调用把线程进一步压死。"""
+        now_ms = time.monotonic() * 1000.0
+        last_ms = getattr(self, '_last_poll_wall_ms', 0.0)
+        if now_ms - last_ms < COM_POLL_MIN_GAP_MS:
+            return True
+        self._last_poll_wall_ms = now_ms
+        return False
+
     def _start_keepalive_sync(self):
         """启动低频保活轮询（每1500ms检测LocationURL变化，主同步未覆盖时兜底）"""
         # 如果主同步正在运行，不启动保活（避免双重轮询）
@@ -4958,8 +4995,13 @@ class FileExplorerTab(QWidget):
                     return
             except Exception:
                 pass
+        # 抗高负载：爆发触发跳过 + 退避窗口内跳过 COM 读取（与主同步一致），避免 CPU 高时压死 UI 线程
+        if self._poll_burst_guard():
+            return
+        if self._com_under_stress():
+            return
         try:
-            url = self.explorer.property('LocationURL')
+            url = self._read_location_url_timed()
             if url:
                 url_str = str(url)
                 local_path = None
@@ -5006,8 +5048,18 @@ class FileExplorerTab(QWidget):
         if not getattr(self, '_refresh_active', True):
             self._stop_path_sync_timer()
             return
+        # 抗高负载①：卡顿后堆积的爆发式定时器触发直接跳过，避免连续慢 COM 调用进一步压死 UI 线程
+        if self._poll_burst_guard():
+            return
+        # 抗高负载②：高负载退避窗口内拉长轮询间隔并跳过本次 COM 读取，给 UI 线程喘息；
+        # 路径仍由 NavigateComplete2 信号与保活轮询兜底更新，窗口到期后自动恢复正常频率。
+        if self._com_under_stress():
+            t = getattr(self, '_path_sync_timer', None)
+            if t and t.interval() < COM_POLL_STRESS_BACKOFF_MS:
+                t.setInterval(COM_POLL_STRESS_BACKOFF_MS)
+            return
         try:
-            url = self.explorer.property('LocationURL')
+            url = self._read_location_url_timed()
             if url:
                 url_str = str(url)
                 local_path = None
