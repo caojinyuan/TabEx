@@ -210,7 +210,7 @@ _LANG_EN = {
     "监听新Explorer窗口": "Monitor New Explorer Windows",
     "状态栏显示 CPU/内存占用": "Show CPU/Memory in Status Bar",
     "内存": "Mem",
-    "在状态栏右侧实时显示本程序的 CPU 与内存占用，每2秒刷新": "Show this app's CPU and memory on the right of the status bar, refreshed every 2s",
+    "在状态栏右侧实时显示整机 CPU 与内存占用，每2秒刷新": "Show system-wide CPU and memory on the right of the status bar, refreshed every 2s",
     "监听间隔（秒）:": "Monitor Interval (s):",
     "检查新Explorer窗口的时间间隔，更长的间隔降低CPU占用": "Interval for checking new Explorer windows; longer = less CPU",
     "（推荐: 2.0秒）": "(Recommended: 2.0s)",
@@ -2571,6 +2571,80 @@ def get_process_cpu_percent():
         return max(0.0, min(100.0, pct))
     except Exception:
         return None
+
+
+# 整机 CPU 采样状态（GetSystemTimes：idle/kernel/user 时间增量，1 - idle/total = 占用率）
+_sys_cpu_last_idle = None
+_sys_cpu_last_total = None
+
+
+def get_system_cpu_percent():
+    """返回整机 CPU 占用率（0~100）。Windows 用 GetSystemTimes 计算 idle/total 增量；
+    非 Windows 返回 None。需间隔调用两次取增量。"""
+    global _sys_cpu_last_idle, _sys_cpu_last_total
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [('dwLowDateTime', wintypes.DWORD), ('dwHighDateTime', wintypes.DWORD)]
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        idle = FILETIME(); kern = FILETIME(); user = FILETIME()
+        if not kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+            return None
+        idle_t = (idle.dwHighDateTime << 32) | idle.dwLowDateTime
+        kern_t = (kern.dwHighDateTime << 32) | kern.dwLowDateTime  # 含 idle
+        user_t = (user.dwHighDateTime << 32) | user.dwLowDateTime
+        total = kern_t + user_t
+        if _sys_cpu_last_total is None:
+            _sys_cpu_last_idle = idle_t
+            _sys_cpu_last_total = total
+            return None
+        idle_d = idle_t - _sys_cpu_last_idle
+        total_d = total - _sys_cpu_last_total
+        _sys_cpu_last_idle = idle_t
+        _sys_cpu_last_total = total
+        if total_d <= 0:
+            return None
+        return max(0.0, min(100.0, (1.0 - idle_d / total_d) * 100.0))
+    except Exception:
+        return None
+
+
+def get_system_memory_status():
+    """返回整机内存 (used_mb, total_mb, percent_used)；非 Windows 或失败返回 None。"""
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ('dwLength', wintypes.DWORD),
+                ('dwMemoryLoad', wintypes.DWORD),
+                ('ullTotalPhys', ctypes.c_ulonglong),
+                ('ullAvailPhys', ctypes.c_ulonglong),
+                ('ullTotalPageFile', ctypes.c_ulonglong),
+                ('ullAvailPageFile', ctypes.c_ulonglong),
+                ('ullTotalVirtual', ctypes.c_ulonglong),
+                ('ullAvailVirtual', ctypes.c_ulonglong),
+                ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+            ]
+
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(stat)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return None
+        total_mb = stat.ullTotalPhys / (1024 * 1024)
+        used_mb = (stat.ullTotalPhys - stat.ullAvailPhys) / (1024 * 1024)
+        return (used_mb, total_mb, int(stat.dwMemoryLoad))
+    except Exception:
+        return None
+
 
 
 
@@ -13077,13 +13151,17 @@ class MainWindow(QMainWindow):
                     lbl.setText("")
 
     def _update_resource_usage_display(self):
-        """计算 CPU/内存占用并显示到当前活动标签的资源标签上（仅活动标签可见）。"""
+        """显示整机 CPU/内存占用到当前活动标签的资源标签上（仅活动标签可见）。"""
         if not self.config.get("show_resource_usage_in_statusbar", False):
             return
-        cpu = get_process_cpu_percent()
-        mem = get_process_memory_usage_mb()
+        cpu = get_system_cpu_percent()
+        mem = get_system_memory_status()
         cpu_txt = f"CPU {cpu:.0f}%" if cpu is not None else "CPU --"
-        mem_txt = (tr("内存") + f" {mem:.0f} MB") if mem is not None else ""
+        if mem is not None:
+            used_mb, total_mb, pct = mem
+            mem_txt = f"{tr('内存')} {used_mb/1024:.1f}/{total_mb/1024:.1f} GB ({pct}%)"
+        else:
+            mem_txt = ""
         text = f"{cpu_txt}   {mem_txt}".strip()
         tab = self.get_current_tab_widget()
         lbl = getattr(tab, 'resource_label', None) if tab else None
@@ -14583,7 +14661,7 @@ class SettingsDialog(QDialog):
         self.resource_usage_cb = QCheckBox(tr("状态栏显示 CPU/内存占用"), self)
         self.resource_usage_cb.setChecked(config.get("show_resource_usage_in_statusbar", False))
         self.resource_usage_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        self.resource_usage_cb.setToolTip(tr("在状态栏右侧实时显示本程序的 CPU 与内存占用，每2秒刷新"))
+        self.resource_usage_cb.setToolTip(tr("在状态栏右侧实时显示整机 CPU 与内存占用，每2秒刷新"))
         monitor_layout.addWidget(self.resource_usage_cb)
         # 监听间隔设置
         interval_layout = QHBoxLayout()
