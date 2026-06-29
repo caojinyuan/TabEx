@@ -734,6 +734,9 @@ COM_POLL_SLOW_MS = 180        # 单次 LocationURL 调用超过此耗时即判�
 COM_POLL_STRESS_BACKOFF_MS = 3000  # 高负载期间将 COM 轮询间隔退避到此值，给 UI 线程喘息
 COM_POLL_MIN_GAP_MS = 50      # 挂钟防抖：两次实际轮询的最小真实间隔，吸收卡顿后的爆发触发
 COM_POLL_HARD_DEADLINE_MS = 250  # [spike] QAx LocationURL 看门狗硬超时：超时即放弃读取并用缓存值
+# 状态栏资源占用颜色预警阈值（百分比）：低于 WARN 绿色，WARN~CRIT 橙色，>=CRIT 红色
+RESOURCE_WARN_PERCENT = 75
+RESOURCE_CRIT_PERCENT = 90
 SEARCH_RESULT_TYPE_COL_WIDTH = 90
 SEARCH_RESULT_DATE_COL_WIDTH = 155
 SEARCH_RESULT_SIZE_COL_WIDTH = 100
@@ -5481,7 +5484,7 @@ class FileExplorerTab(QWidget):
         self.resource_label.setFixedHeight(20)
         self.resource_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.resource_label.setStyleSheet(
-            "QLabel { padding: 2px 10px; background: white; border-top: 1px solid #e0e0e0; font-size: 12px; color: #666; }"
+            "QLabel { padding: 2px 10px; background: white; border-top: 1px solid #e0e0e0; font-size: 12px; }"
         )
         self.resource_label.hide()
         status_row = QHBoxLayout()
@@ -13151,18 +13154,28 @@ class MainWindow(QMainWindow):
                     lbl.setText("")
 
     def _update_resource_usage_display(self):
-        """显示整机 CPU/内存占用到当前活动标签的资源标签上（仅活动标签可见）。"""
+        """显示整机 CPU/内存占用到当前活动标签的资源标签上，占用过高时变色预警。"""
         if not self.config.get("show_resource_usage_in_statusbar", False):
             return
+
+        def _color(pct):
+            if pct >= RESOURCE_CRIT_PERCENT:
+                return "#d32f2f"  # 红：危急
+            if pct >= RESOURCE_WARN_PERCENT:
+                return "#e67700"  # 橙：偏高
+            return "#666"          # 常态
+
         cpu = get_system_cpu_percent()
         mem = get_system_memory_status()
-        cpu_txt = f"CPU {cpu:.0f}%" if cpu is not None else "CPU --"
+        cpu_html = (f"<span style='color:{_color(cpu)}'>CPU {cpu:.0f}%</span>"
+                    if cpu is not None else "<span style='color:#666'>CPU --</span>")
         if mem is not None:
             used_mb, total_mb, pct = mem
-            mem_txt = f"{tr('内存')} {used_mb/1024:.1f}/{total_mb/1024:.1f} GB ({pct}%)"
+            mem_html = (f"<span style='color:{_color(pct)}'>{tr('内存')} "
+                        f"{used_mb/1024:.1f}/{total_mb/1024:.1f} GB ({pct}%)</span>")
         else:
-            mem_txt = ""
-        text = f"{cpu_txt}   {mem_txt}".strip()
+            mem_html = ""
+        text = f"{cpu_html}&nbsp;&nbsp;&nbsp;{mem_html}".strip()
         tab = self.get_current_tab_widget()
         lbl = getattr(tab, 'resource_label', None) if tab else None
         if lbl:

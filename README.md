@@ -41,6 +41,7 @@
 ## 🆕 最近更新
 
 ### v3.56-spike (2026-06-29) — 实验分支 spike/async-com，未合入 main
+- **状态栏资源占用颜色预警**：整机 CPU/内存占用 ≥75% 显示橙色、≥90% 显示红色，常态灰色，一眼看出系统是否吃紧
 - **状态栏 CPU/内存改为整机占用**：状态栏右侧现示整机 CPU 占用与内存 已用/总量 GB（含百分比），便于判断系统是否还有剩余（GetSystemTimes + GlobalMemoryStatusEx，纯 ctypes）
 - **实验：旧 QAx 路径读取看门狗硬超时**：仅回退到 Shell.Explorer 时生效，`LocationURL` 跨进程读取改在单 worker 线程（STA CoInitialize）上执行，250ms 硬超时即放弃并用缓存路径，UI 线程永不阻塞；IExplorerBrowser 仍走缓存值，不受影响。仅供长稳验证，验稳后再合 main
 
