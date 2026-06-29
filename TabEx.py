@@ -4993,14 +4993,22 @@ class FileExplorerTab(QWidget):
         return url
 
     def _read_qax_location_with_watchdog(self):
-        """带硬超时的 QAx LocationURL 读取：超时则返回上次缓存值，避免阻塞 UI。"""
+        """带硬超时的 QAx LocationURL 读取：超时则返回上次缓存值，避免阻塞 UI。
+
+        [spike] 看门狗线程读取跨进程 COM 属性前先 CoInitialize（STA），避免在未初始化
+        COM 的工作线程上调用导致失败；同时用 _com_inflight 抑制重叠提交，避免超时后旧任务
+        仍占用单 worker 造成 future 堆积。"""
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FTimeout
+        # 上一次读取尚未返回：不重复提交，直接用缓存值（worker 阻塞时避免任务堆积）
+        if getattr(self, '_com_inflight', False):
+            return getattr(self, '_last_location_url', '')
         ex = getattr(self, '_com_executor', None)
         if ex is None:
             ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix='com-loc')
             self._com_executor = ex
+        self._com_inflight = True
         try:
-            fut = ex.submit(self.explorer.property, 'LocationURL')
+            fut = ex.submit(self._qax_read_location_worker)
             return fut.result(timeout=COM_POLL_HARD_DEADLINE_MS / 1000.0)
         except _FTimeout:
             self._com_stress_until = time.monotonic() + (COM_POLL_STRESS_BACKOFF_MS / 1000.0)
@@ -5009,6 +5017,24 @@ class FileExplorerTab(QWidget):
         except Exception as e:
             debug_print(f"[PathSync] watchdog read error: {e}")
             return getattr(self, '_last_location_url', '')
+
+    def _qax_read_location_worker(self):
+        """worker 线程：初始化 STA 公寓后读取 LocationURL，结束后清除 in-flight 标志。"""
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+        try:
+            return self.explorer.property('LocationURL')
+        finally:
+            self._com_inflight = False
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
 
 
     def _com_under_stress(self):
