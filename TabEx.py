@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.53"
+APP_VERSION = "3.54"
 
 
 # TabEx i18n module
@@ -3993,6 +3993,25 @@ def _patch_tortoise_overlays():
 _OVERLAY_PRELOADED_DIRS = set()
 
 
+def _path_is_slow_for_shell(path):
+    """模块级慢盘判断：UNC / OneDrive / 映射网络盘上同步 Shell 调用可能阻塞 UI 线程。
+    供 _preload_overlay_icons 早退使用（与 FileExplorerTab._is_slow_path 逻辑一致）。"""
+    if not path:
+        return False
+    if path.startswith('\\\\') or path.startswith('//'):
+        return True
+    if 'onedrive' in path.replace('\\', '/').lower():
+        return True
+    try:
+        import ctypes
+        drive = os.path.splitdrive(path)[0]
+        if drive and ctypes.windll.kernel32.GetDriveTypeW(drive + '\\') == 4:  # DRIVE_REMOTE
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _preload_overlay_icons(directory_path):
     """Force-load overlay icons into the system image list by calling
     SHGetFileInfo(SHGFI_OVERLAYINDEX) on files in the given directory.
@@ -4002,6 +4021,10 @@ def _preload_overlay_icons(directory_path):
     The overlay INDEX comes from the cross-process shell cache (populated
     by explorer.exe), so TortoiseOverlays' IsMemberOf doesn't need to work.
     """
+    # 慢盘（网络/OneDrive）上 SHGetFileInfo+scandir 是同步阻塞调用，导航前预加载会卡 UI；
+    # 跳过即可，overlay 仍由导航完成后 600ms 的 IShellView::Refresh() 兜底渲染。
+    if _path_is_slow_for_shell(directory_path):
+        return
     try:
         import ctypes
         import ctypes.wintypes
