@@ -5479,6 +5479,7 @@ class FileExplorerTab(QWidget):
         self.status_bar.mousePressEvent = self._status_bar_mouse_press
         self.status_bar.mouseMoveEvent = self._status_bar_mouse_move
         self.status_bar.mouseReleaseEvent = self._status_bar_mouse_release
+        self.status_bar.mouseDoubleClickEvent = self._status_bar_mouse_double_click
         # 右侧资源占用标签（CPU/内存），默认隐藏，可在设置中开启
         self.resource_label = QLabel("")
         self.resource_label.setFixedHeight(20)
@@ -5486,6 +5487,7 @@ class FileExplorerTab(QWidget):
         self.resource_label.setStyleSheet(
             "QLabel { padding: 2px 10px; background: white; border-top: 1px solid #e0e0e0; font-size: 12px; }"
         )
+        self.resource_label.mouseDoubleClickEvent = self._status_bar_mouse_double_click
         self.resource_label.hide()
         status_row = QHBoxLayout()
         status_row.setContentsMargins(0, 0, 0, 0)
@@ -6910,6 +6912,34 @@ class FileExplorerTab(QWidget):
         """结束状态栏拖动。"""
         self._status_drag_pos = None
         QLabel.mouseReleaseEvent(self.status_bar, event)
+
+    def _status_bar_mouse_double_click(self, event):
+        """双击底部状态栏：手动触发一次“缩放式”重排刷新，兜底修复路径栏偶发卡死。"""
+        if event.button() != Qt.LeftButton:
+            QLabel.mouseDoubleClickEvent(self.status_bar, event)
+            return
+        try:
+            mw = getattr(self, 'main_window', None)
+            if mw and hasattr(mw, '_manual_statusbar_reflow_refresh'):
+                mw._manual_statusbar_reflow_refresh()
+            else:
+                self._manual_pathbar_rebuild()
+            event.accept()
+        except Exception as e:
+            debug_print(f"[StatusBar] manual reflow refresh failed: {e}")
+            QLabel.mouseDoubleClickEvent(self.status_bar, event)
+
+    def _manual_pathbar_rebuild(self):
+        """仅重建当前标签路径栏（MainWindow 不可用时的兜底）。"""
+        pb = getattr(self, 'path_bar', None)
+        current_path = getattr(self, 'current_path', '')
+        if pb and current_path and not getattr(pb, '_in_edit', False):
+            pb._last_built_path = ''
+            pb.set_path(current_path)
+            try:
+                pb._force_relayout(reason="statusbar_manual")
+            except Exception:
+                pass
 
     # 移除 on_document_complete 和 eventFilter 相关内容
 
@@ -11880,6 +11910,29 @@ class MainWindow(QMainWindow):
                         pass
         except Exception as e:
             debug_print(f"[Reactivate] failed: {e}")
+
+    def _manual_statusbar_reflow_refresh(self):
+        """底部状态栏双击触发：模拟一次 resize 级别的 UI 重排，并重新武装当前标签刷新。
+
+        这个入口用于手动兜底“路径栏偶发不更新，但手动调整窗口大小后恢复”的情况。
+        它不做导航，只强制当前标签路径栏重建、重排布局，并用 1px 临时 resize 触发 Qt/
+        shell 宿主的几何刷新；最大化状态下不改窗口大小，只做布局刷新。
+        """
+        try:
+            self._reactivate_current_tab_refresh(rebuild_pathbar=True)
+            tab = self.get_current_tab_widget()
+            if tab and hasattr(tab, '_manual_pathbar_rebuild'):
+                tab._manual_pathbar_rebuild()
+
+            self.updateGeometry()
+            self.update()
+            if not self.isMaximized() and not self.isMinimized():
+                old_size = self.size()
+                self.resize(old_size.width() + 1, old_size.height())
+                QTimer.singleShot(0, lambda s=old_size: self.resize(s))
+            debug_print("[StatusBar] Manual reflow refresh triggered")
+        except Exception as e:
+            debug_print(f"[StatusBar] manual reflow failed: {e}")
     
     def setup_shortcuts(self):
         """设置全局快捷键（现在使用轮询方式，不再使用QShortcut）"""
