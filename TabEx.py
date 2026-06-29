@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.54"
+APP_VERSION = "3.55"
 
 
 # TabEx i18n module
@@ -5014,13 +5014,16 @@ class FileExplorerTab(QWidget):
             if hasattr(self, '_keepalive_sync_timer') and self._keepalive_sync_timer:
                 self._keepalive_sync_timer.stop()
             return
-        # 窗口最小化时跳过COM轮询：用户无法在内嵌shell视图中导航，
+        # 窗口最小化或失去前台焦点时跳过COM轮询：用户无法在内嵌shell视图中导航，
         # 持续读取 LocationURL 只会触发后台 shell worker 线程 churn（见 runtime_health.log）。
-        # 仅在确定最小化时跳过；定时器继续运行，恢复窗口后自动重新轮询，无需重启逻辑。
+        # 定时器继续运行（成本仅两次属性判断），窗口恢复/重新激活时由
+        # MainWindow._reactivate_current_tab_refresh 兜底重armed，无需重启逻辑。
         mw = getattr(self, 'main_window', None)
         if mw is not None:
             try:
                 if mw.windowState() & Qt.WindowMinimized:
+                    return
+                if not mw.isActiveWindow():
                     return
             except Exception:
                 pass

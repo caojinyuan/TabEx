@@ -1,4 +1,4 @@
-start "" pythonw.exe TabEx.py
+start "" pythonw.exe -OO TabEx.py
 exit
 
 
