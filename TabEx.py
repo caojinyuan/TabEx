@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.56"
+APP_VERSION = "3.57"
 
 
 # TabEx i18n module
@@ -208,6 +208,9 @@ _LANG_EN = {
     "设置从路径栏拷贝时使用的分隔符": "Separator used when copying from path bar",
     "Explorer监听设置": "Explorer Monitor",
     "监听新Explorer窗口": "Monitor New Explorer Windows",
+    "状态栏显示 CPU/内存占用": "Show CPU/Memory in Status Bar",
+    "内存": "Mem",
+    "在状态栏右侧实时显示本程序的 CPU 与内存占用，每2秒刷新": "Show this app's CPU and memory on the right of the status bar, refreshed every 2s",
     "监听间隔（秒）:": "Monitor Interval (s):",
     "检查新Explorer窗口的时间间隔，更长的间隔降低CPU占用": "Interval for checking new Explorer windows; longer = less CPU",
     "（推荐: 2.0秒）": "(Recommended: 2.0s)",
@@ -2518,6 +2521,56 @@ def get_process_memory_usage_mb():
     except Exception:
         return None
     return None
+
+
+# CPU 占用率采样状态（进程 CPU 时间 / 挂钟时间 增量法，无 psutil 依赖）
+_cpu_last_proc_time = None
+_cpu_last_wall_time = None
+_cpu_logical_count = os.cpu_count() or 1
+
+
+def get_process_cpu_percent():
+    """返回本进程自上次调用以来的平均 CPU 占用率（0~100，按逻辑核归一）。
+    Windows 用 GetProcessTimes 取内核+用户时间增量除以挂钟增量；非 Windows 返回 None。"""
+    global _cpu_last_proc_time, _cpu_last_wall_time
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [('dwLowDateTime', wintypes.DWORD), ('dwHighDateTime', wintypes.DWORD)]
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.POINTER(FILETIME),
+                                             ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
+                                             ctypes.POINTER(FILETIME)]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        creation = FILETIME(); exitt = FILETIME(); kern = FILETIME(); user = FILETIME()
+        if not kernel32.GetProcessTimes(kernel32.GetCurrentProcess(),
+                                        ctypes.byref(creation), ctypes.byref(exitt),
+                                        ctypes.byref(kern), ctypes.byref(user)):
+            return None
+        proc_100ns = ((kern.dwHighDateTime << 32) | kern.dwLowDateTime) + \
+                     ((user.dwHighDateTime << 32) | user.dwLowDateTime)
+        now = time.monotonic()
+        if _cpu_last_proc_time is None:
+            _cpu_last_proc_time = proc_100ns
+            _cpu_last_wall_time = now
+            return None
+        wall_delta = now - _cpu_last_wall_time
+        proc_delta = (proc_100ns - _cpu_last_proc_time) / 1e7  # 100ns -> seconds
+        _cpu_last_proc_time = proc_100ns
+        _cpu_last_wall_time = now
+        if wall_delta <= 0:
+            return None
+        pct = (proc_delta / wall_delta) * 100.0 / _cpu_logical_count
+        return max(0.0, min(100.0, pct))
+    except Exception:
+        return None
+
 
 
 # 启动外部进程时与当前进程解耦，避免主程序退出时连带关闭子进程
@@ -5293,7 +5346,21 @@ class FileExplorerTab(QWidget):
         self.status_bar.mousePressEvent = self._status_bar_mouse_press
         self.status_bar.mouseMoveEvent = self._status_bar_mouse_move
         self.status_bar.mouseReleaseEvent = self._status_bar_mouse_release
-        layout.addWidget(self.status_bar)
+        # 右侧资源占用标签（CPU/内存），默认隐藏，可在设置中开启
+        self.resource_label = QLabel("")
+        self.resource_label.setFixedHeight(20)
+        self.resource_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.resource_label.setStyleSheet(
+            "QLabel { padding: 2px 10px; background: white; border-top: 1px solid #e0e0e0; font-size: 12px; color: #666; }"
+        )
+        self.resource_label.hide()
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(0)
+        status_row.addWidget(self.status_bar, 1)
+        status_row.addWidget(self.resource_label, 0)
+        layout.addLayout(status_row)
+
         
         # 异步加载相关
         self.folder_checker = None  # 文件夹大小检查线程
@@ -10442,6 +10509,9 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
             
+            # 切换标签后立即把资源占用刷到新活动标签的标签上（若功能开启）
+            self._update_resource_usage_display()
+
             # 从 content_stack 获取实际的标签页内容
             tab = self.content_stack.widget(index) if hasattr(self, 'content_stack') else self.tab_widget.widget(index)
             if hasattr(tab, 'current_path'):
@@ -12509,6 +12579,12 @@ class MainWindow(QMainWindow):
         self._housekeeping_timer = QTimer(self)
         self._housekeeping_timer.timeout.connect(self._run_housekeeping)
         self._housekeeping_timer.start(self._get_housekeeping_interval_ms())
+
+        # 状态栏右侧 CPU/内存占用显示（默认关闭，可在设置中开启）
+        self._resource_usage_timer = QTimer(self)
+        self._resource_usage_timer.timeout.connect(self._update_resource_usage_display)
+        self.apply_resource_usage_config()
+
         
         # 性能优化：延迟加载非关键功能（100ms后加载）
         QTimer.singleShot(100, self._delayed_initialization)
@@ -12571,6 +12647,7 @@ class MainWindow(QMainWindow):
             "explorer_monitor_debug": False,  # 默认关闭Explorer Monitor调试输出
             "resource_snapshot_logging": False,  # 默认关闭运行资源快照日志
             "resource_snapshot_interval_ms": HOUSEKEEPING_INTERVAL_MS,
+            "show_resource_usage_in_statusbar": False,  # 默认关闭状态栏右侧 CPU/内存占用显示
             "pinned_tabs": [],  # 默认没有固定标签页
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
@@ -12912,6 +12989,42 @@ class MainWindow(QMainWindow):
                 f"[Housekeeping] dialogs={removed_dialogs} toasts={removed_toasts}"
                 f" gc={gc_collected} dummy_threads_cleaned={dummy_cleaned}"
             )
+
+    def apply_resource_usage_config(self):
+        """根据配置开启/关闭状态栏右侧 CPU/内存占用显示。"""
+        timer = getattr(self, '_resource_usage_timer', None)
+        if timer is None:
+            return
+        enabled = self.config.get("show_resource_usage_in_statusbar", False)
+        if enabled:
+            if not timer.isActive():
+                timer.start(2000)  # 每2秒刷新一次，足够直观又低开销
+            self._update_resource_usage_display()
+        else:
+            if timer.isActive():
+                timer.stop()
+            # 隐藏所有标签上的资源标签
+            for i in range(self.tab_widget.count()):
+                tab = self.get_tab_widget(i)
+                lbl = getattr(tab, 'resource_label', None) if tab else None
+                if lbl:
+                    lbl.hide()
+                    lbl.setText("")
+
+    def _update_resource_usage_display(self):
+        """计算 CPU/内存占用并显示到当前活动标签的资源标签上（仅活动标签可见）。"""
+        if not self.config.get("show_resource_usage_in_statusbar", False):
+            return
+        cpu = get_process_cpu_percent()
+        mem = get_process_memory_usage_mb()
+        cpu_txt = f"CPU {cpu:.0f}%" if cpu is not None else "CPU --"
+        mem_txt = (tr("内存") + f" {mem:.0f} MB") if mem is not None else ""
+        text = f"{cpu_txt}   {mem_txt}".strip()
+        tab = self.get_current_tab_widget()
+        lbl = getattr(tab, 'resource_label', None) if tab else None
+        if lbl:
+            lbl.setText(text)
+            lbl.show()
 
     def _restore_last_active_tab(self):
         last_active_path = self.config.get("last_active_tab_path", "")
@@ -13970,6 +14083,7 @@ class MainWindow(QMainWindow):
             '_session_snapshot_debounce_timer',
             '_session_snapshot_timer',
             '_housekeeping_timer',
+            '_resource_usage_timer',
             '_config_save_timer',
         ):
             timer = getattr(self, timer_name, None)
@@ -14400,6 +14514,12 @@ class SettingsDialog(QDialog):
         self.monitor_cb.setChecked(config.get("enable_explorer_monitor", True))
         self.monitor_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         monitor_layout.addWidget(self.monitor_cb)
+        # 状态栏右侧 CPU/内存占用显示
+        self.resource_usage_cb = QCheckBox(tr("状态栏显示 CPU/内存占用"), self)
+        self.resource_usage_cb.setChecked(config.get("show_resource_usage_in_statusbar", False))
+        self.resource_usage_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.resource_usage_cb.setToolTip(tr("在状态栏右侧实时显示本程序的 CPU 与内存占用，每2秒刷新"))
+        monitor_layout.addWidget(self.resource_usage_cb)
         # 监听间隔设置
         interval_layout = QHBoxLayout()
         interval_layout.addWidget(QLabel(tr("监听间隔（秒）:")))
@@ -14949,6 +15069,7 @@ class SettingsDialog(QDialog):
             self.parent().config["explorer_monitor_debug"] = self.explorer_monitor_debug_cb.isChecked()
             self.parent().config["resource_snapshot_logging"] = self.resource_snapshot_logging_cb.isChecked()
             self.parent().config["resource_snapshot_interval_ms"] = self.resource_snapshot_interval_spin.value() * 60 * 1000
+            self.parent().config["show_resource_usage_in_statusbar"] = self.resource_usage_cb.isChecked()
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
             self.parent().config["preferred_terminal_tool"] = normalize_terminal_tool_name(self.preferred_terminal_combo.currentData())
@@ -14986,6 +15107,8 @@ class SettingsDialog(QDialog):
             set_explorer_monitor_debug(self.parent().config.get("explorer_monitor_debug", False))
             if hasattr(self.parent(), '_housekeeping_timer') and self.parent()._housekeeping_timer:
                 self.parent()._housekeeping_timer.start(self.parent()._get_housekeeping_interval_ms())
+            if hasattr(self.parent(), 'apply_resource_usage_config'):
+                self.parent().apply_resource_usage_config()
             self.parent().apply_tortoisegit_buttons_config()
             # 重新设置快捷键
             self.parent().setup_shortcuts()
