@@ -5071,15 +5071,14 @@ class FileExplorerTab(QWidget):
                 self._keepalive_sync_timer.stop()
             return
         # 窗口最小化或失去前台焦点时跳过COM轮询：用户无法在内嵌shell视图中导航，
+        # 窗口最小化时跳过COM轮询：用户无法在内嵌shell视图中导航，
         # 持续读取 LocationURL 只会触发后台 shell worker 线程 churn（见 runtime_health.log）。
-        # 定时器继续运行（成本仅两次属性判断），窗口恢复/重新激活时由
-        # MainWindow._reactivate_current_tab_refresh 兜底重armed，无需重启逻辑。
+        # 注意：不要用 isActiveWindow() 判断——内嵌 IExplorerBrowser/QAx 控件经常抢占焦点，
+        # 主窗口虽在前台却报告非激活，会导致路径同步永久休眠、地址栏冻结需手动 resize 才恢复。
         mw = getattr(self, 'main_window', None)
         if mw is not None:
             try:
                 if mw.windowState() & Qt.WindowMinimized:
-                    return
-                if not mw.isActiveWindow():
                     return
             except Exception:
                 pass
