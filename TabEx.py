@@ -730,6 +730,7 @@ SHORTCUT_POLL_INACTIVE_MS = 500  # 主窗口非激活时快捷键轮询频率
 COM_POLL_SLOW_MS = 180        # 单次 LocationURL 调用超过此耗时即判定系统高负载
 COM_POLL_STRESS_BACKOFF_MS = 3000  # 高负载期间将 COM 轮询间隔退避到此值，给 UI 线程喘息
 COM_POLL_MIN_GAP_MS = 50      # 挂钟防抖：两次实际轮询的最小真实间隔，吸收卡顿后的爆发触发
+COM_POLL_HARD_DEADLINE_MS = 250  # [spike] QAx LocationURL 看门狗硬超时：超时即放弃读取并用缓存值
 SEARCH_RESULT_TYPE_COL_WIDTH = 90
 SEARCH_RESULT_DATE_COL_WIDTH = 155
 SEARCH_RESULT_SIZE_COL_WIDTH = 100
@@ -4971,15 +4972,44 @@ class FileExplorerTab(QWidget):
 
         返回读取到的 URL；若本次调用耗时超过 COM_POLL_SLOW_MS，则设置高负载退避截止
         时间戳 self._com_stress_until，供轮询函数据此拉长间隔，打断 CPU 高时的死亡螺旋。
-        """
+
+        [spike/async-com] 对真正跨进程的旧 QAx Shell.Explorer 控件，改用带硬超时的
+        看门狗读取：调用挂死时 UI 线程最多阻塞 COM_POLL_HARD_DEADLINE_MS 即放弃并返回
+        上次已知 URL，彻底根治“无超时同步 COM 卡死 UI”。IExplorerBrowser 的 LocationURL
+        是进程内缓存值（快），直接在 UI 线程读取。"""
+        # IEB 缓存值：进程内、零阻塞，直接读
+        if isinstance(self.explorer, IExplorerBrowserWidget):
+            return self.explorer.property('LocationURL')
+        # 旧 QAx：跨进程 COM，加看门狗硬超时
         start = time.perf_counter()
-        url = self.explorer.property('LocationURL')
+        url = self._read_qax_location_with_watchdog()
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         if elapsed_ms >= COM_POLL_SLOW_MS:
             self._com_stress_until = time.monotonic() + (COM_POLL_STRESS_BACKOFF_MS / 1000.0)
             debug_print(f"[PathSync] Slow LocationURL read {elapsed_ms:.0f}ms -> backoff "
                         f"{COM_POLL_STRESS_BACKOFF_MS}ms")
+        if url:
+            self._last_location_url = url
         return url
+
+    def _read_qax_location_with_watchdog(self):
+        """带硬超时的 QAx LocationURL 读取：超时则返回上次缓存值，避免阻塞 UI。"""
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FTimeout
+        ex = getattr(self, '_com_executor', None)
+        if ex is None:
+            ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix='com-loc')
+            self._com_executor = ex
+        try:
+            fut = ex.submit(self.explorer.property, 'LocationURL')
+            return fut.result(timeout=COM_POLL_HARD_DEADLINE_MS / 1000.0)
+        except _FTimeout:
+            self._com_stress_until = time.monotonic() + (COM_POLL_STRESS_BACKOFF_MS / 1000.0)
+            debug_print(f"[PathSync] LocationURL watchdog timeout -> using cached, backoff")
+            return getattr(self, '_last_location_url', '')
+        except Exception as e:
+            debug_print(f"[PathSync] watchdog read error: {e}")
+            return getattr(self, '_last_location_url', '')
+
 
     def _com_under_stress(self):
         """当前是否处于 COM 高负载退避窗口内。"""
@@ -6908,6 +6938,15 @@ class FileExplorerTab(QWidget):
                 pass
 
         self._release_folder_checker(wait_ms=150)
+
+        # [spike/async-com] 关闭 LocationURL 看门狗线程池
+        ex = getattr(self, '_com_executor', None)
+        if ex is not None:
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self._com_executor = None
 
         explorer = getattr(self, 'explorer', None)
         if explorer:
