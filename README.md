@@ -40,6 +40,9 @@
 
 ## 🆕 最近更新
 
+### v3.56-spike (2026-06-29) — 实验分支 spike/async-com，未合入 main
+- **实验：旧 QAx 路径读取看门狗硬超时**：仅回退到 Shell.Explorer 时生效，`LocationURL` 跨进程读取改在单 worker 线程（STA CoInitialize）上执行，250ms 硬超时即放弃并用缓存路径，UI 线程永不阻塞；IExplorerBrowser 仍走缓存值，不受影响。仅供长稳验证，验稳后再合 main
+
 ### v3.55 (2026-06-29)
 - **性能：失焦/最小化时停止 COM 轮询**：保活路径轮询现在仅在主窗口为前台活动窗口时读取 `LocationURL`，切到其他程序/最小化后彻底休眠，减少后台 shell 工作线程 churn；恢复焦点时由“激活自愈”自动重新轮询
 - **启动：使用 `-OO` 优化运行**：`1_TabEx.bat` 改为 `pythonw -OO`，去掉文档字符串/断言开销（默认关闭调试输出，生产运行更轻）
