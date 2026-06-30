@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.56-spike"
+APP_VERSION = "3.58"
 
 
 # TabEx i18n module
@@ -721,9 +721,9 @@ APP_INTERNAL_CHANGE_FILENAMES = {
 LARGE_FOLDER_THRESHOLD = 1000  # 超过此数量文件视为大文件夹
 FOLDER_CHECK_TIMEOUT = 500  # 文件夹检查超时时间(ms)
 ASYNC_LOAD_ENABLED = True  # 是否启用异步加载
-# 状态栏目录计数缓存（避免高频 os.scandir）
-DIR_ENTRY_COUNT_CACHE_TTL_MS = 5000  # 状态栏目录计数缓存时间（提升到5秒，减少频繁os.scandir）
-STATUS_SELECTION_CACHE_TTL_MS = 400  # 选中项状态缓存，降低频繁 COM/文件属性查询
+# 兜底轮询快照逐项 stat 的上限：超大目录每 8s 在 UI 线程逐项 stat 会造成周期性卡顿，
+# 超过此上限后停止逐项统计，改用“总项目数 + 目录自身 mtime”兜底检测增删/重命名。
+DIR_SNAPSHOT_MAX_ENTRIES = 5000
 STATUS_SELECTION_METADATA_LIMIT = 20  # 多选超过阈值时跳过逐项大小统计
 SHORTCUT_POLL_ACTIVE_MS = 160  # 主窗口激活时快捷键轮询频率
 SHORTCUT_POLL_INACTIVE_MS = 500  # 主窗口非激活时快捷键轮询频率
@@ -733,7 +733,7 @@ SHORTCUT_POLL_INACTIVE_MS = 500  # 主窗口非激活时快捷键轮询频率
 COM_POLL_SLOW_MS = 180        # 单次 LocationURL 调用超过此耗时即判定系统高负载
 COM_POLL_STRESS_BACKOFF_MS = 3000  # 高负载期间将 COM 轮询间隔退避到此值，给 UI 线程喘息
 COM_POLL_MIN_GAP_MS = 50      # 挂钟防抖：两次实际轮询的最小真实间隔，吸收卡顿后的爆发触发
-COM_POLL_HARD_DEADLINE_MS = 250  # [spike] QAx LocationURL 看门狗硬超时：超时即放弃读取并用缓存值
+COM_POLL_HARD_DEADLINE_MS = 250  # QAx LocationURL 看门狗硬超时：超时即放弃读取并用缓存值
 # 状态栏资源占用颜色预警阈值（百分比）：低于 WARN 绿色，WARN~CRIT 橙色，>=CRIT 红色
 RESOURCE_WARN_PERCENT = 75
 RESOURCE_CRIT_PERCENT = 90
@@ -3275,7 +3275,10 @@ class SimplePathBar(QWidget):
     def set_path(self, path):
         new_path = path or ''
         path_changed = (new_path != self._current_path)
-        debug_print(f"[SimplePathBar] set_path: new='{new_path}', old='{self._current_path}', changed={path_changed}, in_edit={self._in_edit}, stack_idx={self._stack.currentIndex()}, crumb_count={self._crumb_row.count()}")
+        # 热路径：set_path 每次导航都调用；该诊断 f-string 含两个控件方法调用，
+        # 仅在调试模式下构造，避免生产运行时每次导航的无谓开销。
+        if _DEBUG_MODE:
+            debug_print(f"[SimplePathBar] set_path: new='{new_path}', old='{self._current_path}', changed={path_changed}, in_edit={self._in_edit}, stack_idx={self._stack.currentIndex()}, crumb_count={self._crumb_row.count()}")
         self._current_path = new_path
         if self._in_edit:
             if path_changed:
@@ -4786,19 +4789,39 @@ class FileExplorerTab(QWidget):
             latest_mtime_ns = 0
             size_sum = 0
             name_hash = 0
+            truncated = False
+            ignore_check = self._should_ignore_internal_dir_entry
             with os.scandir(path) as entries:
                 for entry in entries:
-                    if self._should_ignore_internal_dir_entry(path, entry.name):
+                    if ignore_check(path, entry.name):
                         continue
                     count += 1
+                    if count > DIR_SNAPSHOT_MAX_ENTRIES:
+                        # 超大目录：停止逐项 stat，避免 UI 线程每 8s 周期性卡顿。
+                        # 仍继续累计总数，配合目录自身 mtime 兜底检测增删/重命名。
+                        truncated = True
+                        continue
                     try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
                         stat = entry.stat(follow_symlinks=False)
-                        latest_mtime_ns = max(latest_mtime_ns, getattr(stat, 'st_mtime_ns', int(stat.st_mtime * 1_000_000_000)))
-                        if not entry.is_dir(follow_symlinks=False):
+                        mtime_ns = getattr(stat, 'st_mtime_ns', None)
+                        if mtime_ns is None:
+                            mtime_ns = int(stat.st_mtime * 1_000_000_000)
+                        if mtime_ns > latest_mtime_ns:
+                            latest_mtime_ns = mtime_ns
+                        if not is_dir:
                             size_sum += getattr(stat, 'st_size', 0)
-                        name_hash ^= hash((entry.name, entry.is_dir(follow_symlinks=False)))
+                        name_hash ^= hash((entry.name, is_dir))
                     except Exception:
                         continue
+            if truncated:
+                # 折叠目录自身 mtime，保证超出上限部分的增删/重命名仍能触发刷新
+                try:
+                    dir_mtime_ns = os.stat(path).st_mtime_ns
+                    if dir_mtime_ns > latest_mtime_ns:
+                        latest_mtime_ns = dir_mtime_ns
+                except Exception:
+                    pass
             return (count, latest_mtime_ns, size_sum, name_hash)
         except Exception:
             return None
@@ -4819,12 +4842,6 @@ class FileExplorerTab(QWidget):
         except Exception:
             return False
         return False
-
-    def _invalidate_entry_count_cache(self, path=None):
-        """失效目录总项目数缓存。"""
-        cache_path = self._entry_count_cache.get('path')
-        if path is None or (cache_path and os.path.normcase(cache_path) == os.path.normcase(path)):
-            self._entry_count_cache = {'path': None, 'count': None, 'ts_ms': 0}
 
     def _refresh_file_watch_paths(self, path):
         """同步当前目录下的文件 watcher，提升对文件内容修改的检测能力。"""
@@ -4975,7 +4992,6 @@ class FileExplorerTab(QWidget):
             debug_print(f"[FileWatcher] File changed: {path}")
             current_dir = getattr(self, 'current_path', '')
             if current_dir and os.path.normcase(os.path.dirname(path)) == os.path.normcase(current_dir):
-                self._invalidate_entry_count_cache(current_dir)
                 if not getattr(self, '_refresh_active', True):
                     self._request_refresh(reason="file_changed")
                     debug_print(f"[FileWatcher] Background tab file changed, marked dirty: {path}")
@@ -5103,7 +5119,7 @@ class FileExplorerTab(QWidget):
         返回读取到的 URL；若本次调用耗时超过 COM_POLL_SLOW_MS，则设置高负载退避截止
         时间戳 self._com_stress_until，供轮询函数据此拉长间隔，打断 CPU 高时的死亡螺旋。
 
-        [spike/async-com] 对真正跨进程的旧 QAx Shell.Explorer 控件，改用带硬超时的
+        对真正跨进程的旧 QAx Shell.Explorer 控件，改用带硬超时的
         看门狗读取：调用挂死时 UI 线程最多阻塞 COM_POLL_HARD_DEADLINE_MS 即放弃并返回
         上次已知 URL，彻底根治“无超时同步 COM 卡死 UI”。IExplorerBrowser 的 LocationURL
         是进程内缓存值（快），直接在 UI 线程读取。"""
@@ -5125,7 +5141,7 @@ class FileExplorerTab(QWidget):
     def _read_qax_location_with_watchdog(self):
         """带硬超时的 QAx LocationURL 读取：超时则返回上次缓存值，避免阻塞 UI。
 
-        [spike] 看门狗线程读取跨进程 COM 属性前先 CoInitialize（STA），避免在未初始化
+        看门狗线程读取跨进程 COM 属性前先 CoInitialize（STA），避免在未初始化
         COM 的工作线程上调用导致失败；同时用 _com_inflight 抑制重叠提交，避免超时后旧任务
         仍占用单 worker 造成 future 堆积。"""
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FTimeout
@@ -5384,12 +5400,8 @@ class FileExplorerTab(QWidget):
         except Exception as e:
             debug_print(f"[PathSync] ERROR resuming timer: {e}")
 
-    def _invalidate_selection_cache(self):
-        self._selection_cache = {'path': None, 'entries': None, 'ts_ms': 0}
-
     def _schedule_status_update(self, delay_ms=STATUS_UPDATE_DEFER_MS, track_selection=False):
         if track_selection:
-            self._invalidate_selection_cache()
             self._start_status_tracking()
         if delay_ms <= 0:
             if self.status_update_timer.isActive():
@@ -5411,7 +5423,6 @@ class FileExplorerTab(QWidget):
             self.status_tracking_timer.stop()
 
     def _poll_status_during_interaction(self):
-        self._invalidate_selection_cache()
         self.update_explorer_status()
         now_ms = int(time.time() * 1000)
         if now_ms >= int(getattr(self, '_status_tracking_deadline_ms', 0) or 0):
@@ -7039,8 +7050,6 @@ class FileExplorerTab(QWidget):
         # Refresh()（完整重导航）立即清掉刚设置的选中项，导致“跳转选中总是失败”。
         # 注意：仅抑制自动刷新，不影响路径同步（回车进入子目录仍能更新地址栏）。
         self._selection_guard_until = 0.0
-        self._entry_count_cache = {'path': None, 'count': None, 'ts_ms': 0}
-        self._selection_cache = {'path': None, 'entries': None, 'ts_ms': 0}
         self._status_tracking_deadline_ms = 0
         self.status_update_timer = QTimer(self)
         self.status_update_timer.setSingleShot(True)
@@ -7138,7 +7147,7 @@ class FileExplorerTab(QWidget):
 
         self._release_folder_checker(wait_ms=150)
 
-        # [spike/async-com] 关闭 LocationURL 看门狗线程池
+        # 关闭 LocationURL 看门狗线程池
         ex = getattr(self, '_com_executor', None)
         if ex is not None:
             try:
@@ -7171,8 +7180,6 @@ class FileExplorerTab(QWidget):
         self._last_watcher_event.clear()
         self._last_file_event.clear()
         self._last_dir_snapshot = None
-        self._selection_cache = {'path': None, 'entries': None, 'ts_ms': 0}
-        self._entry_count_cache = {'path': None, 'count': None, 'ts_ms': 0}
 
     def closeEvent(self, event):
         self.cleanup()
@@ -7564,7 +7571,6 @@ class FileExplorerTab(QWidget):
         """文件系统监控：目录内容发生变化（带防抖+风暴检测）"""
         import time, os
         current_time = time.time() * 1000  # 转为毫秒
-        self._invalidate_entry_count_cache(path)
         # 目录已不存在，强制移除watcher，防止事件风暴
         if not os.path.exists(path):
             debug_print(f"[FileWatcher] Directory not exist, remove watcher: {path}")
@@ -7834,6 +7840,11 @@ class FileExplorerTab(QWidget):
         return [entry.get('path') for entry in entries if entry and entry.get('path')]
 
     def _get_single_selected_path(self):
+        # 先用廉价的计数（单次 COM Count）短路：仅在恪好选中 1 项时才逐项枚举，
+        # 避免大目录 Ctrl+A 后右键时对成千上万项做 COM Item()+isfile 的无谓枚举。
+        cnt = self._get_selected_count_safe()
+        if cnt is not None and cnt != 1:
+            return None
         paths = self._get_selected_paths()
         if len(paths) == 1:
             return paths[0]
@@ -7940,91 +7951,6 @@ class FileExplorerTab(QWidget):
         menu.exec_(global_pos)
         return True
 
-    def _get_selection_entries_cached(self):
-        """短TTL缓存选中项，减少状态栏高频轮询时的 COM 与磁盘查询。"""
-        try:
-            now_ms = int(time.time() * 1000)
-            path = getattr(self, 'current_path', None)
-            cache = getattr(self, '_selection_cache', None)
-            if cache and cache.get('entries') is not None:
-                if (
-                    cache.get('path')
-                    and path
-                    and os.path.normcase(cache.get('path')) == os.path.normcase(path)
-                    and now_ms - int(cache.get('ts_ms', 0)) < STATUS_SELECTION_CACHE_TTL_MS
-                ):
-                    return cache.get('entries')
-
-            entries = self._get_selection_entries()
-            self._selection_cache = {
-                'path': path,
-                'entries': entries,
-                'ts_ms': now_ms,
-            }
-            return entries
-        except Exception:
-            return self._get_selection_entries()
-
-    def _count_dir_entries(self, path):
-        """计算目录下的项目数"""
-        try:
-            if self._is_slow_path(path):
-                return None
-            now_ms = int(time.time() * 1000)
-            cache_path = self._entry_count_cache.get('path')
-            cache_count = self._entry_count_cache.get('count')
-            cache_ts = self._entry_count_cache.get('ts_ms', 0)
-            if (
-                cache_count is not None
-                and cache_path
-                and os.path.normcase(cache_path) == os.path.normcase(path)
-                and now_ms - cache_ts < DIR_ENTRY_COUNT_CACHE_TTL_MS
-            ):
-                return cache_count
-
-            with os.scandir(path) as it:
-                count = sum(1 for _ in it)
-
-            self._entry_count_cache = {
-                'path': path,
-                'count': count,
-                'ts_ms': now_ms,
-            }
-            return count
-        except Exception:
-            return None
-
-    def _format_size(self, size):
-        """格式化文件大小"""
-        try:
-            units = ['B', 'KB', 'MB', 'GB', 'TB']
-            s = float(size)
-            idx = 0
-            while s >= 1024 and idx < len(units) - 1:
-                s /= 1024
-                idx += 1
-            if idx == 0:
-                return f"{int(s)} {units[idx]}"
-            return f"{s:.2f} {units[idx]}"
-        except Exception:
-            return "-"
-
-    def _get_mtime(self, path):
-        """获取文件/文件夹修改时间字符串"""
-        try:
-            ts = os.path.getmtime(path)
-            return self._format_mtime(ts)
-        except Exception:
-            return None
-
-    def _format_mtime(self, ts):
-        try:
-            import datetime
-            dt = datetime.datetime.fromtimestamp(ts)
-            return dt.strftime('%Y-%m-%d %H:%M')
-        except Exception:
-            return None
-    
     def select_file_in_explorer(self, filename, retries=6, delay_ms=250):
         """在Explorer控件中选中当前目录下指定的文件或文件夹。"""
         try:
