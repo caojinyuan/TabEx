@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.59"
+APP_VERSION = "3.60"
 
 
 # TabEx i18n module
@@ -3377,6 +3377,11 @@ class SimplePathBar(QWidget):
             # 路径已被新的 set_path 取代，放弃本轮（新一轮 heal 会接管）
             if self._last_built_path != self._current_path:
                 return
+            # 隐藏/后台标签的路径栏永远不可见，heal 判定恒为不健康且会空转烧 CPU；
+            # 直接放弃本轮并停止重试，等它首次变为可见时 _rebuild 会以真实宽度重建
+            # （见 _last_build_was_hidden）。这是分屏多标签下“卡顿+CPU 高”的主因修复。
+            if not self._is_fully_visible_for_build():
+                return
             btn = self._first_crumb_button()
             if btn is None:
                 return
@@ -3466,8 +3471,10 @@ class SimplePathBar(QWidget):
         QTimer.singleShot(0, lambda: self._force_relayout(reason="deferred"))
         # 自愈：上面两次重排若发生在容器尚未获得有效宽度时（标签切换/隐藏态/布局竞态）
         # 会落空，表现为“切换目录后路径栏不刷新、点击无响应，必须缩放窗口才恢复”。
-        # 这里启动带退避的校验循环，等容器获得有效宽度后再次强制重排，直到按钮几何非0。
-        self._schedule_heal()
+        # 仅当路径栏当前真正可见时才启动 heal 自愈循环；隐藏的后台标签无需自愈，
+        # 避免多标签/分屏下大量后台路径栏空转 heal 导致卡顿与 CPU 飙高。
+        if self._is_fully_visible_for_build():
+            self._schedule_heal()
 
     def _create_crumb_button(self, label, full_path, is_current=False):
         btn = QPushButton(self._elide_crumb_text(label, is_current=is_current))
@@ -5069,19 +5076,31 @@ class FileExplorerTab(QWidget):
             
             title = pin_prefix + display
             debug_print(f"DEBUG update_tab_title: path={path}, is_pinned={is_pinned}, pin_prefix='{pin_prefix}', title='{title}'")
-            if self.main_window and hasattr(self.main_window, 'tab_widget'):
-                # 因为 tab_widget 只包含占位符，需要在 content_stack 中查找索引
+            mw = self.main_window
+            if mw and hasattr(mw, 'tab_widget'):
+                # 定位该标签所属的组（左侧主组或右侧分屏组），只更新其所在标签栏
+                target_tw = None
                 idx = -1
-                if hasattr(self.main_window, 'content_stack'):
-                    idx = self.main_window.content_stack.indexOf(self)
-                else:
-                    idx = self.main_window.tab_widget.indexOf(self)
-                
+                if hasattr(mw, '_all_groups'):
+                    for cand_tw, cand_cs in mw._all_groups():
+                        if cand_cs is not None:
+                            j = cand_cs.indexOf(self)
+                            if j != -1:
+                                target_tw, idx = cand_tw, j
+                                break
+                if target_tw is None:
+                    # 回退：默认左侧主组（因 tab_widget 只含占位符，需在 content_stack 中查找索引）
+                    target_tw = mw.tab_widget
+                    if hasattr(mw, 'content_stack'):
+                        idx = mw.content_stack.indexOf(self)
+                    else:
+                        idx = mw.tab_widget.indexOf(self)
+
                 if idx != -1:
-                    self.main_window.tab_widget.setTabText(idx, title)
+                    target_tw.setTabText(idx, title)
                     debug_print(f"DEBUG: Set tab {idx} text to '{title}'")
-                    if hasattr(self.main_window, '_schedule_session_snapshot'):
-                        self.main_window._schedule_session_snapshot()
+                    if hasattr(mw, '_schedule_session_snapshot'):
+                        mw._schedule_session_snapshot()
 
     def start_path_sync_timer(self, duration_ms=2000):
         """启动路径同步定时器，duration_ms 后自动停止（按需触发，减少持续COM调用）"""
@@ -5655,11 +5674,19 @@ class FileExplorerTab(QWidget):
                             show_toast(self, tr("已打开"), tr("控制面板已在新窗口打开"), level="info", duration=2000)
                         except Exception as ex:
                             show_toast(self, tr("错误"), tr("无法打开控制面板: {}").format(ex), level="error")
-                        # 关闭当前标签页
-                        if self.main_window and hasattr(self.main_window, 'tab_widget'):
-                            idx = self.main_window.tab_widget.indexOf(self)
+                        # 关闭当前标签页（定位其所属标签组，左右分屏均可）
+                        mw = self.main_window
+                        if mw and hasattr(mw, '_all_groups'):
+                            for cand_tw, cand_cs in mw._all_groups():
+                                if cand_cs is not None:
+                                    j = cand_cs.indexOf(self)
+                                    if j != -1:
+                                        mw.close_tab(j, target_tabwidget=cand_tw)
+                                        break
+                        elif mw and hasattr(mw, 'tab_widget'):
+                            idx = mw.tab_widget.indexOf(self)
                             if idx != -1:
-                                self.main_window.close_tab(idx)
+                                mw.close_tab(idx)
                         return True
                     if url.startswith('file:///'):
                         from urllib.parse import unquote
@@ -7015,12 +7042,15 @@ class FileExplorerTab(QWidget):
         except Exception:
             return path
 
-    def __init__(self, parent=None, path="", is_shell=False, select_file=None):
+    def __init__(self, parent=None, path="", is_shell=False, select_file=None, defer_nav=False):
         super().__init__(parent)
         self.main_window = parent
         initial_path = path if path else QDir.homePath()
         self.current_path = self._normalize_local_path(initial_path)
         self.select_file = select_file  # 要选中的文件名
+        # 延迟首次导航：会话恢复时后台标签用此模式，避免启动瞬间 N 个 IExplorerBrowser
+        # 同时创建 COM/导航/overlay 预加载/scandir 造成的 CPU 洪峰。首次可见（showEvent）时才导航。
+        self._deferred_nav = None  # (path, is_shell) 待首次可见时执行；None 表示无待处理导航
         self.notepad_plus_plus_path = detect_notepad_plus_plus()
         # 浏览历史记录
         self.history = []
@@ -7085,7 +7115,19 @@ class FileExplorerTab(QWidget):
         if hasattr(self, 'explorer'):
             self.explorer.installEventFilter(self)
         
-        self.navigate_to(self.current_path, is_shell=is_shell)
+        if defer_nav:
+            # 延迟首次导航：仅在路径栏显示占位路径，暂存导航参数；
+            # 不创建 IExplorerBrowser、不导航、不 scandir、不 overlay 预加载，
+            # 直到该标签首次可见（showEvent）时才真正导航。
+            self._deferred_nav = (self.current_path, is_shell)
+            if hasattr(self, 'path_bar') and self.path_bar:
+                try:
+                    self.path_bar.set_path(self.current_path)
+                except Exception:
+                    pass
+            self.update_tab_title()
+        else:
+            self.navigate_to(self.current_path, is_shell=is_shell)
         # 路径同步定时器已在setup_ui中启动，这里不需要重复启动
         
         # 如果指定了要选中的文件，延迟选中（等待导航完成）
@@ -7229,11 +7271,26 @@ class FileExplorerTab(QWidget):
             debug_print(f"[get_selected_filenames] Error: {e}")
         return filenames
 
+    def showEvent(self, event):
+        """标签首次可见时消费延迟导航：真正创建 IExplorerBrowser 并导航。
+
+        会话恢复时后台标签以 defer_nav 模式创建（不导航），切换过去首次可见即在此导航，
+        从而把 N 个 Shell 视图的创建/导航分摊到用户实际访问时，消除启动 CPU 洪峰。"""
+        super().showEvent(event)
+        deferred = getattr(self, '_deferred_nav', None)
+        if deferred is not None:
+            self._deferred_nav = None
+            path, is_shell = deferred
+            debug_print(f"[navigate_to] Deferred first navigation on show: '{path}' (is_shell={is_shell})")
+            try:
+                self.navigate_to(path, is_shell=is_shell)
+            except Exception as e:
+                debug_print(f"[navigate_to] Deferred navigation failed: {e}")
+
     def navigate_to(self, path, is_shell=False, add_to_history=True, skip_async_check=False):
         if not is_shell:
             path = self._normalize_local_path(path)
         debug_print(f"[navigate_to] To '{path}' (is_shell={is_shell}, skip_async={skip_async_check})")
-
         # 控制面板及其子目录用原生窗口打开，不嵌入
         if self._is_control_panel_path(path):
             try:
@@ -8176,20 +8233,20 @@ class DragDropTabWidget(QTabWidget):
             debug_print(f"[DEBUG] Clicked tab index: {clicked_tab}")
             
             if clicked_tab == -1:
-                # 空白区域，打开新标签页
+                # 空白区域，打开新标签页（归属本标签组，左右分屏各自独立）
                 if self.main_window and hasattr(self.main_window, 'add_new_tab'):
                     debug_print(f"[DEBUG] Opening new tab from TabBar blank area...")
-                    self.main_window.add_new_tab()
+                    self.main_window.add_new_tab(target_tabwidget=self)
                     return
         else:
             # 不在 TabBar 内，检查是否在标签页头部区域（TabBar 右侧的空白）
             # 获取 TabWidget 的 TabBar 所在的区域高度
             if event.pos().y() < tabbar.height():
                 debug_print(f"[DEBUG] Click is in tab header area but outside TabBar")
-                # 这是标签头和按钮之间的空白区域，打开新标签页
+                # 这是标签头和按钮之间的空白区域，打开新标签页（归属本标签组）
                 if self.main_window and hasattr(self.main_window, 'add_new_tab'):
                     debug_print(f"[DEBUG] Opening new tab from header blank area...")
-                    self.main_window.add_new_tab()
+                    self.main_window.add_new_tab(target_tabwidget=self)
                     return
         
         super().mouseDoubleClickEvent(event)
@@ -8233,10 +8290,10 @@ class DragDropTabWidget(QTabWidget):
                         if self.main_window and hasattr(self.main_window, 'add_new_tab'):
                             self.main_window.add_new_tab(path, target_tabwidget=self)
                     elif os.path.isfile(path):
-                        # 如果是文件，打开其所在文件夹
+                        # 如果是文件，打开其所在文件夹（归属本标签组）
                         folder = os.path.dirname(path)
                         if self.main_window and hasattr(self.main_window, 'add_new_tab'):
-                            self.main_window.add_new_tab(folder)
+                            self.main_window.add_new_tab(folder, target_tabwidget=self)
             event.acceptProposedAction()
         else:
             event.ignore()
@@ -8294,11 +8351,21 @@ class CustomTabBar(QTabBar):
         self.owner_tabwidget = None  # 所属标签组的 QTabWidget（左侧或右侧分屏组）
         self.hovered_tab = -1  # 当前鼠标悬停的标签页索引
         self.setMouseTracking(True)  # 启用鼠标追踪
-        self.setMovable(True)  # 启用标签页拖拽排序
-        # 连接标签移动信号
+        # 自行处理拖拽（组内重排 + 跨组转移），不用原生 setMovable：
+        # 原生拖拽会把被拖标签夹在标签栏自身右边缘，拖出本栏时“卡在右侧看不到”，
+        # 且无法给跨组拖拽提供清晰的落点预览。手动实现可全程显示跟随光标的浮动预览。
+        self.setMovable(False)
+        # 连接标签移动信号（手动 moveTab 仍会触发 tabMoved → on_tab_moved 同步内容栈）
         self.tabMoved.connect(self.on_tab_moved)
         # 拖拽期间抑制重型 on_tab_changed 操作
         self._is_dragging_tab = False
+        # 拖拽状态：内容面板(对象身份)、标题、起始索引、按下位置、是否已进入拖拽、浮动预览
+        self._press_content = None
+        self._press_title = ""
+        self._press_index = -1
+        self._press_pos = None
+        self._dragging = False
+        self._drag_preview = None
         from PyQt5.QtCore import QTimer
         self._drag_end_timer = QTimer(self)
         self._drag_end_timer.setSingleShot(True)
@@ -8321,11 +8388,149 @@ class CustomTabBar(QTabBar):
             idx = tw.currentIndex() if tw is not None else -1
             self.main_window._on_group_tab_changed(tw, idx)
 
+    def mousePressEvent(self, event):
+        # 记录拖拽起点：内容面板(对象身份)、标题、索引、按下位置；供组内重排与跨组转移使用
+        self._press_content = None
+        self._press_title = ""
+        self._press_index = -1
+        self._press_pos = None
+        self._dragging = False
+        try:
+            if event.button() == Qt.LeftButton and self.main_window is not None:
+                # 点击本组任一标签即把该组设为活动面板：即使不切换标签，右上角按钮/终端/
+                # TortoiseGit 等也能作用于用户正在操作的这一侧，而非总是左侧。
+                if hasattr(self.main_window, 'set_active_pane_to_group'):
+                    try:
+                        self.main_window.set_active_pane_to_group(self._owner_tw())
+                    except Exception:
+                        pass
+                idx = self.tabAt(event.pos())
+                if idx >= 0:
+                    cs = self.main_window._content_stack_for(self._owner_tw())
+                    if cs is not None and idx < cs.count():
+                        self._press_content = cs.widget(idx)
+                        self._press_title = self.tabText(idx)
+                        self._press_index = idx
+                        self._press_pos = event.pos()
+        except Exception:
+            self._press_content = None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # 悬停追踪：更新鼠标下的标签索引（供关闭按钮显示等）
+        self.hovered_tab = self.tabAt(event.pos())
+        # 拖拽判定：左键按住并移动超过阈值 → 进入拖拽，显示跟随光标的浮动预览
+        if (self._press_index >= 0 and (event.buttons() & Qt.LeftButton)
+                and self._press_pos is not None):
+            if not self._dragging:
+                try:
+                    from PyQt5.QtWidgets import QApplication
+                    threshold = QApplication.startDragDistance()
+                except Exception:
+                    threshold = 6
+                if (event.pos() - self._press_pos).manhattanLength() >= threshold:
+                    self._dragging = True
+                    self._is_dragging_tab = True
+                    if self.main_window is not None:
+                        self.main_window._tab_drag_in_progress = True
+            if self._dragging:
+                self._update_drag_preview(event.globalPos())
+        super().mouseMoveEvent(event)
+
+    def _update_drag_preview(self, gpos):
+        """拖拽中显示跟随光标的浮动预览（标签标题气泡），并按目标组区分提示样式。"""
+        dest_tw = None
+        try:
+            if self.main_window is not None and hasattr(self.main_window, '_pane_group_hit_test'):
+                dest_tw, _idx = self.main_window._pane_group_hit_test(gpos)
+        except Exception:
+            dest_tw = None
+        prev = getattr(self, '_drag_preview', None)
+        if prev is None:
+            from PyQt5.QtWidgets import QLabel
+            prev = QLabel(None)
+            prev.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint)
+            prev.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            prev.setAttribute(Qt.WA_ShowWithoutActivating, True)
+            self._drag_preview = prev
+        cross = (dest_tw is not None and dest_tw is not self._owner_tw())
+        border = "#4a90d9" if cross else "#b0b0b0"
+        title = getattr(self, '_press_title', '') or tr("标签页")
+        prefix = "\u21a6 " if cross else ""  # ↦ 表示将转移到另一组
+        prev.setStyleSheet(
+            f"QLabel {{ background: #ffffff; border: 1px solid {border};"
+            f" border-radius: 4px; padding: 4px 10px; color: #202020; font-size: 12px; }}"
+        )
+        prev.setText(prefix + title)
+        prev.adjustSize()
+        prev.move(int(gpos.x()) + 14, int(gpos.y()) + 14)
+        if not prev.isVisible():
+            prev.show()
+        prev.raise_()
+
+    def _hide_drag_preview(self):
+        prev = getattr(self, '_drag_preview', None)
+        if prev is not None and prev.isVisible():
+            prev.hide()
+
     def mouseReleaseEvent(self, event):
+        was_dragging = self._dragging
+        press_content = self._press_content
+        press_index = self._press_index
+        self._press_content = None
+        self._press_index = -1
+        self._press_pos = None
+        self._dragging = False
+        self._hide_drag_preview()
         super().mouseReleaseEvent(event)
-        # 鼠标释放时启动去抖计时器完成最终更新
-        if self._is_dragging_tab:
-            self._drag_end_timer.start(150)
+
+        if not was_dragging or press_content is None or event.button() != Qt.LeftButton:
+            # 普通点击（未触发拖拽）：清理拖拽标志即可
+            if self._is_dragging_tab:
+                self._is_dragging_tab = False
+                if self.main_window is not None:
+                    self.main_window._tab_drag_in_progress = False
+            return
+
+        # 确定落点目标组与插入位置
+        dest_tw, dest_index = None, -1
+        try:
+            if self.main_window is not None and hasattr(self.main_window, '_pane_group_hit_test'):
+                dest_tw, dest_index = self.main_window._pane_group_hit_test(event.globalPos())
+        except Exception:
+            dest_tw, dest_index = None, -1
+        owner = self._owner_tw()
+        moved = False
+        if dest_tw is not None and dest_tw is not owner:
+            # 跨组转移
+            try:
+                moved = self.main_window.move_tab_across_groups(
+                    owner, press_content, dest_tw, dest_index)
+            except Exception as _e:
+                debug_print(f"[CrossGroupDrag] transfer failed: {_e}")
+        elif dest_tw is owner:
+            # 组内重排：按光标位置计算目标索引，move 到该位置（tabMoved → on_tab_moved 同步内容栈）
+            try:
+                target = self.tabAt(self.mapFromGlobal(event.globalPos()))
+                if target < 0:
+                    target = self.count() - 1
+                if 0 <= press_index < self.count() and target != press_index:
+                    self.moveTab(press_index, target)
+                    moved = True
+            except Exception as _e:
+                debug_print(f"[TabReorder] failed: {_e}")
+        # dest_tw 为 None（释放在任何标签组之外，如标题栏）→ 视为取消，不移动
+
+        # 结束拖拽：恢复正常刷新状态
+        self._is_dragging_tab = False
+        if self.main_window is not None:
+            self.main_window._tab_drag_in_progress = False
+        if not moved:
+            # 未发生移动：补一次当前组的 tab_changed，恢复正常刷新
+            try:
+                self.main_window._on_group_tab_changed(owner, owner.currentIndex())
+            except Exception:
+                pass
     
     def event(self, event):
         # 拦截所有事件，确保双击事件能被处理
@@ -8364,12 +8569,6 @@ class CustomTabBar(QTabBar):
         
         # 如果点击在标签页上，调用默认行为
         super().mouseDoubleClickEvent(event)
-    
-    def mouseMoveEvent(self, event):
-        """追踪鼠标位置，更新悬停的标签页"""
-        tab_index = self.tabAt(event.pos())
-        self.hovered_tab = tab_index
-        super().mouseMoveEvent(event)
     
     def leaveEvent(self, event):
         """鼠标离开标签栏"""
@@ -10256,6 +10455,110 @@ class MainWindow(QMainWindow):
         _tw, cs, _is_right = self._resolve_group(target_tabwidget)
         return cs
 
+    def _all_groups(self):
+        """返回当前存在的所有标签组 (tab_widget, content_stack) 列表（左侧主组 + 右侧分屏组）。"""
+        groups = [(self.tab_widget, self.content_stack)]
+        stw = getattr(self, 'split_tab_widget', None)
+        scs = getattr(self, 'split_content_stack', None)
+        if stw is not None and scs is not None:
+            groups.append((stw, scs))
+        return groups
+
+    def _pane_group_hit_test(self, gpos):
+        """判断全局坐标 gpos 落在哪个标签组，用于跨组拖拽落点。
+
+        以各组内容区(content_stack)的水平范围界定归属：命中内容区 → (tab_widget, -1) 追加；
+        命中内容区正上方的标签栏/书签栏行 → (tab_widget, 插入索引)。分屏激活时右侧组优先，
+        未命中 → (None, None)。用内容区宽度界定标签栏归属，不依赖窄窄的 tabBar 实际宽度，命中更宽松。"""
+        from PyQt5.QtCore import QPoint, QRect
+        groups = []
+        if getattr(self, '_split_active', False):
+            stw = getattr(self, 'split_tab_widget', None)
+            scs = getattr(self, 'split_content_stack', None)
+            if stw is not None and scs is not None:
+                groups.append((stw, scs))
+        groups.append((self.tab_widget, self.content_stack))
+        for tw, cs in groups:
+            try:
+                if cs is None or not cs.isVisible():
+                    continue
+                cs_tl = cs.mapToGlobal(QPoint(0, 0))
+                cs_rect = QRect(cs_tl, cs.size())
+                # 内容区：追加到末尾
+                if cs_rect.contains(gpos):
+                    return tw, -1
+                # 内容区正上方（标签栏/书签栏行）：按该组内容的水平范围归属，使拖放命中更容易
+                if cs_rect.left() <= gpos.x() <= cs_rect.right() and gpos.y() < cs_rect.top():
+                    bar = tw.tabBar() if tw is not None else None
+                    insert_idx = bar.tabAt(bar.mapFromGlobal(gpos)) if bar is not None else -1
+                    return tw, insert_idx
+            except Exception:
+                continue
+        return None, None
+
+    def move_tab_across_groups(self, source_tabwidget, content_widget, dest_tabwidget, dest_index):
+        """把一个标签（连同其嵌入内容/历史/状态）从源标签组转移到目标标签组。
+
+        content_widget 为被拖拽标签对应的 FileExplorerTab（以对象身份定位，避免索引漂移）。
+        保持“固定标签在前”不变量；左侧主组不允许被拖空；右侧组拖空后自动收起分屏。
+        返回 True 表示已成功转移。"""
+        if content_widget is None:
+            return False
+        src_tw, src_cs, src_is_right = self._resolve_group(source_tabwidget)
+        dst_tw, dst_cs, dst_is_right = self._resolve_group(dest_tabwidget)
+        if src_tw is dst_tw or src_cs is None or dst_cs is None:
+            return False
+        src_index = src_cs.indexOf(content_widget)
+        if src_index < 0:
+            return False
+        # 左侧主组必须至少保留一个标签页
+        if not src_is_right and src_tw.count() <= 1:
+            show_toast(self, tr("拖拽标签"), tr("左侧至少需要保留一个标签页。"), level="warning", duration=2000)
+            return False
+        # 跨组转移是一次明确的最终操作，清除拖拽中标志，确保两组标签切换处理完整执行
+        self._tab_drag_in_progress = False
+        title = src_tw.tabText(src_index)
+        is_pinned = getattr(content_widget, 'is_pinned', False)
+        # 计算目标插入位置，并保持“固定标签在前”不变量
+        dst_count = dst_tw.count()
+        if dest_index is None or dest_index < 0 or dest_index > dst_count:
+            dest_index = dst_count
+        pinned_count = 0
+        for i in range(dst_count):
+            w = dst_cs.widget(i)
+            if getattr(w, 'is_pinned', False):
+                pinned_count += 1
+        if is_pinned:
+            dest_index = min(dest_index, pinned_count)
+        else:
+            dest_index = max(dest_index, pinned_count)
+        # 从源组移除（先内容栈后标签栏，保持索引同步）
+        src_cs.removeWidget(content_widget)
+        src_tw.removeTab(src_index)
+        # 插入到目标组（占位标签 + 实际内容，索引保持同步）
+        dst_cs.insertWidget(dest_index, content_widget)
+        dst_tw.insertTab(dest_index, QWidget(), title)
+        dst_tw.setCurrentIndex(dest_index)
+        try:
+            content_widget.update_tab_title()
+        except Exception:
+            pass
+        try:
+            content_widget.set_refresh_active(True)
+        except Exception:
+            pass
+        self._active_pane = content_widget
+        # 源为右侧分屏组且已被拖空 → 收起分屏，回到单组
+        if src_is_right and src_tw.count() == 0:
+            self._teardown_split_group()
+        try:
+            self.update_navigation_buttons()
+        except Exception:
+            pass
+        self.save_pinned_tabs()
+        self._schedule_session_snapshot()
+        return True
+
     def _on_group_tab_changed(self, target_tabwidget, index):
         """将标签切换分派到对应组的处理函数（左侧 on_tab_changed / 右侧 _on_split_tab_changed）。"""
         if target_tabwidget is not None and target_tabwidget is getattr(self, 'split_tab_widget', None):
@@ -10300,6 +10603,25 @@ class MainWindow(QMainWindow):
                 self.update_navigation_buttons()
             except Exception:
                 pass
+
+    def set_active_pane_to_group(self, target_tabwidget):
+        """把“活动面板”显式设为指定标签组的当前面板。
+
+        点击某一组的标签栏（即使未切换标签、不改变索引）也能可靠地把该组设为活动，
+        使右上角按钮/终端/TortoiseGit 等作用于用户正在操作的一侧，而非总是左侧。"""
+        try:
+            if target_tabwidget is not None and target_tabwidget is getattr(self, 'split_tab_widget', None):
+                p = self._get_split_pane()
+            else:
+                p = self.get_current_tab_widget()
+            if p is not None and p is not getattr(self, '_active_pane', None):
+                self._active_pane = p
+                try:
+                    self.update_navigation_buttons()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def get_active_pane(self):
         """返回当前操作应作用的浏览面板：最近交互的面板（含分屏），默认当前标签。
@@ -10383,20 +10705,20 @@ class MainWindow(QMainWindow):
             self.forward_button.setEnabled(False)
     
     def open_tortoisegit_log_current_tab(self):
-        """打开当前标签页的 TortoiseGit 日志"""
-        current_tab = self.get_current_tab_widget()
+        """打开当前标签页的 TortoiseGit 日志（作用于活动面板，分屏时跟随最近交互的一侧）"""
+        current_tab = self.get_active_pane()
         if current_tab and hasattr(current_tab, 'open_tortoisegit_log'):
             current_tab.open_tortoisegit_log()
     
     def open_tortoisegit_commit_current_tab(self):
-        """打开当前标签页的 TortoiseGit 提交窗口"""
-        current_tab = self.get_current_tab_widget()
+        """打开当前标签页的 TortoiseGit 提交窗口（作用于活动面板，分屏时跟随最近交互的一侧）"""
+        current_tab = self.get_active_pane()
         if current_tab and hasattr(current_tab, 'open_tortoisegit_commit'):
             current_tab.open_tortoisegit_commit()
 
     def _get_current_tab_launch_dir(self):
-        """获取适合外部终端启动的当前标签页目录。"""
-        current_tab = self.get_current_tab_widget()
+        """获取适合外部终端启动的当前标签页目录（作用于活动面板，分屏时跟随最近交互的一侧）。"""
+        current_tab = self.get_active_pane()
         current_path = getattr(current_tab, 'current_path', '') if current_tab else ''
 
         if not current_path:
@@ -10593,19 +10915,27 @@ class MainWindow(QMainWindow):
             self._enter_split_view()
 
     def _on_split_tab_changed(self, index):
-        """右侧标签组当前项变化：同步右侧内容栈、设为活动面板并保持刷新。"""
+        """右侧标签组当前项变化：同步右侧内容栈，仅当前标签保持刷新，其余暂停以避免卡顿。"""
         scs = getattr(self, 'split_content_stack', None)
         if scs is None:
             return
         if 0 <= index < scs.count():
             scs.setCurrentIndex(index)
-            content = scs.widget(index)
-            if content is not None:
-                self._active_pane = content
+        # 拖拽重排期间仅同步显示，跳过重型刷新切换（与左侧 on_tab_changed 一致）
+        if getattr(self, '_tab_drag_in_progress', False):
+            return
+        # 仅右侧当前可见标签保持高频刷新；其余右侧后台标签暂停轮询，
+        # 避免多次切换后累积多个活跃面板导致 COM/scandir 高频轮询卡顿
+        for i in range(scs.count()):
+            tab_item = scs.widget(i)
+            if tab_item and hasattr(tab_item, 'set_refresh_active'):
                 try:
-                    content.set_refresh_active(True)
+                    tab_item.set_refresh_active(i == index)
                 except Exception:
                     pass
+        content = scs.widget(index) if 0 <= index < scs.count() else None
+        if content is not None:
+            self._active_pane = content
         try:
             self.update_navigation_buttons()
         except Exception:
@@ -10634,10 +10964,40 @@ class MainWindow(QMainWindow):
             return
         try:
             w = scs.width()
-            if w > 0:
+            # 仅在宽度变化时才 setFixedWidth，避免拖动分隔条时高频触发布局重算导致卡顿
+            if w > 0 and stw.maximumWidth() != w:
                 stw.setFixedWidth(w)
         except Exception:
             pass
+
+    def _activate_split_layout(self):
+        """显示右侧分屏组的 UI 布局（加入分割器、显示、设置尺寸与折叠属性）。
+
+        供“进入分屏”与“启动/崩溃恢复”共用，只负责布局，不涉及具体标签内容。"""
+        if self.splitter.indexOf(self.split_content_stack) < 0:
+            self.splitter.insertWidget(1, self.split_content_stack)
+        self.split_content_stack.setVisible(True)
+        self.split_tab_widget.setVisible(True)
+        self._split_active = True
+        # 分屏后：左侧内容(0)、右侧内容(1) 不可折叠，AI 面板(2) 可折叠
+        try:
+            self.splitter.setCollapsible(0, False)
+            self.splitter.setCollapsible(1, False)
+            self.splitter.setCollapsible(2, True)
+        except Exception:
+            pass
+        # 左右各半，保留 AI 面板宽度
+        try:
+            chat_w = self.chat_panel.width() if (hasattr(self, 'chat_panel') and self.chat_panel.isVisible()) else 0
+            total = max(self.splitter.width() - chat_w, 200)
+            half = max(total // 2, 100)
+            self.splitter.setSizes([half, half, chat_w])
+        except Exception:
+            pass
+        from PyQt5.QtCore import QTimer as _QTimer
+        _QTimer.singleShot(0, self._sync_split_tabbar_width)
+        if hasattr(self, 'split_view_btn'):
+            self.split_view_btn.setChecked(True)
 
     def _enter_split_view(self):
         """把当前标签从左侧标签组移动到右侧标签组（含其嵌入内容、历史与状态）。"""
@@ -10661,40 +11021,19 @@ class MainWindow(QMainWindow):
         # 从左侧分离（先 content_stack 再 tab_widget，保持索引同步）
         self.content_stack.removeWidget(content)
         self.tab_widget.removeTab(idx)
-        # 把右侧内容栈加入主分割器（索引 1，位于左侧内容与 AI 面板之间）
-        if self.splitter.indexOf(self.split_content_stack) < 0:
-            self.splitter.insertWidget(1, self.split_content_stack)
-        self.split_content_stack.setVisible(True)
-        self.split_tab_widget.setVisible(True)
+        # 显示右侧分屏 UI 布局（加入分割器并设置尺寸）
+        self._activate_split_layout()
         # 放入右侧标签组（占位标签 + 实际内容，索引保持同步）
         self.split_content_stack.addWidget(content)
         new_idx = self.split_tab_widget.addTab(QWidget(), title)
         self.split_tab_widget.setCurrentIndex(new_idx)
-        self._split_active = True
-        # 分屏后：左侧内容(0)、右侧内容(1) 不可折叠，AI 面板(2) 可折叠
-        try:
-            self.splitter.setCollapsible(0, False)
-            self.splitter.setCollapsible(1, False)
-            self.splitter.setCollapsible(2, True)
-        except Exception:
-            pass
         try:
             content.set_refresh_active(True)
         except Exception:
             pass
         self._active_pane = content
-        # 左右各半，保留 AI 面板宽度
-        try:
-            chat_w = self.chat_panel.width() if (hasattr(self, 'chat_panel') and self.chat_panel.isVisible()) else 0
-            total = max(self.splitter.width() - chat_w, 200)
-            half = max(total // 2, 100)
-            self.splitter.setSizes([half, half, chat_w])
-        except Exception:
-            pass
-        from PyQt5.QtCore import QTimer as _QTimer
-        _QTimer.singleShot(0, self._sync_split_tabbar_width)
-        if hasattr(self, 'split_view_btn'):
-            self.split_view_btn.setChecked(True)
+        # 持久化分屏状态，确保重启/崩溃后可恢复
+        self._schedule_session_snapshot()
         show_toast(self, tr("分屏对比"), tr("已将当前标签移到右侧。再次按 F3 合并回左侧。"), level="info", duration=2000)
 
     def _merge_split_back(self):
@@ -10717,6 +11056,8 @@ class MainWindow(QMainWindow):
         if last_idx >= 0:
             self.tab_widget.setCurrentIndex(last_idx)
         self._teardown_split_group()
+        # 合并回左侧后持久化，清除已保存的分屏状态
+        self._schedule_session_snapshot()
 
     def _teardown_split_group(self):
         """收起右侧标签组：隐藏其标签栏与内容栈，从分割器移除并恢复单组布局。"""
@@ -10788,7 +11129,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     @pyqtSlot(str)
     @pyqtSlot(str, bool)
-    def add_new_tab(self, path="", is_shell=False, select_file=None, target_tabwidget=None):
+    def add_new_tab(self, path="", is_shell=False, select_file=None, target_tabwidget=None, activate=True):
         # 默认新建标签页为“此电脑”
         if not path:
             path = 'shell:MyComputerFolder'
@@ -10797,7 +11138,10 @@ class MainWindow(QMainWindow):
         tab_widget, content_stack, _is_right = self._resolve_group(target_tabwidget)
 
         try:
-            tab = FileExplorerTab(self, path, is_shell=is_shell, select_file=select_file)
+            # activate=False（会话恢复用）：延迟首次导航到该标签首次可见时，避免启动瞬间
+            # 大量 IExplorerBrowser 同时创建/导航导致的 CPU 洪峰。
+            tab = FileExplorerTab(self, path, is_shell=is_shell, select_file=select_file,
+                                  defer_nav=(not activate))
         except Exception as e:
             debug_print(f"[MainWindow] Failed to create embedded explorer tab for '{path}': {e}")
             try:
@@ -10814,8 +11158,10 @@ class MainWindow(QMainWindow):
         tab_index = tab_widget.addTab(QWidget(), short)
         content_stack.addWidget(tab)
         
-        tab_widget.setCurrentIndex(tab_index)
-        
+        # activate=True：切到该标签（触发 showEvent → 首次导航）。
+        # activate=False：不激活，标签保持隐藏，其导航延迟到用户首次切过去（懒加载）。
+        if activate:
+            tab_widget.setCurrentIndex(tab_index)
         
         # 更新导航按钮状态（确保新标签页的按钮状态正确）
         self.update_navigation_buttons()
@@ -10970,55 +11316,8 @@ class MainWindow(QMainWindow):
             self.update_chat_context()
             self._schedule_session_snapshot()
         
-        # 更新所有标签页的字体：选中的加粗，未选中的正常
-        from PyQt5.QtGui import QFont
-        for i in range(self.tab_widget.count()):
-            font = QFont()
-            if i == index:
-                # 选中的标签页：加粗
-                font.setBold(True)
-            else:
-                # 未选中的标签页：正常
-                font.setBold(False)
-            self.tab_widget.tabBar().setTabTextColor(i, self.tab_widget.tabBar().tabTextColor(i))  # 保持颜色不变
-            # 设置字体
-            tab_bar = self.tab_widget.tabBar()
-            # 通过样式表设置字体粗细
-            if i == index:
-                # 当前标签加粗
-                current_text = self.tab_widget.tabText(i)
-                self.tab_widget.setTabText(i, current_text)  # 触发重绘
-            
-        # 使用样式表设置选中标签的字体加粗（保持与初始样式一致）
-        self.tab_widget.tabBar().setStyleSheet("""
-            QTabBar::tab {
-                border: 1px solid #b0b0b0;
-                border-bottom: none;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                padding: 2px 4px;
-                height: 24px;
-                width: 120px;
-                min-width: 120px;
-                max-width: 120px;
-                font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial, sans-serif;
-                font-size: 12px;
-                margin-top: 2px;
-                text-align: center;
-            }
-            QTabBar::tab:selected {
-                background: #FFF9CC;
-                border: 1px solid #999;
-                border-bottom: none;
-                margin-top: 0px;
-                padding-top: 3px;
-            }
-            QTabBar::tab:!selected {
-                font-weight: normal;
-            }
-        """)
-        # 设置标签文本省略模式 - 左边省略，保留右侧文件/文件夹名称
-        self.tab_widget.tabBar().setElideMode(Qt.ElideLeft)
+        # 选中/非选中标签样式统一由创建时的共享样式表控制（左右两组一致，淡黄色选中）。
+        # 此处不再每次切换重设左侧样式，避免与右侧分屏组样式分叉，并省去每次切换的重绘开销。
 
 
     def dragEnterEvent(self, event):
@@ -12820,21 +13119,22 @@ class MainWindow(QMainWindow):
         self.config["search_history"] = self.search_history
         self.save_config()
 
-    def tab_context_menu(self, pos):
-        tab_index = self.tab_widget.tabBar().tabAt(pos)
+    def tab_context_menu(self, pos, target_tabwidget=None):
+        tw, cs, is_right = self._resolve_group(target_tabwidget)
+        tab_index = tw.tabBar().tabAt(pos)
         if tab_index < 0:
             return
-        tab = self.get_tab_widget(tab_index)
+        tab = cs.widget(tab_index) if cs is not None else None
         is_pinned = hasattr(tab, 'is_pinned') and tab.is_pinned
         menu = QMenu()
         # 图标可用emoji或标准QIcon
         if is_pinned:
             pin_action = QAction(tr("🔨 取消固定"), self)
-            pin_action.triggered.connect(lambda: self.unpin_tab(tab_index))
+            pin_action.triggered.connect(lambda: self.unpin_tab(tab_index, tw))
             menu.addAction(pin_action)
         else:
             pin_action = QAction(tr("📌 固定"), self)
-            pin_action.triggered.connect(lambda: self.pin_tab(tab_index))
+            pin_action.triggered.connect(lambda: self.pin_tab(tab_index, tw))
             menu.addAction(pin_action)
 
         # 添加“添加书签”菜单项，使用书签emoji
@@ -12845,16 +13145,17 @@ class MainWindow(QMainWindow):
         if hasattr(tab, 'set_auto_refresh_frozen'):
             if tab.is_auto_refresh_frozen():
                 refresh_action = QAction(tr("▶ 恢复自动刷新"), self)
-                refresh_action.triggered.connect(lambda: self.toggle_tab_auto_refresh(tab_index, False))
+                refresh_action.triggered.connect(lambda: self.toggle_tab_auto_refresh(tab_index, False, tw))
             else:
                 refresh_action = QAction(tr("⏸ 冻结自动刷新"), self)
-                refresh_action.triggered.connect(lambda: self.toggle_tab_auto_refresh(tab_index, True))
+                refresh_action.triggered.connect(lambda: self.toggle_tab_auto_refresh(tab_index, True, tw))
             menu.addAction(refresh_action)
 
-        menu.exec_(self.tab_widget.tabBar().mapToGlobal(pos))
+        menu.exec_(tw.tabBar().mapToGlobal(pos))
 
-    def toggle_tab_auto_refresh(self, tab_index, frozen):
-        tab = self.get_tab_widget(tab_index)
+    def toggle_tab_auto_refresh(self, tab_index, frozen, target_tabwidget=None):
+        _tw, cs, _is_right = self._resolve_group(target_tabwidget)
+        tab = cs.widget(tab_index) if cs is not None else None
         if not tab or not hasattr(tab, 'set_auto_refresh_frozen'):
             return
         is_frozen = tab.set_auto_refresh_frozen(frozen)
@@ -12907,62 +13208,71 @@ class MainWindow(QMainWindow):
         else:
             show_toast(self, tr("添加失败"), tr("未能添加书签，请检查父文件夹。"), level="warning")
 
-    def pin_tab(self, tab_index):
-        tab = self.get_tab_widget(tab_index)
+    def pin_tab(self, tab_index, target_tabwidget=None):
+        tw, cs, _is_right = self._resolve_group(target_tabwidget)
+        tab = cs.widget(tab_index) if cs is not None else None
+        if tab is None:
+            return
         tab.is_pinned = True
-        # 重新排序：所有固定的在最左侧
-        self.sort_tabs_by_pinned()
+        # 重新排序：所有固定的在最左侧（仅作用于该标签组）
+        self.sort_tabs_by_pinned(tw)
         self.save_pinned_tabs()
 
-    def unpin_tab(self, tab_index):
-        tab = self.get_tab_widget(tab_index)
+    def unpin_tab(self, tab_index, target_tabwidget=None):
+        tw, cs, _is_right = self._resolve_group(target_tabwidget)
+        tab = cs.widget(tab_index) if cs is not None else None
+        if tab is None:
+            return
         tab.is_pinned = False
-        self.sort_tabs_by_pinned()
+        self.sort_tabs_by_pinned(tw)
         self.save_pinned_tabs()
 
-    def sort_tabs_by_pinned(self):
+    def sort_tabs_by_pinned(self, target_tabwidget=None):
+        tw, cs, _is_right = self._resolve_group(target_tabwidget)
+        if cs is None:
+            return
         pinned = []
         unpinned = []
         # 记录当前tab对象
-        current_index = self.tab_widget.currentIndex()
-        current_tab = self.get_tab_widget(current_index) if current_index >= 0 else None
-        for i in range(self.tab_widget.count()):
-            tab = self.get_tab_widget(i)
+        current_index = tw.currentIndex()
+        current_tab = cs.widget(current_index) if current_index >= 0 else None
+        for i in range(tw.count()):
+            tab = cs.widget(i)
             if hasattr(tab, 'is_pinned') and tab.is_pinned:
                 pinned.append(tab)
             else:
                 unpinned.append(tab)
-        self.tab_widget.clear()
-        if hasattr(self, 'content_stack'):
-            # 清空 content_stack
-            while self.content_stack.count() > 0:
-                widget = self.content_stack.widget(0)
-                self.content_stack.removeWidget(widget)
+        tw.clear()
+        # 清空该组 content_stack
+        while cs.count() > 0:
+            widget = cs.widget(0)
+            cs.removeWidget(widget)
         new_tabs = pinned + unpinned
         for tab in new_tabs:
             # 先添加标签页（临时标题）- 占位widget
-            self.tab_widget.addTab(QWidget(), "")
+            tw.addTab(QWidget(), "")
             # 将实际内容添加到 content_stack
-            if hasattr(self, 'content_stack'):
-                self.content_stack.addWidget(tab)
+            cs.addWidget(tab)
             # 然后调用update_tab_title更新标题（会考虑shell路径映射和图标）
             tab.update_tab_title()
         # 恢复原先的tab焦点
         if current_tab is not None:
             for i, tab in enumerate(new_tabs):
                 if tab is current_tab:
-                    self.tab_widget.setCurrentIndex(i)
+                    tw.setCurrentIndex(i)
                     break
 
     def save_pinned_tabs(self):
-        """保存固定标签页到config.json"""
+        """保存固定标签页到config.json（扫描左右两个标签组）"""
         pinned_paths = []
-        for i in range(self.tab_widget.count()):
-            tab = self.get_tab_widget(i)
-            if hasattr(tab, 'is_pinned') and tab.is_pinned:
-                if hasattr(tab, 'current_path'):
+        for _tw, cs in self._all_groups():
+            if cs is None:
+                continue
+            for i in range(cs.count()):
+                tab = cs.widget(i)
+                if tab and getattr(tab, 'is_pinned', False) and hasattr(tab, 'current_path'):
                     pinned_paths.append(tab.current_path)
-        
+
         # 更新config并保存
         self.config["pinned_tabs"] = pinned_paths
         self.save_config()
@@ -12983,7 +13293,8 @@ class MainWindow(QMainWindow):
                 if os.path.exists(path) or path.startswith('shell:'):
                     try:
                         is_shell = path.startswith('shell:')
-                        tab = FileExplorerTab(self, path, is_shell=is_shell)
+                        # 懒加载：固定标签也延迟首次导航，避免启动瞬间多个 Shell 视图同时创建
+                        tab = FileExplorerTab(self, path, is_shell=is_shell, defer_nav=True)
                         tab.is_pinned = True
                         short = path[-12:] if len(path) > 12 else path
                         pin_prefix = "📌"
@@ -13152,6 +13463,7 @@ class MainWindow(QMainWindow):
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
             "last_active_tab_path": "",  # 最近一次激活的标签页路径
+            "split_session": {"active": False, "tabs": [], "active_index": 0},  # 右侧分屏组会话（用于重启/崩溃恢复分屏）
             "enable_tortoisegit_buttons": False,  # 默认关闭TortoiseGit按钮
             "preferred_terminal_tool": "cmd",  # 默认终端类型
             "enable_title_shortcuts": True,  # 默认启用标题栏快捷方式区域
@@ -13290,8 +13602,12 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'tab_widget'):
             return cached_tabs
 
-        for i in range(self.tab_widget.count()):
-            tab = self.get_tab_widget(i)
+        # 仅收集左侧主标签组的非固定标签（右侧分屏组由 split_session 单独持久化，避免重复恢复）
+        cs = getattr(self, 'content_stack', None)
+        if cs is None:
+            return cached_tabs
+        for i in range(cs.count()):
+            tab = cs.widget(i)
             if not tab or not hasattr(tab, 'current_path'):
                 continue
             if getattr(tab, 'is_pinned', False):
@@ -13312,6 +13628,49 @@ class MainWindow(QMainWindow):
             })
 
         return cached_tabs
+
+    def _collect_split_session(self):
+        """收集右侧分屏组会话状态用于持久化恢复。
+
+        仅记录右侧组的非固定标签（固定标签统一在左侧恢复）。返回结构：
+        {"active": bool, "tabs": [{"path", "is_shell"}], "active_index": int}。"""
+        state = {"active": False, "tabs": [], "active_index": 0}
+        if not getattr(self, '_split_active', False):
+            return state
+        scs = getattr(self, 'split_content_stack', None)
+        stw = getattr(self, 'split_tab_widget', None)
+        if scs is None or stw is None or stw.count() == 0:
+            return state
+        pinned_norm = {
+            self._normalize_path_for_compare(p)
+            for p in self.config.get("pinned_tabs", []) if p
+        }
+        seen = set()
+        tabs = []
+        for i in range(scs.count()):
+            tab = scs.widget(i)
+            if not tab or not hasattr(tab, 'current_path'):
+                continue
+            if getattr(tab, 'is_pinned', False):
+                continue
+            current_path = getattr(tab, 'current_path', '')
+            if not current_path:
+                continue
+            norm = self._normalize_path_for_compare(current_path)
+            if norm in pinned_norm or norm in seen:
+                continue
+            seen.add(norm)
+            tabs.append({
+                'path': current_path,
+                'is_shell': current_path.startswith('shell:'),
+            })
+        if not tabs:
+            return state
+        state["active"] = True
+        state["tabs"] = tabs
+        idx = stw.currentIndex()
+        state["active_index"] = max(0, min(idx, len(tabs) - 1))
+        return state
 
     def _get_last_active_tab_path(self):
         try:
@@ -13553,6 +13912,47 @@ class MainWindow(QMainWindow):
         self.tab_widget.setCurrentIndex(tab_index)
         return True
 
+    def _restore_split_session(self):
+        """根据持久化的 split_session 恢复右侧分屏组（启动/崩溃恢复时调用）。
+
+        左侧组至少要有一个标签，右侧分屏才独立成立。返回 True 表示已恢复分屏。"""
+        if not self.config.get("enable_cache_tabs", True):
+            return False
+        state = self.config.get("split_session", {}) or {}
+        if not state.get("active"):
+            return False
+        tabs = state.get("tabs", []) or []
+        if not tabs:
+            return False
+        # 左侧主组必须至少保留一个标签，否则不进入分屏
+        if not hasattr(self, 'tab_widget') or self.tab_widget.count() == 0:
+            return False
+        # 显示右侧分屏 UI 布局，然后逐个在右侧组创建标签
+        self._activate_split_layout()
+        added = 0
+        for tab_info in tabs:
+            path = tab_info.get('path', '')
+            if not path:
+                continue
+            try:
+                self.add_new_tab(
+                    path,
+                    is_shell=tab_info.get('is_shell', False),
+                    target_tabwidget=self.split_tab_widget,
+                    activate=False,
+                )
+                added += 1
+            except Exception as e:
+                debug_print(f"[App] 恢复右侧分屏标签失败: {path} -> {e}")
+        if added == 0:
+            # 一个都没成功 → 收起分屏，回到单组
+            self._teardown_split_group()
+            return False
+        active_index = state.get("active_index", 0)
+        if 0 <= active_index < self.split_tab_widget.count():
+            self.split_tab_widget.setCurrentIndex(active_index)
+        return True
+
     def save_session_snapshot(self, immediate=False):
         if not hasattr(self, 'config') or not hasattr(self, 'tab_widget'):
             return
@@ -13561,24 +13961,31 @@ class MainWindow(QMainWindow):
             import time
             self._last_snapshot_save_time_ms = int(time.monotonic() * 1000)
             cached_tabs = []
+            split_session = {"active": False, "tabs": [], "active_index": 0}
             if self.config.get("enable_cache_tabs", True):
                 cached_tabs = self._collect_cached_tabs()
+                split_session = self._collect_split_session()
 
             new_active = self._get_last_active_tab_path()
 
             # 快照内容无变化时跳过写盘，避免无意义IO和日志刷屏
             # 使用 JSON 签名比较，避免 list/dict 对象引用差异导致误判
             import json as _json
-            _sig = _json.dumps(cached_tabs, sort_keys=True, ensure_ascii=False) + '|' + new_active
-            if _sig == getattr(self, '_last_snapshot_sig', ''):
+            _sig = (_json.dumps(cached_tabs, sort_keys=True, ensure_ascii=False)
+                    + '|' + new_active
+                    + '|' + _json.dumps(split_session, sort_keys=True, ensure_ascii=False))
+            # immediate=True 用于关闭/初始化等关键时机，必须确保落盘，因此绕过签名去重
+            if not immediate and _sig == getattr(self, '_last_snapshot_sig', ''):
                 return
             self._last_snapshot_sig = _sig
 
             self.config["cached_tabs"] = cached_tabs
             self.config["last_active_tab_path"] = new_active
+            self.config["split_session"] = split_session
             self.save_config(immediate=immediate)
             debug_print(
-                f"[App] 会话快照已更新: tabs={len(cached_tabs)}, active='{new_active}'"
+                f"[App] 会话快照已更新: tabs={len(cached_tabs)}, active='{new_active}', "
+                f"split={'on' if split_session.get('active') else 'off'}({len(split_session.get('tabs', []))})"
             )
         except Exception as e:
             print(f"Error saving session snapshot: {e}")
@@ -13870,7 +14277,7 @@ class MainWindow(QMainWindow):
                 font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial, sans-serif;
                 font-size: {tab_font_size}px;
                 margin-top: {tab_margin}px;
-                margin-right: 2px;
+                margin-right: 0px;
                 text-align: center;
                 color: #505050;
             }}
@@ -13879,7 +14286,7 @@ class MainWindow(QMainWindow):
                 border-color: #c0c0c0;
             }}
             QTabBar::tab:selected {{
-                background: #ffffff;
+                background: #FFF9CC;
                 border: 1px solid #c0c0c0;
                 border-bottom: none;
                 margin-top: 0px;
@@ -13919,6 +14326,10 @@ class MainWindow(QMainWindow):
         split_tabbar.setAcceptDrops(True)
         split_tabbar.setStyleSheet(tabbar.styleSheet())
         split_tabbar.setElideMode(Qt.ElideLeft)
+        # 右侧分屏标签栏也支持右键菜单（固定/取消固定/书签等），与左侧一致
+        split_tabbar.setContextMenuPolicy(Qt.CustomContextMenu)
+        split_tabbar.customContextMenuRequested.connect(
+            lambda pos: self.tab_context_menu(pos, self.split_tab_widget))
         self.split_tab_widget.setMaximumHeight(tab_bar_height)
         self.split_tab_widget.setVisible(False)
         self._split_active = False
@@ -13929,7 +14340,8 @@ class MainWindow(QMainWindow):
         
         # 右键标签页支持固定/取消固定
         tabbar.setContextMenuPolicy(Qt.CustomContextMenu)
-        tabbar.customContextMenuRequested.connect(self.tab_context_menu)
+        tabbar.customContextMenuRequested.connect(
+            lambda pos: self.tab_context_menu(pos, self.tab_widget))
 
         # 书签栏（使用自定义菜单栏）
         self.menu_bar = CustomMenuBar(self)
@@ -13940,6 +14352,7 @@ class MainWindow(QMainWindow):
         self.menu_bar.setStyleSheet("""
             QMenuBar {
                 background-color: #f3f3f3;
+                border-top: 1px solid #d0d0d0;
                 border-bottom: 1px solid #e0e0e0;
                 padding: 2px;
             }
@@ -14151,7 +14564,8 @@ class MainWindow(QMainWindow):
                             if self.is_path_open(path):
                                 debug_print(tr("[App] 跳过缓存标签（已打开）: {}").format(path))
                                 continue
-                            self.add_new_tab(path)
+                            # 懒加载：恢复的缓存标签不逐个激活，后台标签首次可见时才导航
+                            self.add_new_tab(path, activate=False)
                     debug_print(f"[App] 恢复缓存标签后标签页数: {self.tab_widget.count()}")
                 else:
                     # 没有缓存标签且没有固定标签，现在添加默认标签
@@ -14163,7 +14577,14 @@ class MainWindow(QMainWindow):
             # 如果恢复失败且当前没有标签，添加默认标签
             if self.tab_widget.count() == 0:
                 self.add_new_tab(QDir.homePath())
-        
+
+        # 恢复右侧分屏组（若上次退出/崩溃时处于分屏状态）
+        try:
+            if self._restore_split_session():
+                debug_print(tr("[App] 已恢复右侧分屏组"))
+        except Exception as e:
+            debug_print(f"[Performance] Failed to restore split session: {e}")
+
         # 延迟启动实例服务器
         try:
             self.start_instance_server()
@@ -14182,6 +14603,27 @@ class MainWindow(QMainWindow):
         restored_active = self._restore_last_active_tab()
         if restored_active:
             debug_print(tr("[App] 已恢复上次激活的标签页"))
+        # 兜底：懒加载下所有恢复标签均未激活时，_restore_last_active_tab 可能未选中任何标签，
+        # 导致左侧当前标签仍处于延迟态（界面空白）。这里强制激活一次左侧当前标签，
+        # 触发其 showEvent → 首次导航，保证启动后左侧有一个已加载的可见标签。
+        try:
+            if self.tab_widget.count() > 0:
+                cur = self.tab_widget.currentIndex()
+                if cur < 0:
+                    cur = 0
+                    self.tab_widget.setCurrentIndex(0)
+                cur_tab = self.get_tab_widget(cur)
+                if cur_tab is not None and getattr(cur_tab, '_deferred_nav', None) is not None:
+                    # 已是当前项但 showEvent 可能未触发（内容栈未切换）：显式同步并激活
+                    self.on_tab_changed(cur)
+                    if cur_tab.isVisible():
+                        # 直接消费延迟导航，避免依赖 showEvent 时序
+                        deferred = cur_tab._deferred_nav
+                        cur_tab._deferred_nav = None
+                        p, ish = deferred
+                        cur_tab.navigate_to(p, is_shell=ish)
+        except Exception as e:
+            debug_print(f"[App] 兜底激活当前标签失败: {e}")
         self.save_session_snapshot(immediate=True)
         
         # 恢复完成：取消恢复状态并更新标题
@@ -14565,21 +15007,24 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"Error cleaning chat panel: {e}")
 
-        # 合并分屏回左侧，使右侧标签随主流程正常清理与会话保存
+        self._active_pane = None
+
+        self._append_resource_snapshot_log(reason="close")
+
+        # 先保存会话快照（此时分屏仍处于激活态，确保 split_session 被正确持久化）；
+        # 若先合并分屏再保存，_split_active 会被清为 False 导致分屏状态丢失、重启无法恢复
+        try:
+            self.save_session_snapshot(immediate=True)
+        except Exception as e:
+            print(f"Error caching tabs: {e}")
+
+        # 保存快照后再合并分屏回左侧，使右侧标签随主流程正常清理
         if getattr(self, '_split_active', False):
             try:
                 self._merge_split_back()
             except Exception as e:
                 print(f"Error merging split back: {e}")
-        self._active_pane = None
 
-        self._append_resource_snapshot_log(reason="close")
-
-        try:
-            self.save_session_snapshot(immediate=True)
-        except Exception as e:
-            print(f"Error caching tabs: {e}")
-        
         # 清除搜索缓存
         try:
             global _search_cache
