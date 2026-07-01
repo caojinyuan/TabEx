@@ -6548,7 +6548,8 @@ class FileExplorerTab(QWidget):
                 elif action == 'close':
                     mw.close_current_tab()
                 elif action == 'new':
-                    mw.add_new_tab()
+                    # 新建标签作用于手势所在的一侧（左/右分屏组）
+                    mw.add_new_tab(target_tabwidget=mw.get_active_group_tabwidget())
                 elif action == 'refresh':
                     mw.refresh_current_tab()
                 elif action == 'up_dir':
@@ -10640,6 +10641,19 @@ class MainWindow(QMainWindow):
             self._active_pane = None
         return self.get_current_tab_widget()
 
+    def get_active_group_tabwidget(self):
+        """返回当前活动面板所属的标签组 QTabWidget（右侧分屏当前面板 → split_tab_widget，否则左侧）。
+
+        供手势/快捷键的“关闭当前标签、新建标签、恢复关闭标签”等操作定位到用户正在操作的一侧，
+        避免在右侧分屏画手势时这些动作错误地作用于左侧组。"""
+        try:
+            pane = getattr(self, '_active_pane', None)
+            if pane is not None and pane is self._get_split_pane():
+                return self.split_tab_widget
+        except Exception:
+            pass
+        return self.tab_widget
+
     def _set_restore_nav_guard(self):
         """窗口从最小化恢复时，设置 guard 抑制 IEB 树面板自动展开的虚假导航"""
         tab = self.get_current_tab_widget()
@@ -11242,8 +11256,9 @@ class MainWindow(QMainWindow):
 
 
     def close_current_tab(self):
-        current_index = self.tab_widget.currentIndex()
-        self.close_tab(current_index)
+        # 作用于活动面板所属组：在右侧分屏操作时关闭右侧当前标签，而非总是左侧
+        tw = self.get_active_group_tabwidget()
+        self.close_tab(tw.currentIndex(), target_tabwidget=tw)
     
     def reopen_closed_tab(self):
         """恢复最近关闭的标签页"""
@@ -11255,8 +11270,9 @@ class MainWindow(QMainWindow):
         tab_info = self.closed_tabs_history.pop(0)
         debug_print(f"[ClosedTabs] Restoring tab: {tab_info['path']}, remaining history: {len(self.closed_tabs_history)}")
         
-        # 重新打开标签页
-        self.add_new_tab(tab_info['path'], is_shell=tab_info.get('is_shell', False))
+        # 重新打开标签页（作用于活动面板所属组，右侧分屏操作时恢复到右侧）
+        self.add_new_tab(tab_info['path'], is_shell=tab_info.get('is_shell', False),
+                         target_tabwidget=self.get_active_group_tabwidget())
         
         # 更新恢复按钮状态
         if hasattr(self, 'reopen_tab_button'):
