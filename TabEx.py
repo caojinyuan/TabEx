@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.60"
+APP_VERSION = "3.61"
 
 
 # TabEx i18n module
@@ -724,6 +724,53 @@ ASYNC_LOAD_ENABLED = True  # 是否启用异步加载
 # 兜底轮询快照逐项 stat 的上限：超大目录每 8s 在 UI 线程逐项 stat 会造成周期性卡顿，
 # 超过此上限后停止逐项统计，改用“总项目数 + 目录自身 mtime”兜底检测增删/重命名。
 DIR_SNAPSHOT_MAX_ENTRIES = 5000
+
+
+def _compute_dir_snapshot(path, ignore_check=None):
+    """计算目录轻量元数据快照 (count, latest_mtime_ns, size_sum, name_hash)，失败返回 None。
+
+    纯 I/O + 计算，不触碰任何 Qt 对象，可安全在后台线程（QRunnable）中执行。
+    ignore_check(path, name) 用于忽略应用自身写出的配置/日志文件（可为 None）。"""
+    try:
+        count = 0
+        latest_mtime_ns = 0
+        size_sum = 0
+        name_hash = 0
+        truncated = False
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if ignore_check is not None and ignore_check(path, entry.name):
+                    continue
+                count += 1
+                if count > DIR_SNAPSHOT_MAX_ENTRIES:
+                    # 超大目录：停止逐项 stat，仍继续累计总数，配合目录自身 mtime 兜底
+                    truncated = True
+                    continue
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    stat = entry.stat(follow_symlinks=False)
+                    mtime_ns = getattr(stat, 'st_mtime_ns', None)
+                    if mtime_ns is None:
+                        mtime_ns = int(stat.st_mtime * 1_000_000_000)
+                    if mtime_ns > latest_mtime_ns:
+                        latest_mtime_ns = mtime_ns
+                    if not is_dir:
+                        size_sum += getattr(stat, 'st_size', 0)
+                    name_hash ^= hash((entry.name, is_dir))
+                except Exception:
+                    continue
+        if truncated:
+            # 折叠目录自身 mtime，保证超出上限部分的增删/重命名仍能触发刷新
+            try:
+                dir_mtime_ns = os.stat(path).st_mtime_ns
+                if dir_mtime_ns > latest_mtime_ns:
+                    latest_mtime_ns = dir_mtime_ns
+            except Exception:
+                pass
+        return (count, latest_mtime_ns, size_sum, name_hash)
+    except Exception:
+        return None
+
 STATUS_SELECTION_METADATA_LIMIT = 20  # 多选超过阈值时跳过逐项大小统计
 SHORTCUT_POLL_ACTIVE_MS = 160  # 主窗口激活时快捷键轮询频率
 SHORTCUT_POLL_INACTIVE_MS = 500  # 主窗口非激活时快捷键轮询频率
@@ -2337,7 +2384,7 @@ class SearchDialog(QDialog):
             show_toast(self, tr("提示"), tr("未找到 {}").format(display_name), level="warning")
             return False
         try:
-            launch_detached([program_path, file_path], cwd=os.path.dirname(file_path) or None)
+            launch_detached_async([program_path, file_path], cwd=os.path.dirname(file_path) or None)
             return True
         except Exception as e:
             show_toast(self, tr("错误"), tr("无法使用 {} 打开文件: {}").format(display_name, e), level="error")
@@ -2371,7 +2418,7 @@ class SearchDialog(QDialog):
             show_toast(self, tr("提示"), tr("当前系统不支持打开“选择其他应用”对话框"), level="warning")
             return False
         try:
-            launch_detached(['rundll32.exe', 'shell32.dll,OpenAs_RunDLL', file_path], cwd=os.path.dirname(file_path) or None)
+            launch_detached_async(['rundll32.exe', 'shell32.dll,OpenAs_RunDLL', file_path], cwd=os.path.dirname(file_path) or None)
             return True
         except Exception as e:
             show_toast(self, tr("错误"), tr("无法打开“选择其他应用”对话框: {}").format(e), level="error")
@@ -2442,7 +2489,7 @@ import threading
 import queue
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QFileSystemModel, QSplitter, QProgressBar, QCompleter, QFrame, QToolButton, QFileIconProvider)  # 添加QFrame
 from PyQt5.QAxContainer import QAxWidget
-from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer, QThread, QMutex, QMimeData, QFileInfo, QEvent, QPoint
+from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer, QThread, QMutex, QMimeData, QFileInfo, QEvent, QPoint, QThreadPool, QRunnable
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor, QDrag
 import ctypes
 import ctypes.wintypes
@@ -2691,6 +2738,29 @@ def launch_detached(cmd, cwd=None, extra_creationflags=0):
     return subprocess.Popen(cmd, cwd=cwd, start_new_session=True, close_fds=True)
 
 
+def launch_detached_async(cmd, cwd=None, extra_creationflags=0):
+    """在后台守护线程执行 launch_detached，避免 CreateProcess（及 Job Object 降级链）
+    在 UI 线程阻塞。仅用于 fire-and-forget 场景（不使用返回的 Popen）。
+
+    子进程一旦创建即与父进程解耦（DETACHED/BREAKAWAY），后台线程随即结束不影响其存活。
+    调用方应先在 UI 线程完成校验（路径/可执行文件存在性）再调用本函数，以便错误提示仍能弹出。"""
+    def _worker():
+        try:
+            launch_detached(cmd, cwd=cwd, extra_creationflags=extra_creationflags)
+        except Exception as e:
+            debug_print(f"[launch_detached_async] failed for {cmd!r}: {e}")
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception as e:
+        # 线程创建失败极罕见：退回同步启动，保证功能可用
+        debug_print(f"[launch_detached_async] thread start failed, fallback sync: {e}")
+        try:
+            launch_detached(cmd, cwd=cwd, extra_creationflags=extra_creationflags)
+        except Exception as e2:
+            debug_print(f"[launch_detached_async] sync fallback failed: {e2}")
+
+
+
 def normalize_external_launch_dir(path):
     if not path:
         return None
@@ -2720,22 +2790,27 @@ def launch_shell_tool(tool_name, cwd=None):
     _DETACH_CONSOLE = (getattr(subprocess, 'CREATE_NEW_CONSOLE', 0x00000010)
                        | _NEW_PROCESS_GROUP | _BREAKAWAY_FROM_JOB)
 
+    def _spawn_console_async(argv):
+        """在后台守护线程创建带新控制台的进程，避免 CreateProcess 阻塞 UI 线程。
+        路径/工具校验已在上方同步完成，故此处异常仅记录日志。"""
+        def _worker():
+            try:
+                subprocess.Popen(argv, creationflags=_DETACH_CONSOLE, close_fds=True, cwd=cwd)
+            except Exception as e:
+                debug_print(f"[launch_shell_tool] async spawn failed for {argv!r}: {e}")
+        try:
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception:
+            _worker()  # 线程创建失败：退回同步
+
     if tool_name == 'cmd':
-        return subprocess.Popen(
-            ['cmd.exe', '/K', 'cd', '/d', cwd],
-            creationflags=_DETACH_CONSOLE,
-            close_fds=True,
-            cwd=cwd,
-        )
+        _spawn_console_async(['cmd.exe', '/K', 'cd', '/d', cwd])
+        return None
 
     if tool_name == 'powershell':
         escaped_dir = cwd.replace("'", "''")
-        return subprocess.Popen(
-            ['powershell.exe', '-NoExit', '-Command', f"Set-Location -LiteralPath '{escaped_dir}'"],
-            creationflags=_DETACH_CONSOLE,
-            close_fds=True,
-            cwd=cwd,
-        )
+        _spawn_console_async(['powershell.exe', '-NoExit', '-Command', f"Set-Location -LiteralPath '{escaped_dir}'"])
+        return None
 
     if tool_name == 'git-bash':
         git_root = find_git_install_root()
@@ -2744,12 +2819,14 @@ def launch_shell_tool(tool_name, cwd=None):
         git_bash_exe = os.path.join(git_root, 'git-bash.exe')
         if not os.path.exists(git_bash_exe):
             raise FileNotFoundError(tr("未找到可用的 Git Bash 可执行文件"))
-        return launch_detached([git_bash_exe, f'--cd={cwd}'], cwd=cwd)
+        launch_detached_async([git_bash_exe, f'--cd={cwd}'], cwd=cwd)
+        return None
 
     if tool_name == 'calculator':
         if os.name != 'nt':
             raise OSError(tr("当前系统不支持打开计算器"))
-        return launch_detached(['calc.exe'])
+        launch_detached_async(['calc.exe'])
+        return None
 
     raise ValueError(f"Unsupported tool: {tool_name}")
 
@@ -4239,6 +4316,68 @@ def _preload_overlay_icons(directory_path):
         pass
 
 
+class _OverlayPreloadSignals(QObject):
+    """后台 overlay 图标预加载完成信号：done(path)。"""
+    done = pyqtSignal(str)
+
+
+class _OverlayPreloadRunnable(QRunnable):
+    """在 QThreadPool 后台线程执行 _preload_overlay_icons（含 SHGetFileInfo 扫描），
+    避免在 UI 线程做同步 Shell 调用造成切标签卡顿。完成后经信号回 UI 线程调用
+    IShellView::Refresh()（COM 必须在 UI/STA 线程）。工作线程自行 CoInitialize。"""
+    def __init__(self, path, signals):
+        super().__init__()
+        self._path = path
+        self._signals = signals
+
+    def run(self):
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+        try:
+            _preload_overlay_icons(self._path)
+        except Exception as e:
+            debug_print(f"[TortoiseGit] async overlay preload error: {e}")
+        finally:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+            try:
+                self._signals.done.emit(self._path)
+            except RuntimeError:
+                pass  # 信号对象已随标签销毁
+
+
+class _DirSnapshotSignals(QObject):
+    """后台目录快照计算完成信号：done(path, snapshot_or_None)。"""
+    done = pyqtSignal(str, object)
+
+
+class _DirSnapshotRunnable(QRunnable):
+    """在 QThreadPool 后台线程计算目录快照，完成后经信号回到 UI 线程比较。
+
+    用于 FileExplorerTab 的 8 秒兜底轮询，避免在 UI 线程逐项 stat 造成周期性卡顿。"""
+    def __init__(self, path, ignore_check, signals):
+        super().__init__()
+        self._path = path
+        self._ignore_check = ignore_check
+        self._signals = signals
+
+    def run(self):
+        snap = _compute_dir_snapshot(self._path, self._ignore_check)
+        try:
+            self._signals.done.emit(self._path, snap)
+        except RuntimeError:
+            # 信号对象已随标签销毁：忽略
+            pass
+
+
+
+
 # ── Early overlay initialization ─────────────────────────────────────────────
 # Must run BEFORE IExplorerBrowser creates its shell view (which triggers SIOM).
 if _COMTYPES_AVAILABLE and HAS_PYWIN:
@@ -4484,6 +4623,9 @@ class IExplorerBrowserWidget(QWidget):
         self._location_url = ''
         self._pending_path = None
         self._init_ok      = False
+        # 后台 overlay 图标预加载：懒创建信号对象 + in-flight 去重标志
+        self._overlay_signals = None
+        self._overlay_preload_inflight = False
         # Force native HWND creation; IExplorerBrowser::Initialize needs a real HWND
         self.setAttribute(Qt.WA_NativeWindow, True)
 
@@ -4651,23 +4793,42 @@ class IExplorerBrowserWidget(QWidget):
                 QTimer.singleShot(500, self._clear_overlay_refreshing)
 
     def _do_overlay_notify(self, path):
-        """Pre-load overlay icons then refresh shell view to render overlays."""
+        """后台预加载 overlay 图标，完成后回到 UI 线程刷新视图渲染图标。"""
         if path in _OVERLAY_PRELOADED_DIRS:
-            return
-        try:
-            # Pre-load overlay icons from shell cache into system image list
-            _preload_overlay_icons(path)
-            # IShellView::Refresh() forces DefView to re-render with overlays
-            # Guard against re-entrancy (Refresh triggers NavigateComplete2)
+            # 已预加载过：无需再扫描，直接在 UI 线程刷新一次即可
             self._overlay_refreshing = True
             self._overlay_visible_refreshed = True
             try:
                 self._refresh_shell_view()
             finally:
-                # Clear flag after a short delay to allow the nav-complete to fire
+                QTimer.singleShot(500, self._clear_overlay_refreshing)
+            return
+        # 预加载（SHGetFileInfo 扫描）放到后台线程，避免在 UI 线程同步 Shell 调用卡顿；
+        # in-flight 去重，防止同一控件重复提交。
+        if getattr(self, '_overlay_preload_inflight', False):
+            return
+        try:
+            if not getattr(self, '_overlay_signals', None):
+                self._overlay_signals = _OverlayPreloadSignals(self)
+                self._overlay_signals.done.connect(self._on_overlay_preload_done)
+            self._overlay_preload_inflight = True
+            QThreadPool.globalInstance().start(_OverlayPreloadRunnable(path, self._overlay_signals))
+        except Exception as e:
+            self._overlay_preload_inflight = False
+            debug_print(f"[TortoiseGit] overlay notify error: {e}")
+
+    def _on_overlay_preload_done(self, _path):
+        """后台预加载完成（回到 UI 线程）：调用 IShellView::Refresh() 渲染 overlay。"""
+        self._overlay_preload_inflight = False
+        try:
+            self._overlay_refreshing = True
+            self._overlay_visible_refreshed = True
+            try:
+                self._refresh_shell_view()
+            finally:
                 QTimer.singleShot(500, self._clear_overlay_refreshing)
         except Exception as e:
-            debug_print(f"[TortoiseGit] overlay notify error: {e}")
+            debug_print(f"[TortoiseGit] overlay refresh error: {e}")
 
     def _clear_overlay_refreshing(self):
         self._overlay_refreshing = False
@@ -4744,6 +4905,19 @@ class IExplorerBrowserWidget(QWidget):
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def cleanup(self):
+        # 断开后台 overlay 预加载信号，避免延迟到达的 QThreadPool 结果回调已销毁的控件
+        sig = getattr(self, '_overlay_signals', None)
+        if sig is not None:
+            try:
+                sig.done.disconnect()
+            except Exception:
+                pass
+            try:
+                sig.deleteLater()
+            except Exception:
+                pass
+            self._overlay_signals = None
+        self._overlay_preload_inflight = False
         if self._browser is None:
             return
         try:
@@ -4787,51 +4961,17 @@ class FileExplorerTab(QWidget):
             debug_print(f"[FileWatcher] Exception in force_remove_watcher: {e}")
 
     def _build_dir_snapshot(self, path):
-        """构建当前目录的轻量元数据快照，用于检测文件修改时间/大小变化。"""
+        """构建当前目录的轻量元数据快照，用于检测文件修改时间/大小变化。
+
+        纯计算逻辑委托给模块级 _compute_dir_snapshot()，以便定时兜底轮询可在后台线程
+        复用同一算法（见 _poll_directory_changes 的 QRunnable 异步路径），避免 UI 线程逐项 stat。"""
         try:
             if not path or not os.path.isdir(path):
                 return None
             # OneDrive/网络路径的os.scandir()会阻塞UI线程（云同步），直接跳过
             if self._is_slow_path(path):
                 return None
-            count = 0
-            latest_mtime_ns = 0
-            size_sum = 0
-            name_hash = 0
-            truncated = False
-            ignore_check = self._should_ignore_internal_dir_entry
-            with os.scandir(path) as entries:
-                for entry in entries:
-                    if ignore_check(path, entry.name):
-                        continue
-                    count += 1
-                    if count > DIR_SNAPSHOT_MAX_ENTRIES:
-                        # 超大目录：停止逐项 stat，避免 UI 线程每 8s 周期性卡顿。
-                        # 仍继续累计总数，配合目录自身 mtime 兜底检测增删/重命名。
-                        truncated = True
-                        continue
-                    try:
-                        is_dir = entry.is_dir(follow_symlinks=False)
-                        stat = entry.stat(follow_symlinks=False)
-                        mtime_ns = getattr(stat, 'st_mtime_ns', None)
-                        if mtime_ns is None:
-                            mtime_ns = int(stat.st_mtime * 1_000_000_000)
-                        if mtime_ns > latest_mtime_ns:
-                            latest_mtime_ns = mtime_ns
-                        if not is_dir:
-                            size_sum += getattr(stat, 'st_size', 0)
-                        name_hash ^= hash((entry.name, is_dir))
-                    except Exception:
-                        continue
-            if truncated:
-                # 折叠目录自身 mtime，保证超出上限部分的增删/重命名仍能触发刷新
-                try:
-                    dir_mtime_ns = os.stat(path).st_mtime_ns
-                    if dir_mtime_ns > latest_mtime_ns:
-                        latest_mtime_ns = dir_mtime_ns
-                except Exception:
-                    pass
-            return (count, latest_mtime_ns, size_sum, name_hash)
+            return _compute_dir_snapshot(path, self._should_ignore_internal_dir_entry)
         except Exception:
             return None
 
@@ -5754,7 +5894,7 @@ class FileExplorerTab(QWidget):
                 return
             
             # 启动 TortoiseGit Log
-            launch_detached([tortoisegit_exe, '/command:log', f'/path:{repo_root}'])
+            launch_detached_async([tortoisegit_exe, '/command:log', f'/path:{repo_root}'])
             debug_print(f"[TortoiseGit] Opened log for: {repo_root}")
             
         except Exception as e:
@@ -5796,7 +5936,7 @@ class FileExplorerTab(QWidget):
                 return
             
             # 启动 TortoiseGit Commit
-            launch_detached([tortoisegit_exe, '/command:commit', f'/path:{repo_root}'])
+            launch_detached_async([tortoisegit_exe, '/command:commit', f'/path:{repo_root}'])
             debug_print(f"[TortoiseGit] Opened commit for: {repo_root}")
             
         except Exception as e:
@@ -7087,6 +7227,9 @@ class FileExplorerTab(QWidget):
         self._file_event_debounce_ms = 400
         self._watched_files = set()
         self._last_dir_snapshot = None
+        # 后台目录快照（兜底轮询）：懒创建的信号对象 + in-flight 去重标志
+        self._snapshot_signals = None
+        self._snapshot_inflight = False
         self._refresh_active = False
         self._refresh_pending = False
         self._refresh_pending_reason = None
@@ -7237,10 +7380,19 @@ class FileExplorerTab(QWidget):
         self._last_watcher_event.clear()
         self._last_file_event.clear()
         self._last_dir_snapshot = None
-
-    def closeEvent(self, event):
-        self.cleanup()
-        super().closeEvent(event)
+        # 断开后台快照信号，避免延迟到达的 QThreadPool 结果回调已销毁的标签
+        sig = getattr(self, '_snapshot_signals', None)
+        if sig is not None:
+            try:
+                sig.done.disconnect()
+            except Exception:
+                pass
+            try:
+                sig.deleteLater()
+            except Exception:
+                pass
+            self._snapshot_signals = None
+        self._snapshot_inflight = False
 
     # 移除重复的setup_ui，保留带路径栏的实现
 
@@ -7803,14 +7955,34 @@ class FileExplorerTab(QWidget):
         # OneDrive/网络路径的os.scandir()会阻塞UI线程，不做轮询
         if self._is_slow_path(path):
             return
-        current_snapshot = self._build_dir_snapshot(path)
+        # 快照计算（scandir + 逐项 stat）放到后台线程池，避免大目录每 8s 在 UI 线程卡顿。
+        # 上一次计算尚未返回时跳过本次，防止慢目录任务堆积。
+        if getattr(self, '_snapshot_inflight', False):
+            return
+        try:
+            if not hasattr(self, '_snapshot_signals') or self._snapshot_signals is None:
+                self._snapshot_signals = _DirSnapshotSignals(self)
+                self._snapshot_signals.done.connect(self._on_dir_snapshot_ready)
+            self._snapshot_inflight = True
+            runnable = _DirSnapshotRunnable(path, self._should_ignore_internal_dir_entry, self._snapshot_signals)
+            QThreadPool.globalInstance().start(runnable)
+        except Exception as e:
+            self._snapshot_inflight = False
+            debug_print(f"[DirPoll] Failed to start snapshot worker: {e}")
+
+    def _on_dir_snapshot_ready(self, snap_path, current_snapshot):
+        """后台快照计算完成（回到 UI 线程）：与上次快照比较，变化则调度刷新。"""
+        self._snapshot_inflight = False
+        # 计算期间已切换目录：丢弃过期结果
+        if snap_path != getattr(self, 'current_path', None):
+            return
         if current_snapshot is None:
             return
         if self._last_dir_snapshot is None:
             self._last_dir_snapshot = current_snapshot
             return
         if current_snapshot != self._last_dir_snapshot:
-            debug_print(f"[DirPoll] Detected snapshot change for {path}, scheduling refresh")
+            debug_print(f"[DirPoll] Detected snapshot change for {snap_path}, scheduling refresh")
             self._last_dir_snapshot = current_snapshot
             self._request_refresh(reason="poll")
 
@@ -7930,7 +8102,7 @@ class FileExplorerTab(QWidget):
             show_toast(self, tr("提示"), tr("未找到 {}").format(display_name), level="warning")
             return False
         try:
-            launch_detached([program_path, file_path], cwd=os.path.dirname(file_path) or None)
+            launch_detached_async([program_path, file_path], cwd=os.path.dirname(file_path) or None)
             return True
         except Exception as e:
             show_toast(self, tr("错误"), tr("无法使用 {} 打开文件: {}").format(display_name, e), level="error")
@@ -7967,7 +8139,7 @@ class FileExplorerTab(QWidget):
             show_toast(self, tr("提示"), tr("当前系统不支持打开“选择其他应用”对话框"), level="warning")
             return False
         try:
-            launch_detached(['rundll32.exe', 'shell32.dll,OpenAs_RunDLL', file_path], cwd=os.path.dirname(file_path) or None)
+            launch_detached_async(['rundll32.exe', 'shell32.dll,OpenAs_RunDLL', file_path], cwd=os.path.dirname(file_path) or None)
             return True
         except Exception as e:
             show_toast(self, tr("错误"), tr("无法打开“选择其他应用”对话框: {}").format(e), level="error")
@@ -12548,11 +12720,6 @@ class MainWindow(QMainWindow):
         # QShortcut 被 QAxWidget 拦截，所以现在使用定时器轮询方式
         # 保留此方法以便将来扩展或备用
         self.shortcuts = []
-    def setup_shortcuts(self):
-        """设置全局快捷键（现在使用轮询方式，不再使用QShortcut）"""
-        # QShortcut 被 QAxWidget 拦截，所以现在使用定时器轮询方式
-        # 保留此方法以便将来扩展或备用
-        self.shortcuts = []
     
     def refresh_current_tab(self):
         """刷新当前标签页"""
@@ -14694,8 +14861,8 @@ class MainWindow(QMainWindow):
         server_thread_obj = threading.Thread(target=server_thread, daemon=True)
         self.server_thread = server_thread_obj
         server_thread_obj.start()
-        # 等待服务器启动
-        time.sleep(0.2)
+        # 服务器在 daemon 线程中独立 bind/listen，主线程无需等待其就绪；
+        # 移除原先的 time.sleep(0.2)，避免在延迟初始化阶段无谓阻塞 UI 线程约 200ms。
     
     def start_explorer_monitor(self):
         """启动Explorer窗口监听（优化版）"""
