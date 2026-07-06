@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.61"
+APP_VERSION = "3.62"
 
 
 # TabEx i18n module
@@ -3252,161 +3252,320 @@ if HAS_PYWIN:
         debug_print(f"Failed to setup Windows API monitoring: {e}")
 
 
-class _CrumbDragFilter(QObject):
-    """事件过滤器：为 SimplePathBar 面包屑按钮提供拖拽功能，可拖到标签栏打开新tab。"""
-
-    def eventFilter(self, obj, event):
-        t = event.type()
-        if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-            obj._drag_start = event.pos()
-            return False  # 不拦截，让 clicked 正常工作
-        elif t == QEvent.MouseMove and obj._drag_start is not None:
-            if (event.pos() - obj._drag_start).manhattanLength() >= QApplication.startDragDistance():
-                # 开始拖拽
-                drag = QDrag(obj)
-                mime = QMimeData()
-                mime.setUrls([QUrl.fromLocalFile(obj._crumb_path)])
-                mime.setText(obj._crumb_path)
-                drag.setMimeData(mime)
-                drag.exec_(Qt.CopyAction | Qt.MoveAction)
-                obj._drag_start = None
-                return True
-        elif t == QEvent.MouseButtonRelease:
-            obj._drag_start = None
-        return False
-
-
 class SimplePathBar(QWidget):
-    """Windows Explorer 风格面包屑地址栏。
-    - 普通模式：显示可点击的路径分段 (C: › project › EOL)，点击某段导航到该层
-    - 编辑模式：显示 QLineEdit，按 Enter 导航，按 Escape 取消
-    - 点击路径段之间的空白区域或调用 enter_edit_mode() 进入编辑模式
-    接口与 BreadcrumbPathBar 兼容：set_path / pathChanged /
-    enter_edit_mode / exit_edit_mode / get_path_for_copy
+    """Windows Explorer 风格面包屑地址栏（单控件自绘实现）。
+    - 普通模式：paintEvent 一次性绘制可点击的路径分段 (C: › project › EOL)，
+      通过命中测试判断点击了哪一段；不再为每一段创建/销毁子控件。
+    - 编辑模式：覆盖显示常驻 QLineEdit，按 Enter 导航，按 Escape 取消。
+    - 点击路径段之间的空白区域或调用 enter_edit_mode() 进入编辑模式。
+    接口与旧实现兼容：set_path / pathChanged /
+    enter_edit_mode / exit_edit_mode / get_path_for_copy。
+
+    重要：旧实现每次导航都销毁并重建 N 个 QPushButton/QToolButton，叠加多轮
+    强制重排与自愈循环，导致最小化恢复后偶发“地址栏不刷新/卡顿”（数据正确、
+    像素滞后）。单控件自绘从根本上消除该问题——一个 paintEvent 一定会被 Qt
+    正确绘制，且没有子控件析构/创建开销。
     """
     pathChanged = pyqtSignal(str)
 
     _FONT   = "font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif; font-size: 11pt;"
-    _S_BAR  = ("SimplePathBar { background: transparent; border: none; }")
-    _S_BTN  = ("QPushButton { background: transparent; border: none; padding: 1px 2px;"
-               " font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif; font-size: 11pt;"
-               " font-weight: 500; color: #003d7a; margin: 0 2px; border-radius: 2px; }"
-               "QPushButton:hover { background: #cce5ff; text-decoration: underline; }"
-               "QPushButton:pressed { background: #99ccff; }")
-    _S_SEP  = ("QLabel { color: #888; font-size: 11pt;"
-               " padding: 0; margin: 0 2px; background: transparent; }")
-    _S_SEPBTN = ("QToolButton { color: #888; font-size: 12pt; border: none;"
-                 " background: transparent; padding: 0; margin: 0 1px; }"
-                 "QToolButton:hover { background: #cce5ff; color: #003d7a; border-radius: 2px; }"
-                 "QToolButton:pressed { background: #99ccff; }"
-                 "QToolButton::menu-indicator { image: none; width: 0; }")
+    _S_BAR  = ("SimplePathBar { background: #ffffff; border: none; }")
     _S_EDIT = ("QLineEdit { background: white; border: 1px solid #ccc; border-radius: 3px;"
                " font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif; font-size: 10pt;"
                " color: #202020; padding: 2px 6px; selection-background-color: #0078d4; }")
 
+    # 绘制配色（与旧样式表一致）
+    _COL_SEG   = '#003d7a'   # 路径段文字
+    _COL_SEP   = '#888888'   # 分隔符 ›
+    _COL_HOVER = '#cce5ff'   # 悬停背景
+    _CHEVRON   = '\u203a'    # ›
+    _PAD       = 6           # 段内文字左右内边距
+    _SEP_W     = 16          # 分隔符宽度
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_path = ''
-        self._last_built_path = ''
-        self._last_build_was_hidden = False
+        self._segments = []            # [(显示名, 完整路径), …] 全部层级
+        self._display_regions = []     # 绘制时记录的命中区: dict(kind,x0,x1,payload,label,is_current)
+        self._hover_idx = -1
         self._in_edit = False
-        self._completer = None  # 编辑模式路径自动补全（首次进入编辑时惰性创建）
+        self._completer = None         # 编辑模式路径自动补全（首次进入编辑时惰性创建）
+        self._press_pos = None         # 左键按下位置（用于拖拽判定）
+        self._press_idx = -1           # 按下时命中的区索引
+        self._dragging = False
         self.setFixedHeight(30)
+        self.setMouseTracking(True)    # hover 高亮需要
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(self._S_BAR)
 
-        from PyQt5.QtWidgets import QStackedWidget
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        self._stack = QStackedWidget(self)
-        outer.addWidget(self._stack)
-
-        # ── 面包屑行 ──────────────────────────────────────────────────────
-        self._crumb_w = QWidget()
-        self._crumb_w.setStyleSheet("background: transparent;")
-        self._crumb_row = QHBoxLayout(self._crumb_w)
-        self._crumb_row.setContentsMargins(2, 0, 2, 0)
-        self._crumb_row.setSpacing(0)
-        self._stack.addWidget(self._crumb_w)
-
-        # ── 文本编辑行 ────────────────────────────────────────────────────
+        from PyQt5.QtGui import QFont
+        self._font = QFont("Segoe UI", 11)
+        try:
+            self._font.setWeight(QFont.Medium)  # 500
+        except Exception:
+            pass
+        # 让 self.fontMetrics()（_choose_display_parts / _elide_crumb_text 使用）
+        # 与 paintEvent 绘制字体一致，避免宽度测算与实际绘制不符导致的折叠/裁剪偏差。
+        self.setFont(self._font)
+        # 编辑框：常驻子控件，编辑模式下覆盖显示，不参与常态绘制
         self._edit = QLineEdit(self)
         self._edit.setStyleSheet(self._S_EDIT)
         self._edit.setFrame(False)
         self._edit.returnPressed.connect(self._commit_edit)
         self._edit.installEventFilter(self)
-        self._stack.addWidget(self._edit)
-
-        self._stack.setCurrentIndex(0)
-
-        # 点击面包屑行空白处 → 编辑模式
-        self._crumb_w.mousePressEvent = self._on_crumb_click
-
-        # 面包屑按钮拖拽事件过滤器
-        self._crumb_drag_filter = _CrumbDragFilter(self)
+        self._edit.hide()
 
     # ── 公共 API ─────────────────────────────────────────────────────────────
 
     def set_path(self, path):
         new_path = path or ''
         path_changed = (new_path != self._current_path)
-        # 热路径：set_path 每次导航都调用；该诊断 f-string 含两个控件方法调用，
-        # 仅在调试模式下构造，避免生产运行时每次导航的无谓开销。
         if _DEBUG_MODE:
-            debug_print(f"[SimplePathBar] set_path: new='{new_path}', old='{self._current_path}', changed={path_changed}, in_edit={self._in_edit}, stack_idx={self._stack.currentIndex()}, crumb_count={self._crumb_row.count()}")
+            debug_print(f"[SimplePathBar] set_path: new='{new_path}', old='{self._current_path}', changed={path_changed}, in_edit={self._in_edit}")
         self._current_path = new_path
         if self._in_edit:
             if path_changed:
-                # 路径已变化（用户通过 Explorer 导航了）→ 强制退出编辑模式并显示新路径
-                debug_print(f"[SimplePathBar] set_path: path changed while editing, exit edit mode")
+                # 路径已变化（用户通过 Explorer 导航了）→ 退出编辑模式并显示新路径
                 self.exit_edit_mode()
             # 路径未变化时保持编辑模式不中断（用户可能在复制路径）
+            return
+        # 单控件自绘：只更新分段数据并请求重绘，绝不创建/销毁子控件。
+        if path_changed:
+            # 空路径时保留现有分段，避免瞬时空白。
+            if new_path:
+                self._segments = self._split_path(new_path)
+            self._hover_idx = -1
+            self.update()
         else:
-            self._rebuild()
+            # 路径未变化（来自轮询/保活的重复回写）：轻量异步刷新即可，无需强制同步。
+            self.update()
+
+    def force_refresh(self):
+        """同步重绘：供窗口恢复/手动兜底调用，强制像素立即跟上当前路径。
+        单控件 repaint() 一定被 Qt 立即执行，规避恢复后异步 update() 被合成器丢弃。"""
+        if self._in_edit:
+            return
+        if self._current_path:
+            self._segments = self._split_path(self._current_path)
+        self.repaint()
 
     def enter_edit_mode(self):
-        debug_print(f"[SimplePathBar] enter_edit_mode: path='{self._current_path}', stack_idx={self._stack.currentIndex()}")
+        if self._in_edit:
+            return
+        debug_print(f"[SimplePathBar] enter_edit_mode: path='{self._current_path}'")
         self._ensure_completer()
         self._in_edit = True
+        self._edit.setGeometry(self.rect())
         self._edit.setText(self._current_path)
-        self._stack.setCurrentIndex(1)
+        self._edit.show()
+        self._edit.raise_()
         self._edit.setFocus()
         self._edit.selectAll()
         # 安装应用级事件过滤器，监听点击外部区域时退出编辑模式
         QApplication.instance().installEventFilter(self)
+        self.update()
 
     def exit_edit_mode(self):
-        if _DEBUG_MODE:
-            import traceback
-            caller = ''.join(traceback.format_stack(limit=3)[:-1]).strip()
-            debug_print(f"[SimplePathBar] exit_edit_mode: path='{self._current_path}', was_in_edit={self._in_edit}, caller={caller[-200:]}")
         if not self._in_edit:
-            return  # 已经不在编辑模式，无需重建
+            return  # 已经不在编辑模式
         self._in_edit = False
-        self._stack.setCurrentIndex(0)
-        self._last_built_path = ''  # 强制重建
-        self._rebuild()
+        self._edit.hide()
         # 移除应用级事件过滤器
         try:
             QApplication.instance().removeEventFilter(self)
         except Exception:
             pass
+        self.update()
 
     def changeEvent(self, event):
-        """窗口激活时强制刷新面包屑"""
+        """窗口激活时请求重绘（单控件自绘，无子控件丢失问题）。"""
         if event.type() == QEvent.WindowActivate and not self._in_edit:
-            debug_print(f"[SimplePathBar] changeEvent(WindowActivate): path='{self._current_path}', crumb_count={self._crumb_row.count()}, stack_idx={self._stack.currentIndex()}")
-            # 如果面包屑控件都不可见了，强制重建
-            crumb_count = self._crumb_row.count()
-            if crumb_count <= 1 and self._current_path:
-                debug_print(f"[SimplePathBar] changeEvent: crumbs lost, forcing rebuild")
-                self._last_built_path = ''
-                self._rebuild()
-            else:
-                self.update()
+            self.update()
         super().changeEvent(event)
+
+    # ── 自绘 + 命中测试 ────────────────────────────────────────────────────────
+
+    def _region_at(self, x):
+        """返回横坐标 x 命中的显示区索引；未命中返回 -1。"""
+        for i, r in enumerate(self._display_regions):
+            if r['x0'] <= x < r['x1']:
+                return i
+        return -1
+
+    def paintEvent(self, event):
+        if self._in_edit:
+            return
+        from PyQt5.QtGui import QPainter, QColor, QFont
+        from PyQt5.QtCore import QRectF
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor('#ffffff'))
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        painter.setFont(self._font)
+        fm = painter.fontMetrics()
+        h = self.height()
+        y = int((h + fm.ascent() - fm.descent()) / 2)
+        regions = []
+        parts = self._segments
+        if not parts:
+            self._display_regions = regions
+            painter.end()
+            return
+        display_parts = self._choose_display_parts(parts)
+        left_collapsed = len(display_parts) < len(parts)
+        col_seg = QColor(self._COL_SEG)
+        col_sep = QColor(self._COL_SEP)
+        col_hover = QColor(self._COL_HOVER)
+        pad = self._PAD
+        sep_w = self._SEP_W
+        chevron = self._CHEVRON
+        x = 2
+
+        def hover_bg(x0, x1):
+            painter.save()
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(col_hover)
+            painter.drawRoundedRect(QRectF(float(x0), 4.0, float(x1 - x0), float(h - 8)), 3.0, 3.0)
+            painter.restore()
+
+        idx = 0
+        if left_collapsed:
+            # 折叠省略号（点击进入编辑模式，与旧行为一致）
+            ell = '...'
+            w = fm.horizontalAdvance(ell) + pad * 2
+            if self._hover_idx == idx:
+                hover_bg(x, x + w)
+            painter.setPen(col_sep)
+            painter.drawText(x + pad, y, ell)
+            regions.append({'kind': 'ellipsis', 'x0': x, 'x1': x + w,
+                            'payload': None, 'label': self._current_path, 'is_current': False})
+            x += w
+            idx += 1
+            # 折叠后的分隔符：列出首个显示段的同级文件夹
+            first_parent = os.path.dirname(display_parts[0][1]) if display_parts else None
+            if self._hover_idx == idx and first_parent:
+                hover_bg(x, x + sep_w)
+            painter.setPen(col_sep)
+            painter.drawText(x + (sep_w - fm.horizontalAdvance(chevron)) // 2, y, chevron)
+            regions.append({'kind': 'separator', 'x0': x, 'x1': x + sep_w,
+                            'payload': first_parent, 'label': None, 'is_current': False})
+            x += sep_w
+            idx += 1
+
+        for i, (label, full) in enumerate(display_parts):
+            if i > 0:
+                # 分隔符下拉列出左侧段的子文件夹（即当前段的同级）
+                parent = display_parts[i - 1][1]
+                if self._hover_idx == idx and parent:
+                    hover_bg(x, x + sep_w)
+                painter.setPen(col_sep)
+                painter.drawText(x + (sep_w - fm.horizontalAdvance(chevron)) // 2, y, chevron)
+                regions.append({'kind': 'separator', 'x0': x, 'x1': x + sep_w,
+                                'payload': parent, 'label': None, 'is_current': False})
+                x += sep_w
+                idx += 1
+            is_current = (full == self._current_path)
+            shown = self._elide_crumb_text(label, is_current=is_current)
+            w = fm.horizontalAdvance(shown) + pad * 2
+            hovered = (self._hover_idx == idx)
+            if hovered:
+                hover_bg(x, x + w)
+            f = QFont(self._font)
+            f.setUnderline(hovered)
+            painter.setFont(f)
+            painter.setPen(col_seg)
+            painter.drawText(x + pad, y, shown)
+            painter.setFont(self._font)
+            regions.append({'kind': 'segment', 'x0': x, 'x1': x + w,
+                            'payload': full, 'label': label, 'is_current': is_current})
+            x += w
+            idx += 1
+
+        self._display_regions = regions
+        painter.end()
+
+    def mouseMoveEvent(self, event):
+        if self._in_edit:
+            return super().mouseMoveEvent(event)
+        # 拖拽判定：在某个路径段上按下并拖动 → 拖到标签栏打开新 tab
+        if self._press_pos is not None and (event.buttons() & Qt.LeftButton):
+            if (0 <= self._press_idx < len(self._display_regions) and
+                    (event.pos() - self._press_pos).manhattanLength() >= QApplication.startDragDistance()):
+                r = self._display_regions[self._press_idx]
+                if r['kind'] == 'segment' and r['payload']:
+                    self._dragging = True
+                    drag = QDrag(self)
+                    mime = QMimeData()
+                    mime.setUrls([QUrl.fromLocalFile(r['payload'])])
+                    mime.setText(r['payload'])
+                    drag.setMimeData(mime)
+                    self._press_pos = None
+                    self._press_idx = -1
+                    drag.exec_(Qt.CopyAction | Qt.MoveAction)
+                    return
+        idx = self._region_at(int(event.pos().x()))
+        if idx != self._hover_idx:
+            self._hover_idx = idx
+            if idx >= 0:
+                r = self._display_regions[idx]
+                clickable = (r['kind'] == 'segment' or
+                             (r['kind'] == 'separator' and r['payload']) or
+                             r['kind'] == 'ellipsis')
+                self.setCursor(Qt.PointingHandCursor if clickable else Qt.IBeamCursor)
+                self.setToolTip(r.get('label') or '')
+            else:
+                self.setCursor(Qt.IBeamCursor)   # 空白处点击可进入编辑模式
+                self.setToolTip('')
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and not self._in_edit:
+            self._press_pos = event.pos()
+            self._press_idx = self._region_at(int(event.pos().x()))
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._in_edit or event.button() != Qt.LeftButton:
+            return super().mouseReleaseEvent(event)
+        was_dragging = self._dragging
+        press_idx = self._press_idx
+        self._press_pos = None
+        self._press_idx = -1
+        self._dragging = False
+        if was_dragging:
+            return super().mouseReleaseEvent(event)
+        idx = self._region_at(int(event.pos().x()))
+        if idx < 0:
+            # 空白区域 → 进入编辑模式（与旧行为一致）
+            if press_idx < 0:
+                self.enter_edit_mode()
+            return super().mouseReleaseEvent(event)
+        if idx != press_idx:
+            # 按下与释放不在同一区，视为取消
+            return super().mouseReleaseEvent(event)
+        r = self._display_regions[idx]
+        kind = r['kind']
+        if kind == 'segment':
+            if r.get('is_current'):
+                self.enter_edit_mode()        # 点击当前(末级)目录 → 编辑
+            elif r['payload']:
+                self.pathChanged.emit(r['payload'])
+        elif kind == 'separator':
+            parent = r['payload']
+            if parent and os.path.isdir(parent):
+                self._show_sibling_menu(parent)
+        elif kind == 'ellipsis':
+            self.enter_edit_mode()
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        if self._hover_idx != -1:
+            self._hover_idx = -1
+            self.setToolTip('')
+            self.update()
+        super().leaveEvent(event)
 
     def get_path_for_copy(self, separator='\\'):
         p = self._current_path
@@ -3432,170 +3591,6 @@ class SimplePathBar(QWidget):
         except Exception as e:
             debug_print(f"[SimplePathBar] completer init failed: {e}")
             self._completer = False  # 标记已尝试，不重试
-
-    # ── 布局自愈 ──────────────────────────────────────────
-    def _first_crumb_button(self):
-        for idx in range(self._crumb_row.count()):
-            w = self._crumb_row.itemAt(idx).widget()
-            if isinstance(w, QPushButton):
-                return w
-        return None
-
-    def _schedule_heal(self, attempt=0):
-        QTimer.singleShot(30 + attempt * 45, lambda: self._verify_and_heal_layout(attempt))
-
-    def _verify_and_heal_layout(self, attempt=0):
-        """校验面包屑按钮是否获得了有效几何；若仍“卡死”（几何为0）则强制重排，
-        并带退避重试，直到容器获得有效宽度、按钮几何非0。这是“必须手动
-        resize 才刷新路径栏”问题的安全网。"""
-        try:
-            if self._in_edit or not self._current_path:
-                return
-            # 路径已被新的 set_path 取代，放弃本轮（新一轮 heal 会接管）
-            if self._last_built_path != self._current_path:
-                return
-            # 隐藏/后台标签的路径栏永远不可见，heal 判定恒为不健康且会空转烧 CPU；
-            # 直接放弃本轮并停止重试，等它首次变为可见时 _rebuild 会以真实宽度重建
-            # （见 _last_build_was_hidden）。这是分屏多标签下“卡顿+CPU 高”的主因修复。
-            if not self._is_fully_visible_for_build():
-                return
-            btn = self._first_crumb_button()
-            if btn is None:
-                return
-            healthy = (btn.width() > 0 and self._crumb_w.width() > 1 and btn.isVisible())
-            if healthy:
-                return
-            self._force_relayout(reason=f"heal#{attempt}")
-            if attempt < 8:
-                self._schedule_heal(attempt + 1)
-        except Exception as e:
-            debug_print(f"[SimplePathBar] _verify_and_heal_layout error: {e}")
-
-    # ── 内部 ─────────────────────────────────────────────────────────────────
-
-    def _rebuild(self):
-        """重建面包屑按钮列表。"""
-        parts = self._split_path(self._current_path)
-        crumb_count = self._crumb_row.count()
-        # 路径为空时保留现有内容，避免显示空白
-        if not parts and crumb_count > 0:
-            debug_print(f"[SimplePathBar] _rebuild: empty path, keep existing {crumb_count} widgets")
-            return
-
-        # 内容未变化时仅重绘，避免频繁销毁/重建控件
-        if self._last_built_path == self._current_path and crumb_count > 1:
-            # 如果上次真正构建发生在隐藏态（如软件启动时后台恢复的标签页），
-            # 当时算出的折叠结果不可信。首次变为可见后，即使路径未变也需要
-            # 重新按真实可见宽度评估一次；否则只会 relayout 旧结果，导致第一次打开仍折叠。
-            if self._last_build_was_hidden and self._is_fully_visible_for_build():
-                debug_print(f"[SimplePathBar] _rebuild: unchanged path but previous build was hidden, forcing first visible rebuild")
-                self._last_built_path = ''
-            else:
-                # 强制重算几何：避免上次重建时布局未激活导致按钮几何为0
-                # （表现为路径栏“不刷新且点击无响应”，需 resize 才恢复）
-                self._force_relayout(reason="unchanged")
-                return
-        debug_print(f"[SimplePathBar] _rebuild: rebuilding. path='{self._current_path}', last='{self._last_built_path}', count={crumb_count}, parts={len(parts)}")
-        self._last_built_path = self._current_path
-        self._last_build_was_hidden = not self._is_fully_visible_for_build()
-
-        # 清除旧控件
-        while self._crumb_row.count():
-            item = self._crumb_row.takeAt(0)
-            w = item.widget()
-            if w:
-                w.hide()
-                w.deleteLater()
-
-        # Explorer 风格：优先保留右端（当前目录），左侧折叠为 ...，
-        # 并对过长目录名做中间省略，避免“路径已更新但最后一级被挤出可视区”。
-        display_parts = self._choose_display_parts(parts)
-        left_collapsed = len(display_parts) < len(parts)
-
-        if left_collapsed:
-            self._crumb_row.addWidget(self._create_ellipsis_label())
-            # 折叠区后的分隔符：下拉列出首个显示段的同级文件夹
-            _first_parent = os.path.dirname(display_parts[0][1]) if display_parts else None
-            self._add_separator_widget(_first_parent)
-
-        for i, (label, full_path) in enumerate(display_parts):
-            if i > 0:
-                # 分隔符下拉列出左侧段的子文件夹（即当前段的同级），点击可快速切换
-                self._add_separator_widget(display_parts[i - 1][1])
-            is_current = (full_path == self._current_path)
-            btn = self._create_crumb_button(label, full_path, is_current=is_current)
-            # 最后一级(当前目录)点击时进入编辑模式，而非发出无效的pathChanged
-            if is_current:
-                btn.clicked.connect(lambda _=False: self.enter_edit_mode())
-            else:
-                btn.clicked.connect(lambda _=False, p=full_path: self.pathChanged.emit(p))
-            # 拖拽支持：面包屑可拖拽到标签栏打开新tab
-            btn._crumb_path = full_path
-            btn._drag_start = None
-            btn.installEventFilter(self._crumb_drag_filter)
-            self._crumb_row.addWidget(btn)
-            btn.show()  # 显式 show，确保按钮可见且可点击
-
-        # 恢复靠左显示：尾部放弹性空白。
-        self._crumb_row.addStretch()
-
-        # 立即激活布局并重算几何，避免偶发“按钮几何为0/路径栏未刷新且点击无响应，
-        # 需手动改变窗口大小才恢复”的问题。
-        self._force_relayout(reason="rebuild")
-        # 关键：deleteLater 是异步的，旧控件在下一轮事件循环才真正销毁；
-        # 必须在那之后再做一次自上而下的强制重排（等价于一次 resize），
-        # 否则布局有时停留在按钮几何为0的状态，直到用户手动改变窗口大小。
-        QTimer.singleShot(0, lambda: self._force_relayout(reason="deferred"))
-        # 自愈：上面两次重排若发生在容器尚未获得有效宽度时（标签切换/隐藏态/布局竞态）
-        # 会落空，表现为“切换目录后路径栏不刷新、点击无响应，必须缩放窗口才恢复”。
-        # 仅当路径栏当前真正可见时才启动 heal 自愈循环；隐藏的后台标签无需自愈，
-        # 避免多标签/分屏下大量后台路径栏空转 heal 导致卡顿与 CPU 飙高。
-        if self._is_fully_visible_for_build():
-            self._schedule_heal()
-
-    def _create_crumb_button(self, label, full_path, is_current=False):
-        btn = QPushButton(self._elide_crumb_text(label, is_current=is_current))
-        btn.setFlat(True)
-        btn.setStyleSheet(self._S_BTN)
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setFocusPolicy(Qt.NoFocus)
-        btn.setToolTip(label)
-        btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
-        return btn
-
-    def _is_fully_visible_for_build(self):
-        try:
-            return bool(self.isVisible() and self._crumb_w.isVisible())
-        except Exception:
-            return False
-
-    def _create_ellipsis_label(self):
-        lbl = QLabel('...')
-        lbl.setStyleSheet(self._S_SEP)
-        lbl.setAlignment(Qt.AlignCenter)
-        lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        lbl.setToolTip(self._current_path)
-        lbl.show()
-        return lbl
-
-    def _add_separator_widget(self, parent_path=None):
-        """添加路径段分隔符。当 parent_path 为有效目录时，分隔符可点击，
-        弹出该目录下的子文件夹列表，实现 Explorer 风格的同级快速切换。"""
-        sep = QToolButton()
-        sep.setText('\u203a')  # ›
-        sep.setFixedWidth(16)
-        sep.setFocusPolicy(Qt.NoFocus)
-        sep.setAutoRaise(True)
-        sep.setStyleSheet(self._S_SEPBTN)
-        if parent_path and os.path.isdir(parent_path):
-            sep.setCursor(Qt.PointingHandCursor)
-            sep.setToolTip(tr("切换到同级文件夹"))
-            sep.clicked.connect(lambda _=False, p=parent_path: self._show_sibling_menu(p))
-        else:
-            sep.setEnabled(False)
-            sep.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self._crumb_row.addWidget(sep)
-        sep.show()
 
     def _show_sibling_menu(self, parent_path):
         """弹出 parent_path 下的子文件夹菜单，选择后导航到该文件夹。"""
@@ -3652,7 +3647,7 @@ class SimplePathBar(QWidget):
                 return parts
 
             fm = self.fontMetrics()
-            avail = max(120, int(self._crumb_w.width() or self.width() or 0) - 12)
+            avail = max(120, int(self.width() or 0) - 12)
             sep_w = 18
             ellipsis_w = max(24, fm.horizontalAdvance('...') + 8)
 
@@ -3705,49 +3700,6 @@ class SimplePathBar(QWidget):
         except Exception:
             return parts
 
-    def _force_relayout(self, reason=""):
-        """自上而下强制重排面包屑布局，修复偶发按钮几何为0需 resize 才恢复的问题。"""
-        try:
-            self._crumb_row.invalidate()   # 标记布局为脏，确保 activate() 不被当成 no-op
-            self._crumb_row.activate()
-            self._crumb_w.updateGeometry()
-            # 向上传播到外层 QStackedWidget / QVBoxLayout，触发 _crumb_w 自身的重新 setGeometry
-            self.updateGeometry()
-            lay = self.layout()
-            if lay is not None:
-                lay.invalidate()
-                lay.activate()
-            # 关键修复：双击进入子目录时 QStackedWidget 始终停在面包屑页（不发生页切换），
-            # invalidate()/activate() 在 Qt 认为容器尺寸未变时可能不会真正重排子按钮，
-            # 导致路径栏停留旧布局、需手动 resize 才恢复。这里显式让布局在容器矩形内
-            # 立即重排（等价于一次 resize 内部的 setGeometry），强制同步重新摆放所有按钮。
-            crumb_rect = self._crumb_w.rect()
-            if crumb_rect.width() > 1 and crumb_rect.height() > 1:
-                self._crumb_row.setGeometry(crumb_rect)
-            self._crumb_w.update()
-            self.update()
-            # 诊断日志：打印 _crumb_w 可见性与首个按钮几何，便于确认是否仍为0。
-            # 该诊断会遍历面包屑并构造几何字符串，且 _force_relayout 在自愈循环中
-            # 可能每次导航运行多达 8 次，故仅在调试模式下执行。
-            if _DEBUG_MODE:
-                try:
-                    first_btn = None
-                    for idx in range(self._crumb_row.count()):
-                        w = self._crumb_row.itemAt(idx).widget()
-                        if isinstance(w, QPushButton):
-                            first_btn = w
-                            break
-                    cw_sz = self._crumb_w.size()
-                    btn_geo = first_btn.geometry() if first_btn is not None else None
-                    btn_vis = first_btn.isVisible() if first_btn is not None else None
-                    debug_print(f"[SimplePathBar] _force_relayout({reason}): crumb_w visible={self._crumb_w.isVisible()}, "
-                                f"size={cw_sz.width()}x{cw_sz.height()}, stack_idx={self._stack.currentIndex()}, "
-                                f"first_btn visible={btn_vis}, geo={btn_geo}")
-                except Exception:
-                    pass
-        except Exception as e:
-            debug_print(f"[SimplePathBar] _force_relayout({reason}) ERROR: {e}")
-
     def _split_path(self, path):
         """将路径拆分为 [(显示名, 完整路径), …]。"""
         if not path:
@@ -3773,25 +3725,11 @@ class SimplePathBar(QWidget):
         if path:
             self.pathChanged.emit(path)
 
-    def _on_crumb_click(self, event):
-        if event.button() == Qt.LeftButton:
-            child = self._crumb_w.childAt(event.pos())
-            if child is None:          # 点中空白区域
-                self.enter_edit_mode()
-        # 接受事件，阻止传播到父级 SimplePathBar 触发误操作
-        event.accept()
-
     def resizeEvent(self, event):
-        """检测路径栏被resize为极小宽度的异常情况"""
-        new_w = event.size().width()
-        old_w = event.oldSize().width() if event.oldSize().isValid() else -1
-        if new_w < 50 and self._current_path:
-            debug_print(f"[SimplePathBar] resizeEvent: WARNING width shrunk to {new_w} (was {old_w}), path='{self._current_path}'")
-        elif old_w >= 0 and old_w < 50 and new_w >= 50 and self._current_path:
-            # 从极小宽度恢复 → 强制重建面包屑
-            debug_print(f"[SimplePathBar] resizeEvent: recovered from {old_w} to {new_w}, forcing rebuild")
-            self._last_built_path = ''
-            self._rebuild()
+        # 单控件自绘：尺寸变化时重定位编辑框覆盖层并请求重绘（无子控件重建）
+        if self._in_edit:
+            self._edit.setGeometry(self.rect())
+        self.update()
         super().resizeEvent(event)
 
     def eventFilter(self, obj, event):
@@ -4123,6 +4061,11 @@ if _COMTYPES_AVAILABLE:
             return 0  # S_OK
 
         def OnNavigationComplete(self, pidlFolder):
+            # DIAGNOSTIC: this is the raw COM navigation event. If this line
+            # stops printing after a minimize/restore while in-shell navigation
+            # still visibly happens, the COM event sink has gone deaf (which
+            # would leave current_path / _location_url permanently stale).
+            debug_print("[IEB NavSink] OnNavigationComplete fired (COM event alive)")
             try:
                 if pidlFolder and self._on_complete:
                     _fn = ctypes.windll.shell32.SHGetPathFromIDListW
@@ -4132,6 +4075,7 @@ if _COMTYPES_AVAILABLE:
                     if _fn(pidlFolder, buf):
                         path = buf.value
                         if path:
+                            debug_print(f"[IEB NavSink] resolved path: {path}")
                             self._on_complete(path)
             except Exception:
                 pass
@@ -5518,19 +5462,13 @@ class FileExplorerTab(QWidget):
                     # 优化：若面包屑已存在，只做 repaint 而非全量重建，减少控件析构/创建开销。
                     if hasattr(self, 'path_bar'):
                         pb = self.path_bar
-                        _has_crumbs = (hasattr(pb, '_crumb_row') and
-                                       pb._crumb_row.count() > 1 and
-                                       not getattr(pb, '_in_edit', False))
-                        if _has_crumbs:
+                        if not getattr(pb, '_in_edit', False):
+                            # 单控件自绘面包屑：轻量更新分段并同步重绘，无子控件重建开销
                             try:
-                                pb._crumb_w.update()
-                                pb._crumb_w.repaint()
-                                pb.update()
+                                pb.set_path(local_path)
                                 pb.repaint()
                             except Exception:
                                 pass
-                        else:
-                            pb.set_path(local_path)
                     if hasattr(self, '_path_sync_timer') and self._path_sync_timer:
                         target_interval = 220 if self._path_sync_stable_hits == 1 else 360
                         if self._path_sync_timer.interval() != target_interval:
@@ -7127,10 +7065,9 @@ class FileExplorerTab(QWidget):
         pb = getattr(self, 'path_bar', None)
         current_path = getattr(self, 'current_path', '')
         if pb and current_path and not getattr(pb, '_in_edit', False):
-            pb._last_built_path = ''
             pb.set_path(current_path)
             try:
-                pb._force_relayout(reason="statusbar_manual")
+                pb.force_refresh()
             except Exception:
                 pass
 
@@ -11561,8 +11498,8 @@ class MainWindow(QMainWindow):
             event.ignore()
     
     def create_custom_titlebar(self, main_layout):
-        """创建自定义标题栏，包含窗口控制按钮和功能按钮"""
-        # 根据DPI调整标题栏高度
+        """创建工具栏（系统原生标题栏下方的功能按钮区域）"""
+        # 根据DPI调整工具栏高度
         titlebar_height = int(32 * getattr(self, 'dpi_scale', 1.0))
         titlebar = QWidget()
         titlebar.setFixedHeight(titlebar_height)
@@ -11571,49 +11508,8 @@ class MainWindow(QMainWindow):
         titlebar_layout.setContentsMargins(10, 0, 0, 0)
         titlebar_layout.setSpacing(0)
         
-        # 窗口标题 - 使用图标 + 文字的组合
-        title_container = QWidget()
-        title_layout = QHBoxLayout(title_container)
-        title_layout.setContentsMargins(0, 0, 0, 0)
-        title_layout.setSpacing(6)
-        
-        # 应用图标 - 使用 QLabel 显示 QPixmap
-        icon_label = QLabel()
-        icon_label.setFixedSize(18, 18)
-        icon_label.setStyleSheet("padding: 0; margin: 0;")
-        try:
-            from PyQt5.QtWidgets import QApplication
-            app_icon = QApplication.instance().windowIcon()
-            if not app_icon.isNull():
-                icon_label.setPixmap(app_icon.pixmap(18, 18))
-        except Exception:
-            icon_label.setText("🗂")
-            icon_label.setStyleSheet("font-size: 14pt; padding: 0; margin: 0;")
-        title_layout.addWidget(icon_label)
-        self._title_icon_label = icon_label  # 保存引用供后续更新
-        
-        # 应用名称
-        self.title_label = QLabel("Tab Explorer")
-        title_font_size = int(12 * getattr(self, 'dpi_scale', 1.0))
-        self.title_label.setStyleSheet(f"""
-            font-family: 'Segoe UI Semibold', 'Segoe UI', 'Microsoft YaHei UI', sans-serif;
-            font-weight: 600;
-            font-size: 10.5pt;
-            color: #303030;
-            letter-spacing: 0.3px;
-            padding: 0;
-            margin: 0;
-        """)
-        title_layout.addWidget(self.title_label)
-        title_layout.addStretch()
-        
-        titlebar_layout.addWidget(title_container)
-        
-        # 用于拖动窗口
+        # 保存引用（兼容其他代码对 titlebar_widget 的引用）
         self.titlebar_widget = titlebar
-        self.drag_position = None
-        
-        titlebar_layout.addStretch()
         
         # TortoiseGit 按钮（可在设置中启用/禁用）
         btn_size = int(32 * getattr(self, 'dpi_scale', 1.0))
@@ -11908,14 +11804,6 @@ class MainWindow(QMainWindow):
         self.split_view_btn.clicked.connect(self.toggle_split_view)
         titlebar_layout.addWidget(self.split_view_btn)
         
-        # 添加竖杠分隔符
-        separator = QLabel("|")
-        sep_font_size = int(16 * getattr(self, 'dpi_scale', 1.0))
-        sep_padding = int(8 * getattr(self, 'dpi_scale', 1.0))
-        separator.setStyleSheet(f"color: #d0d0d0; font-size: {sep_font_size}pt; padding: 0px {sep_padding}px; font-weight: 300;")
-        separator.setFixedHeight(titlebar_height)
-        titlebar_layout.addWidget(separator)
-        
         # 书签管理按钮
         bookmark_btn = QPushButton("★")
         bookmark_btn.setToolTip(tr("书签管理"))
@@ -11999,79 +11887,8 @@ class MainWindow(QMainWindow):
         self.ai_chat_btn.setChecked(panel_visible)
         self.ai_chat_btn.setVisible(ai_enabled)
         titlebar_layout.addWidget(self.ai_chat_btn)
-    
-        # 最小化按钮
-        min_btn = QPushButton("─")
-        win_btn_width = int(45 * getattr(self, 'dpi_scale', 1.0))
-        min_btn.setFixedSize(win_btn_width, titlebar_height)
-        min_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                border: none;
-                border-radius: 4px;
-                font-size: {btn_font_size}pt;
-                font-weight: bold;
-                color: #202020;
-            }}
-            QPushButton:hover {{
-                background: #e5e5e5;
-                color: #000000;
-            }}
-            QPushButton:pressed {{
-                background: #d5d5d5;
-                color: #000000;
-            }}
-        """)
-        min_btn.clicked.connect(self.showMinimized)
-        titlebar_layout.addWidget(min_btn)
         
-        # 最大化/还原按钮
-        self.max_btn = QPushButton("☐")
-        self.max_btn.setFixedSize(win_btn_width, titlebar_height)
-        self.max_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                border: none;
-                border-radius: 4px;
-                font-size: {btn_font_size}pt;
-                font-weight: bold;
-                color: #202020;
-            }}
-            QPushButton:hover {{
-                background: #e5e5e5;
-                color: #000000;
-            }}
-            QPushButton:pressed {{
-                background: #d5d5d5;
-                color: #000000;
-            }}
-        """)
-        self.max_btn.clicked.connect(self.toggle_maximize)
-        titlebar_layout.addWidget(self.max_btn)
-        
-        # 关闭按钮
-        close_btn = QPushButton("✖")
-        close_btn.setFixedSize(win_btn_width, titlebar_height)
-        close_btn_font_size = int(16 * getattr(self, 'dpi_scale', 1.0))
-        close_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                border: none;
-                border-radius: 4px;
-                font-size: {close_btn_font_size}pt;
-                color: #202020;
-            }}
-            QPushButton:hover {{
-                background: #e81123;
-                color: white;
-            }}
-            QPushButton:pressed {{
-                background: #c50f1f;
-                color: white;
-            }}
-        """)
-        close_btn.clicked.connect(self.close)
-        titlebar_layout.addWidget(close_btn)
+        # 系统原生标题栏已提供最小化/最大化/关闭按钮，无需自定义
         
         main_layout.addWidget(titlebar)
     
@@ -12079,36 +11896,11 @@ class MainWindow(QMainWindow):
         """切换最大化/还原窗口"""
         if self.isMaximized():
             self.showNormal()
-            self.max_btn.setText("☐")
         else:
             self.showMaximized()
-            self.max_btn.setText("◱")
     
     def mousePressEvent(self, event):
-        """鼠标按下事件 - 用于拖动窗口"""
-        if event.button() == Qt.LeftButton and hasattr(self, 'titlebar_widget'):
-            # 检查点击位置是否在标题栏内
-            titlebar_rect = self.titlebar_widget.geometry()
-            if titlebar_rect.contains(event.pos()):
-                self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
-                event.accept()
-        super().mousePressEvent(event)
-    
-    def mouseMoveEvent(self, event):
-        """鼠标移动事件 - 拖动窗口"""
-        if event.buttons() == Qt.LeftButton and self.drag_position is not None:
-            if not self.isMaximized():
-                self.move(event.globalPos() - self.drag_position)
-                event.accept()
-        super().mouseMoveEvent(event)
-    
-    def mouseReleaseEvent(self, event):
-        """鼠标释放事件"""
-        self.drag_position = None
-        super().mouseReleaseEvent(event)
-    
-    def mousePressEvent(self, event):
-        """鼠标按下事件 - 用于拖动窗口或调整大小"""
+        """鼠标按下事件"""
         # 处理菜单栏的右键点击
         if event.button() == Qt.RightButton:
             menubar = self.menu_bar
@@ -12144,461 +11936,25 @@ class MainWindow(QMainWindow):
                 else:
                     debug_print(f"[DEBUG] No bookmark action found")
         
-        if event.button() == Qt.LeftButton:
-            # 检查点击位置是否在标题栏内（拖动窗口）- 优先检查以避免误触发边缘调整
-            if hasattr(self, 'titlebar_widget'):
-                titlebar_rect = self.titlebar_widget.geometry()
-                if titlebar_rect.contains(event.pos()):
-                    self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
-                    event.accept()
-                    return
-            
-            # 检测是否在边缘（调整大小）- 排除标题栏+标签栏区域
-            titlebar_exclusion_height = int(70 * getattr(self, 'dpi_scale', 1.0))
-            if event.pos().y() > titlebar_exclusion_height:  # 只在标题栏+标签栏下方才检测边缘
-                edge = self.detect_edge(event.pos())
-                if edge and not self.isMaximized():
-                    self.resizing = True
-                    self.resize_direction = edge
-                    self.resize_start_pos = event.globalPos()
-                    self.resize_start_geometry = self.geometry()
-                    event.accept()
-                    return
         super().mousePressEvent(event)
     
-    def mouseMoveEvent(self, event):
-        """鼠标移动事件 - 拖动窗口或调整大小"""
-        # 如果有设置界面、书签管理器或搜索对话框弹出，则不进行边界判断和光标改变
-        has_settings = hasattr(self, 'settings_dialog') and self.settings_dialog and self.settings_dialog.isVisible()
-        has_bookmark = hasattr(self, 'bookmark_manager_dialog') and self.bookmark_manager_dialog and self.bookmark_manager_dialog.isVisible()
-        has_search = hasattr(self, 'search_dialogs') and any(d.isVisible() for d in getattr(self, 'search_dialogs', []))
-        if has_settings or has_bookmark or has_search:
-            self.update_cursor(None)
-            return
-        if event.buttons() == Qt.LeftButton:
-            # 调整窗口大小
-            if self.resizing and self.resize_direction:
-                self.resize_window(event.globalPos())
-                # 调整大小时保持调整大小的光标
-                self.update_cursor(self.resize_direction)
-                event.accept()
-                return
-            # 拖动窗口
-            if self.drag_position is not None:
-                if self.isMaximized():
-                    # 最大化状态下拖动：先恢复窗口，然后继续拖动
-                    # 计算恢复后窗口的位置，使鼠标保持在标题栏的相对位置
-                    mouse_global_pos = event.globalPos()
-                    # 恢复窗口
-                    self.showNormal()
-                    # 计算新的拖动位置，使鼠标在窗口宽度的相对位置保持一致
-                    # 假设鼠标在标题栏的相对位置是 drag_position 的 x 坐标
-                    window_width = self.width()
-                    # 将拖动位置调整为窗口中心附近，让拖动更自然
-                    new_drag_x = window_width // 2
-                    self.drag_position.setX(new_drag_x)
-                    # 移动窗口，使鼠标位置正确
-                    new_pos = mouse_global_pos - self.drag_position
-                    self.move(new_pos)
-                else:
-                    # 正常拖动
-                    self.move(event.globalPos() - self.drag_position)
-                event.accept()
-                return
-        else:
-            # 只有在没有按键按下时才更新光标（仅在未最大化时）
-            if not self.isMaximized():
-                edge = self.detect_edge(event.pos())
-                if edge:
-                    # 在边缘，显示调整大小光标
-                    self.update_cursor(edge)
-                else:
-                    # 不在边缘，恢复默认光标
-                    self.update_cursor(None)
-            else:
-                # 最大化状态下确保恢复默认光标
-                self.update_cursor(None)
-        super().mouseMoveEvent(event)
-    
-    def mouseReleaseEvent(self, event):
-        """鼠标释放事件"""
-        self.drag_position = None
-        self.resizing = False
-        self.resize_direction = None
-        # 释放后恢复默认光标，避免停留在调整大小形状
-        try:
-            self.update_cursor(None)
-        except Exception:
-            pass
-        super().mouseReleaseEvent(event)
-    
-    def leaveEvent(self, event):
-        """鼠标离开窗口时恢复覆盖的光标"""
-        from PyQt5.QtWidgets import QApplication
-        if getattr(self, 'cursor_overridden', False):
-            QApplication.restoreOverrideCursor()
-            self.cursor_overridden = False
-        super().leaveEvent(event)
-    
-    def detect_edge(self, pos):
-        """检测鼠标是否在窗口边缘，返回边缘方向"""
-        rect = self.rect()
-        margin = max(self.resize_margin, 15)
-        
-        left = pos.x() <= margin
-        right = pos.x() >= rect.width() - margin
-        top = pos.y() <= margin
-        bottom = pos.y() >= rect.height() - margin
-        
-        # 检测是否在菜单栏区域，如果是则排除右边缘检测（防止干扰菜单栏溢出按钮">>）
-        in_menubar_area = False
-        if hasattr(self, 'menu_bar') and self.menu_bar:
-            menubar_rect = self.menu_bar.geometry()
-            in_menubar_area = (pos.y() >= menubar_rect.top() and 
-                              pos.y() <= menubar_rect.bottom())
-        
-        # 如果在菜单栏区域，排除右边缘检测
-        if in_menubar_area:
-            right = False
-        
-        if top and left:
-            return 'top-left'
-        elif top and right:
-            return 'top-right'
-        elif bottom and left:
-            return 'bottom-left'
-        elif bottom and right:
-            return 'bottom-right'
-        elif top:
-            return 'top'
-        elif bottom:
-            return 'bottom'
-        elif left:
-            return 'left'
-        elif right:
-            return 'right'
-        return None
 
-    def detect_edge_global(self, global_pos):
-        """基于全局坐标检测边缘命中（包含阴影区域）"""
-        margin = max(self.resize_margin, 15)
-        frame_rect = self.frameGeometry()
-
-        # 检测是否在标题栏+标签栏区域内，如果是则排除上边缘检测
-        # 标题栏32px + 标签栏32px + 额外缓冲6px = 70px
-        titlebar_exclusion_height = int(70 * getattr(self, 'dpi_scale', 1.0))
-        local_pos = self.mapFromGlobal(global_pos)
-        in_titlebar = (hasattr(self, 'titlebar_widget') and 
-                      local_pos.y() >= 0 and 
-                      local_pos.y() <= titlebar_exclusion_height and
-                      local_pos.x() >= 0 and 
-                      local_pos.x() <= self.width())
-
-        # 检测是否在菜单栏区域，如果是则排除右边缘检测（防止干扰菜单栏溢出按钮">>）
-        in_menubar_area = False
-        if hasattr(self, 'menu_bar') and self.menu_bar:
-            menubar_rect = self.menu_bar.geometry()
-            in_menubar_area = (local_pos.y() >= menubar_rect.top() and 
-                              local_pos.y() <= menubar_rect.bottom())
-
-        left = global_pos.x() <= frame_rect.left() + margin
-        right = global_pos.x() >= frame_rect.right() - margin and not in_menubar_area  # 菜单栏区域排除右边缘
-        top = global_pos.y() <= frame_rect.top() + margin and not in_titlebar  # 标题栏内不触发上边缘
-        bottom = global_pos.y() >= frame_rect.bottom() - margin
-
-        if top and left:
-            return 'top-left'
-        elif top and right:
-            return 'top-right'
-        elif bottom and left:
-            return 'bottom-left'
-        elif bottom and right:
-            return 'bottom-right'
-        elif top:
-            return 'top'
-        elif bottom:
-            return 'bottom'
-        elif left:
-            return 'left'
-        elif right:
-            return 'right'
-        return None
-    
-    def update_cursor(self, edge):
-        """根据边缘位置更新鼠标光标（使用QApplication覆盖，避免子控件干扰）"""
-        from PyQt5.QtGui import QCursor
-        from PyQt5.QtWidgets import QApplication
-
-        def apply(shape):
-            if not self.cursor_overridden:
-                QApplication.setOverrideCursor(QCursor(shape))
-                self.cursor_overridden = True
-            else:
-                # 已覆盖则变更形状
-                QApplication.changeOverrideCursor(QCursor(shape))
-
-        def clear():
-            if self.cursor_overridden:
-                QApplication.restoreOverrideCursor()
-                self.cursor_overridden = False
-
-        if edge == 'top-left' or edge == 'bottom-right':
-            apply(Qt.SizeFDiagCursor)
-        elif edge == 'top-right' or edge == 'bottom-left':
-            apply(Qt.SizeBDiagCursor)
-        elif edge == 'top' or edge == 'bottom':
-            apply(Qt.SizeVerCursor)
-        elif edge == 'left' or edge == 'right':
-            apply(Qt.SizeHorCursor)
-        else:
-            clear()
-    
-    def resize_window(self, global_pos):
-        """根据鼠标位置调整窗口大小"""
-        delta = global_pos - self.resize_start_pos
-        old_geo = self.resize_start_geometry
-        
-        # 计算新的位置和大小
-        new_x = old_geo.x()
-        new_y = old_geo.y()
-        new_width = old_geo.width()
-        new_height = old_geo.height()
-        
-        # 根据拖动方向调整窗口位置和大小
-        if 'left' in self.resize_direction:
-            new_x = old_geo.x() + delta.x()
-            new_width = old_geo.width() - delta.x()
-        
-        if 'right' in self.resize_direction:
-            new_width = old_geo.width() + delta.x()
-        
-        if 'top' in self.resize_direction:
-            new_y = old_geo.y() + delta.y()
-            new_height = old_geo.height() - delta.y()
-        
-        if 'bottom' in self.resize_direction:
-            new_height = old_geo.height() + delta.y()
-        
-        # 应用最小尺寸限制
-        if new_width < self.minimumWidth():
-            if 'left' in self.resize_direction:
-                new_x = old_geo.x() + old_geo.width() - self.minimumWidth()
-            new_width = self.minimumWidth()
-        
-        if new_height < self.minimumHeight():
-            if 'top' in self.resize_direction:
-                new_y = old_geo.y() + old_geo.height() - self.minimumHeight()
-            new_height = self.minimumHeight()
-        
-        # 一次性设置新的几何形状
-        self.setGeometry(new_x, new_y, new_width, new_height)
-    
-    def mouseDoubleClickEvent(self, event):
-        """鼠标双击事件 - 双击标题栏切换最大化/还原"""
-        if event.button() == Qt.LeftButton and hasattr(self, 'titlebar_widget'):
-            # 检查双击位置是否在标题栏范围内
-            titlebar_pos = self.titlebar_widget.mapFrom(self, event.pos())
-            if self.titlebar_widget.rect().contains(titlebar_pos):
-                # 排除按钮区域（避免双击按钮触发最大化）
-                clicked_widget = self.titlebar_widget.childAt(titlebar_pos)
-                if clicked_widget is None or isinstance(clicked_widget, QLabel):
-                    self.toggle_maximize()
-                    event.accept()
-                    return
-        super().mouseDoubleClickEvent(event)
     
     def nativeEvent(self, eventType, message):
-        """处理 Windows 原生事件，实现任务栏点击切换"""
+        """处理 Windows 原生事件"""
         try:
             if eventType in (b"windows_generic_MSG", "windows_generic_MSG", b"windows_dispatcher_MSG", "windows_dispatcher_MSG"):
                 from ctypes import wintypes, cast, POINTER
                 import ctypes
                 
-                # 解析消息结构
                 msg = cast(int(message), POINTER(wintypes.MSG)).contents
 
-                # WM_GETMINMAXINFO - 限制最大化时的窗口尺寸为当前屏幕的工作区域（不遮挡任务栏）
-                if msg.message == 0x0024:  # WM_GETMINMAXINFO
-                    import ctypes.wintypes as wt
-
-                    class MINMAXINFO(ctypes.Structure):
-                        _fields_ = [
-                            ("ptReserved", wt.POINT),
-                            ("ptMaxSize", wt.POINT),
-                            ("ptMaxPosition", wt.POINT),
-                            ("ptMinTrackSize", wt.POINT),
-                            ("ptMaxTrackSize", wt.POINT),
-                        ]
-
-                    info = cast(msg.lParam, POINTER(MINMAXINFO)).contents
-
-                    # 获取窗口当前所在的屏幕
-                    from PyQt5.QtWidgets import QApplication
-                    screen = QApplication.screenAt(self.geometry().center())
-                    if screen is None:
-                        screen = QApplication.primaryScreen()
-                    available = screen.availableGeometry()
-                    screen_geo = screen.geometry()
-
-                    # ptMaxPosition 是相对于当前监视器左上角的偏移
-                    info.ptMaxPosition.x = available.x() - screen_geo.x()
-                    info.ptMaxPosition.y = available.y() - screen_geo.y()
-                    info.ptMaxSize.x = available.width()
-                    info.ptMaxSize.y = available.height()
-                    info.ptMaxTrackSize.x = available.width()
-                    info.ptMaxTrackSize.y = available.height()
-
-                    return True, 0
-
-                # WM_NCHITTEST - 让 Windows 自己处理无边框窗口的拖动调整大小
-                if msg.message == 0x0084:  # WM_NCHITTEST
-                    from PyQt5.QtCore import QPoint
-
-                    # 最大化时不允许调整大小
-                    if self.isMaximized():
-                        return False, 0
-
-                    # 从 lParam 解析全局坐标
-                    x = ctypes.c_short(msg.lParam & 0xFFFF).value
-                    y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
-                    global_pos = QPoint(x, y)
-
-                    margin = max(self.resize_margin, 15)  # 阴影+命中容差
-
-                    # 先用客户端坐标检测（无标题栏区域）
-                    client_pos = self.mapFromGlobal(global_pos)
-                    client_rect = self.rect()
-
-                    left = client_pos.x() <= margin
-                    right = client_pos.x() >= client_rect.width() - margin
-                    top = client_pos.y() <= margin
-                    bottom = client_pos.y() >= client_rect.height() - margin
-
-                    # 如果坐标在客户端之外，使用 frameGeometry 兜底（阴影区域）
-                    if not client_rect.contains(client_pos):
-                        frame_rect = self.frameGeometry()
-                        left = global_pos.x() <= frame_rect.left() + margin
-                        right = global_pos.x() >= frame_rect.right() - margin
-                        top = global_pos.y() <= frame_rect.top() + margin
-                        bottom = global_pos.y() >= frame_rect.bottom() - margin
-
-                    # 命中测试结果常量
-                    HTLEFT = 10
-                    HTRIGHT = 11
-                    HTTOP = 12
-                    HTTOPLEFT = 13
-                    HTTOPRIGHT = 14
-                    HTBOTTOM = 15
-                    HTBOTTOMLEFT = 16
-                    HTBOTTOMRIGHT = 17
-
-                    if top and left:
-                        return True, HTTOPLEFT
-                    if top and right:
-                        return True, HTTOPRIGHT
-                    if bottom and left:
-                        return True, HTBOTTOMLEFT
-                    if bottom and right:
-                        return True, HTBOTTOMRIGHT
-                    if top:
-                        return True, HTTOP
-                    if bottom:
-                        return True, HTBOTTOM
-                    if left:
-                        return True, HTLEFT
-                    if right:
-                        return True, HTRIGHT
-                    # 非边缘区域，交回默认处理
-                    return False, 0
-                
-                # WM_SYSCOMMAND = 0x0112
+                # WM_SYSCOMMAND：从最小化恢复时设置 restore guard（抑制 IEB 虚假导航）
                 if msg.message == 0x0112:  # WM_SYSCOMMAND
                     command = msg.wParam & 0xFFF0
-                    SC_MINIMIZE = 0xF020
                     SC_RESTORE = 0xF120
-                    SC_MAXIMIZE = 0xF030
-
-                    if command in (SC_MINIMIZE, SC_RESTORE, SC_MAXIMIZE):
-                        print(f"[Taskbar] WM_SYSCOMMAND received: 0x{command:04X}, minimized={self.isMinimized()}, active={self.isActiveWindow()}")
-                    
-                    # 任务栏点击切换：
-                    # - 最小化状态下：让系统默认恢复
-                    # - 非最小化状态下：点击任务栏按钮则最小化
-                    if command == SC_RESTORE:
-                        # 如果窗口当前可见（包括正常、最大化状态），则最小化
-                        # 只有在最小化时，才执行默认的恢复行为
-                        if not self.isMinimized():
-                            self.showMinimized()
-                            return True, 0
-                        # 如果已经最小化，返回 False 让系统执行默认恢复
-                        # 设置 restore guard：抑制 IEB 树面板自动展开导致的虚假导航
-                        else:
-                            self._set_restore_nav_guard()
-                    elif command == SC_MINIMIZE:
-                        # 某些系统/场景下，任务栏二次点击会发 SC_MINIMIZE
-                        # 主动处理以保证行为一致
-                        if not self.isMinimized():
-                            self.showMinimized()
-                            return True, 0
-
-                # WM_SETCURSOR - 在命中边缘时主动切换调整大小光标
-                if msg.message == 0x0020:  # WM_SETCURSOR
-                    from PyQt5.QtCore import QPoint
-
-                    if self.isMaximized():
-                        return False, 0
-
-                    # 获取当前全局鼠标位置
-                    import ctypes
-                    from ctypes import wintypes
-                    pt = wintypes.POINT()
-                    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-                    global_pos = QPoint(pt.x, pt.y)
-
-                    margin = max(self.resize_margin, 15)
-
-                    # 首先用客户端坐标检测
-                    client_pos = self.mapFromGlobal(global_pos)
-                    client_rect = self.rect()
-
-                    left = client_pos.x() <= margin
-                    right = client_pos.x() >= client_rect.width() - margin
-                    top = client_pos.y() <= margin
-                    bottom = client_pos.y() >= client_rect.height() - margin
-
-                    # 客户端外部则使用 frame 几何（包含阴影）
-                    if not client_rect.contains(client_pos):
-                        frame_rect = self.frameGeometry()
-                        left = global_pos.x() <= frame_rect.left() + margin
-                        right = global_pos.x() >= frame_rect.right() - margin
-                        top = global_pos.y() <= frame_rect.top() + margin
-                        bottom = global_pos.y() >= frame_rect.bottom() - margin
-
-                    edge = None
-                    if top and left:
-                        edge = 'top-left'
-                    elif top and right:
-                        edge = 'top-right'
-                    elif bottom and left:
-                        edge = 'bottom-left'
-                    elif bottom and right:
-                        edge = 'bottom-right'
-                    elif top:
-                        edge = 'top'
-                    elif bottom:
-                        edge = 'bottom'
-                    elif left:
-                        edge = 'left'
-                    elif right:
-                        edge = 'right'
-
-                    # 主动设置光标；若无边缘命中，交给默认处理
-                    if edge:
-                        self.update_cursor(edge)
-                        return True, 1  # 告诉系统已处理，防止重置光标
-                    else:
-                        self.update_cursor(None)
-                        return False, 0
+                    if command == SC_RESTORE and self.isMinimized():
+                        self._set_restore_nav_guard()
         except Exception:
             pass
         
@@ -12609,43 +11965,24 @@ class MainWindow(QMainWindow):
         if event.type() == event.WindowStateChange:
             was_minimized = bool(event.oldState() & Qt.WindowMinimized)
             now_minimized = bool(self.windowState() & Qt.WindowMinimized)
-            # 保存最后的非最小化状态，用于任务栏点击判断
-            if not now_minimized:
-                self._last_active_state = self.windowState()
-            
-            # 根据窗口状态切换阴影显示
-            self._update_window_shadow()
 
-            # 从最小化恢复：延迟到窗口几何稳定后，重新武装当前标签的刷新与路径同步，
-            # 并强制重建路径栏。安全网，针对“最小化期间/某个瞬态停掉刷新后无人重启，
-            # 表现为路径栏不更新、文件夹不自动刷新，需手动 resize 才恢复”的偶发问题。
+            # 从最小化恢复：重新武装当前标签的刷新与路径同步（安全网）
             if was_minimized and not now_minimized:
                 QTimer.singleShot(0, lambda: self._reactivate_current_tab_refresh(rebuild_pathbar=True))
         
         super().changeEvent(event)
-    
+
+
+
+
     def event(self, event):
-        """处理窗口事件，实现任务栏点击切换"""
+        """处理窗口事件"""
         if event.type() == event.WindowActivate:
-            # 窗口激活事件 - 用于检测任务栏点击
-            # 使用定时器短暂延迟检测，避免初始激活时触发
-            if hasattr(self, '_activation_timer'):
-                # 如果窗口已经激活，再次点击任务栏应该最小化
-                if self.isActiveWindow() and not self.isMinimized():
-                    from PyQt5.QtCore import QTimer
-                    QTimer.singleShot(50, self._check_taskbar_click)
-            else:
-                # 首次激活，标记定时器已设置
-                self._activation_timer = True
             # 安全网：窗口重新激活时，若当前标签刷新被瞬态停掉则重新武装（健康时为空操作）
             self._reactivate_current_tab_refresh(rebuild_pathbar=False)
         
         return super().event(event)
     
-    def _check_taskbar_click(self):
-        """检查是否是任务栏点击（通过短时间内重复激活判断）"""
-        # 这个方法可以进一步优化，目前主要依赖 nativeEvent 的实现
-        pass
 
     def _reactivate_current_tab_refresh(self, rebuild_pathbar=False):
         """窗口恢复/重新激活时的刷新自愈安全网。
@@ -12685,7 +12022,6 @@ class MainWindow(QMainWindow):
                 if pb and current_path:
                     try:
                         if not getattr(pb, '_in_edit', False):
-                            pb._last_built_path = ''  # 强制完整重建，按当前可见宽度评估
                             pb.set_path(current_path)
                     except Exception:
                         pass
@@ -13522,11 +12858,6 @@ class MainWindow(QMainWindow):
         # 检查并自动添加常用书签
         self.ensure_default_bookmarks()
         
-        # 窗口调整大小相关变量
-        self.resizing = False
-        self.resize_direction = None
-        self.resize_margin = 15  # 边缘检测范围（像素），与阴影边距一致以便更容易触发
-        self.cursor_overridden = False  # 通过QApplication是否已覆盖光标
         
         # 搜索历史（持久化到config.json）- 使用常量限制大小
         self.search_history = list(self.config.get("search_history", []))[:MAX_SEARCH_HISTORY]
@@ -14277,91 +13608,7 @@ class MainWindow(QMainWindow):
             bar['children'] = new_children
         return changed
 
-    def _setup_window_shadow(self):
-        """设置窗口阴影效果"""
-        # 初始化阴影状态标志
-        self._shadow_enabled = False
-    
-    def _update_window_shadow(self):
-        """根据窗口状态更新阴影显示 - 使用 Windows DWM 原生阴影"""
-        # 只在窗口化状态（非最大化、非最小化、非全屏）时显示阴影
-        is_normal = not (self.windowState() & (Qt.WindowMaximized | Qt.WindowMinimized | Qt.WindowFullScreen))
-        
-        if is_normal and not self._shadow_enabled:
-            # 需要显示阴影且当前未启用，使用 Windows DWM 阴影
-            if HAS_PYWIN:
-                try:
-                    import win32gui
-                    import win32con
-                    hwnd = int(self.winId())
-                    import ctypes
-                    from ctypes import wintypes
-                    dwmapi = ctypes.windll.dwmapi
-                    
-                    # 启用窗口阴影
-                    DWMWA_NCRENDERING_POLICY = 2
-                    DWMNCRP_ENABLED = 2
-                    dwmapi.DwmSetWindowAttribute(
-                        hwnd,
-                        DWMWA_NCRENDERING_POLICY,
-                        ctypes.byref(wintypes.DWORD(DWMNCRP_ENABLED)),
-                        ctypes.sizeof(wintypes.DWORD)
-                    )
-                    
-                    # 不扩展玻璃框架到客户区，避免产生半透明缝隙
-                    # WS_THICKFRAME 本身会提供系统阴影，无需调用 DwmExtendFrameIntoClientArea
-                    
-                    # 设置窗口圆角（Windows 11 风格）
-                    try:
-                        DWM_WINDOW_CORNER_PREFERENCE = 33
-                        DWMWCP_ROUND = 2  # 圆角
-                        dwmapi.DwmSetWindowAttribute(
-                            hwnd,
-                            DWM_WINDOW_CORNER_PREFERENCE,
-                            ctypes.byref(wintypes.DWORD(DWMWCP_ROUND)),
-                            ctypes.sizeof(wintypes.DWORD)
-                        )
-                    except Exception:
-                        pass  # Windows 10 不支持此属性，忽略错误
-                    
-                    # 添加可见边框和可调整大小的样式（WS_THICKFRAME/WS_SIZEBOX）
-                    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-                    # WS_THICKFRAME 允许通过命中测试调整大小
-                    win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style | win32con.WS_BORDER | win32con.WS_THICKFRAME)
-                    
-                    self._shadow_enabled = True
-                    debug_print("[Shadow] Windows shadow enabled with enhanced border")
-                except Exception as e:
-                    debug_print(f"[Shadow] Failed to enable Windows shadow: {e}")
-        elif not is_normal and self._shadow_enabled:
-            # 最大化时移除阴影和边框
-            if HAS_PYWIN:
-                try:
-                    import win32gui
-                    import win32con
-                    hwnd = int(self.winId())
-                    import ctypes
-                    from ctypes import wintypes
-                    dwmapi = ctypes.windll.dwmapi
-                    
-                    # 禁用窗口阴影
-                    DWMWA_NCRENDERING_POLICY = 2
-                    DWMNCRP_DISABLED = 1
-                    dwmapi.DwmSetWindowAttribute(
-                        hwnd,
-                        DWMWA_NCRENDERING_POLICY,
-                        ctypes.byref(wintypes.DWORD(DWMNCRP_DISABLED)),
-                        ctypes.sizeof(wintypes.DWORD)
-                    )
-                    
-                    # 移除边框和可调整大小样式
-                    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-                    win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style & ~win32con.WS_BORDER & ~win32con.WS_THICKFRAME)
-                    
-                    self._shadow_enabled = False
-                    debug_print("[Shadow] Windows shadow disabled")
-                except Exception as e:
-                    debug_print(f"[Shadow] Failed to disable Windows shadow: {e}")
+
 
     def init_ui(self):
         # 获取DPI缩放因子
@@ -14376,16 +13623,9 @@ class MainWindow(QMainWindow):
         min_height = int(300 * self.dpi_scale)
         self.setMinimumSize(min_width, min_height)
         
-        # 启用鼠标追踪，以便在边缘时显示调整大小光标
-        self.setMouseTracking(True)
         
-        # 隐藏默认标题栏，但保留标准窗口能力（任务栏最小化切换依赖最小化样式）
-        self.setWindowFlags(
-            Qt.Window |
-            Qt.FramelessWindowHint |
-            Qt.WindowSystemMenuHint |
-            Qt.WindowMinMaxButtonsHint
-        )
+        # 使用系统原生标题栏（彻底修复无边框窗口最小化恢复后 backing store 停摆问题）
+        self.setWindowFlags(Qt.Window)
 
         # 填充窗口背景，避免边框与内容之间出现半透明缝隙
         self.setAutoFillBackground(True)
@@ -14396,8 +13636,6 @@ class MainWindow(QMainWindow):
         # 再次用样式表确保非客户区也以白色填充
         self.setStyleSheet("QMainWindow { background: white; }")
         
-        # 添加窗口阴影效果（仅在非最大化时显示）
-        self._setup_window_shadow()
         
         # 创建主容器，无边距，纯白填充
         main_container = QWidget()
@@ -15454,58 +14692,6 @@ class MainWindow(QMainWindow):
         from PyQt5.QtWidgets import QMenu
         from PyQt5.QtGui import QMouseEvent
         
-        # 边框命中优先：在全局范围内拦截鼠标用于调整大小，避免子控件抢占事件
-        if event.type() in (QEvent.MouseMove, QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
-            if isinstance(event, QMouseEvent):
-                # 最大化时不处理边框
-                if not self.isMaximized():
-                    global_pos = event.globalPos()
-                    local_pos = self.mapFromGlobal(global_pos)
-                    
-                    # 检查是否在标题栏+标签栏区域，如果是则跳过边缘检测（允许拖动窗口）
-                    # 标题栏32px + 标签栏32px + 额外缓冲6px = 70px
-                    titlebar_exclusion_height = int(70 * getattr(self, 'dpi_scale', 1.0))
-                    in_titlebar = (hasattr(self, 'titlebar_widget') and 
-                                  local_pos.y() >= 0 and 
-                                  local_pos.y() <= titlebar_exclusion_height and
-                                  local_pos.x() >= 0 and 
-                                  local_pos.x() <= self.width())
-                    
-                    # 检查是否在窗口边界外（如菜单弹出到窗口外），如果是则不进行边缘检测
-                    in_window_bounds = (local_pos.x() >= 0 and 
-                                       local_pos.x() <= self.width() and
-                                       local_pos.y() >= 0 and 
-                                       local_pos.y() <= self.height())
-                    
-                    edge = self.detect_edge_global(global_pos) if (not in_titlebar and in_window_bounds) else None
-
-                    if event.type() == QEvent.MouseMove:
-                        if self.resizing and self.resize_direction:
-                            self.resize_window(global_pos)
-                            self.update_cursor(self.resize_direction)
-                            return True  # 吃掉事件，避免子控件触发
-                        if edge:
-                            self.update_cursor(edge)
-                        else:
-                            self.update_cursor(None)
-                        # 鼠标移动仅更新光标，不吃掉事件
-                        return False
-
-                    if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                        if edge:
-                            self.resizing = True
-                            self.resize_direction = edge
-                            self.resize_start_pos = global_pos
-                            self.resize_start_geometry = self.geometry()
-                            self.update_cursor(edge)
-                            return True  # 吃掉事件，防止按钮/目录树收到点击
-
-                    if event.type() == QEvent.MouseButtonRelease:
-                        if self.resizing:
-                            self.resizing = False
-                            self.resize_direction = None
-                            self.update_cursor(None)
-                            return True
 
         # 处理主菜单栏的右键点击
         if obj == self.menu_bar:
@@ -16979,8 +16165,6 @@ def main():
     # 启动时最大化显示
     window.showMaximized()
     
-    # 确保启动时阴影状态正确（最大化时无阴影）
-    window._update_window_shadow()
 
     # No HKCU cleanup needed – overlay fix is vtable-only (process-local).
 
