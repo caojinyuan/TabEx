@@ -721,6 +721,9 @@ APP_INTERNAL_CHANGE_FILENAMES = {
 LARGE_FOLDER_THRESHOLD = 1000  # 超过此数量文件视为大文件夹
 FOLDER_CHECK_TIMEOUT = 500  # 文件夹检查超时时间(ms)
 ASYNC_LOAD_ENABLED = True  # 是否启用异步加载
+# 慢盘（网络/UNC/映射盘）导航兜底超时：后台解析成功但 NavigateComplete2 因网络中断
+# 始终不触发时，用此超时解除“导航中”锁定并隐藏 loading，避免标签永久卡在加载态。
+ASYNC_NAV_TIMEOUT_MS = 20000
 # 兜底轮询快照逐项 stat 的上限：超大目录每 8s 在 UI 线程逐项 stat 会造成周期性卡顿，
 # 超过此上限后停止逐项统计，改用“总项目数 + 目录自身 mtime”兜底检测增删/重命名。
 DIR_SNAPSHOT_MAX_ENTRIES = 5000
@@ -3198,6 +3201,58 @@ class FolderSizeChecker(QThread):
         self.should_stop = True
         self._mutex.unlock()
 
+
+class _PidlResolver(QThread):
+    """后台解析 shell 绝对 PIDL。
+
+    SHParseDisplayName 对网络/UNC/映射盘是同步阻塞调用，若在 UI 线程执行会冻结
+    整个 Qt 事件循环——表现为“一个慢标签把所有标签/窗口都卡住”。本线程在后台完成
+    解析，把解析出的绝对 PIDL（进程内有效、非 COM 接口指针，可跨线程传递并用
+    CoTaskMemFree 释放）通过信号回传 UI 线程，由 UI 线程调用 BrowseToIDList 导航。
+    """
+    resolved = pyqtSignal(str, object, int, int)  # path, pidl(int|None), hr, generation
+
+    def __init__(self, path, generation, parent=None):
+        super().__init__(parent)
+        self._path = path
+        self._generation = generation
+
+    def run(self):
+        import ctypes
+        pidl_val = None
+        hr = -1
+        co_init = False
+        try:
+            try:
+                # 后台线程需自备 COM 环境；COINIT_APARTMENTTHREADED = 0x2
+                ctypes.windll.ole32.CoInitializeEx(None, 0x2)
+                co_init = True
+            except Exception:
+                pass
+            _spdn = ctypes.windll.shell32.SHParseDisplayName
+            _spdn.restype = ctypes.c_long
+            _spdn.argtypes = [
+                ctypes.c_wchar_p, ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+            ]
+            pidl = ctypes.c_void_p(0)
+            sfgao = ctypes.c_ulong(0)
+            hr = _spdn(self._path, None, ctypes.byref(pidl), 0, ctypes.byref(sfgao))
+            if hr == 0 and pidl.value:
+                pidl_val = pidl.value  # 绝对 PIDL：跨线程有效
+        except Exception as e:
+            debug_print(f"[PidlResolver] error for '{self._path}': {e}")
+            hr = -1
+        finally:
+            if co_init:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
+        self.resolved.emit(self._path, pidl_val, int(hr), self._generation)
+
+
 def set_debug_mode(enabled):
     """设置全局调试模式"""
     global _DEBUG_MODE
@@ -3707,14 +3762,23 @@ class SimplePathBar(QWidget):
         if path.startswith('shell:') or '::' in path:
             return [(path, path)]
         norm = os.path.normpath(path)
-        parts = [p for p in norm.split(os.sep) if p]
-        if not parts:
-            return []
+        # splitdrive 可正确识别本地盘符（'C:'）与 UNC 共享根（'\\\\server\\share'），
+        # 直接按 os.sep 拆分会丢失 UNC 的 '\\\\' 前缀，导致面包屑各段路径失效。
+        drive, tail = os.path.splitdrive(norm)
         result = []
-        # 驱动器根，如 C:
-        current = parts[0] + os.sep
-        result.append((parts[0], current))
-        for part in parts[1:]:
+        if drive:
+            root = drive + os.sep
+            result.append((drive, root))
+            current = root
+            parts = [p for p in tail.split(os.sep) if p]
+        else:
+            parts = [p for p in norm.split(os.sep) if p]
+            if not parts:
+                return []
+            current = parts[0] + os.sep
+            result.append((parts[0], current))
+            parts = parts[1:]
+        for part in parts:
             current = os.path.join(current, part)
             result.append((part, current))
         return result
@@ -4554,6 +4618,10 @@ class IExplorerBrowserWidget(QWidget):
     # (pDisp, url) – matches QAxWidget's NavigateComplete2 signature
     NavigateComplete2 = pyqtSignal(object, object)
 
+    # 异步导航（慢盘）状态信号：宿主标签据此显示 loading / 解除导航锁
+    navigationStarted  = pyqtSignal(str)        # path — 后台 PIDL 解析已开始
+    navigationFinished = pyqtSignal(str, bool)  # path, ok — 解析失败/无法访问时触发
+
     # IExplorerBrowser option flags  (SDK shobjidl_core.h values)
     _EBO_SHOWFRAMES  = 0x00000002  # 显示左侧导航窗格
     _EBO_NOTRAVELLOG = 0x00000008  # 禁用前进/后退历史（避免与 TabEx 自身历史冲突）
@@ -4567,6 +4635,9 @@ class IExplorerBrowserWidget(QWidget):
         self._location_url = ''
         self._pending_path = None
         self._init_ok      = False
+        # 异步导航（慢盘）：导航代号用于作废过期的后台解析结果；线程引用防 GC
+        self._nav_generation = 0
+        self._nav_resolver   = None
         # 后台 overlay 图标预加载：懒创建信号对象 + in-flight 去重标志
         self._overlay_signals = None
         self._overlay_preload_inflight = False
@@ -4630,6 +4701,15 @@ class IExplorerBrowserWidget(QWidget):
         if not self._ensure_browser():
             self._pending_path = path
             return
+        # 慢盘（网络/UNC/OneDrive/映射远程盘）：把阻塞的 PIDL 解析放到后台线程，避免冻结
+        # UI 事件循环——一个慢标签不再拖垮其它标签/窗口。本地快盘保持同步（无线程开销）。
+        if _path_is_slow_for_shell(path):
+            self._navigate_async(path)
+        else:
+            self._navigate_sync(path)
+
+    def _navigate_sync(self, path):
+        """同步导航（本地快盘）：UI 线程内解析 PIDL 并浏览。"""
         try:
             # Pre-load overlay icons BEFORE navigation so DefView has them
             # when it first renders (skip if already cached for this dir)
@@ -4658,6 +4738,59 @@ class IExplorerBrowserWidget(QWidget):
                             f"hr=0x{hr & 0xFFFFFFFF:08x} for '{path}'")
         except Exception as e:
             debug_print(f"[IExplorerBrowser] _navigate error: {e}")
+
+    def _navigate_async(self, path):
+        """异步导航（慢盘）：后台线程解析 PIDL，解析完再由 UI 线程浏览。"""
+        # 递增导航代号：解析期间若再次发起导航，旧线程的结果会被作废，避免错误落地
+        self._nav_generation += 1
+        gen = self._nav_generation
+        try:
+            self.navigationStarted.emit(path)
+        except Exception:
+            pass
+        resolver = _PidlResolver(path, gen, self)
+        resolver.resolved.connect(self._on_pidl_resolved)
+        resolver.finished.connect(resolver.deleteLater)
+        self._nav_resolver = resolver
+        resolver.start()
+
+    def _on_pidl_resolved(self, path, pidl_val, hr, generation):
+        """后台 PIDL 解析完成（UI 线程）：作废过期结果，否则浏览到该 PIDL。"""
+        # 期间又发起了新导航 → 丢弃过期结果并释放其 PIDL
+        if generation != self._nav_generation:
+            if pidl_val:
+                try:
+                    ctypes.windll.ole32.CoTaskMemFree(ctypes.c_void_p(pidl_val))
+                except Exception:
+                    pass
+            return
+        try:
+            if pidl_val and self._browser is not None:
+                pidl = ctypes.c_void_p(pidl_val)
+                try:
+                    self._browser.BrowseToIDList(pidl, 0)  # 0 = SBSP_ABSOLUTE
+                finally:
+                    ctypes.windll.ole32.CoTaskMemFree(pidl)
+                # 浏览已发起；内容加载完成由 NavigateComplete2 通知宿主标签隐藏 loading
+            else:
+                debug_print(f"[IExplorerBrowser] async SHParseDisplayName failed "
+                            f"hr=0x{hr & 0xFFFFFFFF:08x} for '{path}'")
+                # 解析失败（网络不可达/路径无效）：NavigateComplete2 不会触发，主动通知结束
+                if pidl_val:
+                    try:
+                        ctypes.windll.ole32.CoTaskMemFree(ctypes.c_void_p(pidl_val))
+                    except Exception:
+                        pass
+                try:
+                    self.navigationFinished.emit(path, False)
+                except Exception:
+                    pass
+        except Exception as e:
+            debug_print(f"[IExplorerBrowser] async _navigate error: {e}")
+            try:
+                self.navigationFinished.emit(path, False)
+            except Exception:
+                pass
 
     def _do_refresh(self):
         if self._location_url:
@@ -4849,6 +4982,20 @@ class IExplorerBrowserWidget(QWidget):
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def cleanup(self):
+        # 作废任何在途的后台 PIDL 解析，并断开信号，避免结果回调已销毁的 COM 浏览器
+        self._nav_generation += 1
+        resolver = getattr(self, '_nav_resolver', None)
+        if resolver is not None:
+            try:
+                resolver.resolved.disconnect()
+            except Exception:
+                pass
+            try:
+                if resolver.isRunning():
+                    resolver.wait(200)  # SHParseDisplayName 无法中断，短等即可，结果会被作废
+            except Exception:
+                pass
+            self._nav_resolver = None
         # 断开后台 overlay 预加载信号，避免延迟到达的 QThreadPool 结果回调已销毁的控件
         sig = getattr(self, '_overlay_signals', None)
         if sig is not None:
@@ -5610,6 +5757,10 @@ class FileExplorerTab(QWidget):
         # 异步加载相关
         self.folder_checker = None  # 文件夹大小检查线程
         self.pending_navigation = None  # 待处理的导航请求
+        # 慢盘异步导航状态：_nav_in_progress 表示后台 PIDL 解析未完成（用于显示 loading
+        # 与拦截重复点击）；_nav_in_progress_path 记录当前正在解析的目标路径。
+        self._nav_in_progress = False
+        self._nav_in_progress_path = None
         
         # Explorer 基础配置：保留必要项，避免重复 COM 调用拖慢初始化
         self.explorer.dynamicCall('Visible', True)
@@ -5652,6 +5803,13 @@ class FileExplorerTab(QWidget):
         except (AttributeError, TypeError) as e:
             debug_print(f"[Explorer] NavigateComplete2 direct signal unavailable: {e}")
 
+        # 连接异步导航（慢盘）状态信号：显示 loading + 进入/解除“导航中”锁定
+        try:
+            self.explorer.navigationStarted.connect(self._on_async_nav_started)
+            self.explorer.navigationFinished.connect(self._on_async_nav_finished)
+        except (AttributeError, TypeError):
+            pass  # Shell.Explorer 回退控件无此信号，忽略
+
         # 初始设置路径栏（确保路径栏显示初始路径）
         if hasattr(self, 'path_bar'):
             self.path_bar.set_path(self.current_path)
@@ -5663,6 +5821,38 @@ class FileExplorerTab(QWidget):
         
         # 初始导航到当前路径（在setup_ui最后调用，确保所有设置已应用）
         self.explorer.dynamicCall('Navigate(const QString&)', QDir.toNativeSeparators(self.current_path))
+
+    def _on_async_nav_started(self, path):
+        """慢盘异步导航开始：显示 loading 并进入导航中锁定状态。"""
+        self._nav_in_progress = True
+        self._nav_in_progress_path = self._normalize_local_path(path)
+        self._show_loading_indicator()
+        # 安全兜底：网络中断时 NavigateComplete2 可能永不触发，超时后强制解锁并隐藏 loading
+        QTimer.singleShot(
+            ASYNC_NAV_TIMEOUT_MS,
+            lambda p=self._nav_in_progress_path: self._async_nav_safety_timeout(p),
+        )
+
+    def _on_async_nav_finished(self, path, ok):
+        """慢盘异步导航结束（仅解析失败/无法访问时触发）：解锁并隐藏 loading。"""
+        self._nav_in_progress = False
+        self._hide_loading_indicator()
+        if not ok:
+            show_toast(self, tr("路径错误"), tr("无法访问: {}").format(path), level="warning")
+
+    def _async_nav_safety_timeout(self, path):
+        """导航中锁定的兜底超时：仍在等待同一目标时强制解锁，避免永久卡在加载态。"""
+        if (getattr(self, '_nav_in_progress', False) and
+                getattr(self, '_nav_in_progress_path', None) == path):
+            debug_print(f"[AsyncNav] Safety timeout, clearing nav lock: {path}")
+            self._nav_in_progress = False
+            self._hide_loading_indicator()
+
+    def _clear_async_nav_lock(self):
+        """导航真正完成（NavigateComplete2）时解除导航中锁定并隐藏 loading。"""
+        if getattr(self, '_nav_in_progress', False):
+            self._nav_in_progress = False
+            self._hide_loading_indicator()
 
     def _on_shell_navigate_complete(self, *args):
         """Shell.Explorer NavigateComplete2 直接信号处理：路径栏即时更新"""
@@ -5680,16 +5870,19 @@ class FileExplorerTab(QWidget):
             if not url:
                 return
             local_path = None
-            if url.startswith('file:///'):
+            if url.startswith('file:'):
+                # 统一解析 file: URL，正确还原本地盘符路径与 UNC 网络路径。
+                # UNC 路径经 _on_nav_complete 编码后形如 file://///server/share，
+                # 直接剥离固定前缀会丢失一个反斜杠，破坏 UNC 前缀，故按前导斜杠数判定。
                 from urllib.parse import unquote
-                local_path = unquote(url[8:])
-                if os.name == 'nt' and local_path.startswith('/'):
-                    local_path = local_path[1:]
-                local_path = self._normalize_local_path(local_path)
-            elif url.startswith('file://') and not url.startswith('file:///'):
-                from urllib.parse import unquote
-                local_path = '\\\\' + unquote(url[7:]).replace('/', '\\')
-                local_path = self._normalize_local_path(local_path)
+                rest = unquote(url[5:]).replace('/', '\\')
+                stripped = rest.lstrip('\\')
+                if len(stripped) >= 2 and stripped[1] == ':':
+                    # 本地盘符路径，如 C:\...
+                    local_path = self._normalize_local_path(stripped)
+                elif stripped:
+                    # UNC 网络路径，如 \\server\share\...
+                    local_path = self._normalize_local_path('\\\\' + stripped)
             # 处理 CLSID 路径（如 ::{20D04FE0-...}\X:\）：尝试提取盘符路径
             if local_path is None and '::' in url:
                 import re
@@ -5716,6 +5909,8 @@ class FileExplorerTab(QWidget):
                 # 无条件更新路径栏（即使路径未变也刷新显示）
                 if hasattr(self, 'path_bar'):
                     self.path_bar.set_path(local_path)
+                # 导航真正完成：解除慢盘异步导航的“导航中”锁定并隐藏 loading
+                self._clear_async_nav_lock()
                 # 延迟安装/更新 IExplorerBrowser 双击钩子（SysListView32 在首次导航后才创建）
                 QTimer.singleShot(200, self._install_listview_dblclick_hook)
                 if local_path and local_path != current:
@@ -5912,6 +6107,12 @@ class FileExplorerTab(QWidget):
         """异步请求 Git 状态（不阻塞 UI 线程）"""
         if not dir_path or dir_path.startswith('shell:') or '::' in dir_path:
             return
+        # 慢盘（网络/UNC/映射盘）：_find_git_root 向上逐级 os.path.isdir/isfile 探测，
+        # 在挂起的网络路径上会同步阻塞 UI 线程导致卡死。网络盘一般非 Git 仓库，直接跳过。
+        if self._is_slow_path(dir_path):
+            self._git_status_cache = {'path': dir_path, 'result': None,
+                                      'ts_ms': int(time.time() * 1000)}
+            return
         # 防止重复请求同一路径
         if getattr(self, '_git_status_pending_path', None) == dir_path:
             return
@@ -6093,10 +6294,11 @@ class FileExplorerTab(QWidget):
 
         # 尝试中英文目录互转
         path2 = translate_common_path(path)
-        if os.path.exists(path2):
+        # 慢盘（网络/UNC/映射盘/OneDrive）：os.path.exists 在挂起路径上会阻塞 UI 线程，
+        # 直接交给 navigate_to（其内部对慢盘走后台异步解析，不做同步文件系统探测）。
+        if self._is_slow_path(path2) or path2.startswith('\\\\') or path2.startswith('//'):
             self.navigate_to(path2)
-        elif path2.startswith('\\\\') or path2.startswith('//'):
-            # UNC 网络路径可能因网络延迟导致 os.path.exists 返回 False，直接尝试导航
+        elif os.path.exists(path2):
             self.navigate_to(path2)
         else:
             show_toast(self, tr("路径错误"), tr("路径不存在: {}").format(path2), level="warning")
@@ -7115,10 +7317,21 @@ class FileExplorerTab(QWidget):
             return path
         if path.startswith('shell:') or '::' in path:
             return path
+        # 自愈：修复历史会话/缓存中被破坏的 UNC 路径。旧版本把 \\server\share
+        # 误存成单反斜杠 \server\share（丢了一个 \），导致 SHParseDisplayName 失败。
+        # 统一分隔符后，若以单个分隔符开头（非双）且至少有两段（\主机\共享…），
+        # 判定为被破坏的 UNC 并还原 \\ 前缀。本应用只存绝对路径，不会有盘符相对路径。
+        unified = path.replace('/', '\\')
+        if unified.startswith('\\') and not unified.startswith('\\\\'):
+            rest = unified.lstrip('\\')
+            if rest and rest[1:2] != ':':  # 排除形如 \C:\ 的异常
+                segs = [s for s in rest.split('\\') if s]
+                if len(segs) >= 2:
+                    unified = '\\\\' + rest
         try:
-            return os.path.normpath(path)
+            return os.path.normpath(unified)
         except Exception:
-            return path
+            return unified
 
     def __init__(self, parent=None, path="", is_shell=False, select_file=None, defer_nav=False):
         super().__init__(parent)
@@ -7381,6 +7594,12 @@ class FileExplorerTab(QWidget):
         if not is_shell:
             path = self._normalize_local_path(path)
         debug_print(f"[navigate_to] To '{path}' (is_shell={is_shell}, skip_async={skip_async_check})")
+        # 导航进行中（慢盘异步解析未完成）：忽略对同一目标的重复点击，避免频繁操作堆积后台线程。
+        # 仅拦截相同目标；切换到不同路径仍放行（旧解析结果由导航代号自动作废）。
+        if (not is_shell and getattr(self, '_nav_in_progress', False) and
+                path == getattr(self, '_nav_in_progress_path', None)):
+            debug_print(f"[navigate_to] Ignoring duplicate nav while in progress: {path}")
+            return
         # 控制面板及其子目录用原生窗口打开，不嵌入
         if self._is_control_panel_path(path):
             try:
@@ -7424,6 +7643,12 @@ class FileExplorerTab(QWidget):
             if add_to_history:
                 self._add_to_history(path)
             self.update_explorer_status()
+        elif self._is_slow_path(path):
+            # 慢盘（网络/UNC/映射盘/OneDrive）：os.path.exists / os.path.isdir 在挂起的
+            # 网络路径上会同步阻塞 UI 线程，导致整个程序卡死。提前判定并跳过所有同步
+            # 文件系统探测，直接进入导航流程（PIDL 解析已在后台线程异步执行）。
+            debug_print(f"[navigate_to] Slow/network path, skipping sync fs checks: {path}")
+            self._perform_navigation(path, add_to_history)
         elif os.path.exists(path):
             # 如果skip_async_check=True或禁用异步，直接导航
             # OneDrive/网络路径的os.scandir()可能永久阻塞，直接跳过异步检查
@@ -7583,9 +7808,16 @@ class FileExplorerTab(QWidget):
         self.update_explorer_status()
         
         # 更新文件系统监控（只监控真实文件系统路径）
-        if hasattr(self, 'file_watcher'):
-            # 移除旧路径的监控
-            if old_path and os.path.exists(old_path) and os.path.isdir(old_path) and not old_path.startswith('shell:'):
+        # 慢盘（网络/UNC/映射盘）：os.path.exists/os.path.isdir/addPath/_build_dir_snapshot
+        # 均为同步文件系统调用，在挂起的网络路径上会阻塞 UI 线程导致整个程序卡死，
+        # 故对慢盘完全跳过 watcher 注册与快照构建（此类路径的自动刷新本就依赖轮询兜底，
+        # 而 _update_dir_polling 已对慢盘跳过轮询）。
+        path_is_slow = self._is_slow_path(path)
+        if hasattr(self, 'file_watcher') and not path_is_slow:
+            # 移除旧路径的监控（旧路径若为慢盘同样跳过，避免 os.path.exists 阻塞）
+            if (old_path and not self._is_slow_path(old_path) and
+                    os.path.exists(old_path) and os.path.isdir(old_path) and
+                    not old_path.startswith('shell:')):
                 self._force_remove_watcher(old_path)
             # 添加新路径的监控
             if os.path.isdir(path):
@@ -7597,6 +7829,10 @@ class FileExplorerTab(QWidget):
                 self._refresh_file_watch_paths(path)
                 self._last_dir_snapshot = self._build_dir_snapshot(path)
                 debug_print(f"[FileWatcher] Now watching: {self.file_watcher.directories()}")
+        elif path_is_slow:
+            # 慢盘不注册 watcher，清空上次快照，避免下次轮询用旧快照误判
+            self._last_dir_snapshot = None
+            debug_print(f"[FileWatcher] Skipped watcher for slow path: {path}")
 
         # 启用低频轮询兜底，处理 watcher 未报告的文件修改时间变化
         self._update_dir_polling(path)
