@@ -775,7 +775,7 @@ def _compute_dir_snapshot(path, ignore_check=None):
         return None
 
 STATUS_SELECTION_METADATA_LIMIT = 20  # 多选超过阈值时跳过逐项大小统计
-SHORTCUT_POLL_ACTIVE_MS = 160  # 主窗口激活时快捷键轮询频率
+SHORTCUT_POLL_ACTIVE_MS = 60  # 主窗口激活时快捷键轮询频率（需足够快以捕捉"同时按住"的短促组合键）
 SHORTCUT_POLL_INACTIVE_MS = 500  # 主窗口非激活时快捷键轮询频率
 # ── 主线程 COM 轮询抗高负载保护 ───────────────────────────────────────────────
 # LocationURL 是同步跨进程 COM 调用，无超时。CPU 饱和时其延迟会飙升，阻塞 UI 线程，
@@ -12495,16 +12495,15 @@ class MainWindow(QMainWindow):
             VK_F5 = 0x74
             
             # 获取键盘状态
-            # require_down=True: 必须当前按住（用于 Ctrl/Shift/Alt 等修饰键）
-            # require_down=False: 支持“当前按住”或“自上次轮询以来被按下过一次”（修复短按漏检）
+            # 组合键必须“同时物理按住”才触发：只信任 GetAsyncKeyState 的高位
+            # (0x8000，表示当前正被按住)，不再使用粘滞位 (0x0001，表示自上次查询
+            # 以来按过一次)。粘滞位会导致“先按松某键后再按修饰键”被误判为组合键。
+            # require_down 参数保留以兼容调用点，但行为统一为“必须当前按住”。
             _GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
 
             def is_key_pressed(vk_code, require_down=False):
                 state = _GetAsyncKeyState(vk_code)
-                is_down = (state & 0x8000) != 0
-                if require_down:
-                    return is_down
-                return is_down or bool(state & 0x0001)
+                return (state & 0x8000) != 0
 
             modifiers_down = (
                 is_key_pressed(VK_CONTROL, require_down=True)
