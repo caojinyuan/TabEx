@@ -2489,6 +2489,7 @@ import string
 import time
 import socket
 import threading
+import collections
 import queue
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QFileSystemModel, QSplitter, QProgressBar, QCompleter, QFrame, QToolButton, QFileIconProvider)  # 添加QFrame
 from PyQt5.QAxContainer import QAxWidget
@@ -4110,6 +4111,19 @@ if _COMTYPES_AVAILABLE:
 
     _CLSID_ExplorerBrowser = GUID("{71F96385-DDD6-48D3-A0C1-AE06E8B055FB}")
 
+    class _IInputObject(IUnknown):
+        """IInputObject – IExplorerBrowser 通过它接收键盘加速键（Ctrl+C/V/X、F2、Del…）。
+        宿主消息泵必须对每条键盘消息调用 TranslateAcceleratorIO，Shell 才能处理它们。"""
+        _iid_ = GUID("{68284FAA-6A48-11D0-8C78-00C04FD918B4}")
+        _methods_ = [
+            COMMETHOD([], HRESULT, 'UIActivateIO',
+                      (['in'], ctypes.c_int, 'fActivate'),
+                      (['in'], ctypes.c_void_p, 'pMsg')),
+            COMMETHOD([], HRESULT, 'HasFocusIO'),
+            COMMETHOD([], HRESULT, 'TranslateAcceleratorIO',
+                      (['in'], ctypes.c_void_p, 'pMsg')),
+        ]
+
     class _NavEventSink(comtypes.COMObject):
         """IExplorerBrowserEvents sink – receives navigation-complete callbacks."""
         _com_interfaces_ = [_IExplorerBrowserEvents]
@@ -5034,6 +5048,446 @@ class IExplorerBrowserWidget(QWidget):
         super().closeEvent(event)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 每标签独立 STA 线程寄宿 IExplorerBrowser（实验特性，config: experimental_threaded_shell）
+#
+# 问题：默认实现把 IExplorerBrowser.Initialize(hwnd=self.winId()) 绑定到 Qt 主线程的
+# 窗口上，Shell 视图的窗口过程在主线程消息泵里执行。用户在某个标签内拷贝/粘贴时，
+# Shell 会在主线程上【同步】执行拷贝，所有标签共用一个 Qt 事件循环 → 整窗转圈卡死。
+#
+# 方案：每个标签把自己的 Shell 视图放到【专属 STA 线程】上运行，该线程拥有自己的消息泵。
+# 某标签内的同步拷贝只会阻塞它自己的线程，主 UI 线程与其它标签保持流畅。也顺带根治
+# “一个慢网络路径卡死全部标签”。
+# ─────────────────────────────────────────────────────────────────────────────
+_USE_THREADED_SHELL = False  # 由 MainWindow 启动时按 config 覆盖
+
+# 主线程 → 工作线程命令唤醒消息（PostMessage 到宿主子窗口，命令负载走线程安全队列）
+_WM_SHELL_CMD = 0x8000 + 0x21  # WM_APP + 0x21
+
+
+class _ShellHostThread(threading.Thread):
+    """在专属 STA 线程上创建并驱动一个 IExplorerBrowser 及其消息泵。
+
+    该线程内：CoInitializeEx(APARTMENTTHREADED) → CreateWindowEx 宿主子窗口
+    （作为 Qt 控件 HWND 的子窗口，跨线程 parent 合法）→ Initialize/Advise →
+    GetMessage/Dispatch 泵循环。主线程通过 post() 投递命令（导航/刷新/尺寸/退出）。
+    导航完成回调在本线程触发，经传入的 on_nav_complete 转发（调用方负责跨线程封送）。
+    """
+
+    def __init__(self, parent_hwnd, init_w, init_h, on_nav_complete, on_ready, options):
+        super().__init__(daemon=True)
+        self._parent_hwnd = int(parent_hwnd)
+        self._init_w = max(int(init_w), 50)
+        self._init_h = max(int(init_h), 50)
+        self._on_nav_complete = on_nav_complete
+        self._on_ready = on_ready
+        self._options = int(options)
+        # 命令队列（线程安全）：元组 ('navigate', path) / ('refresh',) / ('resize', w, h) / ('quit',)
+        self._cmd_lock = threading.Lock()
+        self._cmd_queue = collections.deque()
+        # 就绪同步：host_hwnd / worker_tid 供主线程 SetParent、AttachThreadInput 使用
+        self.ready_event = threading.Event()
+        self.host_hwnd = 0
+        self.worker_tid = 0
+        self.init_error = None
+        self._browser = None
+        self._sink = None
+        self._cookie = 0
+        self._input_object = None
+        self._quit = False
+        self._ole_inited = False
+
+    # ── 主线程调用 ────────────────────────────────────────────────────────────
+    def post(self, cmd_tuple):
+        """线程安全地投递一条命令并唤醒工作线程消息泵。"""
+        with self._cmd_lock:
+            self._cmd_queue.append(cmd_tuple)
+        hwnd = self.host_hwnd
+        if hwnd:
+            try:
+                ctypes.windll.user32.PostMessageW(hwnd, _WM_SHELL_CMD, 0, 0)
+            except Exception:
+                pass
+
+    # ── 工作线程内部 ──────────────────────────────────────────────────────────
+    def run(self):
+        try:
+            # STA + OLE 初始化。必须用 OleInitialize（而非仅 CoInitializeEx）：
+            # Shell 视图的复制/粘贴、拖放依赖 OLE 剪贴板（OleGetClipboard/DoDragDrop），
+            # 这些 API 要求调用线程已 OleInitialize，否则 Ctrl+C/Ctrl+V 静默失败。
+            _ole_hr = ctypes.windll.ole32.OleInitialize(None)
+            self._ole_inited = (_ole_hr in (0, 1))  # S_OK / S_FALSE 均视为成功
+            self.worker_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            if not self._create_host_window():
+                self.ready_event.set()
+                return
+            if not self._create_browser():
+                self.ready_event.set()
+                self._destroy_host_window()
+                return
+            # 通知主线程就绪（host_hwnd/worker_tid 已可用）。主线程据此做 AttachThreadInput。
+            # 注意：主线程【不再阻塞等待】本事件，避免 CreateWindowEx 的跨线程
+            # WM_PARENTNOTIFY(SendMessage) 与主线程 wait() 相互死锁。
+            self.ready_event.set()
+            try:
+                if self._on_ready is not None:
+                    self._on_ready(self.worker_tid, self.host_hwnd)
+            except Exception:
+                pass
+            # 就绪前（host_hwnd 尚为 0 时）入队的命令不会 PostMessage 唤醒，这里先补执行一次
+            self._drain_commands()
+            self._pump()
+        except Exception as e:
+            self.init_error = str(e)
+            self.ready_event.set()
+        finally:
+            self._teardown_com()
+            self._destroy_host_window()
+            try:
+                if getattr(self, '_ole_inited', False):
+                    ctypes.windll.ole32.OleUninitialize()
+            except Exception:
+                pass
+
+    def _create_host_window(self):
+        try:
+            user32 = ctypes.windll.user32
+            CreateWindowExW = user32.CreateWindowExW
+            CreateWindowExW.restype = ctypes.wintypes.HWND
+            CreateWindowExW.argtypes = [
+                ctypes.wintypes.DWORD, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                ctypes.wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.wintypes.HWND, ctypes.wintypes.HMENU,
+                ctypes.wintypes.HINSTANCE, ctypes.c_void_p,
+            ]
+            WS_CHILD = 0x40000000
+            WS_VISIBLE = 0x10000000
+            WS_CLIPCHILDREN = 0x02000000
+            WS_CLIPSIBLINGS = 0x04000000
+            style = WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS
+            hwnd = CreateWindowExW(
+                0, "static", None, style,
+                0, 0, self._init_w, self._init_h,
+                self._parent_hwnd, None, None, None)
+            if not hwnd:
+                self.init_error = "CreateWindowEx failed"
+                return False
+            self.host_hwnd = int(hwnd)
+            return True
+        except Exception as e:
+            self.init_error = f"create_host_window: {e}"
+            return False
+
+    def _destroy_host_window(self):
+        hwnd = self.host_hwnd
+        self.host_hwnd = 0
+        if hwnd:
+            try:
+                ctypes.windll.user32.DestroyWindow(hwnd)
+            except Exception:
+                pass
+
+    def _create_browser(self):
+        try:
+            browser = comtypes.client.CreateObject(
+                _CLSID_ExplorerBrowser, interface=_IExplorerBrowser)
+            rc = ctypes.wintypes.RECT(0, 0, self._init_w, self._init_h)
+            fs = _FOLDERSETTINGS(4, 0)  # FVM_DETAILS
+            browser.Initialize(self.host_hwnd, ctypes.byref(rc), ctypes.byref(fs))
+            browser.SetOptions(self._options)
+            sink = _NavEventSink(self._on_nav_complete)
+            cookie = browser.Advise(sink)
+            self._browser = browser
+            self._sink = sink
+            self._cookie = cookie
+            # 缓存 IInputObject：消息泵据此把键盘加速键交给 Shell 处理（Ctrl+C/V/X、F2、Del…）
+            try:
+                self._input_object = browser.QueryInterface(_IInputObject)
+            except Exception as e:
+                self._input_object = None
+                debug_print(f"[ThreadedShell] IInputObject QI failed: {e}")
+            return True
+        except Exception as e:
+            self.init_error = f"create_browser: {e}"
+            return False
+
+    def _teardown_com(self):
+        browser = self._browser
+        self._browser = None
+        self._input_object = None
+        if browser is None:
+            return
+        try:
+            if self._cookie:
+                browser.Unadvise(self._cookie)
+        except Exception:
+            pass
+        try:
+            browser.Destroy()
+        except Exception:
+            pass
+        self._sink = None
+
+    def _pump(self):
+        user32 = ctypes.windll.user32
+        msg = ctypes.wintypes.MSG()
+        GetMessageW = user32.GetMessageW
+        # 键盘消息范围：WM_KEYDOWN/UP/CHAR/SYSKEYDOWN/SYSKEYUP/SYSCHAR
+        _KEY_MSGS = (0x0100, 0x0101, 0x0102, 0x0104, 0x0105, 0x0106)
+        while not self._quit:
+            ret = GetMessageW(ctypes.byref(msg), 0, 0, 0)
+            if ret == 0 or ret == -1:  # WM_QUIT 或错误
+                break
+            if msg.message == _WM_SHELL_CMD:
+                self._drain_commands()
+                if self._quit:
+                    break
+                continue
+            # 键盘加速键：先交给 Shell 的 IInputObject 处理（Ctrl+C/V/X、F2、Del、方向键…）。
+            # 返回 S_OK 表示已被 Shell 消费，无需再 Translate/Dispatch。
+            if msg.message in _KEY_MSGS and self._input_object is not None:
+                try:
+                    hr = self._input_object.TranslateAcceleratorIO(ctypes.byref(msg))
+                    if hr == 0:  # S_OK
+                        continue
+                except Exception:
+                    pass
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _drain_commands(self):
+        while True:
+            with self._cmd_lock:
+                if not self._cmd_queue:
+                    return
+                cmd = self._cmd_queue.popleft()
+            try:
+                self._exec_command(cmd)
+            except Exception as e:
+                debug_print(f"[ThreadedShell] command {cmd[0]} error: {e}")
+
+    def _exec_command(self, cmd):
+        kind = cmd[0]
+        if kind == 'navigate':
+            self._do_navigate(cmd[1])
+        elif kind == 'refresh':
+            self._do_refresh()
+        elif kind == 'resize':
+            self._do_resize(cmd[1], cmd[2])
+        elif kind == 'quit':
+            self._quit = True
+            try:
+                ctypes.windll.user32.PostQuitMessage(0)
+            except Exception:
+                pass
+
+    def _do_navigate(self, path):
+        if self._browser is None or not path:
+            return
+        try:
+            if _TORTOISE_OVERLAY_PATCHED and path not in _OVERLAY_PRELOADED_DIRS:
+                try:
+                    _preload_overlay_icons(path)
+                except Exception:
+                    pass
+            _spdn = ctypes.windll.shell32.SHParseDisplayName
+            _spdn.restype = ctypes.c_long
+            _spdn.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p,
+                              ctypes.POINTER(ctypes.c_void_p), ctypes.c_ulong,
+                              ctypes.POINTER(ctypes.c_ulong)]
+            pidl = ctypes.c_void_p(0)
+            sfgao = ctypes.c_ulong(0)
+            hr = _spdn(path, None, ctypes.byref(pidl), 0, ctypes.byref(sfgao))
+            if hr == 0 and pidl.value:
+                try:
+                    self._browser.BrowseToIDList(pidl, 0)  # SBSP_ABSOLUTE
+                finally:
+                    ctypes.windll.ole32.CoTaskMemFree(pidl)
+            else:
+                debug_print(f"[ThreadedShell] SHParseDisplayName failed "
+                            f"hr=0x{hr & 0xFFFFFFFF:08x} for '{path}'")
+        except Exception as e:
+            debug_print(f"[ThreadedShell] navigate error: {e}")
+
+    def _do_refresh(self):
+        if self._browser is None:
+            return
+        try:
+            from comtypes import GUID as _GUID
+            iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
+            ppv = self._browser.GetCurrentView(ctypes.byref(iid_sv))
+            iface_ptr = int(ppv) if ppv else 0
+            if not iface_ptr:
+                return
+            try:
+                _vp = ctypes.sizeof(ctypes.c_void_p)
+                vtbl = ctypes.c_void_p.from_address(iface_ptr).value
+                fn = ctypes.c_void_p.from_address(vtbl + 8 * _vp).value  # IShellView::Refresh idx 8
+                _REFRESH = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
+                _REFRESH(fn)(iface_ptr)
+            finally:
+                rel = ctypes.c_void_p.from_address(
+                    ctypes.c_void_p.from_address(iface_ptr).value + 2 * ctypes.sizeof(ctypes.c_void_p)).value
+                ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(rel)(iface_ptr)
+        except Exception as e:
+            debug_print(f"[ThreadedShell] refresh error: {e}")
+
+    def _do_resize(self, w, h):
+        w = max(int(w), 1)
+        h = max(int(h), 1)
+        try:
+            ctypes.windll.user32.MoveWindow(self.host_hwnd, 0, 0, w, h, True)
+        except Exception:
+            pass
+        if self._browser is not None:
+            try:
+                rc = ctypes.wintypes.RECT(0, 0, w, h)
+                self._browser.SetRect(None, rc)
+            except Exception:
+                pass
+
+
+class ThreadedExplorerBrowserWidget(QWidget):
+    """IExplorerBrowserWidget 的“每标签独立线程”替身：对外提供相同的 drop-in 子集
+    （dynamicCall / property('LocationURL') / NavigateComplete2 / navigationStarted /
+    navigationFinished / cleanup），内部把真正的 Shell 视图放到 _ShellHostThread 上运行。
+    """
+    NavigateComplete2 = pyqtSignal(object, object)
+    navigationStarted = pyqtSignal(str)
+    navigationFinished = pyqtSignal(str, bool)
+    # 工作线程 → 主线程封送导航完成路径（跨线程队列连接）
+    _navCompleteInternal = pyqtSignal(str)
+    # 工作线程 → 主线程通知就绪（携带 worker 线程 id），用于 AttachThreadInput
+    _threadReadyInternal = pyqtSignal(int)
+
+    _EBO_SHOWFRAMES = 0x00000002
+    _EBO_NOTRAVELLOG = 0x00000008
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thread = None
+        self._location_url = ''
+        self._pending_path = None
+        self._init_ok = False
+        self._worker_tid = 0
+        self.setAttribute(Qt.WA_NativeWindow, True)
+        self._navCompleteInternal.connect(self._on_nav_complete_main)
+        self._threadReadyInternal.connect(self._on_thread_ready_main)
+
+    # ── QAxWidget 兼容子集 ────────────────────────────────────────────────────
+    def property(self, name):  # noqa: A003
+        if name == 'LocationURL':
+            return self._location_url
+        return super().property(name)
+
+    def dynamicCall(self, sig, *args):
+        s = sig.lower()
+        if (s.startswith('navigate') or s.startswith('navigate2')) and \
+           'complete' not in s and 'before' not in s:
+            url = str(args[0]) if args else ''
+            if url and url != 'None':
+                self._navigate_url(url)
+        elif 'refresh()' in s:
+            if self._thread is not None:
+                self._thread.post(('refresh',))
+
+    def querySubObject(self, _name, *_args):
+        return None
+
+    def clear(self):
+        self.cleanup()
+
+    # ── 导航 ──────────────────────────────────────────────────────────────────
+    def _navigate_url(self, url):
+        path = IExplorerBrowserWidget._url_to_path(url)
+        if path:
+            self._navigate(path)
+
+    def _navigate(self, path):
+        if not _COMTYPES_AVAILABLE:
+            return
+        if not self._ensure_thread():
+            self._pending_path = path
+            return
+        self._thread.post(('navigate', path))
+
+    # ── 线程生命周期 ──────────────────────────────────────────────────────────
+    def _ensure_thread(self):
+        if self._init_ok:
+            return True
+        if not _COMTYPES_AVAILABLE:
+            return False
+        try:
+            parent_hwnd = int(self.winId())
+            if not parent_hwnd:
+                return False
+            w = max(self.width(), 100)
+            h = max(self.height(), 100)
+            options = self._EBO_SHOWFRAMES | self._EBO_NOTRAVELLOG
+            # 回调均在【工作线程】触发 → 经内部信号（Qt 队列连接）封送回主线程执行。
+            # 关键：主线程【不阻塞等待】线程就绪，否则会与工作线程 CreateWindowEx 的
+            # 跨线程 WM_PARENTNOTIFY(SendMessage) 死锁（主线程 wait 时无法处理该消息）。
+            self._thread = _ShellHostThread(
+                parent_hwnd, w, h,
+                lambda p: self._navCompleteInternal.emit(p),
+                lambda tid, hwnd: self._threadReadyInternal.emit(int(tid)),
+                options)
+            self._thread.start()
+            self._init_ok = True  # 线程已启动；命令先入队，就绪后由工作线程消费
+            debug_print("[ThreadedShell] host thread started (non-blocking)")
+            return True
+        except Exception as e:
+            debug_print(f"[ThreadedShell] _ensure_thread error: {e}")
+            return False
+
+    def _on_thread_ready_main(self, worker_tid):
+        """工作线程就绪（主线程槽）。
+
+        注意：此处【不再】调用 AttachThreadInput。曾用它试图路由键盘，但键盘实际是
+        由工作线程消息泵里的 IInputObject::TranslateAcceleratorIO 处理的。而
+        AttachThreadInput 会把主线程与所有 N 个工作线程的输入队列合并，导致某个
+        Shell 视图忙碌（如拷贝的模态循环）时，主线程的标签栏点击被串行阻塞 → 无法切换标签。
+        """
+        self._worker_tid = int(worker_tid)
+        debug_print("[ThreadedShell] host thread ready")
+
+    def _on_nav_complete_main(self, path):
+        """工作线程导航完成 → 主线程更新 LocationURL 并广播 NavigateComplete2。"""
+        norm = os.path.normpath(path)
+        self._location_url = 'file:///' + norm.replace('\\', '/')
+        self.NavigateComplete2.emit(None, self._location_url)
+
+    # ── Qt 事件 ───────────────────────────────────────────────────────────────
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._init_ok:
+            if self._ensure_thread() and self._pending_path:
+                path, self._pending_path = self._pending_path, None
+                self._navigate(path)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._thread is not None and self._init_ok:
+            self._thread.post(('resize', self.width(), self.height()))
+
+    # ── 清理 ──────────────────────────────────────────────────────────────────
+    def cleanup(self):
+        thread = self._thread
+        if thread is None:
+            return
+        try:
+            thread.post(('quit',))
+            thread.join(timeout=3.0)
+        except Exception:
+            pass
+        self._thread = None
+        self._init_ok = False
+
+    def closeEvent(self, event):
+        self.cleanup()
+        super().closeEvent(event)
+
+
 class FileExplorerTab(QWidget):
     # Singleton WH_MOUSE_LL hook for double-click detection (shared across all IEB tabs)
     _global_mouse_hook_handle = None
@@ -5376,7 +5830,7 @@ class FileExplorerTab(QWidget):
         上次已知 URL，彻底根治“无超时同步 COM 卡死 UI”。IExplorerBrowser 的 LocationURL
         是进程内缓存值（快），直接在 UI 线程读取。"""
         # IEB 缓存值：进程内、零阻塞，直接读
-        if isinstance(self.explorer, IExplorerBrowserWidget):
+        if isinstance(self.explorer, (IExplorerBrowserWidget, ThreadedExplorerBrowserWidget)):
             return self.explorer.property('LocationURL')
         # 旧 QAx：跨进程 COM，加看门狗硬超时
         start = time.perf_counter()
@@ -5703,9 +6157,13 @@ class FileExplorerTab(QWidget):
         _ieb_ok = False
         if _COMTYPES_AVAILABLE:
             try:
-                self.explorer = IExplorerBrowserWidget(self)
+                if _USE_THREADED_SHELL:
+                    self.explorer = ThreadedExplorerBrowserWidget(self)
+                    debug_print("[WindowsShellExplorer] Using ThreadedExplorerBrowser (per-tab STA isolation)")
+                else:
+                    self.explorer = IExplorerBrowserWidget(self)
+                    debug_print("[WindowsShellExplorer] Using IExplorerBrowser (TortoiseGit overlay supported)")
                 _ieb_ok = True
-                debug_print("[WindowsShellExplorer] Using IExplorerBrowser (TortoiseGit overlay supported)")
             except Exception as _ieb_err:
                 debug_print(f"[WindowsShellExplorer] IExplorerBrowserWidget failed: {_ieb_err}")
         if not _ieb_ok:
@@ -13082,6 +13540,10 @@ class MainWindow(QMainWindow):
         # 初始化全局调试开关
         set_debug_mode(self.config.get("debug_mode", False))
         set_explorer_monitor_debug(self.config.get("explorer_monitor_debug", False))
+        # 实验特性：每标签独立 STA 线程寄宿 Shell 视图（隔离同步拷贝导致的整窗卡死）
+        globals()['_USE_THREADED_SHELL'] = bool(self.config.get("experimental_threaded_shell", False))
+        if _USE_THREADED_SHELL:
+            debug_print("[ThreadedShell] experimental per-tab STA isolation ENABLED")
         
         # 初始化书签管理器
         self.bookmark_manager = BookmarkManager()
