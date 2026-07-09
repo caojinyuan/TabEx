@@ -7996,7 +7996,12 @@ class FileExplorerTab(QWidget):
                 self._last_watcher_event = dict(sorted_items[:10])
         else:
             self._last_watcher_event = {path: current_time}
-        if os.path.isdir(path) and not self._is_slow_path(path):
+        # 事件风暴（批量拷贝/解压/删除等）期间：跳过 UI 线程上的同步快照扫描。
+        # os.scandir + 逐项 entry.stat() 在目标目录正被大量写入、文件被占用时会
+        # 阻塞 UI 线程；所有标签共用同一个 Qt 事件循环，会导致整个程序转圈无法操作。
+        # 内嵌的资源管理器视图在拷贝过程中会自行刷新，无需我们主动同步刷新——
+        # 这里仅走下面的延后调度，由 delayed_refresh 在风暴平息后统一补刷一次。
+        if not is_storm and os.path.isdir(path) and not self._is_slow_path(path):
             current_snapshot = self._build_dir_snapshot(path)
             if current_snapshot is not None:
                 previous_snapshot = getattr(self, '_last_dir_snapshot', None)
@@ -8054,16 +8059,17 @@ class FileExplorerTab(QWidget):
             return
         now_ms = time.time() * 1000
 
-        # 风暴检测：如果仍在风暴中且距上次刷新太近，重新延后
+        # 风暴检测：批量拷贝/解压/删除等会在短时间内触发大量目录事件
         storm_times = getattr(self, '_watcher_storm_times', [])
         storm_count = sum(1 for t in storm_times if now_ms - t < 10000)
         is_storm = storm_count > 5
-        last_refresh_ms = float(getattr(self, '_last_refresh_ts_ms', 0) or 0)
-        if is_storm and last_refresh_ms > 0 and (now_ms - last_refresh_ms) < 8000:
-            # 风暴中两次刷新间隔不到 8s，重新延后
-            remain = int(8000 - (now_ms - last_refresh_ms))
-            self.refresh_timer.start(remain)
-            debug_print(f"[AutoRefresh] Storm active, deferring refresh by {remain}ms")
+        if is_storm:
+            # 风暴进行中：绝不在 UI 线程上调用同步、无超时的 COM Refresh()。
+            # 对正忙于拷贝的内嵌 shell view 调用 Refresh() 会阻塞数秒，卡死所有标签。
+            # 内嵌视图会自行刷新显示拷贝进度，这里只持续延后本地元数据补刷，
+            # 待风暴平息（事件老化出 10s 窗口）后，由后续一次调用统一刷新一次。
+            self.refresh_timer.start(2000)
+            debug_print("[AutoRefresh] Storm active, skip sync COM refresh; will settle after storm")
             return
 
         if getattr(self, '_manual_refresh_frozen', False):
@@ -8089,20 +8095,9 @@ class FileExplorerTab(QWidget):
                 debug_print(f"[FileWatcher] Refresh completed")
             except Exception as e:
                 debug_print(f"[FileWatcher] Refresh error: {e}")
-        # 刷新后更新快照（风暴时延迟执行，避免阻塞 UI）
-        if is_storm:
-            QTimer.singleShot(500, self._deferred_post_refresh_snapshot)
-        else:
-            self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
-            self.update_explorer_status()
-
-    def _deferred_post_refresh_snapshot(self):
-        """延迟更新快照，避免风暴期间连续 scandir 阻塞 UI"""
-        try:
-            self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
-            self.update_explorer_status()
-        except Exception:
-            pass
+        # 刷新后更新快照（此处已排除风暴：风暴时前面已提前 return）
+        self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
+        self.update_explorer_status()
 
     def _poll_directory_changes(self):
         """兜底轮询目录元数据，解决文件编辑后目录 watcher 不触发的问题"""
