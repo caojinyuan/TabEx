@@ -5074,11 +5074,14 @@ class _ShellHostThread(threading.Thread):
     导航完成回调在本线程触发，经传入的 on_nav_complete 转发（调用方负责跨线程封送）。
     """
 
-    def __init__(self, parent_hwnd, init_w, init_h, on_nav_complete, on_ready, options):
+    def __init__(self, owner_hwnd, init_w, init_h, on_nav_complete, on_ready,
+                 options, init_x=0, init_y=0):
         super().__init__(daemon=True)
-        self._parent_hwnd = int(parent_hwnd)
+        self._owner_hwnd = int(owner_hwnd)
         self._init_w = max(int(init_w), 50)
         self._init_h = max(int(init_h), 50)
+        self._init_x = int(init_x)
+        self._init_y = int(init_y)
         self._on_nav_complete = on_nav_complete
         self._on_ready = on_ready
         self._options = int(options)
@@ -5108,6 +5111,38 @@ class _ShellHostThread(threading.Thread):
                 ctypes.windll.user32.PostMessageW(hwnd, _WM_SHELL_CMD, 0, 0)
             except Exception:
                 pass
+
+    def call_sync(self, fn, timeout=4.0, default=None):
+        """在【工作线程】上同步执行 fn(browser) 并返回结果（主线程调用）。
+
+        专供需要访问 worker STA 线程上 COM 对象（IShellView/IFolderView/IShellItem…）
+        的操作使用：绝不能从主线程跨套间直接调这些接口的 vtable（会崩溃）。
+        线程未就绪、或忙于同步拷贝的模态循环导致超时 → 返回 default（永不抛出/崩溃）。
+        """
+        if not self.is_alive():
+            return default
+        # 已在工作线程内（回调链中再次调用）→ 直接执行，避免自我死锁
+        try:
+            if threading.get_ident() == self.ident:
+                return fn(self._browser)
+        except Exception:
+            return default
+        box = {'v': default}
+        done = threading.Event()
+
+        def _runner():
+            try:
+                box['v'] = fn(self._browser)
+            except Exception as e:
+                debug_print(f"[ThreadedShell] call_sync fn error: {e}")
+            finally:
+                done.set()
+
+        self.post(('call', _runner))
+        if not done.wait(timeout):
+            debug_print("[ThreadedShell] call_sync timeout (worker busy?)")
+            return default
+        return box['v']
 
     # ── 工作线程内部 ──────────────────────────────────────────────────────────
     def run(self):
@@ -5160,15 +5195,18 @@ class _ShellHostThread(threading.Thread):
                 ctypes.c_int, ctypes.wintypes.HWND, ctypes.wintypes.HMENU,
                 ctypes.wintypes.HINSTANCE, ctypes.c_void_p,
             ]
-            WS_CHILD = 0x40000000
-            WS_VISIBLE = 0x10000000
+            WS_POPUP = 0x80000000
             WS_CLIPCHILDREN = 0x02000000
             WS_CLIPSIBLINGS = 0x04000000
-            style = WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS
+            WS_EX_TOOLWINDOW = 0x00000080
+            # 独立顶层 popup（owner=主窗口）：与主线程无 parent-child 关系 → 不会把
+            # 主线程与 worker STA 线程的输入队列 attach（拷贝模态时主窗口仍可点）。
+            # owner 关系仅用于 z-order/最小化跟随、不进 alt-tab；初始隐藏，由主线程 show。
+            style = WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS
             hwnd = CreateWindowExW(
-                0, "static", None, style,
-                0, 0, self._init_w, self._init_h,
-                self._parent_hwnd, None, None, None)
+                WS_EX_TOOLWINDOW, "static", None, style,
+                self._init_x, self._init_y, self._init_w, self._init_h,
+                self._owner_hwnd, None, None, None)
             if not hwnd:
                 self.init_error = "CreateWindowEx failed"
                 return False
@@ -5274,6 +5312,16 @@ class _ShellHostThread(threading.Thread):
             self._do_refresh()
         elif kind == 'resize':
             self._do_resize(cmd[1], cmd[2])
+        elif kind == 'setpos':
+            self._do_setpos(cmd[1], cmd[2], cmd[3], cmd[4])
+        elif kind == 'show':
+            self._do_show(cmd[1])
+        elif kind == 'call':
+            # 主线程封送来的同步 COM 操作（见 call_sync）：在本工作线程套间内执行
+            try:
+                cmd[1]()
+            except Exception:
+                pass
         elif kind == 'quit':
             self._quit = True
             try:
@@ -5346,6 +5394,36 @@ class _ShellHostThread(threading.Thread):
             except Exception:
                 pass
 
+    def _do_setpos(self, x, y, w, h):
+        """把独立 popup host 定位/缩放到给定屏幕矩形（不改激活/焦点/z序）。"""
+        w = max(int(w), 1)
+        h = max(int(h), 1)
+        try:
+            HWND_TOP = 0
+            SWP_NOACTIVATE = 0x0010
+            SWP_NOZORDER = 0x0004
+            ctypes.windll.user32.SetWindowPos(
+                self.host_hwnd, HWND_TOP, int(x), int(y), w, h,
+                SWP_NOACTIVATE | SWP_NOZORDER)
+        except Exception:
+            pass
+        if self._browser is not None:
+            try:
+                rc = ctypes.wintypes.RECT(0, 0, w, h)
+                self._browser.SetRect(None, rc)
+            except Exception:
+                pass
+
+    def _do_show(self, show):
+        """显示/隐藏 host（SW_SHOWNA 不抢激活，避免打断 shell 交互）。"""
+        try:
+            SW_HIDE = 0
+            SW_SHOWNA = 8
+            ctypes.windll.user32.ShowWindow(
+                self.host_hwnd, SW_SHOWNA if show else SW_HIDE)
+        except Exception:
+            pass
+
 
 class ThreadedExplorerBrowserWidget(QWidget):
     """IExplorerBrowserWidget 的“每标签独立线程”替身：对外提供相同的 drop-in 子集
@@ -5373,6 +5451,12 @@ class ThreadedExplorerBrowserWidget(QWidget):
         self.setAttribute(Qt.WA_NativeWindow, True)
         self._navCompleteInternal.connect(self._on_nav_complete_main)
         self._threadReadyInternal.connect(self._on_thread_ready_main)
+        # 独立 popup host 的几何/显隐同步（host 不再是本 widget 的子窗口，需手动跟随）
+        self._last_host_rect = None
+        self._host_shown = False
+        self._geo_sync_timer = QTimer(self)
+        self._geo_sync_timer.setInterval(80)
+        self._geo_sync_timer.timeout.connect(self._sync_host_geometry)
 
     # ── QAxWidget 兼容子集 ────────────────────────────────────────────────────
     def property(self, name):  # noqa: A003
@@ -5397,6 +5481,17 @@ class ThreadedExplorerBrowserWidget(QWidget):
     def clear(self):
         self.cleanup()
 
+    def call_sync(self, fn, timeout=4.0, default=None):
+        """把访问 worker 线程 COM 对象的操作 fn(browser) 封送到该标签的专属 STA 线程同步执行。
+
+        返回 fn 的结果；线程未就绪/超时则返回 default。供 FileExplorerTab 读取选中项、
+        选中项计数、按名选中等 COM 操作跨线程安全调用。
+        """
+        t = self._thread
+        if t is None or not self._init_ok:
+            return default
+        return t.call_sync(fn, timeout=timeout, default=default)
+
     # ── 导航 ──────────────────────────────────────────────────────────────────
     def _navigate_url(self, url):
         path = IExplorerBrowserWidget._url_to_path(url)
@@ -5418,20 +5513,25 @@ class ThreadedExplorerBrowserWidget(QWidget):
         if not _COMTYPES_AVAILABLE:
             return False
         try:
-            parent_hwnd = int(self.winId())
-            if not parent_hwnd:
+            widget_hwnd = int(self.winId())
+            if not widget_hwnd:
                 return False
-            w = max(self.width(), 100)
-            h = max(self.height(), 100)
+            owner_hwnd = int(self.window().winId()) if self.window() else 0
+            rect = self._current_screen_rect()
+            if rect:
+                x, y, w, h = rect
+            else:
+                x, y = 0, 0
+                w, h = max(self.width(), 100), max(self.height(), 100)
+            w = max(w, 100)
+            h = max(h, 100)
             options = self._EBO_SHOWFRAMES | self._EBO_NOTRAVELLOG
-            # 回调均在【工作线程】触发 → 经内部信号（Qt 队列连接）封送回主线程执行。
-            # 关键：主线程【不阻塞等待】线程就绪，否则会与工作线程 CreateWindowEx 的
-            # 跨线程 WM_PARENTNOTIFY(SendMessage) 死锁（主线程 wait 时无法处理该消息）。
+            # host 为独立 popup 顶层窗口（owner=主窗口），初始隐藏；不阻塞等待线程就绪。
             self._thread = _ShellHostThread(
-                parent_hwnd, w, h,
+                owner_hwnd, w, h,
                 lambda p: self._navCompleteInternal.emit(p),
                 lambda tid, hwnd: self._threadReadyInternal.emit(int(tid)),
-                options)
+                options, init_x=x, init_y=y)
             self._thread.start()
             self._init_ok = True  # 线程已启动；命令先入队，就绪后由工作线程消费
             debug_print("[ThreadedShell] host thread started (non-blocking)")
@@ -5457,6 +5557,53 @@ class ThreadedExplorerBrowserWidget(QWidget):
         self._location_url = 'file:///' + norm.replace('\\', '/')
         self.NavigateComplete2.emit(None, self._location_url)
 
+    # ── 独立 popup host 几何同步 ──────────────────────────────────────────────
+    def get_host_hwnd(self):
+        """当前 worker 的独立 popup host 窗口句柄（供 listview 查找等）；未就绪返回 0。"""
+        t = self._thread
+        return int(t.host_hwnd) if t is not None else 0
+
+    def _current_screen_rect(self):
+        """widget 原生 HWND 的屏幕物理矩形 (x,y,w,h)；用于把独立 popup host 精确覆盖到
+        本 widget 所在的内容区。用 GetWindowRect 避免高 DPI 逻辑/物理坐标换算问题。"""
+        try:
+            hwnd = int(self.winId())
+            if not hwnd:
+                return None
+            rc = ctypes.wintypes.RECT()
+            if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+                return None
+            return (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top)
+        except Exception:
+            return None
+
+    def _sync_host_geometry(self):
+        """把 host 定位/显隐同步到本 widget 的当前屏幕矩形与可见状态。
+
+        主窗口最小化/本标签不可见/有 Qt 模态窗口时隐藏 host（避免遮住模态对话框）。"""
+        if self._thread is None or not self._init_ok:
+            return
+        try:
+            from PyQt5.QtWidgets import QApplication
+            win = self.window()
+            minimized = bool(win.isMinimized()) if win else False
+            modal = QApplication.activeModalWidget() is not None
+            visible = self.isVisible() and not minimized and not modal
+            if not visible:
+                if self._host_shown:
+                    self._thread.post(('show', False))
+                    self._host_shown = False
+                return
+            rect = self._current_screen_rect()
+            if rect and rect != self._last_host_rect:
+                self._last_host_rect = rect
+                self._thread.post(('setpos', rect[0], rect[1], rect[2], rect[3]))
+            if not self._host_shown:
+                self._thread.post(('show', True))
+                self._host_shown = True
+        except Exception:
+            pass
+
     # ── Qt 事件 ───────────────────────────────────────────────────────────────
     def showEvent(self, event):
         super().showEvent(event)
@@ -5464,11 +5611,30 @@ class ThreadedExplorerBrowserWidget(QWidget):
             if self._ensure_thread() and self._pending_path:
                 path, self._pending_path = self._pending_path, None
                 self._navigate(path)
+        self._last_host_rect = None  # 强制下次 setpos
+        try:
+            self._geo_sync_timer.start()
+        except Exception:
+            pass
+        self._sync_host_geometry()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        try:
+            self._geo_sync_timer.stop()
+        except Exception:
+            pass
+        if self._thread is not None and self._host_shown:
+            self._thread.post(('show', False))
+            self._host_shown = False
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._sync_host_geometry()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._thread is not None and self._init_ok:
-            self._thread.post(('resize', self.width(), self.height()))
+        self._sync_host_geometry()
 
     # ── 清理 ──────────────────────────────────────────────────────────────────
     def cleanup(self):
@@ -5476,16 +5642,37 @@ class ThreadedExplorerBrowserWidget(QWidget):
         if thread is None:
             return
         try:
-            thread.post(('quit',))
-            thread.join(timeout=3.0)
+            self._geo_sync_timer.stop()
         except Exception:
             pass
         self._thread = None
         self._init_ok = False
+        try:
+            thread.post(('quit',))
+        except Exception:
+            pass
+        # 不在 UI 线程上 join 等待 Shell/OLE 拆卸——那会让“关闭标签页”卡顿（拆卸
+        # 一个寄宿 IExplorerBrowser 的 STA 线程可能耗时数百毫秒）。worker 是 daemon
+        # 线程，_teardown_com / _destroy_host_window / OleUninitialize 都在其 run()
+        # 的 finally 中自行完成。这里用一个后台 daemon 线程回收，主线程立即返回。
+        try:
+            threading.Thread(target=thread.join, kwargs={'timeout': 5.0},
+                             daemon=True, name='ShellHostReaper').start()
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         self.cleanup()
         super().closeEvent(event)
+
+
+def _is_shell_explorer(w):
+    """是否为 Shell 资源管理器控件：原生 IExplorerBrowser 或每标签线程化替身。
+
+    两者对外提供相同的导航/选中读取语义（后者经 call_sync 跨线程封送），
+    因此手势/双击钩子安装、选中读取等判断都应把二者一视同仁。
+    """
+    return isinstance(w, (IExplorerBrowserWidget, ThreadedExplorerBrowserWidget))
 
 
 class FileExplorerTab(QWidget):
@@ -6788,13 +6975,30 @@ class FileExplorerTab(QWidget):
         # 直接返回 None — 不尝试调用 ActiveX 的原始处理（事件仍会被控件处理）
         return None
 
+    def _run_shell_com(self, fn, default=None, timeout=4.0):
+        """在正确的线程/套间上执行访问 Shell COM 对象的操作 fn(browser)，返回其结果。
+
+        - 原生 IExplorerBrowser：COM 位于主线程套间 → 直接调用 fn(browser)。
+        - 线程化替身：COM 位于该标签专属 STA 线程 → 经 call_sync 封送到工作线程执行，
+          绝不从主线程跨套间直接调用 vtable（那会导致崩溃）。
+        失败/超时/未就绪 → 返回 default。
+        """
+        exp = getattr(self, 'explorer', None)
+        try:
+            if isinstance(exp, ThreadedExplorerBrowserWidget):
+                return exp.call_sync(fn, timeout=timeout, default=default)
+            if isinstance(exp, IExplorerBrowserWidget) and getattr(exp, '_browser', None):
+                return fn(exp._browser)
+        except Exception as e:
+            debug_print(f"[ShellCOM] error: {e}")
+        return default
+
     def _get_selected_count_safe(self):
         """安全地获取当前选中项数量，避免触发 ActiveX 属性不存在的警告"""
         try:
-            # IExplorerBrowser 模式：使用 IFolderView COM 接口
-            if isinstance(self.explorer, IExplorerBrowserWidget) and getattr(self.explorer, '_browser', None):
-                return self._get_ieb_selection_count()
-
+            # Shell 资源管理器模式（原生 IEB 或线程化替身）：使用 IFolderView COM 接口
+            if _is_shell_explorer(self.explorer):
+                return self._run_shell_com(self._get_ieb_selection_count)
             # 优先通过 Document 接口获取 SelectedItems（避免 WebBrowser 直接调用警告）
             doc = None
             try:
@@ -6829,14 +7033,15 @@ class FileExplorerTab(QWidget):
         except Exception:
             return None
 
-    def _get_ieb_selection_count(self):
+    def _get_ieb_selection_count(self, browser):
         """通过 IFolderView COM 接口获取 IExplorerBrowser 的选中项数量。
-        先获取 IShellView（已验证可用），再 QueryInterface 获取 IFolderView。"""
+        先获取 IShellView（已验证可用），再 QueryInterface 获取 IFolderView。
+        注意：必须在拥有 browser 的线程/套间执行（见 _run_shell_com）。"""
         try:
             from comtypes import GUID as _GUID
             # 先获取 IShellView（已验证此路径可靠工作）
             iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
-            ppv_sv = self.explorer._browser.GetCurrentView(ctypes.byref(iid_sv))
+            ppv_sv = browser.GetCurrentView(ctypes.byref(iid_sv))
             sv_ptr = int(ppv_sv) if ppv_sv else 0
             if not sv_ptr:
                 return None
@@ -6882,15 +7087,16 @@ class FileExplorerTab(QWidget):
             debug_print(f"[IEB] _get_ieb_selection_count failed: {e}")
         return None
 
-    def _get_ieb_selected_paths(self):
-        """通过 IFolderView::Items(SVGIO_SELECTION) 获取 IExplorerBrowser 选中文件路径列表。"""
+    def _get_ieb_selected_paths(self, browser):
+        """通过 IFolderView::Items(SVGIO_SELECTION) 获取 IExplorerBrowser 选中文件路径列表。
+        注意：必须在拥有 browser 的线程/套间执行（见 _run_shell_com）。"""
         paths = []
         try:
             from comtypes import GUID as _GUID
             _vp_size = ctypes.sizeof(ctypes.c_void_p)
             # 获取 IShellView
             iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
-            ppv_sv = self.explorer._browser.GetCurrentView(ctypes.byref(iid_sv))
+            ppv_sv = browser.GetCurrentView(ctypes.byref(iid_sv))
             sv_ptr = int(ppv_sv) if ppv_sv else 0
             if not sv_ptr:
                 return paths
@@ -6983,18 +7189,36 @@ class FileExplorerTab(QWidget):
         return paths
 
     def _select_ieb_item_by_name(self, filename):
-        """通过 IFolderView 直接选中 IExplorerBrowser 当前视图中的项目。"""
+        """按名选中当前视图中的项目：COM 部分按套间封送执行，UI 收尾在主线程执行。"""
+        if not filename:
+            return False
+        if not _is_shell_explorer(getattr(self, 'explorer', None)):
+            return False
+        ok = bool(self._run_shell_com(
+            lambda br: self._ieb_select_item_com(br, filename), default=False))
+        if ok:
+            self.activateWindow()
+            self.raise_()
+            if getattr(self, 'explorer', None):
+                self.explorer.setFocus(Qt.OtherFocusReason)
+            self._suppress_auto_refresh = False
+            self._arm_selection_guard()
+            self.start_path_sync_timer(duration_ms=8000)
+            debug_print(f"[IEB Select] Successfully selected item: {filename}")
+        return ok
+
+    def _ieb_select_item_com(self, browser, filename):
+        """纯 COM：在 browser 当前视图中按名匹配并 SelectItem，返回是否成功。
+        必须在拥有该 COM 对象的线程/套间执行（见 _run_shell_com）。不含任何 Qt UI 调用。"""
         try:
             if not filename:
-                return False
-            if not isinstance(self.explorer, IExplorerBrowserWidget) or not getattr(self.explorer, '_browser', None):
                 return False
 
             from comtypes import GUID as _GUID
 
             _vp_size = ctypes.sizeof(ctypes.c_void_p)
             iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
-            ppv_sv = self.explorer._browser.GetCurrentView(ctypes.byref(iid_sv))
+            ppv_sv = browser.GetCurrentView(ctypes.byref(iid_sv))
             sv_ptr = int(ppv_sv) if ppv_sv else 0
             if not sv_ptr:
                 debug_print("[IEB Select] IShellView unavailable")
@@ -7104,15 +7328,7 @@ class FileExplorerTab(QWidget):
                             debug_print(f"[IEB Select] SelectItem failed: hr=0x{hr_select & 0xFFFFFFFF:08X}, index={target_index}")
                             return False
 
-                        self.activateWindow()
-                        self.raise_()
-                        if hasattr(self, 'explorer') and self.explorer:
-                            self.explorer.setFocus(Qt.OtherFocusReason)
-
-                        debug_print(f"[IEB Select] Successfully selected item via IFolderView: {filename}")
-                        self._suppress_auto_refresh = False
-                        self._arm_selection_guard()
-                        self.start_path_sync_timer(duration_ms=8000)
+                        debug_print(f"[IEB Select] Selected item via IFolderView: {filename}")
                         return True
                     finally:
                         _release_interface(sia_ptr.value)
@@ -7129,7 +7345,13 @@ class FileExplorerTab(QWidget):
         if not HAS_PYWIN:
             return None
         try:
-            parent = int(self.explorer.winId())
+            # 线程化替身：shell view 在独立 popup host 下（非 widget 子窗口），须从 host 找起
+            parent = 0
+            _gh = getattr(self.explorer, 'get_host_hwnd', None)
+            if callable(_gh):
+                parent = int(_gh() or 0)
+            if not parent:
+                parent = int(self.explorer.winId())
         except Exception:
             return None
 
@@ -7166,7 +7388,7 @@ class FileExplorerTab(QWidget):
         """
         if not HAS_PYWIN:
             return
-        if not isinstance(getattr(self, 'explorer', None), IExplorerBrowserWidget):
+        if not _is_shell_explorer(getattr(self, 'explorer', None)):
             return
         if not getattr(self.explorer, '_init_ok', False):
             return
@@ -7234,7 +7456,7 @@ class FileExplorerTab(QWidget):
                 mw = getattr(_self_ref, 'main_window', None)
                 if mw and hasattr(mw, 'get_active_pane'):
                     tab = mw.get_active_pane()
-                    if tab and isinstance(getattr(tab, 'explorer', None), IExplorerBrowserWidget):
+                    if tab and _is_shell_explorer(getattr(tab, 'explorer', None)):
                         return tab
             except Exception:
                 pass
@@ -7516,7 +7738,7 @@ class FileExplorerTab(QWidget):
         if mw and hasattr(mw, 'content_stack'):
             for i in range(mw.content_stack.count()):
                 w = mw.content_stack.widget(i)
-                if w is not self and isinstance(getattr(w, 'explorer', None), IExplorerBrowserWidget):
+                if w is not self and _is_shell_explorer(getattr(w, 'explorer', None)):
                     return  # other IEB tabs still alive, keep hook
         try:
             ctypes.windll.user32.UnhookWindowsHookEx(handle)
@@ -8008,9 +8230,9 @@ class FileExplorerTab(QWidget):
         """获取选中的文件名列表（仅文件名，含后缀）"""
         filenames = []
         try:
-            # IExplorerBrowser 模式：通过 COM 接口直接获取选中路径
-            if isinstance(self.explorer, IExplorerBrowserWidget):
-                paths = self._get_ieb_selected_paths()
+            # Shell 资源管理器模式（原生 IEB 或线程化替身）：通过 COM 接口获取选中路径
+            if _is_shell_explorer(self.explorer):
+                paths = self._run_shell_com(self._get_ieb_selected_paths, default=[]) or []
                 for p in paths:
                     if p:
                         filenames.append(os.path.basename(str(p)))
@@ -13602,6 +13824,14 @@ class MainWindow(QMainWindow):
         self._resource_usage_timer.timeout.connect(self._update_resource_usage_display)
         self.apply_resource_usage_config()
 
+        # 线程化 Shell 模式：worker STA 线程里的文件操作模态对话框会沿 owner 链禁用整个
+        # 主窗口，导致其它标签无法操作。用低频看门狗周期性地重新启用主窗口，让用户在
+        # 拷贝进行时仍能操作/切换其它标签（尊重本程序自身的 Qt 模态窗口）。
+        if _USE_THREADED_SHELL:
+            self._shell_modal_guard_timer = QTimer(self)
+            self._shell_modal_guard_timer.timeout.connect(self._ensure_main_window_enabled)
+            self._shell_modal_guard_timer.start(250)
+
         
         # 性能优化：延迟加载非关键功能（100ms后加载）
         QTimer.singleShot(100, self._delayed_initialization)
@@ -14158,6 +14388,24 @@ class MainWindow(QMainWindow):
         if 0 <= active_index < self.split_tab_widget.count():
             self.split_tab_widget.setCurrentIndex(active_index)
         return True
+
+    def _ensure_main_window_enabled(self):
+        """线程化 Shell 看门狗（轻量兜底）：仅在主窗口真被某 Shell 模态 EnableWindow(FALSE)
+        禁用时恢复 enabled。不抢前台（抢前台会导致拷贝进度窗反复闪烁且无法解决输入队列耦合）。
+        尊重本程序自身的 Qt 模态窗口。"""
+        try:
+            from PyQt5.QtWidgets import QApplication
+            if QApplication.activeModalWidget() is not None:
+                return
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            user32 = ctypes.windll.user32
+            if not user32.IsWindowEnabled(hwnd):
+                user32.EnableWindow(hwnd, True)
+                debug_print("[ThreadedShell] Re-enabled main window (shell modal had disabled it)")
+        except Exception:
+            pass
 
     def save_session_snapshot(self, immediate=False):
         if not hasattr(self, 'config') or not hasattr(self, 'tab_widget'):
