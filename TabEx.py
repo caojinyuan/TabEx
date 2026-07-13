@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.62"
+APP_VERSION = "3.63"
 
 
 # TabEx i18n module
@@ -5314,6 +5314,8 @@ class _ShellHostThread(threading.Thread):
             self._do_resize(cmd[1], cmd[2])
         elif kind == 'setpos':
             self._do_setpos(cmd[1], cmd[2], cmd[3], cmd[4])
+        elif kind == 'zbelow':
+            self._do_zbelow(cmd[1])
         elif kind == 'show':
             self._do_show(cmd[1])
         elif kind == 'call':
@@ -5414,6 +5416,18 @@ class _ShellHostThread(threading.Thread):
             except Exception:
                 pass
 
+    def _do_zbelow(self, insert_after_hwnd):
+        """把 host 的 z 序压到指定窗口（通常是 Qt 模态对话框）之下，保持内容可见但不遮挡对话框。"""
+        try:
+            SWP_NOACTIVATE = 0x0010
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            ctypes.windll.user32.SetWindowPos(
+                self.host_hwnd, int(insert_after_hwnd), 0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)
+        except Exception:
+            pass
+
     def _do_show(self, show):
         """显示/隐藏 host（SW_SHOWNA 不抢激活，避免打断 shell 交互）。"""
         try:
@@ -5454,6 +5468,7 @@ class ThreadedExplorerBrowserWidget(QWidget):
         # 独立 popup host 的几何/显隐同步（host 不再是本 widget 的子窗口，需手动跟随）
         self._last_host_rect = None
         self._host_shown = False
+        self._host_below_modal = False  # host 当前是否已被压到 Qt 模态窗口之下
         self._geo_sync_timer = QTimer(self)
         self._geo_sync_timer.setInterval(80)
         self._geo_sync_timer.timeout.connect(self._sync_host_geometry)
@@ -5580,15 +5595,17 @@ class ThreadedExplorerBrowserWidget(QWidget):
     def _sync_host_geometry(self):
         """把 host 定位/显隐同步到本 widget 的当前屏幕矩形与可见状态。
 
-        主窗口最小化/本标签不可见/有 Qt 模态窗口时隐藏 host（避免遮住模态对话框）。"""
+        主窗口最小化/本标签不可见时隐藏 host。存在 Qt 模态窗口时不再整片隐藏
+        （那会让资源管理器变空白），而是保持可见并把 host 压到模态窗口之下，
+        既能看到内容又不会遮挡对话框。"""
         if self._thread is None or not self._init_ok:
             return
         try:
             from PyQt5.QtWidgets import QApplication
             win = self.window()
             minimized = bool(win.isMinimized()) if win else False
-            modal = QApplication.activeModalWidget() is not None
-            visible = self.isVisible() and not minimized and not modal
+            modal_w = QApplication.activeModalWidget()
+            visible = self.isVisible() and not minimized
             if not visible:
                 if self._host_shown:
                     self._thread.post(('show', False))
@@ -5601,6 +5618,21 @@ class ThreadedExplorerBrowserWidget(QWidget):
             if not self._host_shown:
                 self._thread.post(('show', True))
                 self._host_shown = True
+            # 模态对话框存在时把 host 压到其下方，避免遮住对话框；无模态时恢复正常 z 序。
+            if modal_w is not None:
+                if not self._host_below_modal:
+                    try:
+                        mw = modal_w.window()
+                        modal_hwnd = int(mw.winId()) if mw is not None else 0
+                    except Exception:
+                        modal_hwnd = 0
+                    if modal_hwnd:
+                        self._thread.post(('zbelow', modal_hwnd))
+                        self._host_below_modal = True
+            elif self._host_below_modal:
+                # 模态刚关闭：把 host 抬回顶层（HWND_TOP=0），恢复正常显示层级。
+                self._thread.post(('zbelow', 0))
+                self._host_below_modal = False
         except Exception:
             pass
 
