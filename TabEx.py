@@ -11236,10 +11236,28 @@ class MainWindow(QMainWindow):
         except Exception as e:
             show_toast(self, tr("错误"), tr("无法启动快捷方式: {}").format(e), level="error")
 
+    def _ensure_chat_panel_created(self):
+        """确保聊天面板已创建（延迟创建）"""
+        if self.chat_panel is None:
+            # 首次创建聊天面板
+            self.chat_panel = ChatPanel(self)
+            ai_panel_width = int(self.config.get("ai_chat", {}).get("panel_width", 360) * self.dpi_scale)
+            self.chat_panel.setMinimumWidth(260)
+            self.chat_panel.setFixedWidth(ai_panel_width)
+            self.chat_panel.setVisible(False)
+            # 根据当前是否分屏，决定插入位置
+            if getattr(self, '_split_active', False):
+                # 如果已经分屏，chat_panel 应该在索引 2
+                self.splitter.insertWidget(2, self.chat_panel)
+                self.splitter.setCollapsible(2, True)
+            else:
+                # 没有分屏，chat_panel 在索引 1
+                self.splitter.addWidget(self.chat_panel)
+                self.splitter.setCollapsible(1, True)
+
     def toggle_chat_panel(self):
         """切换 AI 聊天面板的显示/隐藏。"""
-        if not hasattr(self, 'chat_panel'):
-            return
+        self._ensure_chat_panel_created()  # 确保面板已创建
         visible = not self.chat_panel.isVisible()
         self.chat_panel.setVisible(visible)
         if hasattr(self, 'ai_chat_btn'):
@@ -11338,19 +11356,23 @@ class MainWindow(QMainWindow):
         self.split_content_stack.setVisible(True)
         self.split_tab_widget.setVisible(True)
         self._split_active = True
-        # 分屏后：左侧内容(0)、右侧内容(1) 不可折叠，AI 面板(2) 可折叠
+        # 分屏后：左侧内容(0)、右侧内容(1) 不可折叠，AI 面板(2) 可折叠（如果存在）
         try:
             self.splitter.setCollapsible(0, False)
             self.splitter.setCollapsible(1, False)
-            self.splitter.setCollapsible(2, True)
+            if self.chat_panel is not None and self.splitter.count() > 2:
+                self.splitter.setCollapsible(2, True)
         except Exception:
             pass
         # 左右各半，保留 AI 面板宽度
         try:
-            chat_w = self.chat_panel.width() if (hasattr(self, 'chat_panel') and self.chat_panel.isVisible()) else 0
+            chat_w = self.chat_panel.width() if (self.chat_panel is not None and self.chat_panel.isVisible()) else 0
             total = max(self.splitter.width() - chat_w, 200)
             half = max(total // 2, 100)
-            self.splitter.setSizes([half, half, chat_w])
+            if self.chat_panel is not None:
+                self.splitter.setSizes([half, half, chat_w])
+            else:
+                self.splitter.setSizes([half, half])
         except Exception:
             pass
         from PyQt5.QtCore import QTimer as _QTimer
@@ -11441,7 +11463,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            chat_w = self.chat_panel.width() if (hasattr(self, 'chat_panel') and self.chat_panel.isVisible()) else 0
+            chat_w = self.chat_panel.width() if (self.chat_panel is not None and self.chat_panel.isVisible()) else 0
             total = max(self.splitter.width() - chat_w, 200)
             self.splitter.setSizes([total, chat_w])
         except Exception:
@@ -11451,7 +11473,7 @@ class MainWindow(QMainWindow):
 
     def update_chat_context(self):
         """将当前标签页路径同步到 AI 聊天面板的上下文提示。"""
-        if not hasattr(self, 'chat_panel') or not self.chat_panel.isVisible():
+        if self.chat_panel is None or not self.chat_panel.isVisible():
             return
         try:
             tab = self.get_current_tab_widget()
@@ -13461,7 +13483,7 @@ class MainWindow(QMainWindow):
             search_dialogs = len(getattr(self, 'search_dialogs', []) or [])
             tabs = self.tab_widget.count() if hasattr(self, 'tab_widget') else 0
             chat_worker_running = 0
-            if hasattr(self, 'chat_panel') and self.chat_panel:
+            if self.chat_panel is not None:
                 worker = getattr(self.chat_panel, 'worker', None)
                 if worker and worker.isRunning():
                     chat_worker_running = 1
@@ -14088,24 +14110,11 @@ class MainWindow(QMainWindow):
         # 分割器拖动时让右侧标签栏宽度跟随右侧内容宽度对齐
         self.splitter.splitterMoved.connect(lambda *a: self._sync_split_tabbar_width())
 
-        # 右侧 AI 聊天面板（默认隐藏，点击 🤖 按钮后显示）
-        self.chat_panel = ChatPanel(self)
-        ai_panel_width = int(self.config.get("ai_chat", {}).get("panel_width", 360) * self.dpi_scale)
-        self.chat_panel.setMinimumWidth(260)
-        self.chat_panel.setFixedWidth(ai_panel_width)
-        # 根据保存的配置恢复AI面板的显示状态
-        chat_config = self.config.get("ai_chat", {})
-        panel_visible = chat_config.get("panel_visible", False)
-        self.chat_panel.setVisible(panel_visible)
-        self.splitter.addWidget(self.chat_panel)
-        self.splitter.setCollapsible(1, True)  # AI面板允许折叠
-
-        if panel_visible:
-            right_width = int(1200 * self.dpi_scale) - ai_panel_width
-            self.splitter.setSizes([right_width, ai_panel_width])
-        else:
-            right_width = int(1200 * self.dpi_scale)
-            self.splitter.setSizes([right_width, 0])
+        # 右侧 AI 聊天面板（延迟加载，点击 🤖 按钮后才创建）
+        self.chat_panel = None  # 延迟创建
+        # 先设置 splitter 只有 content_stack
+        right_width = int(1200 * self.dpi_scale)
+        self.splitter.setSizes([right_width, 0])
     
         # 将分割器添加到主容器
         main_layout.addWidget(self.splitter)
@@ -14281,6 +14290,24 @@ class MainWindow(QMainWindow):
         except Exception as e:
             debug_print(f"[App] 兜底激活当前标签失败: {e}")
         self.save_session_snapshot(immediate=True)
+        
+        # 恢复 AI 聊天面板的显示状态（如果配置为显示）
+        try:
+            chat_config = self.config.get("ai_chat", {})
+            panel_visible = chat_config.get("panel_visible", False)
+            if panel_visible:
+                # 用户上次关闭时 AI 面板是可见的，现在创建并显示它
+                self._ensure_chat_panel_created()
+                self.chat_panel.setVisible(True)
+                if hasattr(self, 'ai_chat_btn'):
+                    self.ai_chat_btn.setChecked(True)
+                # 设置面板宽度
+                ai_panel_width = int(chat_config.get("panel_width", 360) * self.dpi_scale)
+                sizes = self.splitter.sizes()
+                total = sum(sizes)
+                self.splitter.setSizes([total - ai_panel_width, ai_panel_width])
+        except Exception as e:
+            debug_print(f"[Performance] Failed to restore chat panel: {e}")
         
         # 恢复完成：取消恢复状态并更新标题
         self.is_restoring = False
@@ -14657,7 +14684,7 @@ class MainWindow(QMainWindow):
                     print(f"Error closing search dialog: {e}")
             self.search_dialogs = []
 
-        if hasattr(self, 'chat_panel') and self.chat_panel:
+        if self.chat_panel is not None:
             try:
                 self.chat_panel.cleanup()
             except Exception as e:
