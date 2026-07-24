@@ -207,6 +207,13 @@ _LANG_EN = {
     "路径栏拷贝分隔符:": "Copy Separator:",
     "设置从路径栏拷贝时使用的分隔符": "Separator used when copying from path bar",
     "Explorer监听设置": "Explorer Monitor",
+    "Shell 视图设置": "Shell View Settings",
+    "启用每标签独立 Shell 线程（实验特性）": "Enable per-tab threaded Shell (experimental)",
+    "为每个标签创建独立 Shell STA 线程，减少慢盘/复制导致的整窗卡顿": "Create an isolated Shell STA thread per tab to reduce whole-window stalls on slow paths/copy operations",
+    "线程化宿主模式:": "Threaded Host Mode:",
+    "popup（独立顶层，隔离更强）": "popup (top-level host, stronger isolation)",
+    "embedded（子窗口嵌入，拖动更顺滑）": "embedded (child-window host, smoother dragging)",
+    "仅在线程化模式下生效；切换后建议重启应用": "Only applies in threaded mode; restart is recommended after changes",
     "监听新Explorer窗口": "Monitor New Explorer Windows",
     "状态栏显示 CPU/内存占用": "Show CPU/Memory in Status Bar",
     "内存": "Mem",
@@ -354,6 +361,7 @@ _LANG_EN = {
     "当前标签自动刷新已恢复": "Auto-refresh resumed for current tab",
     "当前标签页路径无效": "Current tab path is invalid",
     "设置已更新": "Settings Updated",
+    "已应用 Shell 线程化设置（新建标签页生效，已有标签建议重开）": "Applied threaded Shell settings (effective for new tabs; reopen existing tabs for full effect)",
     "无法嵌入该窗口，已尝试用系统资源管理器打开。\n{}": "Cannot embed window; opened with Explorer instead.\n{}",
     "无法启动快捷方式: {}": "Cannot launch shortcut: {}",
     "无法打开选中项: {}": "Cannot open selection: {}",
@@ -3521,7 +3529,8 @@ class SimplePathBar(QWidget):
                 x += sep_w
                 idx += 1
             is_current = (full == self._current_path)
-            shown = self._elide_crumb_text(label, is_current=is_current)
+            max_text_w = max(0, (self.width() - 2) - x - pad * 2)
+            shown = self._elide_crumb_text(label, is_current=is_current, max_text_width=max_text_w)
             w = fm.horizontalAdvance(shown) + pad * 2
             hovered = (self._hover_idx == idx)
             if hovered:
@@ -3685,12 +3694,19 @@ class SimplePathBar(QWidget):
         except Exception as e:
             debug_print(f"[SimplePathBar] sibling menu error: {e}")
 
-    def _elide_crumb_text(self, text, is_current=False):
+    def _elide_crumb_text(self, text, is_current=False, max_text_width=None):
         try:
+            _ = is_current  # 保留参数以兼容现有调用语义
+            s = str(text)
+            if max_text_width is None:
+                return s
+            width = int(max_text_width)
+            if width <= 0:
+                return ''
             fm = self.fontMetrics()
-            # 当前目录尽量完整保留；中间层更积极省略。
-            limit = 240 if is_current else 140
-            return fm.elidedText(str(text), Qt.ElideMiddle, limit)
+            if fm.horizontalAdvance(s) <= width:
+                return s
+            return fm.elidedText(s, Qt.ElideMiddle, width)
         except Exception:
             return text
 
@@ -5060,6 +5076,7 @@ class IExplorerBrowserWidget(QWidget):
 # “一个慢网络路径卡死全部标签”。
 # ─────────────────────────────────────────────────────────────────────────────
 _USE_THREADED_SHELL = False  # 由 MainWindow 启动时按 config 覆盖
+_THREADED_SHELL_HOST_MODE = 'popup'  # popup(默认) / embedded(旧主分支风格)
 
 # 主线程 → 工作线程命令唤醒消息（PostMessage 到宿主子窗口，命令负载走线程安全队列）
 _WM_SHELL_CMD = 0x8000 + 0x21  # WM_APP + 0x21
@@ -5075,7 +5092,7 @@ class _ShellHostThread(threading.Thread):
     """
 
     def __init__(self, owner_hwnd, init_w, init_h, on_nav_complete, on_ready,
-                 options, init_x=0, init_y=0):
+                 options, init_x=0, init_y=0, host_mode='popup'):
         super().__init__(daemon=True)
         self._owner_hwnd = int(owner_hwnd)
         self._init_w = max(int(init_w), 50)
@@ -5085,6 +5102,9 @@ class _ShellHostThread(threading.Thread):
         self._on_nav_complete = on_nav_complete
         self._on_ready = on_ready
         self._options = int(options)
+        self._host_mode = str(host_mode).strip().lower()
+        if self._host_mode not in ('popup', 'embedded'):
+            self._host_mode = 'popup'
         # 命令队列（线程安全）：元组 ('navigate', path) / ('refresh',) / ('resize', w, h) / ('quit',)
         self._cmd_lock = threading.Lock()
         self._cmd_queue = collections.deque()
@@ -5099,12 +5119,26 @@ class _ShellHostThread(threading.Thread):
         self._input_object = None
         self._quit = False
         self._ole_inited = False
+        self._last_rect_size = None
 
     # ── 主线程调用 ────────────────────────────────────────────────────────────
     def post(self, cmd_tuple):
         """线程安全地投递一条命令并唤醒工作线程消息泵。"""
         with self._cmd_lock:
-            self._cmd_queue.append(cmd_tuple)
+            # 高频窗口拖动期间会产生大量 setpos/show/zbelow 指令。
+            # 这些命令只需保留“最新值”，避免队列积压导致画面跟随发抖。
+            kind = cmd_tuple[0] if cmd_tuple else None
+            if kind in ('setpos', 'show', 'zbelow'):
+                replaced = False
+                for i in range(len(self._cmd_queue) - 1, -1, -1):
+                    if self._cmd_queue[i] and self._cmd_queue[i][0] == kind:
+                        self._cmd_queue[i] = cmd_tuple
+                        replaced = True
+                        break
+                if not replaced:
+                    self._cmd_queue.append(cmd_tuple)
+            else:
+                self._cmd_queue.append(cmd_tuple)
         hwnd = self.host_hwnd
         if hwnd:
             try:
@@ -5196,15 +5230,23 @@ class _ShellHostThread(threading.Thread):
                 ctypes.wintypes.HINSTANCE, ctypes.c_void_p,
             ]
             WS_POPUP = 0x80000000
+            WS_CHILD = 0x40000000
             WS_CLIPCHILDREN = 0x02000000
             WS_CLIPSIBLINGS = 0x04000000
             WS_EX_TOOLWINDOW = 0x00000080
-            # 独立顶层 popup（owner=主窗口）：与主线程无 parent-child 关系 → 不会把
-            # 主线程与 worker STA 线程的输入队列 attach（拷贝模态时主窗口仍可点）。
-            # owner 关系仅用于 z-order/最小化跟随、不进 alt-tab；初始隐藏，由主线程 show。
-            style = WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS
+            if self._host_mode == 'embedded':
+                # 旧主分支风格：把 host 作为 Qt explorer widget 的子窗口，窗口移动时由
+                # Win32 自动跟随父窗口，不需要主线程高频 setpos 同步。
+                style = WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS
+                ex_style = 0
+            else:
+                # 独立顶层 popup（owner=主窗口）：与主线程无 parent-child 关系 → 不会把
+                # 主线程与 worker STA 线程的输入队列 attach（拷贝模态时主窗口仍可点）。
+                # owner 关系仅用于 z-order/最小化跟随、不进 alt-tab；初始隐藏，由主线程 show。
+                style = WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS
+                ex_style = WS_EX_TOOLWINDOW
             hwnd = CreateWindowExW(
-                WS_EX_TOOLWINDOW, "static", None, style,
+                ex_style, "static", None, style,
                 self._init_x, self._init_y, self._init_w, self._init_h,
                 self._owner_hwnd, None, None, None)
             if not hwnd:
@@ -5385,6 +5427,7 @@ class _ShellHostThread(threading.Thread):
     def _do_resize(self, w, h):
         w = max(int(w), 1)
         h = max(int(h), 1)
+        self._last_rect_size = (w, h)
         try:
             ctypes.windll.user32.MoveWindow(self.host_hwnd, 0, 0, w, h, True)
         except Exception:
@@ -5400,6 +5443,8 @@ class _ShellHostThread(threading.Thread):
         """把独立 popup host 定位/缩放到给定屏幕矩形（不改激活/焦点/z序）。"""
         w = max(int(w), 1)
         h = max(int(h), 1)
+        size_changed = (w, h) != self._last_rect_size
+        self._last_rect_size = (w, h)
         try:
             HWND_TOP = 0
             SWP_NOACTIVATE = 0x0010
@@ -5409,7 +5454,8 @@ class _ShellHostThread(threading.Thread):
                 SWP_NOACTIVATE | SWP_NOZORDER)
         except Exception:
             pass
-        if self._browser is not None:
+        # 纯位移时无需调用 SetRect；仅尺寸变化时同步，可显著降低拖窗期间抖动。
+        if self._browser is not None and size_changed:
             try:
                 rc = ctypes.wintypes.RECT(0, 0, w, h)
                 self._browser.SetRect(None, rc)
@@ -5462,6 +5508,9 @@ class ThreadedExplorerBrowserWidget(QWidget):
         self._pending_path = None
         self._init_ok = False
         self._worker_tid = 0
+        self._host_mode = str(globals().get('_THREADED_SHELL_HOST_MODE', 'popup')).strip().lower()
+        if self._host_mode not in ('popup', 'embedded'):
+            self._host_mode = 'popup'
         self.setAttribute(Qt.WA_NativeWindow, True)
         self._navCompleteInternal.connect(self._on_nav_complete_main)
         self._threadReadyInternal.connect(self._on_thread_ready_main)
@@ -5531,25 +5580,32 @@ class ThreadedExplorerBrowserWidget(QWidget):
             widget_hwnd = int(self.winId())
             if not widget_hwnd:
                 return False
-            owner_hwnd = int(self.window().winId()) if self.window() else 0
-            rect = self._current_screen_rect()
-            if rect:
-                x, y, w, h = rect
-            else:
+            if self._host_mode == 'embedded':
+                owner_hwnd = widget_hwnd
                 x, y = 0, 0
                 w, h = max(self.width(), 100), max(self.height(), 100)
+            else:
+                # popup 模式使用 ownerless 顶层宿主，避免 Shell 复制/删除对话框沿 owner 链
+                # 禁用主窗口，从而允许其它 tab 在后台操作与切换。
+                owner_hwnd = 0
+                rect = self._current_screen_rect()
+                if rect:
+                    x, y, w, h = rect
+                else:
+                    x, y = 0, 0
+                    w, h = max(self.width(), 100), max(self.height(), 100)
             w = max(w, 100)
             h = max(h, 100)
             options = self._EBO_SHOWFRAMES | self._EBO_NOTRAVELLOG
-            # host 为独立 popup 顶层窗口（owner=主窗口），初始隐藏；不阻塞等待线程就绪。
+            # host 既支持 popup 顶层模式，也支持 embedded 子窗口模式（旧主分支风格）。
             self._thread = _ShellHostThread(
                 owner_hwnd, w, h,
                 lambda p: self._navCompleteInternal.emit(p),
                 lambda tid, hwnd: self._threadReadyInternal.emit(int(tid)),
-                options, init_x=x, init_y=y)
+                options, init_x=x, init_y=y, host_mode=self._host_mode)
             self._thread.start()
             self._init_ok = True  # 线程已启动；命令先入队，就绪后由工作线程消费
-            debug_print("[ThreadedShell] host thread started (non-blocking)")
+            debug_print(f"[ThreadedShell] host thread started (non-blocking), mode={self._host_mode}")
             return True
         except Exception as e:
             debug_print(f"[ThreadedShell] _ensure_thread error: {e}")
@@ -5611,6 +5667,18 @@ class ThreadedExplorerBrowserWidget(QWidget):
                     self._thread.post(('show', False))
                     self._host_shown = False
                 return
+            if self._host_mode == 'embedded':
+                # embedded 子窗口由 Win32 随父窗口移动；只在尺寸变化时下发 resize。
+                w = max(int(self.width()), 1)
+                h = max(int(self.height()), 1)
+                rect = (0, 0, w, h)
+                if rect != self._last_host_rect:
+                    self._last_host_rect = rect
+                    self._thread.post(('resize', w, h))
+                if not self._host_shown:
+                    self._thread.post(('show', True))
+                    self._host_shown = True
+                return
             rect = self._current_screen_rect()
             if rect and rect != self._last_host_rect:
                 self._last_host_rect = rect
@@ -5644,25 +5712,28 @@ class ThreadedExplorerBrowserWidget(QWidget):
                 path, self._pending_path = self._pending_path, None
                 self._navigate(path)
         self._last_host_rect = None  # 强制下次 setpos
-        try:
-            self._geo_sync_timer.start()
-        except Exception:
-            pass
+        if self._host_mode == 'popup':
+            try:
+                self._geo_sync_timer.start()
+            except Exception:
+                pass
         self._sync_host_geometry()
 
     def hideEvent(self, event):
         super().hideEvent(event)
-        try:
-            self._geo_sync_timer.stop()
-        except Exception:
-            pass
+        if self._host_mode == 'popup':
+            try:
+                self._geo_sync_timer.stop()
+            except Exception:
+                pass
         if self._thread is not None and self._host_shown:
             self._thread.post(('show', False))
             self._host_shown = False
 
     def moveEvent(self, event):
         super().moveEvent(event)
-        self._sync_host_geometry()
+        if self._host_mode == 'popup':
+            self._sync_host_geometry()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -5673,10 +5744,11 @@ class ThreadedExplorerBrowserWidget(QWidget):
         thread = self._thread
         if thread is None:
             return
-        try:
-            self._geo_sync_timer.stop()
-        except Exception:
-            pass
+        if self._host_mode == 'popup':
+            try:
+                self._geo_sync_timer.stop()
+            except Exception:
+                pass
         self._thread = None
         self._init_ok = False
         try:
@@ -7700,29 +7772,56 @@ class FileExplorerTab(QWidget):
                                 last_nav = getattr(tab, '_last_nav_complete_time', 0)
                                 if time.monotonic() - last_nav < 0.5:
                                     return
+                                path_before = getattr(tab, 'current_path', None)
 
-                                # LVM_HITTEST
+                                # LVM_HITTEST：优先走明确命中判定；若当前无法拿到 ListView
+                                # 或命中不确定，走一次延迟二次确认，恢复“空白双击返回上级”。
+                                def _late_blank_confirm(path_before_snapshot, delay_ms=220):
+                                    def _confirm(_path_before=path_before_snapshot):
+                                        try:
+                                            # 路径已变化说明 Explorer 已处理为进入目录，放弃 go_up
+                                            if getattr(tab, 'current_path', None) != _path_before:
+                                                return
+                                            # 若仍有选中项，视为点中项目，不执行 go_up
+                                            c2 = tab._get_selected_count_safe()
+                                            if c2 is not None and int(c2) > 0:
+                                                return
+                                            # 正在导航或刚完成导航时不执行，避免与目录双击竞争
+                                            if getattr(tab, '_navigating_folder', False):
+                                                return
+                                            _last2 = getattr(tab, '_last_nav_complete_time', 0)
+                                            if time.monotonic() - _last2 < 0.35:
+                                                return
+                                            debug_print("[DoubleClick/IEB] Blank area (late confirm) → go_up")
+                                            tab.go_up(force=True)
+                                        except Exception as _e2:
+                                            debug_print(f"[DoubleClick/IEB] late confirm: {_e2}")
+                                    QTimer.singleShot(int(delay_ms), _confirm)
+
                                 lv = tab._find_syslistview_hwnd()
-                                if lv:
-                                    try:
-                                        cpt = win32gui.ScreenToClient(lv, (_px, _py))
+                                if not lv:
+                                    _late_blank_confirm(path_before)
+                                    return
+                                try:
+                                    cpt = win32gui.ScreenToClient(lv, (_px, _py))
 
-                                        class _PT(ctypes.Structure):
-                                            _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
-                                        class _LVHI(ctypes.Structure):
-                                            _fields_ = [('pt', _PT), ('flags', ctypes.c_uint),
-                                                         ('iItem', ctypes.c_int), ('iSubItem', ctypes.c_int)]
+                                    class _PT(ctypes.Structure):
+                                        _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+                                    class _LVHI(ctypes.Structure):
+                                        _fields_ = [('pt', _PT), ('flags', ctypes.c_uint),
+                                                     ('iItem', ctypes.c_int), ('iSubItem', ctypes.c_int)]
 
-                                        hi = _LVHI()
-                                        hi.pt.x, hi.pt.y = int(cpt[0]), int(cpt[1])
-                                        res = ctypes.windll.user32.SendMessageW(
-                                            lv, 0x1012, 0, ctypes.byref(hi))
-                                        if int(res) != -1:
-                                            tab._suppress_auto_refresh = False
-                                            tab._resume_path_sync_after_navigation()
-                                            return
-                                    except Exception:
-                                        pass
+                                    hi = _LVHI()
+                                    hi.pt.x, hi.pt.y = int(cpt[0]), int(cpt[1])
+                                    res = ctypes.windll.user32.SendMessageW(
+                                        lv, 0x1012, 0, ctypes.byref(hi))
+                                    if int(res) != -1:
+                                        tab._suppress_auto_refresh = False
+                                        tab._resume_path_sync_after_navigation()
+                                        return
+                                except Exception:
+                                    _late_blank_confirm(path_before)
+                                    return
 
                                 cnt = tab._get_selected_count_safe()
                                 if cnt is not None and int(cnt) > 0:
@@ -13795,9 +13894,13 @@ class MainWindow(QMainWindow):
         set_debug_mode(self.config.get("debug_mode", False))
         set_explorer_monitor_debug(self.config.get("explorer_monitor_debug", False))
         # 实验特性：每标签独立 STA 线程寄宿 Shell 视图（隔离同步拷贝导致的整窗卡死）
-        globals()['_USE_THREADED_SHELL'] = bool(self.config.get("experimental_threaded_shell", False))
+        globals()['_USE_THREADED_SHELL'] = bool(self.config.get("experimental_threaded_shell", True))
+        _host_mode = str(self.config.get("threaded_shell_host_mode", "popup")).strip().lower()
+        if _host_mode not in ('popup', 'embedded'):
+            _host_mode = 'popup'
+        globals()['_THREADED_SHELL_HOST_MODE'] = _host_mode
         if _USE_THREADED_SHELL:
-            debug_print("[ThreadedShell] experimental per-tab STA isolation ENABLED")
+            debug_print(f"[ThreadedShell] experimental per-tab STA isolation ENABLED, host_mode={_host_mode}")
         
         # 初始化书签管理器
         self.bookmark_manager = BookmarkManager()
@@ -13937,6 +14040,8 @@ class MainWindow(QMainWindow):
             "enable_title_shortcuts": True,  # 默认启用标题栏快捷方式区域
             "title_shortcuts": [],  # 标题栏快捷方式（.lnk/.exe/.bat/.cmd/.ps1 路径）
             "enable_mouse_gestures": True,  # 默认启用鼠标手势（右键画线导航）
+            "threaded_shell_host_mode": "popup",  # popup(默认)/embedded(旧主分支嵌入风格)
+            "experimental_threaded_shell": True,  # 默认启用每标签独立 Shell 线程，隔离复制/删除阻塞
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -15922,6 +16027,49 @@ class SettingsDialog(QDialog):
                 compact_widget(item.widget())
         advanced_layout.addWidget(debug_group)
 
+        # Shell 视图设置组
+        shell_group = QGroupBox(tr("Shell 视图设置"))
+        shell_layout = QVBoxLayout()
+        self.experimental_threaded_shell_cb = QCheckBox(tr("启用每标签独立 Shell 线程（实验特性）"), self)
+        self.experimental_threaded_shell_cb.setChecked(config.get("experimental_threaded_shell", True))
+        self.experimental_threaded_shell_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.experimental_threaded_shell_cb.setToolTip(tr("为每个标签创建独立 Shell STA 线程，减少慢盘/复制导致的整窗卡顿"))
+        shell_layout.addWidget(self.experimental_threaded_shell_cb)
+
+        host_mode_layout = QHBoxLayout()
+        host_mode_layout.addWidget(QLabel(tr("线程化宿主模式:")))
+        self.threaded_shell_host_mode_combo = QComboBox(self)
+        self.threaded_shell_host_mode_combo.addItem(tr("popup（独立顶层，隔离更强）"), "popup")
+        self.threaded_shell_host_mode_combo.addItem(tr("embedded（子窗口嵌入，拖动更顺滑）"), "embedded")
+        host_mode = str(config.get("threaded_shell_host_mode", "popup")).strip().lower()
+        if host_mode not in ('popup', 'embedded'):
+            host_mode = 'popup'
+        host_mode_index = self.threaded_shell_host_mode_combo.findData(host_mode)
+        self.threaded_shell_host_mode_combo.setCurrentIndex(max(0, host_mode_index))
+        self.threaded_shell_host_mode_combo.setEnabled(self.experimental_threaded_shell_cb.isChecked())
+        self.experimental_threaded_shell_cb.toggled.connect(self.threaded_shell_host_mode_combo.setEnabled)
+        host_mode_layout.addWidget(self.threaded_shell_host_mode_combo)
+        host_mode_layout.addStretch(1)
+        shell_layout.addLayout(host_mode_layout)
+
+        shell_note = QLabel(tr("仅在线程化模式下生效；切换后建议重启应用"))
+        shell_note.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
+        shell_note.setWordWrap(True)
+        shell_layout.addWidget(shell_note)
+
+        shell_group.setLayout(shell_layout)
+        compact_groupbox(shell_group)
+        for i in range(shell_layout.count()):
+            item = shell_layout.itemAt(i)
+            if item.layout():
+                for j in range(item.layout().count()):
+                    w = item.layout().itemAt(j).widget()
+                    if w:
+                        compact_widget(w)
+            elif item.widget():
+                compact_widget(item.widget())
+        advanced_layout.addWidget(shell_group)
+
         # 标签页设置组
         tabs_group = QGroupBox(tr("标签页设置"))
         tabs_layout = QVBoxLayout()
@@ -16384,6 +16532,11 @@ class SettingsDialog(QDialog):
         """保存设置"""
         # 保存所有设置到 parent (MainWindow)
         if self.parent():
+            old_threaded_shell = bool(self.parent().config.get("experimental_threaded_shell", True))
+            old_host_mode = str(self.parent().config.get("threaded_shell_host_mode", "popup")).strip().lower()
+            if old_host_mode not in ('popup', 'embedded'):
+                old_host_mode = 'popup'
+
             # 处理开机启动设置
             auto_startup_enabled = self.auto_startup_cb.isChecked()
             current_enabled = self._is_auto_startup_enabled()
@@ -16400,6 +16553,11 @@ class SettingsDialog(QDialog):
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
             self.parent().config["preferred_terminal_tool"] = normalize_terminal_tool_name(self.preferred_terminal_combo.currentData())
+            self.parent().config["experimental_threaded_shell"] = self.experimental_threaded_shell_cb.isChecked()
+            host_mode_val = str(self.threaded_shell_host_mode_combo.currentData() or "popup").strip().lower()
+            if host_mode_val not in ('popup', 'embedded'):
+                host_mode_val = 'popup'
+            self.parent().config["threaded_shell_host_mode"] = host_mode_val
             # 保存路径栏分隔符设置
             self.parent().config["breadcrumb_copy_separator"] = self.path_separator_combo.currentData()
             
@@ -16437,6 +16595,34 @@ class SettingsDialog(QDialog):
             if hasattr(self.parent(), 'apply_resource_usage_config'):
                 self.parent().apply_resource_usage_config()
             self.parent().apply_tortoisegit_buttons_config()
+
+            # 运行时同步 Shell 线程化设置（新建标签页立即生效）
+            new_threaded_shell = bool(self.parent().config.get("experimental_threaded_shell", True))
+            new_host_mode = str(self.parent().config.get("threaded_shell_host_mode", "popup")).strip().lower()
+            if new_host_mode not in ('popup', 'embedded'):
+                new_host_mode = 'popup'
+            globals()['_USE_THREADED_SHELL'] = new_threaded_shell
+            globals()['_THREADED_SHELL_HOST_MODE'] = new_host_mode
+
+            shell_guard_timer = getattr(self.parent(), '_shell_modal_guard_timer', None)
+            if new_threaded_shell:
+                if shell_guard_timer is None:
+                    shell_guard_timer = QTimer(self.parent())
+                    shell_guard_timer.timeout.connect(self.parent()._ensure_main_window_enabled)
+                    self.parent()._shell_modal_guard_timer = shell_guard_timer
+                if not shell_guard_timer.isActive():
+                    shell_guard_timer.start(250)
+            elif shell_guard_timer is not None and shell_guard_timer.isActive():
+                shell_guard_timer.stop()
+
+            if old_threaded_shell != new_threaded_shell or old_host_mode != new_host_mode:
+                show_toast(
+                    self.parent(),
+                    tr("设置已更新"),
+                    tr("已应用 Shell 线程化设置（新建标签页生效，已有标签建议重开）"),
+                    level="info"
+                )
+
             # 重新设置快捷键
             self.parent().setup_shortcuts()
             # 保存 AI 助手设置
