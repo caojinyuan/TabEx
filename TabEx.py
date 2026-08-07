@@ -5120,6 +5120,8 @@ class _ShellHostThread(threading.Thread):
         self._quit = False
         self._ole_inited = False
         self._last_rect_size = None
+        self._current_path = None  # 最近导航路径，供 _do_rebuild 强制重建视图
+        self._last_rebuild_time = 0.0  # 上次强制重建时间，用于节流防止重建循环
         # host 窗口子类化：保存旧窗口过程与新过程引用（防 GC）。子类化后，即便 Shell 的
         # 文件操作进度对话框在本线程跑模态消息循环，DispatchMessage 到 host 时也会触发
         # 命令排空，避免拷贝/取消期间 resize/show 命令堆积不执行导致 explorer 空白。
@@ -5133,7 +5135,7 @@ class _ShellHostThread(threading.Thread):
             # 高频窗口拖动期间会产生大量 setpos/show/zbelow 指令。
             # 这些命令只需保留“最新值”，避免队列积压导致画面跟随发抖。
             kind = cmd_tuple[0] if cmd_tuple else None
-            if kind in ('setpos', 'show', 'zbelow', 'raise'):
+            if kind in ('setpos', 'show', 'zbelow', 'raise', 'refit'):
                 replaced = False
                 for i in range(len(self._cmd_queue) - 1, -1, -1):
                     if self._cmd_queue[i] and self._cmd_queue[i][0] == kind:
@@ -5400,6 +5402,11 @@ class _ShellHostThread(threading.Thread):
             self._do_navigate(cmd[1])
         elif kind == 'refresh':
             self._do_refresh()
+        elif kind == 'rebuild':
+            # 携带真实路径（可选），用于彻底重建后导航回当前目录
+            if len(cmd) > 1 and cmd[1]:
+                self._current_path = cmd[1]
+            self._do_rebuild()
         elif kind == 'resize':
             self._do_resize(cmd[1], cmd[2])
         elif kind == 'setpos':
@@ -5408,6 +5415,11 @@ class _ShellHostThread(threading.Thread):
             self._do_zbelow(cmd[1])
         elif kind == 'raise':
             self._do_raise()
+        elif kind == 'refit':
+            # refit 可携带真实路径（cmd[1]），用于视图损坏时精确重建到当前目录
+            if len(cmd) > 1 and cmd[1]:
+                self._current_path = cmd[1]
+            self._do_refit()
         elif kind == 'show':
             self._do_show(cmd[1])
         elif kind == 'call':
@@ -5426,6 +5438,7 @@ class _ShellHostThread(threading.Thread):
     def _do_navigate(self, path):
         if self._browser is None or not path:
             return
+        self._current_path = path  # 记录当前路径，供 _do_rebuild 强制重建视图使用
         try:
             if _TORTOISE_OVERLAY_PATCHED and path not in _OVERLAY_PRELOADED_DIRS:
                 try:
@@ -5452,27 +5465,32 @@ class _ShellHostThread(threading.Thread):
             debug_print(f"[ThreadedShell] navigate error: {e}")
 
     def _do_refresh(self):
+        """触发 IShellView::Refresh。返回 True 表示成功，False 表示视图缺失/调用失败
+        （用作“视图已损坏”的信号，供 refit 决定是否强制重建）。"""
         if self._browser is None:
-            return
+            return False
         try:
             from comtypes import GUID as _GUID
             iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
             ppv = self._browser.GetCurrentView(ctypes.byref(iid_sv))
             iface_ptr = int(ppv) if ppv else 0
             if not iface_ptr:
-                return
+                return False
+            hr = -1
             try:
                 _vp = ctypes.sizeof(ctypes.c_void_p)
                 vtbl = ctypes.c_void_p.from_address(iface_ptr).value
                 fn = ctypes.c_void_p.from_address(vtbl + 8 * _vp).value  # IShellView::Refresh idx 8
                 _REFRESH = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
-                _REFRESH(fn)(iface_ptr)
+                hr = _REFRESH(fn)(iface_ptr)
             finally:
                 rel = ctypes.c_void_p.from_address(
                     ctypes.c_void_p.from_address(iface_ptr).value + 2 * ctypes.sizeof(ctypes.c_void_p)).value
                 ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(rel)(iface_ptr)
+            return hr == 0
         except Exception as e:
             debug_print(f"[ThreadedShell] refresh error: {e}")
+            return False
 
     def _do_resize(self, w, h):
         w = max(int(w), 1)
@@ -5559,6 +5577,87 @@ class _ShellHostThread(threading.Thread):
         except Exception:
             pass
 
+    def _do_refit(self):
+        """强制 IExplorerBrowser 内部视图按 host 真实客户区重新布局，修复内部视图塌陷（空白）。
+
+        关键：对已塌陷的现有 IShellView 用【相同尺寸】SetRect 不会触发重排（它内部缓存了
+        rect，认为无变化）——这就是“只有打开新目录才恢复”的原因（新目录会新建 IShellView
+        并重新 fit）。因此这里用【尺寸抖动】：先 SetRect 一个差 1px 的尺寸，再设回真实尺寸，
+        强制视图重新布局并重绘。GetClientRect(host) 取真实物理客户区（DPI 无关）。"""
+        if not self.host_hwnd or self._browser is None:
+            return
+        try:
+            rc = ctypes.wintypes.RECT()
+            if not ctypes.windll.user32.GetClientRect(self.host_hwnd, ctypes.byref(rc)):
+                return
+            cw = rc.right - rc.left
+            ch = rc.bottom - rc.top
+            if cw <= 0 or ch <= 0:
+                return
+            self._last_rect_size = (cw, ch)
+            # 抖动：先设一个不同尺寸（-1px），再设回真实尺寸，逼迫 IShellView 重排
+            jitter = ctypes.wintypes.RECT(0, 0, max(cw - 1, 1), max(ch - 1, 1))
+            self._browser.SetRect(None, jitter)
+            real = ctypes.wintypes.RECT(0, 0, cw, ch)
+            self._browser.SetRect(None, real)
+            # SetRect 抖动对已塌陷的视图仍可能不重排其子窗口（DefView/列表视图 HWND），
+            # 直接枚举 host 的子窗口强制 MoveWindow 填满客户区 + 重绘，绕过浏览器内部缓存。
+            try:
+                _resized = [0]
+                EnumChildProc = ctypes.WINFUNCTYPE(
+                    ctypes.c_int, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+                _host = self.host_hwnd
+                RDW_INVALIDATE = 0x0001
+                RDW_ERASE = 0x0004
+                RDW_ALLCHILDREN = 0x0080
+                RDW_UPDATENOW = 0x0100
+
+                def _proc(child, _lp):
+                    # 只处理 host 的直接子窗口（GetParent==host），把它铺满客户区
+                    try:
+                        if ctypes.windll.user32.GetParent(child) == _host:
+                            ctypes.windll.user32.MoveWindow(child, 0, 0, cw, ch, True)
+                            _resized[0] += 1
+                    except Exception:
+                        pass
+                    return 1
+
+                ctypes.windll.user32.EnumChildWindows(_host, EnumChildProc(_proc), 0)
+                ctypes.windll.user32.RedrawWindow(
+                    _host, None, None,
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW)
+            except Exception as _ce:
+                debug_print(f"[ThreadedShell] refit child-resize error: {_ce}")
+        except Exception as e:
+            debug_print(f"[ThreadedShell] refit error: {e}")
+
+    def _do_rebuild(self):
+        """彻底重建浏览器：销毁旧 IExplorerBrowser → 重新 Initialize → 导航到当前路径。
+
+        拷贝取消等会让内嵌 IShellView 进入不可恢复的空白状态（几何修复/相同路径重导航
+        都无效，只有“打开新目录”能恢复）。这里做等价于新建标签的完整重建：Unadvise+Destroy
+        旧 browser，用同一 host 重新 CreateObject+Initialize+Advise，再导航回当前目录，
+        保证可靠恢复。运行在工作线程，COM 调用安全。由 F5 刷新触发（可靠的手动恢复）。"""
+        if not self.host_hwnd:
+            debug_print("[ThreadedShell] rebuild SKIP: no host")
+            return
+        path = self._current_path
+        debug_print(f"[ThreadedShell] rebuild: tearing down + recreating browser, path={path}")
+        try:
+            # 1) 拆掉旧 browser（Unadvise + Destroy）
+            self._teardown_com()
+            # 2) 用同一 host 重新创建 + Initialize + Advise
+            if not self._create_browser():
+                debug_print("[ThreadedShell] rebuild: _create_browser failed")
+                return
+            # 3) 恢复视图矩形并导航回当前路径
+            self._do_refit()
+            if path:
+                self._do_navigate(path)
+            debug_print("[ThreadedShell] rebuild: done")
+        except Exception as e:
+            debug_print(f"[ThreadedShell] rebuild error: {e}")
+
     def _do_show(self, show):
         """显示/隐藏 host（SW_SHOWNA 不抢激活，避免打断 shell 交互）。"""
         try:
@@ -5590,6 +5689,7 @@ class ThreadedExplorerBrowserWidget(QWidget):
         super().__init__(parent)
         self._thread = None
         self._location_url = ''
+        self._nav_real_path = None  # 最近导航解析出的真实路径，供视图损坏时精确重建
         self._pending_path = None
         self._init_ok = False
         self._worker_tid = 0
@@ -5622,7 +5722,9 @@ class ThreadedExplorerBrowserWidget(QWidget):
             if url and url != 'None':
                 self._navigate_url(url)
         elif 'refresh()' in s:
-            if self._thread is not None:
+            # 文件监视器等的【日常轻量刷新】：只让视图重读当前目录内容，不重建 worker/host。
+            # 全量重建（rebuild_thread）成本高且会打断导航，仅保留给 F5 与拷贝对话框自动恢复。
+            if self._thread is not None and self._init_ok:
                 self._thread.post(('refresh',))
 
     def querySubObject(self, _name, *_args):
@@ -5651,6 +5753,16 @@ class ThreadedExplorerBrowserWidget(QWidget):
     def _navigate(self, path):
         if not _COMTYPES_AVAILABLE:
             return
+        # shell: 虚拟位置（此电脑/回收站等）无文件系统路径，NavSink 解析不出 → 不会更新
+        # _location_url。若保留旧的 file:///盘符，Keepalive 会读到陈旧路径把地址栏拉回旧盘符
+        # （路径栏显示 D:\ 但视图在“此电脑”、点盘符进不去）。这里导航前就把 _location_url 设为
+        # 该 shell: 字符串，使 Keepalive 不再从中提取盘符、不再误拉回。
+        try:
+            if isinstance(path, str) and path.lower().startswith('shell:'):
+                self._location_url = path
+                self._nav_real_path = path
+        except Exception:
+            pass
         if not self._ensure_thread():
             self._pending_path = path
             return
@@ -5711,8 +5823,73 @@ class ThreadedExplorerBrowserWidget(QWidget):
     def _on_nav_complete_main(self, path):
         """工作线程导航完成 → 主线程更新 LocationURL 并广播 NavigateComplete2。"""
         norm = os.path.normpath(path)
+        self._nav_real_path = norm  # 记录真实解析路径，供视图损坏时精确重建
         self._location_url = 'file:///' + norm.replace('\\', '/')
         self.NavigateComplete2.emit(None, self._location_url)
+        # 导航完成后触发 refit：修复拷贝取消等导致的内部视图塌陷（空白）。带上真实路径，
+        # 以便视图损坏时精确重建到当前目录（而非过期的 shell: 路径）。
+        self._post_refit()
+
+    def _post_refit(self):
+        """向工作线程投递 refit，并携带当前真实路径用于必要时的视图重建。"""
+        if self._thread is None or not self._init_ok:
+            return
+        try:
+            self._thread.post(('refit', getattr(self, '_nav_real_path', None)))
+        except Exception:
+            pass
+
+    def rebuild_thread(self):
+        """彻底重建：销毁旧 worker 线程 + host 窗口，新建一套并导航回当前路径。
+
+        拷贝取消会让【host 窗口本身】进入不可恢复的空白状态（在同一 host 上重建浏览器
+        COM 无效——已验证）。唯一等价于“新建标签”的恢复是丢弃整个 host 窗口 + worker 线程，
+        新建全新的一套。由 F5 触发，作为可靠的手动恢复。"""
+        old = self._thread
+        target = getattr(self, '_nav_real_path', None) or self._pending_path
+        # 无已知目标路径时不重建：否则新 worker 会导航到空，造成路径栏与视图不一致
+        # （路径栏显示旧路径、视图停在“此电脑”、点盘符进不去）。尝试从宿主标签取当前路径兜底。
+        if not target:
+            try:
+                par = self.parent()
+                while par is not None and not hasattr(par, 'current_path'):
+                    par = par.parent()
+                if par is not None:
+                    target = getattr(par, 'current_path', None)
+            except Exception:
+                target = None
+        if not target:
+            debug_print("[ThreadedShell] rebuild_thread SKIP: no target path")
+            return
+        debug_print(f"[ThreadedShell] rebuild_thread: recreating worker+host, target={target}")
+        # 停几何同步并拆掉旧线程（后台回收，不阻塞 UI）
+        try:
+            self._geo_sync_timer.stop()
+        except Exception:
+            pass
+        self._thread = None
+        self._init_ok = False
+        self._host_shown = False
+        self._last_host_rect = None
+        if old is not None:
+            try:
+                old.post(('quit',))
+            except Exception:
+                pass
+            try:
+                threading.Thread(target=old.join, kwargs={'timeout': 5.0},
+                                 daemon=True, name='ShellHostReaper').start()
+            except Exception:
+                pass
+        # 新建一套 worker+host 并导航回当前目录
+        if self._ensure_thread():
+            self._geo_sync_timer.start()
+            self._sync_host_geometry()
+            if target:
+                self._navigate(target)
+            debug_print("[ThreadedShell] rebuild_thread: new worker started")
+        else:
+            debug_print("[ThreadedShell] rebuild_thread: _ensure_thread failed")
 
     # ── 独立 popup host 几何同步 ──────────────────────────────────────────────
     def get_host_hwnd(self):
@@ -5766,12 +5943,37 @@ class ThreadedExplorerBrowserWidget(QWidget):
                     self._host_shown = True
                 return
             rect = self._current_screen_rect()
-            if rect and rect != self._last_host_rect:
+            # 真实状态自愈：相等门（_last_host_rect/_host_shown）记录的是“我们下发过什么命令”，
+            # 而非窗口真实状态。拷贝进度框的模态循环取消后，宿主窗口可能被隐藏或 z 序下沉，
+            # 与我们的标志不一致 → 相等门再也不重发命令，缩放/最小化都救不回（最大化矩形不变，
+            # setpos 被门挡住）。这里直接查宿主 HWND 的真实可见性与矩形，一旦不符就强制重发。
+            host_hwnd = int(self._thread.host_hwnd) if self._thread else 0
+            actual_visible = False
+            actual_rect = None
+            if host_hwnd:
+                try:
+                    actual_visible = bool(ctypes.windll.user32.IsWindowVisible(host_hwnd))
+                    _rc = ctypes.wintypes.RECT()
+                    if ctypes.windll.user32.GetWindowRect(host_hwnd, ctypes.byref(_rc)):
+                        actual_rect = (_rc.left, _rc.top, _rc.right - _rc.left, _rc.bottom - _rc.top)
+                except Exception:
+                    pass
+            # 位置：命令记录变化 或 实际矩形与期望不符 → 重发 setpos
+            pos_mismatch = bool(rect and actual_rect and rect != actual_rect)
+            if rect and (rect != self._last_host_rect or pos_mismatch):
                 self._last_host_rect = rect
                 self._thread.post(('setpos', rect[0], rect[1], rect[2], rect[3]))
-            if not self._host_shown:
+            # 可见性：期望可见但实际不可见（或标志未置位）→ 重发 show
+            if not self._host_shown or (host_hwnd and not actual_visible):
                 self._thread.post(('show', True))
                 self._host_shown = True
+                # 重新显示时一并 refit，修复隐藏期间可能塌陷的内部视图
+                self._post_refit()
+            # 检测到真实状态异常（隐藏/位置错位）时补一次 raise + refit，
+            # 修复模态取消后 z 序下沉与内部视图塌陷（空白）。
+            if modal_w is None and (pos_mismatch or (host_hwnd and not actual_visible)):
+                self._thread.post(('raise',))
+                self._post_refit()
             # 模态对话框存在时把 host 压到其下方，避免遮住对话框；无模态时恢复正常 z 序。
             # 关键：模态期间【每个 tick 都重新压制】而非只压一次——切标签/setpos/系统事件都
             # 可能把 ownerless popup host 重新抬起，只压一次会导致 explorer 再次盖住设置对话框。
@@ -5817,6 +6019,9 @@ class ThreadedExplorerBrowserWidget(QWidget):
         except Exception:
             pass
         self._sync_host_geometry()
+        # tab 重新可见时主动 refit：修复拷贝取消等导致的内部视图塌陷（空白），
+        # 用户无需再“打开新目录”即可恢复——切走再切回本 tab 即可。
+        self._post_refit()
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -13200,9 +13405,16 @@ class MainWindow(QMainWindow):
     def refresh_current_tab(self):
         """刷新当前标签页"""
         current_tab = self.get_active_pane()
-        if hasattr(current_tab, 'current_path'):
-            current_tab.navigate_to(current_tab.current_path, 
-                                  is_shell=current_tab.current_path.startswith('shell:'))
+        if not current_tab or not hasattr(current_tab, 'current_path'):
+            return
+        # 线程化 Shell（popup）：F5 做【彻底重建】worker+host，可靠恢复拷贝取消导致的空白。
+        exp = getattr(current_tab, 'explorer', None)
+        if isinstance(exp, ThreadedExplorerBrowserWidget) and hasattr(exp, 'rebuild_thread'):
+            debug_print("[Refresh] F5 → threaded rebuild_thread()")
+            exp.rebuild_thread()
+            return
+        current_tab.navigate_to(current_tab.current_path,
+                              is_shell=current_tab.current_path.startswith('shell:'))
     
     def add_current_tab_bookmark(self):
         """添加当前标签页到书签"""
@@ -14641,6 +14853,56 @@ class MainWindow(QMainWindow):
                 debug_print("[ThreadedShell] Re-enabled main window (shell modal had disabled it)")
         except Exception:
             pass
+        # Shell 文件操作（拷贝/移动/删除）进度对话框关闭后，寄宿其视图的 worker 线程/host
+        # 可能进入不可恢复的空白状态。检测该对话框“从有到无”的下降沿，自动重建当前 tab
+        # （等价于用户按 F5），无需手动干预。
+        self._check_shell_fileop_dialog_closed()
+
+    def _check_shell_fileop_dialog_closed(self):
+        """检测 shell 文件操作进度框（OperationStatusWindow）是否刚刚关闭；是则重建活动 tab。"""
+        try:
+            present = self._shell_fileop_dialog_present()
+        except Exception:
+            return
+        was_present = getattr(self, '_shell_fileop_dialog_was_present', False)
+        self._shell_fileop_dialog_was_present = present
+        if was_present and not present:
+            # 下降沿：拷贝/删除对话框刚关闭 → 重建当前活动 tab 的线程化 explorer
+            debug_print("[ThreadedShell] shell file-op dialog closed → auto-rebuild active tab")
+            try:
+                pane = self.get_active_pane()
+                exp = getattr(pane, 'explorer', None) if pane else None
+                if isinstance(exp, ThreadedExplorerBrowserWidget) and hasattr(exp, 'rebuild_thread'):
+                    exp.rebuild_thread()
+            except Exception as e:
+                debug_print(f"[ThreadedShell] auto-rebuild error: {e}")
+
+    def _shell_fileop_dialog_present(self):
+        """本进程内是否存在 shell 文件操作进度对话框（class 'OperationStatusWindow'）。"""
+        user32 = ctypes.windll.user32
+        our_pid = ctypes.windll.kernel32.GetCurrentProcessId()
+        found = [False]
+        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        _GetClassName = user32.GetClassNameW
+        _GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+
+        def _proc(hwnd, _lp):
+            try:
+                buf = ctypes.create_unicode_buffer(48)
+                _GetClassName(hwnd, buf, 48)
+                if buf.value == 'OperationStatusWindow':
+                    pid = ctypes.wintypes.DWORD(0)
+                    _GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if pid.value == our_pid:
+                        found[0] = True
+                        return 0  # 找到即停止
+            except Exception:
+                pass
+            return 1
+
+        user32.EnumWindows(EnumProc(_proc), 0)
+        return found[0]
+
 
     def save_session_snapshot(self, immediate=False):
         if not hasattr(self, 'config') or not hasattr(self, 'tab_widget'):
