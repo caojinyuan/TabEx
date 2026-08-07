@@ -5076,7 +5076,7 @@ class IExplorerBrowserWidget(QWidget):
 # “一个慢网络路径卡死全部标签”。
 # ─────────────────────────────────────────────────────────────────────────────
 _USE_THREADED_SHELL = False  # 由 MainWindow 启动时按 config 覆盖
-_THREADED_SHELL_HOST_MODE = 'popup'  # popup(默认) / embedded(旧主分支风格)
+_THREADED_SHELL_HOST_MODE = 'embedded'  # embedded(默认，WS_CHILD 子窗口，视觉无卡顿) / popup(独立顶层，隔离更强但需手动贴窗)
 
 # 主线程 → 工作线程命令唤醒消息（PostMessage 到宿主子窗口，命令负载走线程安全队列）
 _WM_SHELL_CMD = 0x8000 + 0x21  # WM_APP + 0x21
@@ -5120,6 +5120,11 @@ class _ShellHostThread(threading.Thread):
         self._quit = False
         self._ole_inited = False
         self._last_rect_size = None
+        # host 窗口子类化：保存旧窗口过程与新过程引用（防 GC）。子类化后，即便 Shell 的
+        # 文件操作进度对话框在本线程跑模态消息循环，DispatchMessage 到 host 时也会触发
+        # 命令排空，避免拷贝/取消期间 resize/show 命令堆积不执行导致 explorer 空白。
+        self._old_wndproc = None
+        self._wndproc_ref = None
 
     # ── 主线程调用 ────────────────────────────────────────────────────────────
     def post(self, cmd_tuple):
@@ -5128,7 +5133,7 @@ class _ShellHostThread(threading.Thread):
             # 高频窗口拖动期间会产生大量 setpos/show/zbelow 指令。
             # 这些命令只需保留“最新值”，避免队列积压导致画面跟随发抖。
             kind = cmd_tuple[0] if cmd_tuple else None
-            if kind in ('setpos', 'show', 'zbelow'):
+            if kind in ('setpos', 'show', 'zbelow', 'raise'):
                 replaced = False
                 for i in range(len(self._cmd_queue) - 1, -1, -1):
                     if self._cmd_queue[i] and self._cmd_queue[i][0] == kind:
@@ -5253,10 +5258,53 @@ class _ShellHostThread(threading.Thread):
                 self.init_error = "CreateWindowEx failed"
                 return False
             self.host_hwnd = int(hwnd)
+            self._install_host_subclass()
             return True
         except Exception as e:
             self.init_error = f"create_host_window: {e}"
             return False
+
+    def _install_host_subclass(self):
+        """子类化 host 窗口过程，使 _WM_SHELL_CMD 在窗口过程内即时排空命令队列。
+
+        关键：Shell 的文件操作进度对话框在【本 worker STA 线程】上跑自己的模态消息循环。
+        未子类化时，我们 PostMessage 的唤醒消息被那个模态循环 GetMessage/Dispatch 消费掉
+        （交给 static 默认过程后丢弃），命令堆积且唤醒消息耗尽 → 拷贝/取消后 _pump 阻塞在
+        GetMessage，堆积的 resize/show 永不执行 → explorer 永久空白。子类化后无论哪个消息
+        循环 DispatchMessage 到 host，都会走到这里排空命令，缩放/切换/取消均能即时恢复。"""
+        try:
+            user32 = ctypes.windll.user32
+            LRESULT = ctypes.c_ssize_t
+            WPARAM = ctypes.c_size_t
+            LPARAM = ctypes.c_ssize_t
+            WNDPROC = ctypes.WINFUNCTYPE(
+                LRESULT, ctypes.wintypes.HWND, ctypes.c_uint, WPARAM, LPARAM)
+            SetWindowLongPtr = getattr(user32, 'SetWindowLongPtrW', None) or user32.SetWindowLongW
+            CallWindowProc = user32.CallWindowProcW
+            CallWindowProc.restype = LRESULT
+            CallWindowProc.argtypes = [
+                ctypes.c_void_p, ctypes.wintypes.HWND, ctypes.c_uint, WPARAM, LPARAM]
+            GWLP_WNDPROC = -4
+
+            def _wndproc(hwnd, msg, wparam, lparam):
+                if msg == _WM_SHELL_CMD and not self._quit:
+                    try:
+                        self._drain_commands()
+                    except Exception:
+                        pass
+                    return 0
+                return CallWindowProc(
+                    self._old_wndproc, hwnd, msg, wparam, lparam)
+
+            self._wndproc_ref = WNDPROC(_wndproc)
+            SetWindowLongPtr.restype = ctypes.c_void_p
+            SetWindowLongPtr.argtypes = [
+                ctypes.wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            new_ptr = ctypes.cast(self._wndproc_ref, ctypes.c_void_p)
+            self._old_wndproc = SetWindowLongPtr(
+                self.host_hwnd, GWLP_WNDPROC, new_ptr)
+        except Exception as e:
+            debug_print(f"[ThreadedShell] subclass host failed: {e}")
 
     def _destroy_host_window(self):
         hwnd = self.host_hwnd
@@ -5358,6 +5406,8 @@ class _ShellHostThread(threading.Thread):
             self._do_setpos(cmd[1], cmd[2], cmd[3], cmd[4])
         elif kind == 'zbelow':
             self._do_zbelow(cmd[1])
+        elif kind == 'raise':
+            self._do_raise()
         elif kind == 'show':
             self._do_show(cmd[1])
         elif kind == 'call':
@@ -5427,6 +5477,24 @@ class _ShellHostThread(threading.Thread):
     def _do_resize(self, w, h):
         w = max(int(w), 1)
         h = max(int(h), 1)
+        # embedded 子窗口应精确铺满父窗口客户区（物理像素）。主线程传来的是逻辑像素
+        # （self.width()/height()），高 DPI 缩放下会偏小 → 资源管理器区域露出空白。
+        # 这里直接用 GetClientRect(父窗口) 拿物理客户区，DPI 无关，始终铺满。
+        if self._host_mode == 'embedded' and self.host_hwnd:
+            try:
+                _GetParent = ctypes.windll.user32.GetParent
+                _GetParent.restype = ctypes.wintypes.HWND
+                _GetParent.argtypes = [ctypes.wintypes.HWND]
+                parent = _GetParent(self.host_hwnd)
+                if parent:
+                    rc = ctypes.wintypes.RECT()
+                    if ctypes.windll.user32.GetClientRect(parent, ctypes.byref(rc)):
+                        pw = rc.right - rc.left
+                        ph = rc.bottom - rc.top
+                        if pw > 0 and ph > 0:
+                            w, h = pw, ph
+            except Exception:
+                pass
         self._last_rect_size = (w, h)
         try:
             ctypes.windll.user32.MoveWindow(self.host_hwnd, 0, 0, w, h, True)
@@ -5470,6 +5538,23 @@ class _ShellHostThread(threading.Thread):
             SWP_NOSIZE = 0x0001
             ctypes.windll.user32.SetWindowPos(
                 self.host_hwnd, int(insert_after_hwnd), 0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)
+        except Exception:
+            pass
+
+    def _do_raise(self):
+        """把 host 抬回 z 序顶端（仅在 TabEx 重新成为前台时调用）。
+
+        独立 popup host 与主窗口无 owner 关系，不会随主窗口 z 序联动：当其它程序
+        覆盖 TabEx 后再最小化，系统把主窗口抬到前台，却把 host 留在主窗口之下 →
+        资源管理器区域变空白。此处用 HWND_TOP 把 host 抬回主窗口之上修复该问题。"""
+        try:
+            HWND_TOP = 0
+            SWP_NOACTIVATE = 0x0010
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            ctypes.windll.user32.SetWindowPos(
+                self.host_hwnd, HWND_TOP, 0, 0, 0, 0,
                 SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)
         except Exception:
             pass
@@ -5518,6 +5603,7 @@ class ThreadedExplorerBrowserWidget(QWidget):
         self._last_host_rect = None
         self._host_shown = False
         self._host_below_modal = False  # host 当前是否已被压到 Qt 模态窗口之下
+        self._main_fg = False  # 主窗口上一次同步时是否为前台（用于检测重新激活的上升沿）
         self._geo_sync_timer = QTimer(self)
         self._geo_sync_timer.setInterval(80)
         self._geo_sync_timer.timeout.connect(self._sync_host_geometry)
@@ -5701,6 +5787,18 @@ class ThreadedExplorerBrowserWidget(QWidget):
                 # 模态刚关闭：把 host 抬回顶层（HWND_TOP=0），恢复正常显示层级。
                 self._thread.post(('zbelow', 0))
                 self._host_below_modal = False
+            # 主窗口重新变为前台（例如遮挡它的其它程序被最小化）时，ownerless popup host
+            # 不会随主窗口自动上移 z 序，会被留在主窗口之下导致资源管理器区域变空白。
+            # 检测“主窗口成为前台”的上升沿，把 host 重新抬回主窗口之上修复该问题。
+            try:
+                fg = int(ctypes.windll.user32.GetForegroundWindow())
+                main_hwnd = int(win.winId()) if win is not None else 0
+                is_fg = bool(main_hwnd) and fg == main_hwnd
+            except Exception:
+                is_fg = False
+            if is_fg and not self._main_fg and modal_w is None:
+                self._thread.post(('raise',))
+            self._main_fg = is_fg
         except Exception:
             pass
 
@@ -5712,20 +5810,18 @@ class ThreadedExplorerBrowserWidget(QWidget):
                 path, self._pending_path = self._pending_path, None
                 self._navigate(path)
         self._last_host_rect = None  # 强制下次 setpos
-        if self._host_mode == 'popup':
-            try:
-                self._geo_sync_timer.start()
-            except Exception:
-                pass
+        try:
+            self._geo_sync_timer.start()
+        except Exception:
+            pass
         self._sync_host_geometry()
 
     def hideEvent(self, event):
         super().hideEvent(event)
-        if self._host_mode == 'popup':
-            try:
-                self._geo_sync_timer.stop()
-            except Exception:
-                pass
+        try:
+            self._geo_sync_timer.stop()
+        except Exception:
+            pass
         if self._thread is not None and self._host_shown:
             self._thread.post(('show', False))
             self._host_shown = False
@@ -13895,7 +13991,7 @@ class MainWindow(QMainWindow):
         set_explorer_monitor_debug(self.config.get("explorer_monitor_debug", False))
         # 实验特性：每标签独立 STA 线程寄宿 Shell 视图（隔离同步拷贝导致的整窗卡死）
         globals()['_USE_THREADED_SHELL'] = bool(self.config.get("experimental_threaded_shell", True))
-        _host_mode = str(self.config.get("threaded_shell_host_mode", "popup")).strip().lower()
+        _host_mode = str(self.config.get("threaded_shell_host_mode", "embedded")).strip().lower()
         if _host_mode not in ('popup', 'embedded'):
             _host_mode = 'popup'
         globals()['_THREADED_SHELL_HOST_MODE'] = _host_mode
@@ -14040,8 +14136,8 @@ class MainWindow(QMainWindow):
             "enable_title_shortcuts": True,  # 默认启用标题栏快捷方式区域
             "title_shortcuts": [],  # 标题栏快捷方式（.lnk/.exe/.bat/.cmd/.ps1 路径）
             "enable_mouse_gestures": True,  # 默认启用鼠标手势（右键画线导航）
-            "threaded_shell_host_mode": "popup",  # popup(默认)/embedded(旧主分支嵌入风格)
-            "experimental_threaded_shell": True,  # 默认启用每标签独立 Shell 线程，隔离复制/删除阻塞
+            "threaded_shell_host_mode": "embedded",  # embedded(默认，子窗口嵌入，无卡顿)/popup(独立顶层，隔离更强)
+            "experimental_threaded_shell": False,  # 默认关闭：单线程原生嵌入（拷贝不阻塞且视觉无毛病；慢盘导航已内置异步解析）。开启仅用于需要更强隔离的实验场景
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -16041,7 +16137,7 @@ class SettingsDialog(QDialog):
         self.threaded_shell_host_mode_combo = QComboBox(self)
         self.threaded_shell_host_mode_combo.addItem(tr("popup（独立顶层，隔离更强）"), "popup")
         self.threaded_shell_host_mode_combo.addItem(tr("embedded（子窗口嵌入，拖动更顺滑）"), "embedded")
-        host_mode = str(config.get("threaded_shell_host_mode", "popup")).strip().lower()
+        host_mode = str(config.get("threaded_shell_host_mode", "embedded")).strip().lower()
         if host_mode not in ('popup', 'embedded'):
             host_mode = 'popup'
         host_mode_index = self.threaded_shell_host_mode_combo.findData(host_mode)
@@ -16533,9 +16629,9 @@ class SettingsDialog(QDialog):
         # 保存所有设置到 parent (MainWindow)
         if self.parent():
             old_threaded_shell = bool(self.parent().config.get("experimental_threaded_shell", True))
-            old_host_mode = str(self.parent().config.get("threaded_shell_host_mode", "popup")).strip().lower()
+            old_host_mode = str(self.parent().config.get("threaded_shell_host_mode", "embedded")).strip().lower()
             if old_host_mode not in ('popup', 'embedded'):
-                old_host_mode = 'popup'
+                old_host_mode = 'embedded'
 
             # 处理开机启动设置
             auto_startup_enabled = self.auto_startup_cb.isChecked()
@@ -16554,9 +16650,9 @@ class SettingsDialog(QDialog):
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
             self.parent().config["preferred_terminal_tool"] = normalize_terminal_tool_name(self.preferred_terminal_combo.currentData())
             self.parent().config["experimental_threaded_shell"] = self.experimental_threaded_shell_cb.isChecked()
-            host_mode_val = str(self.threaded_shell_host_mode_combo.currentData() or "popup").strip().lower()
+            host_mode_val = str(self.threaded_shell_host_mode_combo.currentData() or "embedded").strip().lower()
             if host_mode_val not in ('popup', 'embedded'):
-                host_mode_val = 'popup'
+                host_mode_val = 'embedded'
             self.parent().config["threaded_shell_host_mode"] = host_mode_val
             # 保存路径栏分隔符设置
             self.parent().config["breadcrumb_copy_separator"] = self.path_separator_combo.currentData()
@@ -16598,9 +16694,9 @@ class SettingsDialog(QDialog):
 
             # 运行时同步 Shell 线程化设置（新建标签页立即生效）
             new_threaded_shell = bool(self.parent().config.get("experimental_threaded_shell", True))
-            new_host_mode = str(self.parent().config.get("threaded_shell_host_mode", "popup")).strip().lower()
+            new_host_mode = str(self.parent().config.get("threaded_shell_host_mode", "embedded")).strip().lower()
             if new_host_mode not in ('popup', 'embedded'):
-                new_host_mode = 'popup'
+                new_host_mode = 'embedded'
             globals()['_USE_THREADED_SHELL'] = new_threaded_shell
             globals()['_THREADED_SHELL_HOST_MODE'] = new_host_mode
 
