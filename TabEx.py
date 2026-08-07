@@ -5076,7 +5076,7 @@ class IExplorerBrowserWidget(QWidget):
 # “一个慢网络路径卡死全部标签”。
 # ─────────────────────────────────────────────────────────────────────────────
 _USE_THREADED_SHELL = False  # 由 MainWindow 启动时按 config 覆盖
-_THREADED_SHELL_HOST_MODE = 'embedded'  # embedded(默认，WS_CHILD 子窗口，视觉无卡顿) / popup(独立顶层，隔离更强但需手动贴窗)
+_THREADED_SHELL_HOST_MODE = 'popup'  # popup(默认，独立顶层，拷贝不阻塞) / embedded(WS_CHILD 子窗口，视觉无卡顿但拷贝阻塞)
 
 # 主线程 → 工作线程命令唤醒消息（PostMessage 到宿主子窗口，命令负载走线程安全队列）
 _WM_SHELL_CMD = 0x8000 + 0x21  # WM_APP + 0x21
@@ -5773,16 +5773,18 @@ class ThreadedExplorerBrowserWidget(QWidget):
                 self._thread.post(('show', True))
                 self._host_shown = True
             # 模态对话框存在时把 host 压到其下方，避免遮住对话框；无模态时恢复正常 z 序。
+            # 关键：模态期间【每个 tick 都重新压制】而非只压一次——切标签/setpos/系统事件都
+            # 可能把 ownerless popup host 重新抬起，只压一次会导致 explorer 再次盖住设置对话框。
+            # post() 对 'zbelow' 做去重合并，每 80ms 至多一次 SetWindowPos，开销可忽略。
             if modal_w is not None:
-                if not self._host_below_modal:
-                    try:
-                        mw = modal_w.window()
-                        modal_hwnd = int(mw.winId()) if mw is not None else 0
-                    except Exception:
-                        modal_hwnd = 0
-                    if modal_hwnd:
-                        self._thread.post(('zbelow', modal_hwnd))
-                        self._host_below_modal = True
+                try:
+                    mw = modal_w.window()
+                    modal_hwnd = int(mw.winId()) if mw is not None else 0
+                except Exception:
+                    modal_hwnd = 0
+                if modal_hwnd:
+                    self._thread.post(('zbelow', modal_hwnd))
+                    self._host_below_modal = True
             elif self._host_below_modal:
                 # 模态刚关闭：把 host 抬回顶层（HWND_TOP=0），恢复正常显示层级。
                 self._thread.post(('zbelow', 0))
@@ -13991,7 +13993,7 @@ class MainWindow(QMainWindow):
         set_explorer_monitor_debug(self.config.get("explorer_monitor_debug", False))
         # 实验特性：每标签独立 STA 线程寄宿 Shell 视图（隔离同步拷贝导致的整窗卡死）
         globals()['_USE_THREADED_SHELL'] = bool(self.config.get("experimental_threaded_shell", True))
-        _host_mode = str(self.config.get("threaded_shell_host_mode", "embedded")).strip().lower()
+        _host_mode = str(self.config.get("threaded_shell_host_mode", "popup")).strip().lower()
         if _host_mode not in ('popup', 'embedded'):
             _host_mode = 'popup'
         globals()['_THREADED_SHELL_HOST_MODE'] = _host_mode
@@ -14136,8 +14138,8 @@ class MainWindow(QMainWindow):
             "enable_title_shortcuts": True,  # 默认启用标题栏快捷方式区域
             "title_shortcuts": [],  # 标题栏快捷方式（.lnk/.exe/.bat/.cmd/.ps1 路径）
             "enable_mouse_gestures": True,  # 默认启用鼠标手势（右键画线导航）
-            "threaded_shell_host_mode": "embedded",  # embedded(默认，子窗口嵌入，无卡顿)/popup(独立顶层，隔离更强)
-            "experimental_threaded_shell": False,  # 默认关闭：单线程原生嵌入（拷贝不阻塞且视觉无毛病；慢盘导航已内置异步解析）。开启仅用于需要更强隔离的实验场景
+            "threaded_shell_host_mode": "popup",  # popup(默认，独立顶层，拷贝不阻塞其它 tab)/embedded(子窗口嵌入，视觉无卡顿但拷贝会阻塞)
+            "experimental_threaded_shell": True,  # 默认开启：每标签独立 Shell STA 线程 + popup 宿主，使拷贝/删除进度框不阻塞其它标签
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -16137,7 +16139,7 @@ class SettingsDialog(QDialog):
         self.threaded_shell_host_mode_combo = QComboBox(self)
         self.threaded_shell_host_mode_combo.addItem(tr("popup（独立顶层，隔离更强）"), "popup")
         self.threaded_shell_host_mode_combo.addItem(tr("embedded（子窗口嵌入，拖动更顺滑）"), "embedded")
-        host_mode = str(config.get("threaded_shell_host_mode", "embedded")).strip().lower()
+        host_mode = str(config.get("threaded_shell_host_mode", "popup")).strip().lower()
         if host_mode not in ('popup', 'embedded'):
             host_mode = 'popup'
         host_mode_index = self.threaded_shell_host_mode_combo.findData(host_mode)
@@ -16629,9 +16631,9 @@ class SettingsDialog(QDialog):
         # 保存所有设置到 parent (MainWindow)
         if self.parent():
             old_threaded_shell = bool(self.parent().config.get("experimental_threaded_shell", True))
-            old_host_mode = str(self.parent().config.get("threaded_shell_host_mode", "embedded")).strip().lower()
+            old_host_mode = str(self.parent().config.get("threaded_shell_host_mode", "popup")).strip().lower()
             if old_host_mode not in ('popup', 'embedded'):
-                old_host_mode = 'embedded'
+                old_host_mode = 'popup'
 
             # 处理开机启动设置
             auto_startup_enabled = self.auto_startup_cb.isChecked()
@@ -16650,9 +16652,9 @@ class SettingsDialog(QDialog):
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
             self.parent().config["preferred_terminal_tool"] = normalize_terminal_tool_name(self.preferred_terminal_combo.currentData())
             self.parent().config["experimental_threaded_shell"] = self.experimental_threaded_shell_cb.isChecked()
-            host_mode_val = str(self.threaded_shell_host_mode_combo.currentData() or "embedded").strip().lower()
+            host_mode_val = str(self.threaded_shell_host_mode_combo.currentData() or "popup").strip().lower()
             if host_mode_val not in ('popup', 'embedded'):
-                host_mode_val = 'embedded'
+                host_mode_val = 'popup'
             self.parent().config["threaded_shell_host_mode"] = host_mode_val
             # 保存路径栏分隔符设置
             self.parent().config["breadcrumb_copy_separator"] = self.path_separator_combo.currentData()
@@ -16694,9 +16696,9 @@ class SettingsDialog(QDialog):
 
             # 运行时同步 Shell 线程化设置（新建标签页立即生效）
             new_threaded_shell = bool(self.parent().config.get("experimental_threaded_shell", True))
-            new_host_mode = str(self.parent().config.get("threaded_shell_host_mode", "embedded")).strip().lower()
+            new_host_mode = str(self.parent().config.get("threaded_shell_host_mode", "popup")).strip().lower()
             if new_host_mode not in ('popup', 'embedded'):
-                new_host_mode = 'embedded'
+                new_host_mode = 'popup'
             globals()['_USE_THREADED_SHELL'] = new_threaded_shell
             globals()['_THREADED_SHELL_HOST_MODE'] = new_host_mode
 
