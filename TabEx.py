@@ -1027,6 +1027,8 @@ class QuickFindResultsDialog(QDialog):
     def __init__(self, matched_paths, parent=None):
         super().__init__(parent)
         self.setWindowTitle(tr("选择匹配项"))
+        # 置顶：避免被当前标签的 ownerless popup explorer host（仅抬到 HWND_TOP）遮挡。
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self.resize(680, 420)
         self.selected_path = None
 
@@ -1293,7 +1295,8 @@ class SearchDialog(QDialog):
     def __init__(self, search_path, parent=None, search_history=None):
         super().__init__(parent)
         self.setWindowTitle(tr("搜索 - {}").format(search_path))
-        # 设置为可调整大小，并显示最小化/最大化按钮
+        # 设置为可调整大小，并显示最小化/最大化按钮；加 WindowStaysOnTopHint
+        # 使其处于 topmost 层，避免被 ownerless popup explorer host（仅抬到 HWND_TOP）遮挡。
         self.setWindowFlags(
             Qt.Dialog
             | Qt.WindowTitleHint
@@ -1301,6 +1304,7 @@ class SearchDialog(QDialog):
             | Qt.WindowMinimizeButtonHint
             | Qt.WindowMaximizeButtonHint
             | Qt.WindowSystemMenuHint
+            | Qt.WindowStaysOnTopHint
         )
         # 关闭时立即销毁 C++ 对象（释放所有 Qt 子控件占用的内存）
         self.setAttribute(Qt.WA_DeleteOnClose)
@@ -2493,6 +2497,7 @@ import sys
 import os
 import json
 import subprocess
+import io
 import string
 import time
 import socket
@@ -2509,16 +2514,65 @@ import ctypes.wintypes
 # 全局调试开关
 _DEBUG_MODE = False  # 生产环境关闭，避免性能损耗
 _EXPLORER_MONITOR_DEBUG = False  # Explorer Monitor 单独的日志开关
+_DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TabEx_debug_latest.log")
+_DEBUG_LOG_LOCK = threading.Lock()
+_DEBUG_LOG_READY = False
+
+
+def _init_debug_log_file():
+    """初始化调试日志文件（覆盖旧内容，仅保留本次运行日志）。"""
+    global _DEBUG_LOG_READY
+    try:
+        with _DEBUG_LOG_LOCK:
+            with open(_DEBUG_LOG_PATH, "w", encoding="utf-8", errors="replace") as f:
+                f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + "[DebugLog] session started\n")
+        _DEBUG_LOG_READY = True
+    except Exception:
+        _DEBUG_LOG_READY = False
+
+
+def _append_debug_log_line(message):
+    """将一行调试信息追加到日志文件。"""
+    if not _DEBUG_LOG_READY:
+        return
+    try:
+        ts = time.strftime("[%Y-%m-%d %H:%M:%S]")
+        line = f"{ts} {message}\n"
+        with _DEBUG_LOG_LOCK:
+            with open(_DEBUG_LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+                f.write(line)
+    except Exception:
+        pass
 
 def debug_print(*args, **kwargs):
-    """根据调试开关决定是否输出调试信息"""
+    """根据调试开关输出调试信息，并写入本地日志文件。"""
+    should_emit = False
     if _DEBUG_MODE:
         # 检查是否是 Explorer Monitor 日志
         if args and isinstance(args[0], str) and '[Explorer Monitor]' in args[0]:
             if _EXPLORER_MONITOR_DEBUG:
-                print(*args, **kwargs)
+                should_emit = True
         else:
-            print(*args, **kwargs)
+            should_emit = True
+
+    if not should_emit:
+        return
+
+    # 输出到控制台
+    print(*args, **kwargs)
+
+    # 同步输出到本地日志文件（与 print 保持一致的拼接规则）
+    try:
+        local_kwargs = dict(kwargs)
+        local_kwargs.pop('file', None)
+        local_kwargs.pop('flush', None)
+        buf = io.StringIO()
+        print(*args, file=buf, **local_kwargs)
+        text = buf.getvalue().rstrip('\r\n')
+        if text:
+            _append_debug_log_line(text)
+    except Exception:
+        pass
 
 
 def dbg_exc(where=""):
@@ -5704,6 +5758,9 @@ class ThreadedExplorerBrowserWidget(QWidget):
         self._host_shown = False
         self._host_below_modal = False  # host 当前是否已被压到 Qt 模态窗口之下
         self._main_fg = False  # 主窗口上一次同步时是否为前台（用于检测重新激活的上升沿）
+        self._dialog_was_active = False  # 上一 tick 是否有本进程置顶对话框激活（用于检测关闭的下降沿）
+        self._zsink_ticks = 0  # host 连续被压在主窗口之下的 tick 数（raise 无效→升级重建）
+        self._recovery_pending = False  # 是否已安排一次去抖的恢复性重建
         self._geo_sync_timer = QTimer(self)
         self._geo_sync_timer.setInterval(80)
         self._geo_sync_timer.timeout.connect(self._sync_host_geometry)
@@ -5783,9 +5840,17 @@ class ThreadedExplorerBrowserWidget(QWidget):
                 x, y = 0, 0
                 w, h = max(self.width(), 100), max(self.height(), 100)
             else:
-                # popup 模式使用 ownerless 顶层宿主，避免 Shell 复制/删除对话框沿 owner 链
-                # 禁用主窗口，从而允许其它 tab 在后台操作与切换。
-                owner_hwnd = 0
+                # popup 模式：host 为主窗口的【owner 弹出窗口】（owner=主窗口顶层 HWND）。
+                # owner 关系让 OS 保证 host 恒在主窗口之上（explorer 永不被主窗口空占位盖成
+                # 空白），而主窗口 own 的对话框（设置/搜索/Ctrl+G）又自然浮在 host 之上 →
+                # 无需任何跨线程 raise/zbelow 竞争。owner 只是 top-level owner（非 WS_CHILD），
+                # 不会 attach 输入队列 → 拷贝仍不阻塞其它 tab（个别 Shell 模态确认会短暂禁用
+                # 主窗口，由 _ensure_main_window_enabled 看门狗 250ms 内重新启用）。
+                try:
+                    _top = self.window()
+                    owner_hwnd = int(_top.winId()) if _top is not None else 0
+                except Exception:
+                    owner_hwnd = 0
                 rect = self._current_screen_rect()
                 if rect:
                     x, y, w, h = rect
@@ -5838,6 +5903,65 @@ class ThreadedExplorerBrowserWidget(QWidget):
             self._thread.post(('refit', getattr(self, '_nav_real_path', None)))
         except Exception:
             pass
+
+    def _schedule_host_recovery(self):
+        """去抖地安排一次 host 恢复检查（延后判定后必要时 rebuild_thread）。
+
+        用于：raise 无法清除的持续 z 序下沉、置顶对话框关闭下降沿、后台创建的空白 host。
+        去抖避免在同一异常期间反复重建。真正的重建判定放在 _do_host_recovery。"""
+        if self._recovery_pending:
+            return
+        if self._host_mode != 'popup':
+            return
+        self._recovery_pending = True
+        try:
+            QTimer.singleShot(180, self._do_host_recovery)
+        except Exception:
+            self._recovery_pending = False
+
+    def _do_host_recovery(self):
+        """延后执行的 host 恢复：仅当 host 确实异常（被主窗口压住/不可见）时才整体重建，
+        否则做一次轻量 refit，避免健康状态下的无谓重建闪烁。"""
+        self._recovery_pending = False
+        if self._thread is None or not self._init_ok:
+            return
+        if not (self.isVisible() and not (self.window().isMinimized() if self.window() else False)):
+            return
+        host_hwnd = int(self._thread.host_hwnd) if self._thread else 0
+        if not host_hwnd:
+            return
+        try:
+            main_hwnd = int(self.window().winId()) if self.window() else 0
+        except Exception:
+            main_hwnd = 0
+        # 真实可见性
+        try:
+            actual_visible = bool(ctypes.windll.user32.IsWindowVisible(host_hwnd))
+        except Exception:
+            actual_visible = True
+        # z 序：host 是否仍被压在主窗口之下
+        host_below_main = False
+        if host_hwnd and main_hwnd:
+            try:
+                GW_HWNDNEXT = 2
+                cur = main_hwnd
+                for _ in range(200):
+                    cur = ctypes.windll.user32.GetWindow(cur, GW_HWNDNEXT)
+                    if not cur:
+                        break
+                    if cur == host_hwnd:
+                        host_below_main = True
+                        break
+            except Exception:
+                host_below_main = False
+        if (not actual_visible) or host_below_main:
+            # 确有异常：整体重建（=新建标签级别恢复，唯一可靠）
+            debug_print("[ThreadedShell] host recovery → rebuild_thread "
+                        f"(visible={actual_visible}, below_main={host_below_main})")
+            self.rebuild_thread()
+        else:
+            # 看似健康（在顶层、可见）：仅做一次轻量 refit（可能修复内部视图塌陷）
+            self._post_refit()
 
     def rebuild_thread(self):
         """彻底重建：销毁旧 worker 线程 + host 窗口，新建一套并导航回当前路径。
@@ -5911,6 +6035,11 @@ class ThreadedExplorerBrowserWidget(QWidget):
         except Exception:
             return None
 
+    def set_host_hidden_for_dialog(self, hidden):
+        """[deprecated no-op] 早期用隐藏 host 规避对话框遮挡，会导致 explorer 变空白。
+        现改为把对话框设为 topmost（见 SettingsDialog/SearchDialog），host 不再需要隐藏。"""
+        return
+
     def _sync_host_geometry(self):
         """把 host 定位/显隐同步到本 widget 的当前屏幕矩形与可见状态。
 
@@ -5923,7 +6052,39 @@ class ThreadedExplorerBrowserWidget(QWidget):
             from PyQt5.QtWidgets import QApplication
             win = self.window()
             minimized = bool(win.isMinimized()) if win else False
+            main_hwnd = int(win.winId()) if win is not None else 0
             modal_w = QApplication.activeModalWidget()
+            # 本进程内是否存在 Shell 文件操作进度框（拷贝/移动/删除，class 'OperationStatusWindow'）。
+            # 由 MainWindow 的 250ms 看门狗刷新到 _shell_fileop_dialog_hwnd（0=无）。存在时必须把
+            # host 压到该进度框之下、且【不再】把 host 抬起，否则 explorer 会盖住进度框，用户无法
+            # 看到/操作它（用户反馈“拷贝窗口永远无法置顶，被 explorer 覆盖”）。
+            fileop_hwnd = 0
+            try:
+                fileop_hwnd = int(getattr(win, '_shell_fileop_dialog_hwnd', 0) or 0)
+            except Exception:
+                fileop_hwnd = 0
+            # 置顶（WindowStaysOnTopHint）的对话框（设置/搜索/Ctrl+G 等）本就在 topmost 层，
+            # host 只抬到 HWND_TOP 永远盖不住它们 → 无需 zbelow，且需每 tick 抬 host。
+            modal_is_topmost = False
+            if modal_w is not None:
+                try:
+                    _mtw = modal_w.window()
+                    modal_is_topmost = bool(
+                        _mtw is not None and (_mtw.windowFlags() & Qt.WindowStaysOnTopHint))
+                except Exception:
+                    modal_is_topmost = False
+            # 我们进程内当前是否有一个【置顶对话框】处于激活态（模态或非模态，如非模态搜索框）。
+            # 关键：这类对话框由主窗口 own，弹出/激活时系统会把主窗口（作为 owner）抬到对话框
+            # 之下、却在 ownerless popup host 之上 → host 被主窗口空占位盖住 → explorer 空白。
+            # 需要在其存在期间每 tick 把 host 抬到 HWND_TOP（低于 topmost 对话框，盖不住它）。
+            dialog_active = False
+            try:
+                aw = QApplication.activeWindow()
+                if aw is not None and win is not None and aw is not win:
+                    dialog_active = bool(aw.windowFlags() & Qt.WindowStaysOnTopHint)
+            except Exception:
+                dialog_active = False
+            want_raise_for_dialog = modal_is_topmost or dialog_active
             visible = self.isVisible() and not minimized
             if not visible:
                 if self._host_shown:
@@ -5969,16 +6130,66 @@ class ThreadedExplorerBrowserWidget(QWidget):
                 self._host_shown = True
                 # 重新显示时一并 refit，修复隐藏期间可能塌陷的内部视图
                 self._post_refit()
-            # 检测到真实状态异常（隐藏/位置错位）时补一次 raise + refit，
+            # 纯 z 序下沉检测：host 可见、矩形也正确，但被主窗口盖在其下（例如新标签在后台
+            # 创建、或 _bring_to_front 把主窗口抬到 host 之上）。相等门/位置门都发现不了这种
+            # 情况（host 可见、矩形对），只有比较真实 z 序才能发现 → host 在主窗口之下则需抬起。
+            # 沿 GW_HWNDNEXT（z 序向下）从主窗口往下走，若能走到 host 说明 host 在主窗口之下。
+            host_below_main = False
+            if (host_hwnd and main_hwnd and modal_w is None
+                    and not want_raise_for_dialog and not fileop_hwnd and actual_visible):
+                try:
+                    GW_HWNDNEXT = 2
+                    cur = main_hwnd
+                    for _ in range(200):
+                        cur = ctypes.windll.user32.GetWindow(cur, GW_HWNDNEXT)
+                        if not cur:
+                            break
+                        if cur == host_hwnd:
+                            host_below_main = True
+                            break
+                except Exception:
+                    host_below_main = False
+            # 检测到真实状态异常（隐藏/位置错位/z 序沉到主窗口下）时补一次 raise + refit，
             # 修复模态取消后 z 序下沉与内部视图塌陷（空白）。
-            if modal_w is None and (pos_mismatch or (host_hwnd and not actual_visible)):
+            # 置顶对话框（模态或非模态）存在期间：主窗口作为其 owner 被抬到 host 之上 →
+            # explorer 空白。此时每 tick 抬 host 到 HWND_TOP（低于 topmost 对话框，盖不住它），
+            # 保证 explorer 始终可见。post() 对 'raise' 去重，每 80ms 至多一次，开销可忽略。
+            if want_raise_for_dialog:
+                self._thread.post(('raise',))
+                if host_hwnd and not actual_visible:
+                    self._post_refit()
+            elif fileop_hwnd:
+                # 拷贝进度框存在：绝不抬 host（会盖住进度框）。仅在内部视图确实塌陷时补 refit。
+                if host_hwnd and not actual_visible:
+                    self._post_refit()
+            elif modal_w is None and (pos_mismatch or (host_hwnd and not actual_visible) or host_below_main):
                 self._thread.post(('raise',))
                 self._post_refit()
+            # 升级重建：raise 只能修 z 序遮挡，修不了“视图已死/一片空白”。若 host 仍被压在
+            # 主窗口之下且连续多个 tick raise 都无法把它抬起（后台创建的 host 常见），说明单纯
+            # raise 无效 → 触发一次去抖的 rebuild_thread（=新建标签级别的可靠恢复，F5 同款）。
+            if host_below_main and not fileop_hwnd:
+                self._zsink_ticks += 1
+                if self._zsink_ticks >= 3:
+                    self._zsink_ticks = 0
+                    self._schedule_host_recovery()
+            else:
+                self._zsink_ticks = 0
+            # 置顶对话框刚关闭的下降沿：对话框存在期间主窗口曾被抬到 host 之上，关闭后 host
+            # 可能残留空白（raise 修不了已死视图）。安排一次去抖恢复（延后再判定是否需重建）。
+            if want_raise_for_dialog:
+                self._dialog_was_active = True
+            elif self._dialog_was_active:
+                self._dialog_was_active = False
+                self._schedule_host_recovery()
             # 模态对话框存在时把 host 压到其下方，避免遮住对话框；无模态时恢复正常 z 序。
             # 关键：模态期间【每个 tick 都重新压制】而非只压一次——切标签/setpos/系统事件都
             # 可能把 ownerless popup host 重新抬起，只压一次会导致 explorer 再次盖住设置对话框。
             # post() 对 'zbelow' 做去重合并，每 80ms 至多一次 SetWindowPos，开销可忽略。
-            if modal_w is not None:
+            # 例外：置顶（WindowStaysOnTopHint）的对话框（设置/搜索/Ctrl+G 等）本就处于 topmost
+            # 层，host 只抬到 HWND_TOP 永远盖不住它们，无需 zbelow。对置顶模态做 zbelow 反而会把
+            # host 的 z 序拉乱，导致对话框关闭后 explorer 变空白——因此这里【跳过置顶模态】。
+            if modal_w is not None and not modal_is_topmost:
                 try:
                     mw = modal_w.window()
                     modal_hwnd = int(mw.winId()) if mw is not None else 0
@@ -5987,8 +6198,14 @@ class ThreadedExplorerBrowserWidget(QWidget):
                 if modal_hwnd:
                     self._thread.post(('zbelow', modal_hwnd))
                     self._host_below_modal = True
+            elif fileop_hwnd:
+                # 拷贝/移动/删除进度框存在：每 tick 把 host 压到它下面，保证进度框始终在
+                # explorer 之上可见、可点（取消/暂停）。进度框由主窗口 own → 在主窗口之上，
+                # host 压到它之下后仍在主窗口之上 → explorer 不会变空白。
+                self._thread.post(('zbelow', fileop_hwnd))
+                self._host_below_modal = True
             elif self._host_below_modal:
-                # 模态刚关闭：把 host 抬回顶层（HWND_TOP=0），恢复正常显示层级。
+                # 模态/进度框刚关闭：把 host 抬回顶层（HWND_TOP=0），恢复正常显示层级。
                 self._thread.post(('zbelow', 0))
                 self._host_below_modal = False
             # 主窗口重新变为前台（例如遮挡它的其它程序被最小化）时，ownerless popup host
@@ -5996,11 +6213,10 @@ class ThreadedExplorerBrowserWidget(QWidget):
             # 检测“主窗口成为前台”的上升沿，把 host 重新抬回主窗口之上修复该问题。
             try:
                 fg = int(ctypes.windll.user32.GetForegroundWindow())
-                main_hwnd = int(win.winId()) if win is not None else 0
                 is_fg = bool(main_hwnd) and fg == main_hwnd
             except Exception:
                 is_fg = False
-            if is_fg and not self._main_fg and modal_w is None:
+            if is_fg and not self._main_fg and modal_w is None and not fileop_hwnd:
                 self._thread.post(('raise',))
             self._main_fg = is_fg
         except Exception:
@@ -7888,11 +8104,18 @@ class FileExplorerTab(QWidget):
                 mw = getattr(_self_ref, 'main_window', None)
                 if mw is None:
                     return False
-                # 仅当本程序为前台窗口时接管右键
+                # 仅当前台窗口属于本进程时才接管右键（避免影响其他程序）。
+                # 注意：线程化 popup 模式下 shell 视图是独立的顶层窗口，点击文件后
+                # 前台窗口会是该 popup 宿主而非主窗口；因此不能只比较主窗口句柄，
+                # 否则手势在 popup 获得焦点时会“时好时坏”地失效。改为判断前台窗口
+                # 是否与主窗口同属一个进程。
                 try:
-                    fg = ctypes.windll.user32.GetForegroundWindow()
-                    if int(fg) != int(mw.winId()):
-                        return False
+                    fg = int(ctypes.windll.user32.GetForegroundWindow())
+                    if fg != int(mw.winId()):
+                        fg_pid = ctypes.wintypes.DWORD(0)
+                        ctypes.windll.user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+                        if fg_pid.value != os.getpid():
+                            return False
                 except Exception:
                     pass
                 return mw.pane_at_global_pos(px, py) is not None
@@ -8058,6 +8281,29 @@ class FileExplorerTab(QWidget):
 
                     if is_dblclick:
                         _state['t'] = 0
+
+                        # 点击瞬间就判定落点是否在 explorer 内（同步，非延迟）。
+                        # 关键：go_up 的确认逻辑延迟 150ms 执行；若此处不在点击瞬间锁定，
+                        # 用户双击【标题栏】会触发窗口最大化/还原 → explorer 控件上移 →
+                        # 150ms 后原屏幕坐标落入 explorer 新矩形 → 误判为空白双击而返回上级。
+                        # 因此在点击当下检查，落点在 explorer 之外（标题栏/工具栏/标签栏/路径栏）
+                        # 直接放弃，不安排 go_up 检测。
+                        try:
+                            from PyQt5.QtCore import QPoint
+                            _tab0 = _get_current_tab()
+                            _inside0 = bool(
+                                _tab0 is not None
+                                and _tab0.explorer.isVisible()
+                                and _tab0.explorer.rect().contains(
+                                    _tab0.explorer.mapFromGlobal(QPoint(px, py))))
+                        except Exception:
+                            _inside0 = False
+                        if not _inside0:
+                            try:
+                                hh = getattr(FileExplorerTab, '_global_mouse_hook_handle', None) or 0
+                                return ctypes.windll.user32.CallNextHookEx(hh, nCode, wParam, lParam)
+                            except Exception:
+                                return 0
 
                         def _check(_px=px, _py=py):
                             try:
@@ -9861,6 +10107,94 @@ class CustomTabBar(QTabBar):
                         pass
                 idx = self.tabAt(event.pos())
                 if idx >= 0:
+                    # 拷贝/移动对话框存在时，系统可能把这次点击用于窗口激活，导致 tab 切换被吞。
+                    # 这里不做任何抢焦点，只做一次显式索引切换，降低副作用风险。
+                    try:
+                        fileop_hwnd = int(getattr(self.main_window, '_shell_fileop_dialog_hwnd', 0) or 0)
+                    except Exception:
+                        fileop_hwnd = 0
+                    if fileop_hwnd:
+                        try:
+                            tw = self._owner_tw()
+                            debug_print(f"[FileOpDiag] tab click captured during file-op: idx={idx}, cur={tw.currentIndex() if tw else -1}")
+                            # 用 Win32 SetForegroundWindow 把主窗口明确设为前景
+                            try:
+                                import ctypes
+                                user32 = ctypes.windll.user32
+                                main_hwnd = int(self.main_window.winId())
+                                if main_hwnd:
+                                    user32.SetForegroundWindow(ctypes.wintypes.HWND(main_hwnd))
+                                    debug_print(f"[FileOpDiag] SetForegroundWindow(0x{main_hwnd:x})")
+                            except Exception:
+                                pass
+                            if tw is not None and idx != tw.currentIndex():
+                                old_idx = tw.currentIndex()
+                                tw.setCurrentIndex(idx)
+                                self.main_window._on_group_tab_changed(tw, idx)
+                                debug_print(f"[FileOpDiag] explicit tab switch during file-op: idx={idx}, old_idx={old_idx}")
+                                
+                                # 仅在拷贝进行中时，临时隐藏/显示 widgets 以加快 UI 响应
+                                # 这样做是因为 explorer host popup 被 shell 拷贝阻塞，show/hide widgets
+                                # 能让 tab 切换立即生效，而不是卡住等待 explorer 响应
+                                if getattr(self.main_window, '_fileop_in_progress', False):
+                                    try:
+                                        cs = self.main_window._content_stack_for(tw)
+                                        if cs is not None:
+                                            current_widget = cs.currentWidget()
+                                            if current_widget is not None:
+                                                current_widget.hide()
+                                                debug_print(f"[FileOpDiag] temporarily hid content widget at stack index {old_idx}")
+                                            
+                                            if idx < cs.count():
+                                                new_widget = cs.widget(idx)
+                                                if new_widget is not None:
+                                                    new_widget.show()
+                                                    debug_print(f"[FileOpDiag] showed content widget at stack index {idx}")
+                                    except Exception as e:
+                                        debug_print(f"[FileOpDiag] widget swap error: {e}")
+                                
+                                # 强制刷新 UI
+                                try:
+                                    from PyQt5.QtWidgets import QApplication
+                                    self.repaint()
+                                    self.main_window.repaint()
+                                    for _ in range(3):
+                                        QApplication.processEvents()
+                                    debug_print(f"[FileOpDiag] UI repaint forced after tab switch")
+                                except Exception:
+                                    pass
+                            # 下一帧再补一次，覆盖“首击被系统激活流程吞掉”的场景。
+                            if tw is not None:
+                                from PyQt5.QtCore import QTimer as _QTimer
+                                def _deferred_force():
+                                    try:
+                                        if idx != tw.currentIndex() and 0 <= idx < tw.count():
+                                            tw.setCurrentIndex(idx)
+                                            self.main_window._on_group_tab_changed(tw, idx)
+                                            # 仅在拷贝进行中时才做 show/hide
+                                            if getattr(self.main_window, '_fileop_in_progress', False):
+                                                try:
+                                                    cs = self.main_window._content_stack_for(tw)
+                                                    if cs is not None:
+                                                        current_widget = cs.currentWidget()
+                                                        if current_widget is not None:
+                                                            current_widget.hide()
+                                                        if idx < cs.count():
+                                                            new_widget = cs.widget(idx)
+                                                            if new_widget is not None:
+                                                                new_widget.show()
+                                                except Exception:
+                                                    pass
+                                            self.repaint()
+                                            self.main_window.repaint()
+                                            from PyQt5.QtWidgets import QApplication
+                                            QApplication.processEvents()
+                                            debug_print(f"[FileOpDiag] deferred tab switch during file-op: idx={idx}")
+                                    except Exception:
+                                        pass
+                                _QTimer.singleShot(0, _deferred_force)
+                        except Exception:
+                            pass
                     cs = self.main_window._content_stack_for(self._owner_tw())
                     if cs is not None and idx < cs.count():
                         self._press_content = cs.widget(idx)
@@ -12108,6 +12442,12 @@ class MainWindow(QMainWindow):
             pass
         return self.tab_widget
 
+    def _ensure_main_foreground_for_tab_click(self):
+        return
+
+    def _is_fileop_dialog_foreground(self):
+        return False
+
     def _set_restore_nav_guard(self):
         """窗口从最小化恢复时，设置 guard 抑制 IEB 树面板自动展开的虚假导航"""
         tab = self.get_current_tab_widget()
@@ -13293,6 +13633,20 @@ class MainWindow(QMainWindow):
                 import ctypes
                 
                 msg = cast(int(message), POINTER(wintypes.MSG)).contents
+                
+                # 仅在 WM_MOUSEACTIVATE 时才日志（减少日志量）
+                if msg.message == 0x0021:  # WM_MOUSEACTIVATE
+                    try:
+                        dlg_hwnd = int(getattr(self, '_shell_fileop_dialog_hwnd', 0) or 0)
+                        fg = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+                        debug_print(f"[nativeEvent] WM_MOUSEACTIVATE received: msg.message=0x{msg.message:04x}, dlg_hwnd=0x{dlg_hwnd:x}, fg=0x{fg:x}, equal={fg==dlg_hwnd}")
+                        
+                        if dlg_hwnd and fg == dlg_hwnd:
+                            # 拷贝窗口正在前台，返回 MA_ACTIVATE(1) 激活主窗口但不吃掉点击
+                            debug_print(f"[nativeEvent] Returning MA_ACTIVATE(1) to NOT swallow click")
+                            return True, 1
+                    except Exception as e:
+                        debug_print(f"[nativeEvent] WM_MOUSEACTIVATE exception: {e}")
 
                 # WM_SYSCOMMAND：从最小化恢复时设置 restore guard（抑制 IEB 虚假导航）
                 if msg.message == 0x0112:  # WM_SYSCOMMAND
@@ -13300,8 +13654,8 @@ class MainWindow(QMainWindow):
                     SC_RESTORE = 0xF120
                     if command == SC_RESTORE and self.isMinimized():
                         self._set_restore_nav_guard()
-        except Exception:
-            pass
+        except Exception as e:
+            debug_print(f"[nativeEvent] general exception: {e}")
         
         return super().nativeEvent(eventType, message)
     
@@ -13469,8 +13823,20 @@ class MainWindow(QMainWindow):
             else:
                 show_toast(self, tr("提示"), tr("未选中文件，也无法获取路径栏地址"), level="warning")
 
+    def _get_quick_find_keyword(self):
+        """弹出置顶的输入框获取 Ctrl+G 检索关键字，返回 (keyword, ok)。
+
+        用带 WindowStaysOnTopHint 的 QInputDialog 实例（而非静态 getText），使其处于
+        topmost 层，避免被当前标签的 ownerless popup explorer host（仅抬到 HWND_TOP）遮挡。"""
+        input_dlg = QInputDialog(self)
+        input_dlg.setWindowFlags(input_dlg.windowFlags() | Qt.WindowStaysOnTopHint)
+        input_dlg.setWindowTitle(tr("快捷定位"))
+        input_dlg.setLabelText(tr("请输入要检索的文件或文件夹关键字："))
+        ok = bool(input_dlg.exec_())
+        keyword = input_dlg.textValue() if ok else ""
+        return keyword, ok
+
     def quick_find_in_current_directory(self):
-        """通过关键字快速检索当前目录下的文件或文件夹名，并在当前目录中选中目标。"""
         current_tab = self.get_active_pane()
         if not current_tab or not hasattr(current_tab, 'current_path'):
             show_toast(self, tr("提示"), tr("当前没有可用的标签页路径"), level="warning")
@@ -13484,7 +13850,7 @@ class MainWindow(QMainWindow):
             show_toast(self, tr("提示"), tr("当前目录无效"), level="warning")
             return
 
-        keyword, ok = QInputDialog.getText(self, tr("快捷定位"), tr("请输入要检索的文件或文件夹关键字："))
+        keyword, ok = self._get_quick_find_keyword()
         self._guard_shortcuts_after_modal()
         if not ok:
             return
@@ -14276,6 +14642,7 @@ class MainWindow(QMainWindow):
             self._shell_modal_guard_timer = QTimer(self)
             self._shell_modal_guard_timer.timeout.connect(self._ensure_main_window_enabled)
             self._shell_modal_guard_timer.start(250)
+            self._shell_fileop_dialog_hwnd = 0
 
         
         # 性能优化：延迟加载非关键功能（100ms后加载）
@@ -14853,10 +15220,91 @@ class MainWindow(QMainWindow):
                 debug_print("[ThreadedShell] Re-enabled main window (shell modal had disabled it)")
         except Exception:
             pass
+        # ── 诊断：拷贝阻塞机制排查（变化时才打印，避免刷屏）───────────────────────
+        try:
+            self._diag_fileop_blocking()
+        except Exception as _e:
+            debug_print(f"[FileOpDiag] error: {_e}")
         # Shell 文件操作（拷贝/移动/删除）进度对话框关闭后，寄宿其视图的 worker 线程/host
         # 可能进入不可恢复的空白状态。检测该对话框“从有到无”的下降沿，自动重建当前 tab
         # （等价于用户按 F5），无需手动干预。
         self._check_shell_fileop_dialog_closed()
+
+    def _diag_fileop_blocking(self):
+        """诊断日志：枚举本进程所有非 Qt 顶层窗口 + 主窗口 enabled + 前台窗口。
+
+        目的：确认拷贝进度框的真实窗口类名/owner/线程，以及主窗口在拷贝时是否被禁用、
+        前台窗口是谁——据此判断“拷贝时点不了别的 tab”的真实机制。仅在状态变化时打印。"""
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        our_pid = kernel32.GetCurrentProcessId()
+        main_hwnd = int(self.winId())
+        main_tid = kernel32.GetCurrentThreadId()
+
+        # 收集本进程所有顶层窗口（类名/owner/线程/可见/enabled），排除 Qt 自身窗口
+        wins = []
+        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        GWLP_HWNDPARENT = -8
+        GetWindowLongPtr = getattr(user32, 'GetWindowLongPtrW', None) or user32.GetWindowLongW
+        GetWindowLongPtr.restype = ctypes.c_void_p
+        GetWindowLongPtr.argtypes = [ctypes.wintypes.HWND, ctypes.c_int]
+
+        def _proc(h, _lp):
+            try:
+                pid = ctypes.wintypes.DWORD(0)
+                tid = user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                if pid.value != our_pid:
+                    return 1
+                buf = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(h, buf, 64)
+                cls = buf.value
+                # 排除 Qt 主/子窗口与常见 Qt 类，聚焦 shell 原生窗口
+                if cls.startswith('Qt'):
+                    return 1
+                owner = GetWindowLongPtr(h, GWLP_HWNDPARENT) or 0
+                vis = bool(user32.IsWindowVisible(h))
+                en = bool(user32.IsWindowEnabled(h))
+                wins.append((int(h), cls, int(owner), int(tid), vis, en))
+            except Exception:
+                pass
+            return 1
+
+        user32.EnumWindows(EnumProc(_proc), 0)
+
+        # 前台窗口信息
+        fg = int(user32.GetForegroundWindow() or 0)
+        fg_cls = ''
+        fg_pid = ctypes.wintypes.DWORD(0)
+        fg_tid = 0
+        if fg:
+            try:
+                b = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(fg, b, 64)
+                fg_cls = b.value
+                fg_tid = user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+            except Exception:
+                pass
+        main_enabled = bool(user32.IsWindowEnabled(main_hwnd)) if main_hwnd else True
+
+        # 构造签名，仅在变化时打印
+        sig = (
+            tuple(sorted((w[1], w[2] != 0, w[4], w[5]) for w in wins)),
+            main_enabled, fg == main_hwnd, fg_cls, int(fg_pid.value) == our_pid,
+        )
+        if sig == getattr(self, '_diag_last_sig', None):
+            return
+        self._diag_last_sig = sig
+        debug_print(
+            f"[FileOpDiag] main_hwnd={main_hwnd} main_tid={main_tid} "
+            f"mainEnabled={main_enabled} fg=0x{fg:x} fgCls='{fg_cls}' "
+            f"fgIsMain={fg == main_hwnd} fgOurPid={int(fg_pid.value) == our_pid} fgTid={fg_tid}")
+        if wins:
+            for (h, cls, owner, tid, vis, en) in wins:
+                debug_print(
+                    f"[FileOpDiag]   win=0x{h:x} cls='{cls}' owner=0x{owner:x} "
+                    f"tid={tid} visible={vis} enabled={en}")
+        else:
+            debug_print("[FileOpDiag]   (no non-Qt top-level windows in our process)")
 
     def _check_shell_fileop_dialog_closed(self):
         """检测 shell 文件操作进度框（OperationStatusWindow）是否刚刚关闭；是则重建活动 tab。"""
@@ -14864,11 +15312,41 @@ class MainWindow(QMainWindow):
             present = self._shell_fileop_dialog_present()
         except Exception:
             return
+        # 进度框存在时：把它从 owner 链（对话框 → host → 主窗口）中解绑，使其成为独立顶层窗口。
+        # 原因：拷贝进度框由 worker STA 线程创建、经 host 挂在主窗口的 owner 链上；拷贝进行时
+        # worker 线程忙于文件 I/O，owner 链耦合会让主窗口的激活/输入被牵连，导致“拷贝时点不了
+        # 别的 tab”。解绑 owner 后进度框与主窗口互不影响：主窗口始终可点、可切标签，进度框仍
+        # 独立可见/可操作（取消/暂停）。仅对本进程的 OperationStatusWindow 做一次，已处理过的
+        # 句柄缓存跳过，开销可忽略。
+        if present:
+            self._fileop_in_progress = True
+            try:
+                self._detach_fileop_dialog_owner()
+            except Exception:
+                pass
         was_present = getattr(self, '_shell_fileop_dialog_was_present', False)
         self._shell_fileop_dialog_was_present = present
         if was_present and not present:
-            # 下降沿：拷贝/删除对话框刚关闭 → 重建当前活动 tab 的线程化 explorer
+            # 下降沿：拷贝/删除对话框刚关闭 → 恢复隐藏的 widgets 并重建
+            self._fileop_in_progress = False
             debug_print("[ThreadedShell] shell file-op dialog closed → auto-rebuild active tab")
+            self._detached_fileop_dialogs = set()  # 重置，下一次拷贝再解绑
+            
+            # 强制恢复所有 widgets（可能在拷贝时被隐藏以加快 UI 响应）
+            try:
+                for i in range(self.tab_widget.count()):
+                    try:
+                        cs = self._content_stack_for(self.tab_widget)
+                        if cs is not None and i < cs.count():
+                            w = cs.widget(i)
+                            if w is not None:
+                                w.show()
+                                debug_print(f"[FileOpDiag] restored content widget for tab {i} after copy complete")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            
             try:
                 pane = self.get_active_pane()
                 exp = getattr(pane, 'explorer', None) if pane else None
@@ -14877,11 +15355,81 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 debug_print(f"[ThreadedShell] auto-rebuild error: {e}")
 
+    def _detach_fileop_dialog_owner(self):
+        """把当前 shell 文件操作进度框从 owner 链解绑为独立顶层窗口（每个句柄仅一次）。
+
+        解绑后进度框不再随主窗口 owner 链耦合激活/输入，主窗口在拷贝进行时仍完全可交互
+        （可点击/切换其它标签）。同时确保主窗口未被进度框禁用。"""
+        dlg = int(getattr(self, '_shell_fileop_dialog_hwnd', 0) or 0)
+        if not dlg:
+            return
+        handled = getattr(self, '_detached_fileop_dialogs', None)
+        if handled is None:
+            handled = set()
+            self._detached_fileop_dialogs = handled
+        if dlg in handled:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            GWLP_HWNDPARENT = -8
+            SetWindowLongPtr = getattr(user32, 'SetWindowLongPtrW', None) or user32.SetWindowLongW
+            SetWindowLongPtr.restype = ctypes.c_void_p
+            SetWindowLongPtr.argtypes = [ctypes.wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            # 读取当前 owner；已经是独立（owner=0）则仅标记，避免重复
+            GetWindowLongPtr = getattr(user32, 'GetWindowLongPtrW', None) or user32.GetWindowLongW
+            GetWindowLongPtr.restype = ctypes.c_void_p
+            GetWindowLongPtr.argtypes = [ctypes.wintypes.HWND, ctypes.c_int]
+            cur_owner = GetWindowLongPtr(dlg, GWLP_HWNDPARENT)
+            if cur_owner:
+                SetWindowLongPtr(dlg, GWLP_HWNDPARENT, ctypes.c_void_p(0))
+                debug_print("[ThreadedShell] detached copy progress dialog from owner chain")
+
+            # 拷贝对话框阻塞了整个消息循环，导致无法点击 tab。
+            # 隐藏拷贝窗口（但在任务栏保留），让主窗口能正常响应点击。
+            # 拷贝仍在后台进行，完成后会自动显示或恢复。
+            try:
+                SW_HIDE = 0
+                user32.ShowWindow(ctypes.wintypes.HWND(dlg), SW_HIDE)
+                debug_print("[ThreadedShell] hid copy progress dialog to unblock input")
+            except Exception as e:
+                debug_print(f"[ThreadedShell] failed to hide copy dialog: {e}")
+
+            # 有些系统会把 OperationStatusWindow 提升到 TOPMOST，导致主窗口点击体验很差。
+            # 这里降回普通顶层（NOTOPMOST），同时 _sync_host_geometry 会持续把 explorer host
+            # 压在该窗口之下，因此进度框仍可见且不被 explorer 覆盖。
+            try:
+                HWND_NOTOPMOST = ctypes.c_void_p(-2)
+                SWP_NOMOVE = 0x0002
+                SWP_NOSIZE = 0x0001
+                SWP_NOACTIVATE = 0x0010
+                SWP_NOOWNERZORDER = 0x0200
+                SWP_NOSENDCHANGING = 0x0400
+                user32.SetWindowPos(
+                    ctypes.wintypes.HWND(dlg),
+                    HWND_NOTOPMOST,
+                    0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING
+                )
+                debug_print("[ThreadedShell] normalized copy progress dialog to NOTOPMOST")
+            except Exception:
+                pass
+
+            handled.add(dlg)
+            # 解绑后确保主窗口仍处于 enabled
+            main_hwnd = int(self.winId())
+            if main_hwnd and not user32.IsWindowEnabled(main_hwnd):
+                user32.EnableWindow(main_hwnd, True)
+        except Exception:
+            pass
+
     def _shell_fileop_dialog_present(self):
-        """本进程内是否存在 shell 文件操作进度对话框（class 'OperationStatusWindow'）。"""
+        """本进程内是否存在 shell 文件操作进度对话框（class 'OperationStatusWindow'）。
+
+        同时把找到的对话框 HWND 记到 self._shell_fileop_dialog_hwnd（无则 0），供各标签的
+        explorer 宿主在同步几何时把自身 z 序压到该进度框之下，避免遮挡它。"""
         user32 = ctypes.windll.user32
         our_pid = ctypes.windll.kernel32.GetCurrentProcessId()
-        found = [False]
+        found = [0]
         EnumProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
         _GetClassName = user32.GetClassNameW
         _GetWindowThreadProcessId = user32.GetWindowThreadProcessId
@@ -14894,15 +15442,15 @@ class MainWindow(QMainWindow):
                     pid = ctypes.wintypes.DWORD(0)
                     _GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
                     if pid.value == our_pid:
-                        found[0] = True
+                        found[0] = int(hwnd)
                         return 0  # 找到即停止
             except Exception:
                 pass
             return 1
 
         user32.EnumWindows(EnumProc(_proc), 0)
-        return found[0]
-
+        self._shell_fileop_dialog_hwnd = found[0]
+        return bool(found[0])
 
     def save_session_snapshot(self, immediate=False):
         if not hasattr(self, 'config') or not hasattr(self, 'tab_widget'):
@@ -16232,8 +16780,9 @@ class SettingsDialog(QDialog):
         from PyQt5.QtWidgets import QDialogButtonBox, QLabel, QGroupBox, QComboBox, QHBoxLayout, QVBoxLayout, QCheckBox, QSpinBox
         super().__init__(parent)
         self.setWindowTitle(tr("设置"))
-        # 设置为不可调边框的对话框
-        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        # 设置为不可调边框的对话框；加 WindowStaysOnTopHint 使其处于 topmost 层，
+        # 避免被当前标签的 ownerless popup explorer host（仅抬到 HWND_TOP）遮挡。
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint | Qt.WindowStaysOnTopHint)
         # 宽度固定，高度按内容自动计算
         self.setFixedWidth(700)
         main_layout = QHBoxLayout(self)
@@ -17636,6 +18185,7 @@ def main():
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     
     # 启动新实例
+    _init_debug_log_file()
     app = QApplication(sys.argv)
     app.setApplicationName("TabExplorer")
     
