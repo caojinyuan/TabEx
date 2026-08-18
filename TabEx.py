@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.62"
+APP_VERSION = "3.64"
 
 
 # TabEx i18n module
@@ -715,6 +715,7 @@ APP_INTERNAL_CHANGE_FILENAMES = {
     'chat_history.json',
     'runtime_health.log',
     'runtime_health.log.1',
+    'tabex_debug_latest.log',
 }
 
 # 大文件夹异步加载配置
@@ -2485,6 +2486,7 @@ import sys
 import os
 import json
 import subprocess
+import io
 import string
 import time
 import socket
@@ -2500,16 +2502,63 @@ import ctypes.wintypes
 # 全局调试开关
 _DEBUG_MODE = False  # 生产环境关闭，避免性能损耗
 _EXPLORER_MONITOR_DEBUG = False  # Explorer Monitor 单独的日志开关
+_DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TabEx_debug_latest.log")
+_DEBUG_LOG_LOCK = threading.Lock()
+_DEBUG_LOG_READY = False
+
+
+def _init_debug_log_file():
+    """初始化调试日志文件（覆盖旧内容，仅保留本次运行日志）。"""
+    global _DEBUG_LOG_READY
+    try:
+        with _DEBUG_LOG_LOCK:
+            with open(_DEBUG_LOG_PATH, "w", encoding="utf-8", errors="replace") as f:
+                f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + "[DebugLog] session started\n")
+        _DEBUG_LOG_READY = True
+    except Exception:
+        _DEBUG_LOG_READY = False
+
+
+def _append_debug_log_line(message):
+    """将一行调试信息追加到日志文件。"""
+    if not _DEBUG_LOG_READY:
+        return
+    try:
+        ts = time.strftime("[%Y-%m-%d %H:%M:%S]")
+        line = f"{ts} {message}\n"
+        with _DEBUG_LOG_LOCK:
+            with open(_DEBUG_LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+                f.write(line)
+    except Exception:
+        pass
 
 def debug_print(*args, **kwargs):
-    """根据调试开关决定是否输出调试信息"""
+    """根据调试开关输出调试信息，并写入本地日志文件。"""
+    should_emit = False
     if _DEBUG_MODE:
         # 检查是否是 Explorer Monitor 日志
         if args and isinstance(args[0], str) and '[Explorer Monitor]' in args[0]:
             if _EXPLORER_MONITOR_DEBUG:
-                print(*args, **kwargs)
+                should_emit = True
         else:
-            print(*args, **kwargs)
+            should_emit = True
+
+    if not should_emit:
+        return
+
+    print(*args, **kwargs)
+
+    try:
+        local_kwargs = dict(kwargs)
+        local_kwargs.pop('file', None)
+        local_kwargs.pop('flush', None)
+        buf = io.StringIO()
+        print(*args, file=buf, **local_kwargs)
+        text = buf.getvalue().rstrip('\r\n')
+        if text:
+            _append_debug_log_line(text)
+    except Exception:
+        pass
 
 
 def dbg_exc(where=""):
@@ -3520,7 +3569,8 @@ class SimplePathBar(QWidget):
                 x += sep_w
                 idx += 1
             is_current = (full == self._current_path)
-            shown = self._elide_crumb_text(label, is_current=is_current)
+            max_text_w = max(0, (self.width() - 2) - x - pad * 2)
+            shown = self._elide_crumb_text(label, is_current=is_current, max_text_width=max_text_w)
             w = fm.horizontalAdvance(shown) + pad * 2
             hovered = (self._hover_idx == idx)
             if hovered:
@@ -3684,12 +3734,19 @@ class SimplePathBar(QWidget):
         except Exception as e:
             debug_print(f"[SimplePathBar] sibling menu error: {e}")
 
-    def _elide_crumb_text(self, text, is_current=False):
+    def _elide_crumb_text(self, text, is_current=False, max_text_width=None):
         try:
+            _ = is_current  # 保留参数以兼容现有调用语义
+            s = str(text)
+            if max_text_width is None:
+                return s
+            width = int(max_text_width)
+            if width <= 0:
+                return ''
             fm = self.fontMetrics()
-            # 当前目录尽量完整保留；中间层更积极省略。
-            limit = 240 if is_current else 140
-            return fm.elidedText(str(text), Qt.ElideMiddle, limit)
+            if fm.horizontalAdvance(s) <= width:
+                return s
+            return fm.elidedText(s, Qt.ElideMiddle, width)
         except Exception:
             return text
 
@@ -5509,11 +5566,32 @@ class FileExplorerTab(QWidget):
                         local_path = self._normalize_local_path(drive_match.group(1))
                 current_path = self._normalize_local_path(getattr(self, 'current_path', ''))
                 if local_path and local_path != current_path:
+                    # shell 虚拟路径（如此电脑）下，LocationURL 可能短暂返回上一次文件路径。
+                    # 这里要求同一候选路径连续出现两次再纠正，避免瞬态误判导致路径回跳。
+                    if str(current_path).lower().startswith('shell:'):
+                        candidate = getattr(self, '_keepalive_candidate_path', None)
+                        count = int(getattr(self, '_keepalive_candidate_count', 0) or 0)
+                        if candidate == local_path:
+                            count += 1
+                        else:
+                            candidate = local_path
+                            count = 1
+                        self._keepalive_candidate_path = candidate
+                        self._keepalive_candidate_count = count
+                        if count < 2:
+                            debug_print(f"[Keepalive] Candidate path from shell view: {local_path!r} (count={count})")
+                            return
+                    else:
+                        self._keepalive_candidate_path = None
+                        self._keepalive_candidate_count = 0
+
                     debug_print(f"[Keepalive] Navigation detected: {current_path!r} -> {local_path!r}, updating path bar")
                     # 保活轮询仅在无程序化导航（主同步定时器停止）时运行，
                     # 因此此处检测到的差异必为真实用户导航（如双击进入子目录）。
                     # 直接更新路径栏，绕过 _suppress_auto_refresh 门控，
                     # 避免 NavigateComplete2 偶发遗漏时路径栏长时间停留在旧路径。
+                    self._keepalive_candidate_path = None
+                    self._keepalive_candidate_count = 0
                     self.current_path = local_path
                     if hasattr(self, 'path_bar') and self.path_bar:
                         self.path_bar.set_path(local_path)
@@ -5524,6 +5602,9 @@ class FileExplorerTab(QWidget):
                     if hasattr(self, '_keepalive_sync_timer') and self._keepalive_sync_timer:
                         self._keepalive_sync_timer.stop()
                     self.start_path_sync_timer(duration_ms=3000)
+                else:
+                    self._keepalive_candidate_path = None
+                    self._keepalive_candidate_count = 0
         except Exception as e:
             debug_print(f"[Keepalive] ERROR: {e}")
 
@@ -5761,6 +5842,10 @@ class FileExplorerTab(QWidget):
         # 与拦截重复点击）；_nav_in_progress_path 记录当前正在解析的目标路径。
         self._nav_in_progress = False
         self._nav_in_progress_path = None
+        # 导航完成一致性保护：记录最近一次程序化导航目标，忽略短窗口内的迟到完成事件
+        self._expected_nav_path = None
+        self._expected_nav_is_shell = False
+        self._expected_nav_until = 0.0
         
         # Explorer 基础配置：保留必要项，避免重复 COM 调用拖慢初始化
         self.explorer.dynamicCall('Visible', True)
@@ -5854,6 +5939,61 @@ class FileExplorerTab(QWidget):
             self._nav_in_progress = False
             self._hide_loading_indicator()
 
+    def _mark_expected_navigation(self, path, is_shell):
+        """记录短时导航期望，用于过滤乱序/迟到的 NavigateComplete2。"""
+        try:
+            self._expected_nav_path = str(path or '')
+            self._expected_nav_is_shell = bool(is_shell)
+            self._expected_nav_until = time.monotonic() + 3.0
+        except Exception:
+            self._expected_nav_path = None
+            self._expected_nav_is_shell = False
+            self._expected_nav_until = 0.0
+
+    def _should_accept_nav_completion(self, local_path, raw_url):
+        """判断本次导航完成事件是否应被接收。"""
+        exp = getattr(self, '_expected_nav_path', None)
+        if not exp:
+            return True
+
+        until = float(getattr(self, '_expected_nav_until', 0.0) or 0.0)
+        now = time.monotonic()
+        if until > 0 and now > until:
+            self._expected_nav_path = None
+            self._expected_nav_is_shell = False
+            self._expected_nav_until = 0.0
+            return True
+
+        exp_is_shell = bool(getattr(self, '_expected_nav_is_shell', False))
+        raw = str(raw_url or '')
+        if exp_is_shell:
+            # 期望是 shell 目标时，短窗口内拒绝 file 路径完成，避免“此电脑 -> D:\”回跳。
+            if local_path is not None:
+                debug_print(f"[NavigateComplete2] Ignored stale file completion during shell target: {local_path}")
+                return False
+            if raw.startswith('shell:') or '::' in raw:
+                self._expected_nav_path = None
+                self._expected_nav_is_shell = False
+                self._expected_nav_until = 0.0
+            return True
+
+        if local_path is None:
+            debug_print(f"[NavigateComplete2] Ignored non-file completion while expecting file path: {exp}")
+            return False
+
+        expected_path = self._normalize_local_path(exp)
+        actual_path = self._normalize_local_path(local_path)
+        if actual_path == expected_path:
+            self._expected_nav_path = None
+            self._expected_nav_is_shell = False
+            self._expected_nav_until = 0.0
+            return True
+
+        debug_print(
+            f"[NavigateComplete2] Ignored stale completion: got {actual_path}, expected {expected_path}"
+        )
+        return False
+
     def _on_shell_navigate_complete(self, *args):
         """Shell.Explorer NavigateComplete2 直接信号处理：路径栏即时更新"""
         try:
@@ -5893,6 +6033,8 @@ class FileExplorerTab(QWidget):
                     local_path = self._normalize_local_path(drive_match.group(1))
                     debug_print(f"[NavigateComplete2] Extracted drive path from CLSID URL: {local_path}")
             if local_path is not None:
+                if not self._should_accept_nav_completion(local_path, url):
+                    return
                 current = self._normalize_local_path(getattr(self, 'current_path', ''))
                 # 抑制窗口恢复后 IEB 树面板自动展开导致的虚假导航
                 # （树面板可能自动展开到之前记忆的子目录，导致 NavigateComplete2 连续触发错误路径）
@@ -5973,6 +6115,8 @@ class FileExplorerTab(QWidget):
                     else:
                         local_path = None
                     if local_path is not None:
+                        if not self._should_accept_nav_completion(local_path, url):
+                            return True
                         current = self._normalize_local_path(getattr(self, 'current_path', ''))
                         if local_path != current:
                             self.current_path = local_path
@@ -6744,7 +6888,7 @@ class FileExplorerTab(QWidget):
         WM_RBUTTONUP   = 0x0205
         _GESTURE_MARKER    = 0x47455354  # 'GEST'：标记本程序合成的右键事件，避免被本钩子再次拦截
         _GESTURE_THRESHOLD = 30          # 触发鼠标手势的最小位移（像素）
-        _state = {'t': 0, 'x': -9999, 'y': -9999}
+        _state = {'t': 0, 'x': -9999, 'y': -9999, 'in_exp': False}
         # 鼠标手势（类似 Mouse Gestures）：按住右键画线，支持多笔画序列
         #   ←后退 / →前进 / ↓关闭标签 / ↑新建标签
         #   ↑↓刷新 / ↓↑上级目录 / ↓→恢复关闭的标签页
@@ -6809,6 +6953,18 @@ class FileExplorerTab(QWidget):
                 except Exception:
                     pass
                 return mw.pane_at_global_pos(px, py) is not None
+            except Exception:
+                return False
+
+        def _point_in_active_explorer(px, py):
+            """按下当下坐标是否位于活动标签的 Explorer 视图区。"""
+            try:
+                from PyQt5.QtCore import QPoint
+                tab = _get_current_tab()
+                if not tab:
+                    return False
+                pt = tab.explorer.mapFromGlobal(QPoint(px, py))
+                return bool(tab.explorer.rect().contains(pt))
             except Exception:
                 return False
 
@@ -6961,12 +7117,14 @@ class FileExplorerTab(QWidget):
 
                     dct = ctypes.windll.user32.GetDoubleClickTime()
                     dt  = (t - _state['t']) & 0xFFFFFFFF
+                    in_exp = _point_in_active_explorer(px, py)
 
                     is_dblclick = (
                         _state['t'] != 0 and
                         dt <= dct and
                         abs(px - _state['x']) <= 4 and
-                        abs(py - _state['y']) <= 4
+                        abs(py - _state['y']) <= 4 and
+                        in_exp and bool(_state.get('in_exp', False))
                     )
 
                     if is_dblclick:
@@ -7026,6 +7184,7 @@ class FileExplorerTab(QWidget):
                         _state['t'] = t
                         _state['x'] = px
                         _state['y'] = py
+                        _state['in_exp'] = bool(in_exp)
                 except Exception:
                     pass
 
@@ -7633,6 +7792,7 @@ class FileExplorerTab(QWidget):
                 if onedrive_path and os.path.exists(onedrive_path):
                     self.navigate_to(onedrive_path, is_shell=False, add_to_history=add_to_history, skip_async_check=True)
                     return
+            self._mark_expected_navigation(path, is_shell=True)
             self._hide_loading_indicator()
             self.explorer.dynamicCall("Navigate(const QString&)", path)
             self.current_path = path
@@ -7769,6 +7929,7 @@ class FileExplorerTab(QWidget):
     def _perform_navigation(self, path, add_to_history):
         """执行实际的导航操作"""
         path = self._normalize_local_path(path)
+        self._mark_expected_navigation(path, is_shell=False)
         old_path = getattr(self, 'current_path', None)
         url = QDir.toNativeSeparators(path)
         
@@ -7996,7 +8157,9 @@ class FileExplorerTab(QWidget):
                 self._last_watcher_event = dict(sorted_items[:10])
         else:
             self._last_watcher_event = {path: current_time}
-        if os.path.isdir(path) and not self._is_slow_path(path):
+        # 事件风暴（批量拷贝/解压/删除等）期间：跳过 UI 线程上的同步快照扫描。
+        # 内嵌视图在拷贝过程中会自行刷新，这里仅走延后调度，等待风暴平息后统一补刷。
+        if not is_storm and os.path.isdir(path) and not self._is_slow_path(path):
             current_snapshot = self._build_dir_snapshot(path)
             if current_snapshot is not None:
                 previous_snapshot = getattr(self, '_last_dir_snapshot', None)
@@ -8054,16 +8217,14 @@ class FileExplorerTab(QWidget):
             return
         now_ms = time.time() * 1000
 
-        # 风暴检测：如果仍在风暴中且距上次刷新太近，重新延后
+        # 风暴检测：批量拷贝/解压/删除等会在短时间内触发大量目录事件
         storm_times = getattr(self, '_watcher_storm_times', [])
         storm_count = sum(1 for t in storm_times if now_ms - t < 10000)
         is_storm = storm_count > 5
-        last_refresh_ms = float(getattr(self, '_last_refresh_ts_ms', 0) or 0)
-        if is_storm and last_refresh_ms > 0 and (now_ms - last_refresh_ms) < 8000:
-            # 风暴中两次刷新间隔不到 8s，重新延后
-            remain = int(8000 - (now_ms - last_refresh_ms))
-            self.refresh_timer.start(remain)
-            debug_print(f"[AutoRefresh] Storm active, deferring refresh by {remain}ms")
+        if is_storm:
+            # 风暴进行中：不在 UI 线程调用同步 COM Refresh()，避免卡住所有标签。
+            self.refresh_timer.start(2000)
+            debug_print("[AutoRefresh] Storm active, skip sync COM refresh; will settle after storm")
             return
 
         if getattr(self, '_manual_refresh_frozen', False):
@@ -8089,20 +8250,9 @@ class FileExplorerTab(QWidget):
                 debug_print(f"[FileWatcher] Refresh completed")
             except Exception as e:
                 debug_print(f"[FileWatcher] Refresh error: {e}")
-        # 刷新后更新快照（风暴时延迟执行，避免阻塞 UI）
-        if is_storm:
-            QTimer.singleShot(500, self._deferred_post_refresh_snapshot)
-        else:
-            self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
-            self.update_explorer_status()
-
-    def _deferred_post_refresh_snapshot(self):
-        """延迟更新快照，避免风暴期间连续 scandir 阻塞 UI"""
-        try:
-            self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
-            self.update_explorer_status()
-        except Exception:
-            pass
+        # 刷新后更新快照（此处已排除风暴：风暴时前面已提前 return）
+        self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
+        self.update_explorer_status()
 
     def _poll_directory_changes(self):
         """兜底轮询目录元数据，解决文件编辑后目录 watcher 不触发的问题"""
@@ -11645,6 +11795,16 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'reopen_tab_button'):
             self.reopen_tab_button.setEnabled(len(self.closed_tabs_history) > 0)
 
+    def _deferred_on_tab_changed(self, index):
+        """延后重试 tab/content_stack 同步，规避启动期短暂初始化竞态。"""
+        self._tab_sync_retry_pending = False
+        try:
+            if self.tab_widget.currentIndex() != index:
+                return
+        except Exception:
+            return
+        self.on_tab_changed(index)
+
     def on_tab_changed(self, index):
         if index >= 0:
             # 调试信息：检查同步状态
@@ -11654,10 +11814,26 @@ class MainWindow(QMainWindow):
 
             # 同步 content_stack 的显示（拖拽期间也需要保持同步）
             if hasattr(self, 'content_stack') and index < self.content_stack.count():
+                self._tab_sync_retry_attempts = 0
                 self.content_stack.setCurrentIndex(index)
                 debug_print(f"[TabSwitch] Set content_stack to index {index}")
             else:
-                debug_print(f"[TabSwitch] WARNING: Cannot sync - content_stack count is {self.content_stack.count() if hasattr(self, 'content_stack') else 'N/A'}")
+                attempts = int(getattr(self, '_tab_sync_retry_attempts', 0))
+                pending = bool(getattr(self, '_tab_sync_retry_pending', False))
+                if attempts < 3 and not pending:
+                    self._tab_sync_retry_attempts = attempts + 1
+                    self._tab_sync_retry_pending = True
+                    debug_print(
+                        f"[TabSwitch] content_stack not ready (retry {self._tab_sync_retry_attempts}/3), "
+                        f"deferring sync for index {index}"
+                    )
+                    QTimer.singleShot(60, lambda idx=index: self._deferred_on_tab_changed(idx))
+                else:
+                    debug_print(
+                        f"[TabSwitch] WARNING: Cannot sync - content_stack count is "
+                        f"{self.content_stack.count() if hasattr(self, 'content_stack') else 'N/A'}"
+                    )
+                return
 
             # 拖拽进行中：仅同步 content_stack，跳过一切重型操作，等拖拽结束后统一执行
             if getattr(self, '_tab_drag_in_progress', False):
@@ -14348,6 +14524,13 @@ class MainWindow(QMainWindow):
                             self.open_path_signal.emit(data)
                     except socket.timeout:
                         continue
+                    except OSError as e:
+                        # 关闭程序时 server_socket 被主线程关闭，accept() 可能抛出 10038。
+                        # 这是预期行为，不应记为异常错误。
+                        if (not getattr(self, 'server_running', True)) and getattr(e, 'winerror', None) == 10038:
+                            break
+                        debug_print(f"[Server] Connection error: {e}")
+                        continue
                     except Exception as e:
                         debug_print(f"[Server] Connection error: {e}")
                         continue
@@ -16378,6 +16561,8 @@ def main():
     # 启用高DPI支持（在创建QApplication之前）
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    _init_debug_log_file()
     
     # 启动新实例
     app = QApplication(sys.argv)
