@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.64"
+APP_VERSION = "3.65"
 
 
 # TabEx i18n module
@@ -2489,6 +2489,7 @@ import subprocess
 import io
 import string
 import time
+import shutil
 import socket
 import threading
 import queue
@@ -3249,6 +3250,231 @@ class FolderSizeChecker(QThread):
         self._mutex.lock()
         self.should_stop = True
         self._mutex.unlock()
+
+
+class FileBatchOpWorker(QThread):
+    """后台执行批量复制/删除，避免系统 Shell 弹框阻塞 UI。"""
+    finished = pyqtSignal(str, int, int, list)  # op_type, ok_count, fail_count, errors
+    progress = pyqtSignal(str, int, int, str)  # op_type, done_count, total_count, current_name
+
+    def __init__(self, op_type, src_paths, dst_dir=None, parent=None):
+        super().__init__(parent)
+        self.op_type = str(op_type or '').lower()
+        self.src_paths = [p for p in (src_paths or []) if isinstance(p, str) and p]
+        self.dst_dir = dst_dir
+        self._cancel_requested = False
+        self.cancelled = False
+        self.ok_count = 0
+        self.fail_count = 0
+        self.done_units = 0
+        self.total_units = 0
+        self.started_at = 0.0
+
+    def request_cancel(self):
+        self._cancel_requested = True
+
+    def _raise_if_cancelled(self):
+        if self._cancel_requested:
+            self.cancelled = True
+            raise RuntimeError("FILE_OP_CANCELLED")
+
+    def _emit_progress(self, current_name):
+        self.progress.emit(self.op_type, self.done_units, max(1, self.total_units), current_name or "")
+
+    @staticmethod
+    def _make_unique_path(target_path):
+        """避免覆盖：若目标已存在，自动追加 " - copy" 后缀。"""
+        if not os.path.exists(target_path):
+            return target_path
+        base, ext = os.path.splitext(target_path)
+        index = 1
+        while True:
+            suffix = " - copy" if index == 1 else f" - copy{index}"
+            candidate = f"{base}{suffix}{ext}"
+            if not os.path.exists(candidate):
+                return candidate
+            index += 1
+
+    @staticmethod
+    def _clear_readonly(path):
+        """Windows 下清除只读位，避免 rmtree 删除 .git 等只读文件失败。"""
+        try:
+            if os.name == 'nt':
+                os.chmod(path, 0o666)
+                try:
+                    subprocess.run(["attrib", "-R", path], check=False,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    @classmethod
+    def _retry_remove_once_cleared(cls, func, target, retries=6):
+        """清只读后重试删除，覆盖 Windows 上短暂占用/权限刷新延迟场景。"""
+        last_error = None
+        for attempt in range(retries):
+            cls._clear_readonly(target)
+            try:
+                func(target)
+                return
+            except Exception as ex:
+                last_error = ex
+                time.sleep(0.05 * (attempt + 1))
+        if last_error:
+            raise last_error
+
+    @classmethod
+    def _rmtree_robust(cls, path):
+        """递归删除目录，遇到只读文件自动修复后重试。"""
+        import shutil
+
+        def _onerror(func, target, exc_info):
+            cls._retry_remove_once_cleared(func, target)
+
+        shutil.rmtree(path, onerror=_onerror)
+
+    @staticmethod
+    def _estimate_path_units(path):
+        """估算工作量：文件/目录总条目数（用于更细粒度进度显示）。"""
+        try:
+            if os.path.isfile(path):
+                return 1
+            if not os.path.isdir(path):
+                return 1
+            total = 1  # 根目录本身
+            for root, dirs, files in os.walk(path):
+                total += len(dirs) + len(files)
+            return max(1, total)
+        except Exception:
+            return 1
+
+    def _estimate_total_units(self):
+        total = 0
+        for p in self.src_paths:
+            total += self._estimate_path_units(p)
+        return max(1, total)
+
+    def _copy_dir_cancelable(self, src_dir, dst_dir):
+        os.makedirs(dst_dir, exist_ok=False)
+        self.done_units += 1
+        self._emit_progress(os.path.basename(src_dir.rstrip('\\/')) or src_dir)
+
+        for root, dirs, files in os.walk(src_dir):
+            self._raise_if_cancelled()
+            rel = os.path.relpath(root, src_dir)
+            dst_root = dst_dir if rel == '.' else os.path.join(dst_dir, rel)
+            os.makedirs(dst_root, exist_ok=True)
+
+            for dname in dirs:
+                self._raise_if_cancelled()
+                target_dir = os.path.join(dst_root, dname)
+                os.makedirs(target_dir, exist_ok=True)
+                self.done_units += 1
+                self._emit_progress(dname)
+
+            for fname in files:
+                self._raise_if_cancelled()
+                src_file = os.path.join(root, fname)
+                dst_file = os.path.join(dst_root, fname)
+                shutil.copy2(src_file, dst_file)
+                self.done_units += 1
+                self._emit_progress(fname)
+
+    def _delete_dir_cancelable(self, src_dir):
+        for root, dirs, files in os.walk(src_dir, topdown=False):
+            self._raise_if_cancelled()
+
+            for fname in files:
+                self._raise_if_cancelled()
+                fpath = os.path.join(root, fname)
+                self._retry_remove_once_cleared(os.remove, fpath)
+                self.done_units += 1
+                self._emit_progress(fname)
+
+            for dname in dirs:
+                self._raise_if_cancelled()
+                dpath = os.path.join(root, dname)
+                self._retry_remove_once_cleared(os.rmdir, dpath)
+                self.done_units += 1
+                self._emit_progress(dname)
+
+        self._retry_remove_once_cleared(os.rmdir, src_dir)
+        self.done_units += 1
+        self._emit_progress(os.path.basename(src_dir.rstrip('\\/')) or src_dir)
+
+    def run(self):
+        import shutil
+
+        self.started_at = time.monotonic()
+        self.ok_count = 0
+        self.fail_count = 0
+        errors = []
+        self.total_units = self._estimate_total_units()
+        self.done_units = 0
+
+        self._emit_progress("")
+
+        try:
+            if self.op_type == 'copy':
+                if not self.dst_dir or not os.path.isdir(self.dst_dir):
+                    self.finished.emit(self.op_type, 0, len(self.src_paths), [tr("复制失败：目标目录无效")])
+                    return
+
+                for src in self.src_paths:
+                    try:
+                        self._raise_if_cancelled()
+                        src_norm = os.path.normpath(src)
+                        name = os.path.basename(src_norm) or os.path.basename(os.path.dirname(src_norm)) or 'item'
+                        dst_path = self._make_unique_path(os.path.join(self.dst_dir, name))
+                        if os.path.isdir(src_norm):
+                            self._copy_dir_cancelable(src_norm, dst_path)
+                        else:
+                            shutil.copy2(src_norm, dst_path)
+                            self.done_units += 1
+                            self._emit_progress(name)
+                        self.ok_count += 1
+                    except RuntimeError as e:
+                        if str(e) == "FILE_OP_CANCELLED":
+                            break
+                        self.fail_count += 1
+                        errors.append(f"{src}: {e}")
+                    except Exception as e:
+                        self.fail_count += 1
+                        errors.append(f"{src}: {e}")
+
+            elif self.op_type == 'delete':
+                for src in self.src_paths:
+                    try:
+                        self._raise_if_cancelled()
+                        src_norm = os.path.normpath(src)
+                        name = os.path.basename(src_norm.rstrip('\\/')) or src_norm
+                        if os.path.isdir(src_norm):
+                            self._delete_dir_cancelable(src_norm)
+                        else:
+                            self._retry_remove_once_cleared(os.remove, src_norm)
+                            self.done_units += 1
+                            self._emit_progress(name)
+                        self.ok_count += 1
+                    except RuntimeError as e:
+                        if str(e) == "FILE_OP_CANCELLED":
+                            break
+                        self.fail_count += 1
+                        errors.append(f"{src}: {e}")
+                    except Exception as e:
+                        self.fail_count += 1
+                        errors.append(f"{src}: {e}")
+            else:
+                self.fail_count = len(self.src_paths)
+                errors.append(tr("不支持的操作类型"))
+        except Exception as e:
+            self.fail_count = max(self.fail_count, len(self.src_paths))
+            errors.append(str(e))
+
+        if self.cancelled and self.done_units < self.total_units:
+            errors.append(tr("操作已取消"))
+
+        self.finished.emit(self.op_type, self.ok_count, self.fail_count, errors)
 
 
 class _PidlResolver(QThread):
@@ -5827,9 +6053,23 @@ class FileExplorerTab(QWidget):
         )
         self.resource_label.mouseDoubleClickEvent = self._status_bar_mouse_double_click
         self.resource_label.hide()
+        self.cancel_file_op_btn = QPushButton(tr("取消"), self)
+        self.cancel_file_op_btn.setFixedHeight(20)
+        self.cancel_file_op_btn.setFixedWidth(52)
+        self.cancel_file_op_btn.setStyleSheet(
+            "QPushButton { background: #f8f8f8; border: 1px solid #dddddd; border-top: 1px solid #e0e0e0;"
+            " color: #444; font-size: 11px; padding: 0 6px; }"
+            "QPushButton:hover { background: #efefef; }"
+            "QPushButton:pressed { background: #e5e5e5; }"
+            "QPushButton:disabled { color: #9a9a9a; background: #f4f4f4; }"
+        )
+        self.cancel_file_op_btn.setToolTip(tr("取消当前后台复制/删除（等效 Alt+Q）"))
+        self.cancel_file_op_btn.clicked.connect(self.cancel_current_file_batch_op)
+        self.cancel_file_op_btn.hide()
         status_row = QHBoxLayout()
         status_row.setContentsMargins(0, 0, 0, 0)
         status_row.setSpacing(0)
+        status_row.addWidget(self.cancel_file_op_btn, 0)
         status_row.addWidget(self.status_bar, 1)
         status_row.addWidget(self.resource_label, 0)
         layout.addLayout(status_row)
@@ -7714,7 +7954,9 @@ class FileExplorerTab(QWidget):
                 paths = self._get_ieb_selected_paths()
                 for p in paths:
                     if p:
-                        filenames.append(os.path.basename(str(p)))
+                        base = os.path.basename(str(p).rstrip('\\/'))
+                        if base:
+                            filenames.append(base)
                 return filenames
             # 旧 QAxWidget 模式：通过Document接口获取SelectedItems
             doc = self.explorer.querySubObject('Document')
@@ -8345,6 +8587,13 @@ class FileExplorerTab(QWidget):
         """更新嵌入 Explorer 下方状态栏（仅显示 Git 状态）"""
         if not hasattr(self, 'status_bar'):
             return
+        try:
+            worker = getattr(self, '_file_op_worker', None)
+            if worker and worker.isRunning():
+                # 后台复制/删除进行中时，保留进度文案，避免被 Git 状态刷新覆盖。
+                return
+        except Exception:
+            pass
         path = getattr(self, 'current_path', None)
         if not path or path.startswith('shell:') or '::' in path:
             self.status_bar.setText('')
@@ -8360,6 +8609,30 @@ class FileExplorerTab(QWidget):
     def _get_selection_entries(self):
         """返回选中条目列表，每项包含 is_file 与 size"""
         try:
+            if isinstance(self.explorer, IExplorerBrowserWidget):
+                paths = self._get_ieb_selected_paths()
+                if not paths:
+                    return []
+                entries = []
+                collect_file_sizes = len(paths) <= STATUS_SELECTION_METADATA_LIMIT
+                for p in paths:
+                    if not p:
+                        continue
+                    path_str = str(p)
+                    is_file = os.path.isfile(path_str)
+                    size = None
+                    if is_file and collect_file_sizes:
+                        try:
+                            size = os.path.getsize(path_str)
+                        except Exception:
+                            size = None
+                    entries.append({
+                        'path': path_str,
+                        'is_file': is_file,
+                        'size': size,
+                    })
+                return entries
+
             doc = self.explorer.querySubObject('Document')
             if not doc:
                 return []
@@ -8483,40 +8756,188 @@ class FileExplorerTab(QWidget):
         return False
 
     def show_selected_item_context_menu(self, global_pos):
-        file_path = self._get_single_selected_path()
-        if not file_path or not os.path.exists(file_path):
+        selected_paths = self._get_selected_paths()
+        if not selected_paths:
+            return False
+        selected_paths = [p for p in selected_paths if p and os.path.exists(p)]
+        if not selected_paths:
+            return False
+
+        file_path = selected_paths[0] if len(selected_paths) == 1 else None
+        if not file_path:
             return False
 
 
         menu = QMenu(self)
-        open_action = menu.addAction(tr("打开"))
-        open_action.triggered.connect(lambda: self.open_selected_with_default_app(file_path))
+        if file_path:
+            open_action = menu.addAction(tr("打开"))
+            open_action.triggered.connect(lambda: self.open_selected_with_default_app(file_path))
 
-        open_folder_action = menu.addAction(tr("打开所在目录"))
-        open_folder_action.triggered.connect(lambda: self.open_selected_parent_folder(file_path))
+            open_folder_action = menu.addAction(tr("打开所在目录"))
+            open_folder_action.triggered.connect(lambda: self.open_selected_parent_folder(file_path))
 
-        if os.path.isfile(file_path):
-            default_action = menu.addAction(tr("用系统默认程序打开"))
-            default_action.triggered.connect(lambda: self.open_selected_with_default_app(file_path))
+            if os.path.isfile(file_path):
+                default_action = menu.addAction(tr("用系统默认程序打开"))
+                default_action.triggered.connect(lambda: self.open_selected_with_default_app(file_path))
+
+                menu.addSeparator()
+
+                notepad_action = menu.addAction(tr("用记事本打开"))
+                notepad_action.triggered.connect(lambda: self.open_selected_with_notepad(file_path))
+
+                notepadpp_action = menu.addAction(tr("用 Notepad++ 打开"))
+                notepadpp_action.setEnabled(bool(getattr(self, 'notepad_plus_plus_path', None)))
+                if not getattr(self, 'notepad_plus_plus_path', None):
+                    notepadpp_action.setToolTip(tr("未检测到 Notepad++"))
+                notepadpp_action.triggered.connect(lambda: self.open_selected_with_notepad_plus_plus(file_path))
+
+                menu.addSeparator()
+
+                system_dialog_action = menu.addAction(tr("选择其他应用..."))
+                system_dialog_action.triggered.connect(lambda: self.open_selected_with_system_dialog(file_path))
 
             menu.addSeparator()
-
-            notepad_action = menu.addAction(tr("用记事本打开"))
-            notepad_action.triggered.connect(lambda: self.open_selected_with_notepad(file_path))
-
-            notepadpp_action = menu.addAction(tr("用 Notepad++ 打开"))
-            notepadpp_action.setEnabled(bool(getattr(self, 'notepad_plus_plus_path', None)))
-            if not getattr(self, 'notepad_plus_plus_path', None):
-                notepadpp_action.setToolTip(tr("未检测到 Notepad++"))
-            notepadpp_action.triggered.connect(lambda: self.open_selected_with_notepad_plus_plus(file_path))
-
-            menu.addSeparator()
-
-            system_dialog_action = menu.addAction(tr("选择其他应用..."))
-            system_dialog_action.triggered.connect(lambda: self.open_selected_with_system_dialog(file_path))
 
         menu.exec_(global_pos)
         return True
+
+    def quick_copy_selected_paths(self, selected_paths):
+        if not selected_paths:
+            show_toast(self, tr("提示"), tr("未选择"), level="warning")
+            return
+        if getattr(self, '_file_op_worker', None) and self._file_op_worker.isRunning():
+            show_toast(self, tr("提示"), tr("已有后台文件操作进行中，请稍后"), level="warning")
+            return
+
+        from PyQt5.QtWidgets import QFileDialog
+        initial_dir = self.current_path if os.path.isdir(getattr(self, 'current_path', '')) else QDir.homePath()
+        dst_dir = QFileDialog.getExistingDirectory(self, tr("选择目标文件夹"), initial_dir)
+        if not dst_dir:
+            return
+
+        self._run_file_batch_op('copy', selected_paths, dst_dir)
+
+    def confirm_delete_selected_paths(self, selected_paths):
+        if not selected_paths:
+            show_toast(self, tr("提示"), tr("未选择"), level="warning")
+            return
+        if getattr(self, '_file_op_worker', None) and self._file_op_worker.isRunning():
+            show_toast(self, tr("提示"), tr("已有后台文件操作进行中，请稍后"), level="warning")
+            return
+
+        from PyQt5.QtWidgets import QMessageBox
+        total = len(selected_paths)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(tr("确认删除"))
+        box.setText(tr("确认删除选中的 {} 项？\n\n将直接删除，不经过系统回收站。\n此操作不可撤销。").format(total))
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        box.setWindowModality(Qt.NonModal)
+        box.setAttribute(Qt.WA_DeleteOnClose, True)
+        box.finished.connect(lambda result, paths=list(selected_paths): self._on_delete_confirm_finished(result, paths))
+        box.open()
+
+    def _on_delete_confirm_finished(self, result, selected_paths):
+        from PyQt5.QtWidgets import QMessageBox
+        if result == QMessageBox.Yes:
+            self._run_file_batch_op('delete', selected_paths)
+
+    def _run_file_batch_op(self, op_type, selected_paths, dst_dir=None):
+        paths = [p for p in (selected_paths or []) if p and os.path.exists(p)]
+        if not paths:
+            show_toast(self, tr("提示"), tr("未找到可操作的文件或文件夹"), level="warning")
+            return
+
+        worker = FileBatchOpWorker(op_type, paths, dst_dir, self)
+        worker.progress.connect(self._on_file_batch_op_progress)
+        worker.finished.connect(self._on_file_batch_op_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._file_op_worker = worker
+        if hasattr(self, 'cancel_file_op_btn') and self.cancel_file_op_btn:
+            self.cancel_file_op_btn.setText(tr("取消"))
+            self.cancel_file_op_btn.setEnabled(True)
+            self.cancel_file_op_btn.show()
+        if op_type == 'copy':
+            show_toast(self, tr("提示"), tr("后台复制已开始，可继续操作其他标签页（Alt+Q 可取消）"), level="info", duration=2600)
+        elif op_type == 'delete':
+            show_toast(self, tr("提示"), tr("后台删除已开始，可继续操作其他标签页（Alt+Q 可取消）"), level="info", duration=2600)
+        worker.start()
+
+    def cancel_current_file_batch_op(self):
+        worker = getattr(self, '_file_op_worker', None)
+        if not worker or not worker.isRunning():
+            return False
+        try:
+            worker.request_cancel()
+            if hasattr(self, 'cancel_file_op_btn') and self.cancel_file_op_btn:
+                self.cancel_file_op_btn.setText(tr("取消中"))
+                self.cancel_file_op_btn.setEnabled(False)
+            if hasattr(self, 'status_bar') and self.status_bar:
+                self.status_bar.setText(tr("正在取消后台任务，请稍候..."))
+            show_toast(self, tr("提示"), tr("已发送取消请求，正在尽快停止..."), level="info", duration=1800)
+            return True
+        except Exception:
+            return False
+
+    def _on_file_batch_op_progress(self, op_type, done_count, total_count, current_name):
+        if total_count <= 0:
+            return
+        percent = int((done_count * 100) / total_count)
+        current_label = current_name or ''
+        worker = getattr(self, '_file_op_worker', None)
+        ok_count = int(getattr(worker, 'ok_count', 0) or 0)
+        fail_count = int(getattr(worker, 'fail_count', 0) or 0)
+        started_at = float(getattr(worker, 'started_at', 0.0) or 0.0)
+        elapsed = max(0.0, time.monotonic() - started_at) if started_at > 0 else 0.0
+        elapsed_text = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
+        remain_count = max(0, total_count - done_count)
+        if op_type == 'copy':
+            msg = tr("后台复制: {}/{} ({}%) 剩余{} | 成功{} 失败{} | 当前: {} | 用时 {} | Alt+Q 取消" ).format(
+                done_count, total_count, percent, remain_count, ok_count, fail_count, current_label, elapsed_text
+            )
+        elif op_type == 'delete':
+            msg = tr("后台删除: {}/{} ({}%) 剩余{} | 成功{} 失败{} | 当前: {} | 用时 {} | Alt+Q 取消" ).format(
+                done_count, total_count, percent, remain_count, ok_count, fail_count, current_label, elapsed_text
+            )
+        else:
+            msg = tr("后台操作进度: {}/{} ({}%) {}" ).format(done_count, total_count, percent, current_label)
+
+        try:
+            if hasattr(self, 'status_bar') and self.status_bar:
+                self.status_bar.setText(msg)
+        except Exception:
+            pass
+
+    def _on_file_batch_op_finished(self, op_type, ok_count, fail_count, errors):
+        worker = getattr(self, '_file_op_worker', None)
+        cancelled = bool(getattr(worker, 'cancelled', False))
+        self._file_op_worker = None
+        if hasattr(self, 'cancel_file_op_btn') and self.cancel_file_op_btn:
+            self.cancel_file_op_btn.hide()
+            self.cancel_file_op_btn.setText(tr("取消"))
+            self.cancel_file_op_btn.setEnabled(True)
+
+        if op_type == 'copy':
+            if cancelled:
+                show_toast(self, tr("提示"), tr("复制已取消：成功 {} 项，失败 {} 项").format(ok_count, fail_count), level="warning")
+            elif fail_count == 0:
+                show_toast(self, tr("成功"), tr("复制完成，共 {} 项").format(ok_count), level="success")
+            else:
+                show_toast(self, tr("警告"), tr("复制完成：成功 {} 项，失败 {} 项").format(ok_count, fail_count), level="warning")
+        elif op_type == 'delete':
+            if cancelled:
+                show_toast(self, tr("提示"), tr("删除已取消：成功 {} 项，失败 {} 项").format(ok_count, fail_count), level="warning")
+            elif fail_count == 0:
+                show_toast(self, tr("成功"), tr("删除完成，共 {} 项").format(ok_count), level="success")
+            else:
+                show_toast(self, tr("警告"), tr("删除完成：成功 {} 项，失败 {} 项").format(ok_count, fail_count), level="warning")
+
+        try:
+            self.update_explorer_status()
+            self._request_refresh(reason='custom_file_op')
+        except Exception:
+            pass
 
     def select_file_in_explorer(self, filename, retries=6, delay_ms=250):
         """在Explorer控件中选中当前目录下指定的文件或文件夹。"""
@@ -12510,9 +12931,34 @@ class MainWindow(QMainWindow):
         mode: "filename" 只拷贝文件名，"path" 拷贝全路径+文件名。
         """
         current_tab = self.get_active_pane()
+
+        def _has_selection(tab):
+            if not tab:
+                return False
+            try:
+                if hasattr(tab, '_get_selected_paths'):
+                    return bool(tab._get_selected_paths())
+            except Exception:
+                return False
+            return False
+
+        # 某些焦点切换场景下 active pane 可能晚于真实选中区域，
+        # 此时回退到当前可见标签页，避免误报“未选中文件”。
+        if not _has_selection(current_tab):
+            cur_tab = self.get_current_tab_widget()
+            if cur_tab is not current_tab and _has_selection(cur_tab):
+                current_tab = cur_tab
+
         names = []
         if current_tab and hasattr(current_tab, 'get_selected_filenames'):
             names = current_tab.get_selected_filenames()
+        if (not names) and current_tab and hasattr(current_tab, '_get_selected_paths'):
+            try:
+                sel_paths = current_tab._get_selected_paths()
+                sel_paths = [p for p in (sel_paths or []) if p]
+                names = [os.path.basename(p.rstrip('\\/')) for p in sel_paths if os.path.basename(p.rstrip('\\/'))]
+            except Exception:
+                names = []
         from PyQt5.QtWidgets import QApplication
         if names:
             if mode == "path":
@@ -12550,6 +12996,72 @@ class MainWindow(QMainWindow):
                 show_toast(self, tr("复制成功"), tr("路径: {}").format(path_text), level="info")
             else:
                 show_toast(self, tr("提示"), tr("未选中文件，也无法获取路径栏地址"), level="warning")
+
+    def quick_copy_selected_items_for_background_paste(self):
+        """Alt+C：复制当前选中项到 TabEx 内部剪贴板（用于 Alt+V 后台粘贴）。"""
+        current_tab = self.get_active_pane()
+        if not current_tab or not hasattr(current_tab, '_get_selected_paths'):
+            show_toast(self, tr("提示"), tr("当前标签不支持快速复制"), level="warning")
+            return
+
+        paths = current_tab._get_selected_paths()
+        paths = [p for p in (paths or []) if p and os.path.exists(p)]
+        if not paths:
+            show_toast(self, tr("提示"), tr("请先选择要复制的文件或文件夹"), level="warning")
+            return
+
+        self._quick_clipboard_paths = list(paths)
+        self._quick_clipboard_mode = 'copy'
+        show_toast(self, tr("复制"), tr("已复制 {} 项，按 Alt+V 粘贴到当前目录").format(len(paths)), level="info")
+
+    def quick_paste_to_current_directory(self):
+        """Alt+V：将 TabEx 内部剪贴板的内容后台复制到当前目录。"""
+        paths = list(getattr(self, '_quick_clipboard_paths', []) or [])
+        if not paths:
+            show_toast(self, tr("提示"), tr("内部剪贴板为空，请先按 Alt+C"), level="warning")
+            return
+
+        current_tab = self.get_active_pane()
+        if not current_tab or not hasattr(current_tab, '_run_file_batch_op'):
+            show_toast(self, tr("提示"), tr("当前标签不支持快速粘贴"), level="warning")
+            return
+
+        dst_dir = getattr(current_tab, 'current_path', '')
+        if not dst_dir or not os.path.isdir(dst_dir):
+            show_toast(self, tr("提示"), tr("当前目录无效，无法粘贴"), level="warning")
+            return
+
+        alive_paths = [p for p in paths if p and os.path.exists(p)]
+        if not alive_paths:
+            show_toast(self, tr("提示"), tr("源文件不存在，请重新 Alt+C"), level="warning")
+            return
+
+        current_tab._run_file_batch_op('copy', alive_paths, dst_dir)
+
+    def quick_delete_selected_items(self):
+        """Alt+Delete：快速删除选中项（不弹确认框，直接后台删除）。"""
+        current_tab = self.get_active_pane()
+        if not current_tab or not hasattr(current_tab, '_get_selected_paths'):
+            show_toast(self, tr("提示"), tr("当前标签不支持快速删除"), level="warning")
+            return
+        selected_paths = current_tab._get_selected_paths()
+        selected_paths = [p for p in (selected_paths or []) if p and os.path.exists(p)]
+        if not selected_paths:
+            show_toast(self, tr("提示"), tr("请先选择要删除的文件或文件夹"), level="warning")
+            return
+        if hasattr(current_tab, '_run_file_batch_op'):
+            current_tab._run_file_batch_op('delete', selected_paths)
+
+    def quick_cancel_background_file_operation(self):
+        """Alt+Q：取消当前标签页正在执行的后台复制/删除任务。"""
+        current_tab = self.get_active_pane()
+        if not current_tab:
+            current_tab = self.get_current_tab_widget()
+        if not current_tab or not hasattr(current_tab, 'cancel_current_file_batch_op'):
+            show_toast(self, tr("提示"), tr("当前标签不支持取消后台任务"), level="warning")
+            return
+        if not current_tab.cancel_current_file_batch_op():
+            show_toast(self, tr("提示"), tr("当前没有可取消的后台复制/删除任务"), level="info")
 
     def quick_find_in_current_directory(self):
         """通过关键字快速检索当前目录下的文件或文件夹名，并在当前目录中选中目标。"""
@@ -12625,8 +13137,8 @@ class MainWindow(QMainWindow):
         # 弹窗关闭后该粘性位残留，下次用户恰好按住 Ctrl 时会产生幽灵 Ctrl+T 触发。
         try:
             _drain = ctypes.windll.user32.GetAsyncKeyState
-            for _vk in (0x5A, 0x58, 0x4C, 0x54, 0x41, 0x57, 0x46, 0x47,
-                        0x44, 0x09, 0x25, 0x27, 0x26, 0x28, 0x74):
+            for _vk in (0x5A, 0x58, 0x43, 0x56, 0x2E, 0x4C, 0x54, 0x41, 0x57, 0x46, 0x47,
+                    0x44, 0x51, 0x09, 0x25, 0x27, 0x26, 0x28, 0x74):
                 _drain(_vk)
         except Exception:
             pass
@@ -12669,7 +13181,7 @@ class MainWindow(QMainWindow):
                 self._last_keys_state.clear()
                 if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
                     self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
-                for _vk in (0x5A, 0x58, 0x4C, 0x54, 0x41, 0x57, 0x46, 0x47, 0x44, 0x09, 0x25, 0x27, 0x26, 0x74):
+                for _vk in (0x5A, 0x58, 0x43, 0x56, 0x2E, 0x4C, 0x54, 0x41, 0x57, 0x46, 0x47, 0x44, 0x51, 0x09, 0x25, 0x27, 0x26, 0x74):
                     ctypes.windll.user32.GetAsyncKeyState(_vk)
                 return
 
@@ -12716,12 +13228,56 @@ class MainWindow(QMainWindow):
 
             if time.monotonic() < getattr(self, '_shortcut_modal_guard_until', 0):
                 # 守卫期间每轮都消耗一次非修饰键粘性位，防止守卫窗口内新产生的按键残留。
-                for _vk in (0x5A, 0x58, 0x4C, 0x54, 0x41, 0x57, 0x46, 0x47,
-                            0x44, 0x09, 0x25, 0x27, 0x26, 0x28, 0x74):
+                for _vk in (0x5A, 0x58, 0x43, 0x56, 0x2E, 0x4C, 0x54, 0x41, 0x57, 0x46, 0x47,
+                            0x44, 0x51, 0x09, 0x25, 0x27, 0x26, 0x28, 0x74):
                     _GetAsyncKeyState(_vk)
                 return
             
             hotkeys = self.config.get("hotkeys", {})
+
+            # Alt+C - 复制选中项到 TabEx 内部剪贴板（后台粘贴用）
+            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x43) and hotkeys.get("quick_copy", True):
+                key_combo = "Alt+C"
+                if not self._last_keys_state.get(key_combo, False):
+                    debug_print("[Shortcut Poll] Detected Alt+C")
+                    self.quick_copy_selected_items_for_background_paste()
+                    self._last_keys_state[key_combo] = True
+                return
+            else:
+                self._last_keys_state["Alt+C"] = False
+
+            # Alt+V - 将内部剪贴板内容粘贴到当前目录（后台执行）
+            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x56) and hotkeys.get("quick_paste", True):
+                key_combo = "Alt+V"
+                if not self._last_keys_state.get(key_combo, False):
+                    debug_print("[Shortcut Poll] Detected Alt+V")
+                    self.quick_paste_to_current_directory()
+                    self._last_keys_state[key_combo] = True
+                return
+            else:
+                self._last_keys_state["Alt+V"] = False
+
+            # Alt+Delete - 快速删除选中项（非阻塞确认）
+            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x2E) and hotkeys.get("quick_delete", True):
+                key_combo = "Alt+Delete"
+                if not self._last_keys_state.get(key_combo, False):
+                    debug_print("[Shortcut Poll] Detected Alt+Delete")
+                    self.quick_delete_selected_items()
+                    self._last_keys_state[key_combo] = True
+                return
+            else:
+                self._last_keys_state["Alt+Delete"] = False
+
+            # Alt+Q - 取消后台复制/删除
+            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x51) and hotkeys.get("cancel_file_op", True):
+                key_combo = "Alt+Q"
+                if not self._last_keys_state.get(key_combo, False):
+                    debug_print("[Shortcut Poll] Detected Alt+Q")
+                    self.quick_cancel_background_file_operation()
+                    self._last_keys_state[key_combo] = True
+                return
+            else:
+                self._last_keys_state["Alt+Q"] = False
             
             # Alt+Z - 拷贝文件名
             if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x5A) and hotkeys.get("copy_filename", True):
@@ -12956,7 +13512,12 @@ class MainWindow(QMainWindow):
             self.config["hotkeys"]["go_up"] = dlg.hotkey_go_up.isChecked()
             self.config["hotkeys"]["refresh"] = dlg.hotkey_refresh.isChecked()
             self.config["hotkeys"]["add_bookmark"] = dlg.hotkey_add_bookmark.isChecked()
+            self.config["hotkeys"]["quick_copy"] = dlg.hotkey_quick_copy.isChecked()
+            self.config["hotkeys"]["quick_paste"] = dlg.hotkey_quick_paste.isChecked()
+            self.config["hotkeys"]["quick_delete"] = dlg.hotkey_quick_delete.isChecked()
+            self.config["hotkeys"]["cancel_file_op"] = dlg.hotkey_cancel_file_op.isChecked()
             self.config["hotkeys"]["copy_filename"] = dlg.hotkey_copy_filename.isChecked()
+            self.config["hotkeys"]["copy_filepath"] = dlg.hotkey_copy_filepath.isChecked()
             self.config["hotkeys"]["quick_find_current_dir"] = dlg.hotkey_quick_find_current_dir.isChecked()
             self.config["hotkeys"]["split_view"] = dlg.hotkey_split_view.isChecked()
             
@@ -13275,6 +13836,8 @@ class MainWindow(QMainWindow):
         self.explorer_monitoring = False
         self.known_explorer_windows = set()
         self.last_check_time = 0
+        self._quick_clipboard_paths = []
+        self._quick_clipboard_mode = 'copy'
         
         # 启用主窗口拖拽支持
         self.setAcceptDrops(True)
@@ -13428,6 +13991,10 @@ class MainWindow(QMainWindow):
                 "go_up": True,             # Alt+Up
                 "refresh": True,           # F5
                 "add_bookmark": True,      # Ctrl+D
+                "quick_copy": True,        # Alt+C - 快速复制选中项
+                "quick_paste": True,       # Alt+V - 快速粘贴到当前目录
+                "quick_delete": True,      # Alt+Delete - 快速删除
+                "cancel_file_op": True,    # Alt+Q - 取消后台复制/删除
                 "copy_filename": True,     # Alt+Z - 复制选中文件名
                 "copy_filepath": True,     # Alt+X - 复制文件路径\文件名
                 "split_view": True         # F3 - 左右分屏对比
@@ -15530,6 +16097,18 @@ class SettingsDialog(QDialog):
         self.hotkey_add_bookmark = QCheckBox(tr("Ctrl+D - 添加当前路径到书签"))
         self.hotkey_add_bookmark.setChecked(hotkeys.get("add_bookmark", True))
         hotkey_layout.addWidget(self.hotkey_add_bookmark)
+        self.hotkey_quick_copy = QCheckBox(tr("Alt+C - 快速复制选中项（后台）"))
+        self.hotkey_quick_copy.setChecked(hotkeys.get("quick_copy", True))
+        hotkey_layout.addWidget(self.hotkey_quick_copy)
+        self.hotkey_quick_paste = QCheckBox(tr("Alt+V - 快速粘贴到当前目录（后台）"))
+        self.hotkey_quick_paste.setChecked(hotkeys.get("quick_paste", True))
+        hotkey_layout.addWidget(self.hotkey_quick_paste)
+        self.hotkey_quick_delete = QCheckBox(tr("Alt+Delete - 快速删除选中项"))
+        self.hotkey_quick_delete.setChecked(hotkeys.get("quick_delete", True))
+        hotkey_layout.addWidget(self.hotkey_quick_delete)
+        self.hotkey_cancel_file_op = QCheckBox(tr("Alt+Q - 取消后台复制/删除"))
+        self.hotkey_cancel_file_op.setChecked(hotkeys.get("cancel_file_op", True))
+        hotkey_layout.addWidget(self.hotkey_cancel_file_op)
         self.hotkey_copy_filename = QCheckBox(tr("Alt+Z - 复制选中文件名（含后缀）"))
         self.hotkey_copy_filename.setChecked(hotkeys.get("copy_filename", True))
         hotkey_layout.addWidget(self.hotkey_copy_filename)
@@ -15888,6 +16467,10 @@ class SettingsDialog(QDialog):
                 "go_up": self.hotkey_go_up.isChecked(),
                 "refresh": self.hotkey_refresh.isChecked(),
                 "add_bookmark": self.hotkey_add_bookmark.isChecked(),
+                "quick_copy": self.hotkey_quick_copy.isChecked(),
+                "quick_paste": self.hotkey_quick_paste.isChecked(),
+                "quick_delete": self.hotkey_quick_delete.isChecked(),
+                "cancel_file_op": self.hotkey_cancel_file_op.isChecked(),
                 "copy_filename": self.hotkey_copy_filename.isChecked(),
                 "copy_filepath": self.hotkey_copy_filepath.isChecked()
             }
