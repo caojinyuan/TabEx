@@ -3257,11 +3257,12 @@ class FileBatchOpWorker(QThread):
     finished = pyqtSignal(str, int, int, list)  # op_type, ok_count, fail_count, errors
     progress = pyqtSignal(str, int, int, str)  # op_type, done_count, total_count, current_name
 
-    def __init__(self, op_type, src_paths, dst_dir=None, parent=None):
+    def __init__(self, op_type, src_paths, dst_dir=None, parent=None, max_workers=0):
         super().__init__(parent)
         self.op_type = str(op_type or '').lower()
         self.src_paths = [p for p in (src_paths or []) if isinstance(p, str) and p]
         self.dst_dir = dst_dir
+        self.max_workers = int(max_workers or 0)
         self._cancel_requested = False
         self.cancelled = False
         self.ok_count = 0
@@ -3280,6 +3281,14 @@ class FileBatchOpWorker(QThread):
 
     def _emit_progress(self, current_name):
         self.progress.emit(self.op_type, self.done_units, max(1, self.total_units), current_name or "")
+
+    def _get_io_workers(self, task_count):
+        if task_count <= 1:
+            return 1
+        if self.max_workers > 0:
+            return max(1, min(self.max_workers, task_count))
+        cpu = os.cpu_count() or 4
+        return max(2, min(8, cpu * 2, task_count))
 
     @staticmethod
     def _make_unique_path(target_path):
@@ -3355,53 +3364,140 @@ class FileBatchOpWorker(QThread):
             total += self._estimate_path_units(p)
         return max(1, total)
 
-    def _copy_dir_cancelable(self, src_dir, dst_dir):
-        os.makedirs(dst_dir, exist_ok=False)
-        self.done_units += 1
-        self._emit_progress(os.path.basename(src_dir.rstrip('\\/')) or src_dir)
-
+    @staticmethod
+    def _collect_copy_tasks(src_dir, dst_dir):
+        """收集目录复制任务：目录创建顺序执行，文件复制可并发。"""
+        dirs_to_create = [dst_dir]
+        file_tasks = []
         for root, dirs, files in os.walk(src_dir):
-            self._raise_if_cancelled()
             rel = os.path.relpath(root, src_dir)
             dst_root = dst_dir if rel == '.' else os.path.join(dst_dir, rel)
-            os.makedirs(dst_root, exist_ok=True)
-
             for dname in dirs:
-                self._raise_if_cancelled()
-                target_dir = os.path.join(dst_root, dname)
-                os.makedirs(target_dir, exist_ok=True)
-                self.done_units += 1
-                self._emit_progress(dname)
-
+                dirs_to_create.append(os.path.join(dst_root, dname))
             for fname in files:
-                self._raise_if_cancelled()
                 src_file = os.path.join(root, fname)
                 dst_file = os.path.join(dst_root, fname)
-                shutil.copy2(src_file, dst_file)
+                file_tasks.append((src_file, dst_file, fname))
+        return dirs_to_create, file_tasks
+
+    @staticmethod
+    def _collect_delete_tasks(src_dir):
+        """收集目录删除任务：文件可并发删除，目录按深度逆序删除。"""
+        file_tasks = []
+        dirs_to_remove = []
+        for root, dirs, files in os.walk(src_dir, topdown=False):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                file_tasks.append((fpath, fname))
+            for dname in dirs:
+                dpath = os.path.join(root, dname)
+                dirs_to_remove.append((dpath, dname))
+        dirs_to_remove.append((src_dir, os.path.basename(src_dir.rstrip('\\/')) or src_dir))
+        return file_tasks, dirs_to_remove
+
+    def _copy_file_task(self, src_file, dst_file):
+        self._raise_if_cancelled()
+        parent = os.path.dirname(dst_file)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        shutil.copy2(src_file, dst_file)
+
+    def _delete_file_task(self, src_file):
+        self._raise_if_cancelled()
+        self._retry_remove_once_cleared(os.remove, src_file)
+
+    def _run_parallel_file_tasks(self, tasks, task_runner, task_name_getter):
+        """并发执行文件级任务，按完成顺序回传逐项进度。"""
+        if not tasks:
+            return []
+
+        errors = []
+        max_workers = self._get_io_workers(len(tasks))
+        if max_workers <= 1:
+            for task in tasks:
+                self._raise_if_cancelled()
+                name = task_name_getter(task)
+                try:
+                    task_runner(task)
+                    self.done_units += 1
+                    self._emit_progress(name)
+                except RuntimeError as e:
+                    if str(e) == "FILE_OP_CANCELLED":
+                        self.cancelled = True
+                        break
+                    errors.append(f"{name}: {e}")
+                    self.done_units += 1
+                    self._emit_progress(name)
+                except Exception as e:
+                    errors.append(f"{name}: {e}")
+                    self.done_units += 1
+                    self._emit_progress(name)
+            return errors
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        future_to_task = {}
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='file-op') as executor:
+            for task in tasks:
+                self._raise_if_cancelled()
+                future = executor.submit(task_runner, task)
+                future_to_task[future] = task
+
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                name = task_name_getter(task)
+                try:
+                    future.result()
+                except RuntimeError as e:
+                    if str(e) == "FILE_OP_CANCELLED":
+                        self.cancelled = True
+                    else:
+                        errors.append(f"{name}: {e}")
+                except Exception as e:
+                    errors.append(f"{name}: {e}")
+
                 self.done_units += 1
-                self._emit_progress(fname)
+                self._emit_progress(name)
+
+                if self._cancel_requested:
+                    self.cancelled = True
+                    break
+
+        return errors
+
+    def _copy_dir_cancelable(self, src_dir, dst_dir):
+        dirs_to_create, file_tasks = self._collect_copy_tasks(src_dir, dst_dir)
+
+        for dpath in dirs_to_create:
+            self._raise_if_cancelled()
+            os.makedirs(dpath, exist_ok=True)
+            self.done_units += 1
+            self._emit_progress(os.path.basename(dpath.rstrip('\\/')) or dpath)
+
+        copy_errors = self._run_parallel_file_tasks(
+            file_tasks,
+            task_runner=lambda t: self._copy_file_task(t[0], t[1]),
+            task_name_getter=lambda t: t[2]
+        )
+        return copy_errors
 
     def _delete_dir_cancelable(self, src_dir):
-        for root, dirs, files in os.walk(src_dir, topdown=False):
+        file_tasks, dirs_to_remove = self._collect_delete_tasks(src_dir)
+        delete_errors = self._run_parallel_file_tasks(
+            file_tasks,
+            task_runner=lambda t: self._delete_file_task(t[0]),
+            task_name_getter=lambda t: t[1]
+        )
+
+        for dpath, dname in dirs_to_remove:
             self._raise_if_cancelled()
-
-            for fname in files:
-                self._raise_if_cancelled()
-                fpath = os.path.join(root, fname)
-                self._retry_remove_once_cleared(os.remove, fpath)
-                self.done_units += 1
-                self._emit_progress(fname)
-
-            for dname in dirs:
-                self._raise_if_cancelled()
-                dpath = os.path.join(root, dname)
+            try:
                 self._retry_remove_once_cleared(os.rmdir, dpath)
-                self.done_units += 1
-                self._emit_progress(dname)
+            except Exception as e:
+                delete_errors.append(f"{dpath}: {e}")
+            self.done_units += 1
+            self._emit_progress(dname)
 
-        self._retry_remove_once_cleared(os.rmdir, src_dir)
-        self.done_units += 1
-        self._emit_progress(os.path.basename(src_dir.rstrip('\\/')) or src_dir)
+        return delete_errors
 
     def run(self):
         import shutil
@@ -3428,7 +3524,9 @@ class FileBatchOpWorker(QThread):
                         name = os.path.basename(src_norm) or os.path.basename(os.path.dirname(src_norm)) or 'item'
                         dst_path = self._make_unique_path(os.path.join(self.dst_dir, name))
                         if os.path.isdir(src_norm):
-                            self._copy_dir_cancelable(src_norm, dst_path)
+                            dir_errors = self._copy_dir_cancelable(src_norm, dst_path)
+                            if dir_errors:
+                                raise RuntimeError("; ".join(dir_errors[:5]))
                         else:
                             shutil.copy2(src_norm, dst_path)
                             self.done_units += 1
@@ -3450,7 +3548,9 @@ class FileBatchOpWorker(QThread):
                         src_norm = os.path.normpath(src)
                         name = os.path.basename(src_norm.rstrip('\\/')) or src_norm
                         if os.path.isdir(src_norm):
-                            self._delete_dir_cancelable(src_norm)
+                            dir_errors = self._delete_dir_cancelable(src_norm)
+                            if dir_errors:
+                                raise RuntimeError("; ".join(dir_errors[:5]))
                         else:
                             self._retry_remove_once_cleared(os.remove, src_norm)
                             self.done_units += 1
@@ -8849,7 +8949,15 @@ class FileExplorerTab(QWidget):
             show_toast(self, tr("提示"), tr("未找到可操作的文件或文件夹"), level="warning")
             return
 
-        worker = FileBatchOpWorker(op_type, paths, dst_dir, self)
+        configured_workers = 0
+        try:
+            mw = getattr(self, 'main_window', None)
+            cfg = getattr(mw, 'config', {}) if mw else {}
+            configured_workers = int(cfg.get('file_op_max_workers', 0) or 0)
+        except Exception:
+            configured_workers = 0
+
+        worker = FileBatchOpWorker(op_type, paths, dst_dir, self, max_workers=configured_workers)
         worker.progress.connect(self._on_file_batch_op_progress)
         worker.finished.connect(self._on_file_batch_op_finished)
         worker.finished.connect(worker.deleteLater)
@@ -8893,12 +9001,12 @@ class FileExplorerTab(QWidget):
         elapsed_text = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
         remain_count = max(0, total_count - done_count)
         if op_type == 'copy':
-            msg = tr("后台复制: {}/{} ({}%) 剩余{} | 成功{} 失败{} | 当前: {} | 用时 {} | Alt+Q 取消" ).format(
-                done_count, total_count, percent, remain_count, ok_count, fail_count, current_label, elapsed_text
+            msg = tr("后台复制: {}/{} ({}%) 剩余{} | 用时 {} | 成功{} 失败{} | 当前: {}" ).format(
+                done_count, total_count, percent, remain_count, elapsed_text, ok_count, fail_count, current_label
             )
         elif op_type == 'delete':
-            msg = tr("后台删除: {}/{} ({}%) 剩余{} | 成功{} 失败{} | 当前: {} | 用时 {} | Alt+Q 取消" ).format(
-                done_count, total_count, percent, remain_count, ok_count, fail_count, current_label, elapsed_text
+            msg = tr("后台删除: {}/{} ({}%) 剩余{} | 用时 {} | 成功{} 失败{} | 当前: {}" ).format(
+                done_count, total_count, percent, remain_count, elapsed_text, ok_count, fail_count, current_label
             )
         else:
             msg = tr("后台操作进度: {}/{} ({}%) {}" ).format(done_count, total_count, percent, current_label)
@@ -13495,6 +13603,7 @@ class MainWindow(QMainWindow):
             self.config["preferred_terminal_tool"] = normalize_terminal_tool_name(dlg.preferred_terminal_combo.currentData())
             self.config["enable_title_shortcuts"] = dlg.title_shortcuts_cb.isChecked()
             self.config["enable_mouse_gestures"] = dlg.mouse_gestures_cb.isChecked()
+            self.config["file_op_max_workers"] = dlg.file_op_workers_spin.value()
 
             # 更新全局调试开关
             set_debug_mode(self.config["debug_mode"])
@@ -13968,6 +14077,7 @@ class MainWindow(QMainWindow):
             "explorer_monitor_debug": False,  # 默认关闭Explorer Monitor调试输出
             "resource_snapshot_logging": False,  # 默认关闭运行资源快照日志
             "resource_snapshot_interval_ms": HOUSEKEEPING_INTERVAL_MS,
+            "file_op_max_workers": 0,  # 后台文件操作并发数：0=自动
             "show_resource_usage_in_statusbar": False,  # 默认关闭状态栏右侧 CPU/内存占用显示
             "pinned_tabs": [],  # 默认没有固定标签页
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
@@ -15943,6 +16053,18 @@ class SettingsDialog(QDialog):
         resource_interval_layout.addStretch(1)
         debug_layout.addLayout(resource_interval_layout)
 
+        file_op_workers_layout = QHBoxLayout()
+        file_op_workers_layout.addWidget(QLabel(tr("文件操作并发数（0=自动）:")))
+        self.file_op_workers_spin = QSpinBox(self)
+        self.file_op_workers_spin.setRange(0, 16)
+        self.file_op_workers_spin.setSingleStep(1)
+        self.file_op_workers_spin.setSpecialValueText(tr("自动"))
+        self.file_op_workers_spin.setValue(int(config.get("file_op_max_workers", 0) or 0))
+        self.file_op_workers_spin.setToolTip(tr("后台复制/删除的并发文件任务数。0=自动，建议机械盘 2-4，SSD 4-8"))
+        file_op_workers_layout.addWidget(self.file_op_workers_spin)
+        file_op_workers_layout.addStretch(1)
+        debug_layout.addLayout(file_op_workers_layout)
+
         resource_log_layout = QHBoxLayout()
         self.open_resource_log_btn = QPushButton(tr("打开资源日志"), self)
         self.open_resource_log_btn.setToolTip(tr("打开 runtime_health.log；如果日志尚未生成，则打开所在目录"))
@@ -16448,6 +16570,7 @@ class SettingsDialog(QDialog):
             self.parent().config["explorer_monitor_debug"] = self.explorer_monitor_debug_cb.isChecked()
             self.parent().config["resource_snapshot_logging"] = self.resource_snapshot_logging_cb.isChecked()
             self.parent().config["resource_snapshot_interval_ms"] = self.resource_snapshot_interval_spin.value() * 60 * 1000
+            self.parent().config["file_op_max_workers"] = self.file_op_workers_spin.value()
             self.parent().config["show_resource_usage_in_statusbar"] = self.resource_usage_cb.isChecked()
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
