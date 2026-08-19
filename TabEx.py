@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.65"
+APP_VERSION = "3.66"
 
 
 # TabEx i18n module
@@ -3308,20 +3308,42 @@ class FileBatchOpWorker(QThread):
     def _clear_readonly(path):
         """Windows 下清除只读位，避免 rmtree 删除 .git 等只读文件失败。"""
         try:
-            if os.name == 'nt':
-                os.chmod(path, 0o666)
-                try:
-                    subprocess.run(["attrib", "-R", path], check=False,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
+            if os.name != 'nt' or not path:
+                return
+
+            # 优先纯 Python 方式改权限，避免在 windowed exe 中频繁拉起控制台进程。
+            import stat
+            try:
+                mode = os.stat(path).st_mode
+                os.chmod(path, mode | stat.S_IWRITE)
+                return
+            except Exception:
+                pass
+
+            # 兜底：仅在 chmod 失败时调用 attrib，并强制无窗口。
+            try:
+                subprocess.run(
+                    ["attrib", "-R", path],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000),
+                )
+            except Exception:
+                pass
         except Exception:
             pass
 
     @classmethod
     def _retry_remove_once_cleared(cls, func, target, retries=6):
         """清只读后重试删除，覆盖 Windows 上短暂占用/权限刷新延迟场景。"""
-        last_error = None
+        # 先直接删，常见场景下可避免无意义的权限修复与额外系统调用。
+        try:
+            func(target)
+            return
+        except Exception as ex:
+            last_error = ex
+
         for attempt in range(retries):
             cls._clear_readonly(target)
             try:
