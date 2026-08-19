@@ -22,22 +22,31 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM 检查pyinstaller是否安装
-pip show pyinstaller >nul 2>&1
+REM 安装/更新运行依赖，确保打包时能正确收集 PyQt5 等模块
+echo [步骤 1/5] 安装运行依赖 requirements.txt...
+python -m pip install -r requirements.txt
 if errorlevel 1 (
-    echo [步骤 1/4] 正在安装 PyInstaller...
-    pip install pyinstaller
+    echo [错误] requirements.txt 安装失败！
+    pause
+    exit /b 1
+)
+
+REM 检查pyinstaller是否安装
+python -m pip show pyinstaller >nul 2>&1
+if errorlevel 1 (
+    echo [步骤 2/5] 正在安装 PyInstaller...
+    python -m pip install pyinstaller
     if errorlevel 1 (
         echo [错误] PyInstaller 安装失败！
         pause
         exit /b 1
     )
 ) else (
-    echo [步骤 1/4] PyInstaller 已安装
+    echo [步骤 2/5] PyInstaller 已安装
 )
 
 echo.
-echo [步骤 2/4] 清理旧文件...
+echo [步骤 3/5] 清理旧文件...
 if exist TabExplorer.exe (
     echo 删除旧的 TabExplorer.exe
     del /q TabExplorer.exe
@@ -56,7 +65,7 @@ if exist *.spec (
 )
 
 echo.
-echo [步骤 3/4] 正在打包程序...
+echo [步骤 4/5] 正在打包程序...
 echo 这可能需要几分钟时间，请耐心等待...
 echo.
 
@@ -72,7 +81,7 @@ if exist TabExplorer.ico (
 )
 
 REM 打包成单个exe文件，直接输出到当前目录
-pyinstaller --onefile --windowed --name TabExplorer %ICON_PARAM% %DATA_PARAM% --distpath . TabEx.py
+python -m PyInstaller --onefile --windowed --name TabExplorer %ICON_PARAM% %DATA_PARAM% --distpath . TabEx.py
 
 if errorlevel 1 (
     echo.
@@ -82,7 +91,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [步骤 4/4] 清理临时文件...
+echo [步骤 5/5] 清理临时文件...
 if exist build rmdir /s /q build
 if exist TabExplorer.spec del /q TabExplorer.spec
 
