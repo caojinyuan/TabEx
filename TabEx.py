@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.66"
+APP_VERSION = "3.67"
 
 
 # TabEx i18n module
@@ -394,6 +394,13 @@ _LANG_EN = {
     "在当前标签页路径打开 cmd": "Open cmd here",
     "在当前标签页路径打开 PowerShell": "Open PowerShell here",
     "打开计算器": "Open Calculator",
+    # ── Split view (F3) ───────────────────────────────────────────────────
+    "分屏对比 (F3)": "Split View (F3)",
+    "分屏对比": "Split View",
+    "分屏失败": "Split Failed",
+    "已将右侧标签合并回左侧。": "Merged the right-side tab back to the left.",
+    "已将当前标签移到右侧。再次按 F3 合并回左侧。": "Moved the current tab to the right. Press F3 again to merge it back.",
+    "无法创建用于左侧的新标签页。": "Failed to create a new tab for the left side.",
     # ── Title bar launcher ────────────────────────────────────────────────
     "拖入应用或快捷方式": "Drop app or shortcut",
     "+ 拖入应用或快捷方式": "+ Drop app or shortcut",
@@ -14058,46 +14065,15 @@ class MainWindow(QMainWindow):
     def _setup_window_icon(self):
         """生成并设置 TE 窗口图标（延迟执行，不阻塞启动首帧）。"""
         try:
-            from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QIcon
-            
-            te_icon = QIcon()
-            # 按 256px 基准等比例生成各尺寸图标
-            for size in [256, 128, 96, 64, 48, 32, 24, 18, 16]:
-                pix = QPixmap(size, size)
-                pix.fill(Qt.transparent)
-                p = QPainter(pix)
-                p.setRenderHint(QPainter.Antialiasing)
-                blue = QColor("#2196F3")
-                white = QColor("white")
-                # 外层蓝色圆角背景
-                outer_radius = max(2, size * 40 // 256)
-                p.setBrush(blue)
-                p.setPen(Qt.NoPen)
-                p.drawRoundedRect(0, 0, size, size, outer_radius, outer_radius)
-                # 内层白色圆角容器（形成蓝色边框效果）
-                margin = max(2, size * 28 // 256)
-                inner_radius = max(2, size * 24 // 256)
-                p.setBrush(white)
-                p.drawRoundedRect(margin, margin, size - 2*margin, size - 2*margin, inner_radius, inner_radius)
-                # 中央蓝色 TE 文字
-                p.setPen(blue)
-                f = QFont()
-                f.setBold(True)
-                f.setPointSize(max(5, size * 130 // 256))
-                f.setStretch(70)  # 压窄字体，使其看起来更高
-                p.setFont(f)
-                p.drawText(pix.rect(), Qt.AlignCenter, "TE")
-                p.end()
-                te_icon.addPixmap(pix, QIcon.Normal)
-            
+            te_icon = _build_te_icon()
             self.setWindowIcon(te_icon)
-            # 同时设置到 QApplication，使任务栏也生效
-            from PyQt5.QtWidgets import QApplication
-            QApplication.instance().setWindowIcon(te_icon)
-            # 更新自定义标题栏中的图标 Label
+            # 应用级（任务栏）图标已在 main() 早期、主窗口书签菜单创建之前设置。
+            # 不在此处调用 QApplication.setWindowIcon：菜单已存在时该调用会向所有顶层
+            # 弹出菜单广播图标变更事件；英文界面书签栏溢出时会在弹出菜单间无限递归
+            # 传播（WindowIconChange/ApplicationWindowIconChange），导致栈溢出崩溃。
             if hasattr(self, '_title_icon_label'):
                 self._title_icon_label.setPixmap(te_icon.pixmap(18, 18))
-            print("[Icon] ✓ TE icon set on window and application")
+            print("[Icon] ✓ TE icon set on window")
         except Exception as e:
             print(f"[Icon] ✗ Failed to set TE icon: {e}")
     
@@ -15845,7 +15821,6 @@ class MainWindow(QMainWindow):
         from PyQt5.QtCore import QEvent
         from PyQt5.QtWidgets import QMenu
         from PyQt5.QtGui import QMouseEvent
-        
 
         # 处理主菜单栏的右键点击
         if obj == self.menu_bar:
@@ -16671,7 +16646,7 @@ class SettingsDialog(QDialog):
             # 立即更新标题栏 AI 按钮显隐
             if hasattr(self.parent(), 'ai_chat_btn'):
                 self.parent().ai_chat_btn.setVisible(ai_enabled)
-                if not ai_enabled and hasattr(self.parent(), 'chat_panel'):
+                if not ai_enabled and getattr(self.parent(), 'chat_panel', None) is not None:
                     self.parent().chat_panel.setVisible(False)
 
             # 语言切换提示（部分静态 UI 需重启生效）
@@ -17269,6 +17244,41 @@ def try_send_to_existing_instance(path):
     debug_print("[Client] No existing instance found, starting new instance")
     return False
 
+def _build_te_icon():
+    """生成多分辨率 TE 图标。仅依赖 QApplication 已创建，可在主窗口构建前调用。"""
+    from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QIcon
+    te_icon = QIcon()
+    # 按 256px 基准等比例生成各尺寸图标
+    for size in [256, 128, 96, 64, 48, 32, 24, 18, 16]:
+        pix = QPixmap(size, size)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing)
+        blue = QColor("#2196F3")
+        white = QColor("white")
+        # 外层蓝色圆角背景
+        outer_radius = max(2, size * 40 // 256)
+        p.setBrush(blue)
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(0, 0, size, size, outer_radius, outer_radius)
+        # 内层白色圆角容器（形成蓝色边框效果）
+        margin = max(2, size * 28 // 256)
+        inner_radius = max(2, size * 24 // 256)
+        p.setBrush(white)
+        p.drawRoundedRect(margin, margin, size - 2*margin, size - 2*margin, inner_radius, inner_radius)
+        # 中央蓝色 TE 文字
+        p.setPen(blue)
+        f = QFont()
+        f.setBold(True)
+        f.setPointSize(max(5, size * 130 // 256))
+        f.setStretch(70)  # 压窄字体，使其看起来更高
+        p.setFont(f)
+        p.drawText(pix.rect(), Qt.AlignCenter, "TE")
+        p.end()
+        te_icon.addPixmap(pix, QIcon.Normal)
+    return te_icon
+
+
 def main():
     # 支持命令行参数：打开指定路径
     import sys
@@ -17331,6 +17341,15 @@ def main():
     
     # 图标将在 MainWindow.__init__ 中生成并设置，确保 Qt 完全初始化后执行
     
+    # 应用级（任务栏）窗口图标：必须在创建主窗口及其书签菜单之前设置。
+    # 此时尚无任何弹出型 QMenu 顶层部件，图标变更事件只广播到极少数顶层部件，
+    # 从而避免英文界面下书签菜单栏溢出时，图标变更事件在弹出菜单之间无限递归
+    # 传播（导致栈溢出崩溃）。
+    try:
+        app.setWindowIcon(_build_te_icon())
+    except Exception as _icon_e:
+        debug_print(f"[Icon] app icon early-set failed: {_icon_e}")
+
     # 创建窗口（图标在 MainWindow.__init__ 内部生成）
     window = MainWindow()
     
@@ -17352,6 +17371,8 @@ def main():
     
 
     # No HKCU cleanup needed – overlay fix is vtable-only (process-local).
+
+    sys.exit(app.exec_())
 
     sys.exit(app.exec_())
 
