@@ -7492,10 +7492,20 @@ class FileExplorerTab(QWidget):
                     if is_dblclick:
                         _state['t'] = 0
 
-                        def _check(_px=px, _py=py):
+                        # 记录双击瞬间的路径：若 150ms 后路径已变化，说明这次双击其实是
+                        # 进入了盘符/文件夹（Explorer 内部导航），绝不能再 go_up，否则会出现
+                        # “双击 D 盘进入后又立即退回此电脑”的抖动。
+                        _tab_at_click = _get_current_tab()
+                        _path_at_click = getattr(_tab_at_click, 'current_path', None) if _tab_at_click else None
+
+                        def _check(_px=px, _py=py, _path_at_click=_path_at_click):
                             try:
                                 tab = _get_current_tab()
                                 if not tab:
+                                    return
+
+                                # 路径已变化 → 双击进入了文件夹/盘符，取消 go_up
+                                if _path_at_click is not None and getattr(tab, 'current_path', None) != _path_at_click:
                                     return
 
                                 # Bounds check
@@ -7506,7 +7516,7 @@ class FileExplorerTab(QWidget):
 
                                 # Navigation guard
                                 last_nav = getattr(tab, '_last_nav_complete_time', 0)
-                                if time.monotonic() - last_nav < 0.5:
+                                if time.monotonic() - last_nav < 0.8:
                                     return
 
                                 # LVM_HITTEST
