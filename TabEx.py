@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.67"
+APP_VERSION = "3.68"
 
 
 # TabEx i18n module
@@ -11877,14 +11877,35 @@ class MainWindow(QMainWindow):
             self.git_bash_button.setVisible(enable)
         if hasattr(self, 'git_tools_separator'):
             self.git_tools_separator.setVisible(enable)
+        # 快捷方式区与右侧工具组之间始终保留视觉间隔（与 Git 显示状态解耦）。
+        if hasattr(self, 'shortcut_git_separator'):
+            self.shortcut_git_separator.setVisible(self.config.get("enable_title_shortcuts", True))
+        self._refresh_titlebar_layout_now()
 
     def apply_title_shortcuts_config(self):
         """根据配置显示/隐藏标题栏快捷方式区域。"""
         enable = self.config.get("enable_title_shortcuts", True)
         if hasattr(self, 'title_shortcut_bar'):
             self.title_shortcut_bar.setVisible(enable)
+            # 从关闭切回开启时，立即按配置重建按钮，确保已保存快捷方式可见。
+            if enable:
+                self.refresh_title_shortcuts_ui()
         if hasattr(self, 'shortcut_git_separator'):
             self.shortcut_git_separator.setVisible(enable)
+        self._refresh_titlebar_layout_now()
+
+    def _refresh_titlebar_layout_now(self):
+        """显隐标题栏控件后立即刷新布局，避免按钮左移延迟到下一次重绘。"""
+        titlebar = getattr(self, 'titlebar_widget', None)
+        if not titlebar:
+            return
+        layout = titlebar.layout()
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
+        titlebar.updateGeometry()
+        titlebar.update()
+        QApplication.sendPostedEvents(None, QEvent.LayoutRequest)
 
     def refresh_title_shortcuts_ui(self):
         """刷新标题栏快捷方式按钮。"""
@@ -12509,6 +12530,8 @@ class MainWindow(QMainWindow):
         titlebar_layout = QHBoxLayout(titlebar)
         titlebar_layout.setContentsMargins(10, 0, 0, 0)
         titlebar_layout.setSpacing(0)
+        # 左侧使用弹性空白，所有功能按钮区域始终靠右紧凑排列。
+        titlebar_layout.addStretch(1)
         
         # 保存引用（兼容其他代码对 titlebar_widget 的引用）
         self.titlebar_widget = titlebar
@@ -12550,6 +12573,7 @@ class MainWindow(QMainWindow):
         self.shortcut_git_separator.setFrameShape(QFrame.VLine)
         self.shortcut_git_separator.setFrameShadow(QFrame.Plain)
         self.shortcut_git_separator.setStyleSheet("background-color: #d0d0d0; max-width: 1px;")
+        self.shortcut_git_separator.setFixedWidth(1)
         self.shortcut_git_separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
         titlebar_layout.addWidget(self.shortcut_git_separator)
         
@@ -12603,6 +12627,7 @@ class MainWindow(QMainWindow):
         self.git_tools_separator.setFrameShape(QFrame.VLine)
         self.git_tools_separator.setFrameShadow(QFrame.Plain)
         self.git_tools_separator.setStyleSheet("background-color: #d0d0d0; max-width: 1px;")
+        self.git_tools_separator.setFixedWidth(1)
         self.git_tools_separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
         titlebar_layout.addWidget(self.git_tools_separator)
 
@@ -12633,6 +12658,7 @@ class MainWindow(QMainWindow):
         separator.setFrameShape(QFrame.VLine)
         separator.setFrameShadow(QFrame.Plain)
         separator.setStyleSheet("background-color: #d0d0d0; max-width: 1px;")
+        separator.setFixedWidth(1)
         separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
         titlebar_layout.addWidget(separator)
         
