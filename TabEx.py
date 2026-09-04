@@ -140,6 +140,8 @@ _LANG_EN = {
     "用记事本打开": "Open with Notepad",
     "用 Notepad++ 打开": "Open with Notepad++",
     "选择其他应用...": "Open with...",
+    "🤖 AI分析此文件": "🤖 Analyze This File",
+    "🤖 AI总结结果": "🤖 Summarize Results",
     "未检测到 Notepad++": "Notepad++ not detected",
     "该搜索结果不是可打开的文件": "This result is not an openable file",
     "当前系统不支持打开\u201c选择其他应用\u201d对话框": "This system does not support 'Open with' dialog",
@@ -433,6 +435,22 @@ _LANG_EN = {
     "⏳ AI 思考中…": "⏳ AI thinking…",
     "⏳ AI 推理中{}…": "⏳ AI reasoning{}…",
     "⏳ AI 第 {} 轮推理中…": "⏳ AI round {} reasoning…",
+    "AI 助手未启用，请先在设置中开启": "AI assistant is disabled. Enable it in settings first",
+    "请先完成搜索后再进行 AI 总结": "Run a search first before requesting AI summary",
+    "✅ 已发送到 AI 分析: {}": "✅ Sent to AI for analysis: {}",
+    "✅ 已发送搜索结果到 AI，总计 {} 条": "✅ Sent search results to AI, total {} items",
+    "读取文件预览失败: {}": "Failed to read file preview: {}",
+    "✅ 已自动发起 AI 文件分析": "✅ Auto-started AI file analysis",
+    "✅ 已自动发起 AI 结构分析": "✅ Auto-started AI structure analysis",
+    "快捷工作流:": "Quick Workflows:",
+    "目录巡检": "Directory Audit",
+    "代码审阅": "Code Review",
+    "变更说明": "Change Summary",
+    "请等待当前 AI 任务完成后再启动新的工作流": "Please wait for current AI task to finish before starting a new workflow",
+    "已启动工作流: {}": "Workflow started: {}",
+    "请分析我刚拖拽的文件：{}\n请按以下结构输出：\n1) 文件用途\n2) 关键逻辑\n3) 风险点\n4) 建议下一步查看的相关文件": "Please analyze the file I just dragged: {}\nUse this structure:\n1) Purpose\n2) Key logic\n3) Risks\n4) Suggested related files",
+    "请分析我刚拖拽的文件：{}\n请按以下结构输出：\n1) 文件用途\n2) 关键逻辑\n3) 风险点\n4) 建议下一步查看的相关文件": "Please analyze the file I just dragged: {}\nUse this structure:\n1) Purpose\n2) Key logic\n3) Risks\n4) Suggested related files",
+    "请综合分析我刚拖拽的 {} 个文件：\n{}\n请按以下结构输出：\n1) 文件分工\n2) 关键逻辑链路\n3) 主要风险点\n4) 建议的阅读顺序": "Please analyze the {} files I just dragged:\n{}\nUse this structure:\n1) File roles\n2) Key logic flow\n3) Main risks\n4) Suggested reading order",
     "⚠️ 检测到重复工具调用，强制要求给出结论…": "⚠️ Repeated tool call detected, forcing conclusion…",
     "空路径": "Empty path",
     "❌ 请先在 设置 → AI 助手 中填写 API 地址": "❌ Please fill in API URL in Settings → AI Assistant",
@@ -442,6 +460,13 @@ _LANG_EN = {
     "⏸ 已取消运行脚本: {}": "⏸ Script run cancelled: {}",
     "确认运行脚本": "Confirm Run Script",
     "确认覆盖文件": "Confirm Overwrite File",
+    "确认 Git 暂存": "Confirm Git Add",
+    "确认 Git 提交": "Confirm Git Commit",
+    "确认 Git 切换分支": "Confirm Git Switch Branch",
+    "确认 Git 还原": "Confirm Git Restore",
+    "确认 Git 软重置": "Confirm Git Soft Reset",
+    "确认 Git 拉取": "Confirm Git Pull",
+    "确认 Git 推送": "Confirm Git Push",
     "目录（及其所有内容）": "directory (and all contents)",
     "确认删除": "Confirm Delete",
     "全量覆盖会丢失未读内容。": "Full overwrite will discard unread content.",
@@ -456,6 +481,17 @@ _LANG_EN = {
     "✅ 已创建目录: {}": "✅ Created dir: {}",
     "✅ 已删除{}: {}": "✅ Deleted {}: {}",
     "✅ 已启动脚本: {}": "✅ Script started: {}",
+    "✅ Git 状态 ({})\n{}": "✅ Git status ({})\n{}",
+    "✅ Git Diff ({})\n{}": "✅ Git diff ({})\n{}",
+    "✅ Git Log ({})\n{}": "✅ Git log ({})\n{}",
+    "✅ Git Branch ({})\n{}": "✅ Git branches ({})\n{}",
+    "✅ Git 已暂存 ({}) 目标: {}": "✅ Git staged ({}) target: {}",
+    "✅ Git 提交成功 ({})\n{}": "✅ Git commit succeeded ({})\n{}",
+    "✅ Git 已切换到分支 ({}) -> {}": "✅ Git switched branch ({}) -> {}",
+    "✅ Git 已还原 ({}) 目标: {}": "✅ Git restored ({}) target: {}",
+    "✅ Git 软重置成功 ({}) -> {}": "✅ Git soft reset succeeded ({}) -> {}",
+    "✅ Git 拉取成功 ({})\n{}": "✅ Git pull succeeded ({})\n{}",
+    "✅ Git 推送成功 ({})\n{}": "✅ Git push succeeded ({})\n{}",
     "✅ 已在当前标签切换到目录: {}": "✅ Switched to dir: {}",
     "✅ 已打开目录: {}": "✅ Opened dir: {}",
     "✅ 补丁成功: {}": "✅ Patch applied: {}",
@@ -480,9 +516,24 @@ _LANG_EN = {
     "❌ 读取失败: {}（{}）": "❌ Read failed: {} ({})",
     "❌ 路径不存在: {}": "❌ Path not found: {}",
     "❌ 运行脚本失败: {}（{}）": "❌ Script failed: {} ({})",
+    "❌ Git 执行失败: {}": "❌ Git failed: {}",
+    "❌ Git 执行超时: {}": "❌ Git timed out: {}",
+    "❌ Git 指令格式应为 [GIT_ADD: 路径|目标]": "❌ Git format must be [GIT_ADD: path|target]",
+    "❌ Git 指令格式应为 [GIT_COMMIT: 路径|提交信息]": "❌ Git format must be [GIT_COMMIT: path|message]",
+    "❌ Git 指令格式应为 [GIT_SWITCH: 路径|分支名]": "❌ Git format must be [GIT_SWITCH: path|branch]",
+    "❌ Git 指令格式应为 [GIT_RESTORE: 路径|目标]": "❌ Git format must be [GIT_RESTORE: path|target]",
     "⚠️ 文件太大（{:.1f}MB），无法读取": "⚠️ File too large ({:.1f}MB) to read",
     "⚠️ 目录不存在: {}": "⚠️ Dir not found: {}",
     "⚠️ 脚本不存在: {}": "⚠️ Script not found: {}",
+    "⚠️ Git 无输出": "⚠️ Git returned no output",
+    "未检测到 Git，请先安装 Git for Windows": "Git not found. Please install Git for Windows first",
+    "⏸ 已取消 Git 暂存: {}": "⏸ Git add cancelled: {}",
+    "⏸ 已取消 Git 提交: {}": "⏸ Git commit cancelled: {}",
+    "⏸ 已取消 Git 切换分支: {}": "⏸ Git switch cancelled: {}",
+    "⏸ 已取消 Git 还原: {}": "⏸ Git restore cancelled: {}",
+    "⏸ 已取消 Git 软重置: {}": "⏸ Git soft reset cancelled: {}",
+    "⏸ 已取消 Git 拉取: {}": "⏸ Git pull cancelled: {}",
+    "⏸ 已取消 Git 推送: {}": "⏸ Git push cancelled: {}",
     "\n⚠️ 文件过大，仅读取前 {} 字符，剩余 {} 字节未读": "\n⚠️ File too large; read first {} chars, {} bytes remaining",
     "\n\n【已截断 {} 个字符】": "\n\n[Truncated {} chars]",
     "（这是文件，请用 READ_FILE）": "(This is a file; use READ_FILE)",
@@ -537,6 +588,17 @@ _LANG_EN = {
     "[LIST_DIR: 目录路径] 列出目录；\n": "[LIST_DIR: path] List directory;\n",
     "[MKDIR: 目录路径] 创建目录；\n": "[MKDIR: path] Create directory;\n",
     "[DELETE: 路径] 删除文件或目录（需用户确认）。\n": "[DELETE: path] Delete file or directory (requires user confirmation).\n",
+    "[GIT_STATUS: 仓库路径] 查看 git 状态；\n": "[GIT_STATUS: repo_path] Show git status;\n",
+    "[GIT_DIFF: 仓库路径] 查看未提交 diff；\n": "[GIT_DIFF: repo_path] Show uncommitted diff;\n",
+    "[GIT_LOG: 仓库路径] 查看最近提交日志；\n": "[GIT_LOG: repo_path] Show recent commits;\n",
+    "[GIT_BRANCH: 仓库路径] 查看分支列表；\n": "[GIT_BRANCH: repo_path] Show branches;\n",
+    "[GIT_ADD: 仓库路径|目标] 暂存变更（需用户确认）；\n": "[GIT_ADD: repo_path|target] Stage changes (requires confirmation);\n",
+    "[GIT_COMMIT: 仓库路径|提交信息] 提交变更（需用户确认）；\n": "[GIT_COMMIT: repo_path|message] Commit changes (requires confirmation);\n",
+    "[GIT_SWITCH: 仓库路径|分支名] 切换分支（需用户确认）。\n": "[GIT_SWITCH: repo_path|branch] Switch branch (requires confirmation).\n",
+    "[GIT_RESTORE: 仓库路径|目标] 还原工作区改动（需用户确认）；\n": "[GIT_RESTORE: repo_path|target] Restore working tree changes (requires confirmation);\n",
+    "[GIT_RESET_SOFT: 仓库路径|目标提交] 软重置 HEAD（需用户确认）；\n": "[GIT_RESET_SOFT: repo_path|target_commit] Soft reset HEAD (requires confirmation);\n",
+    "[GIT_PULL: 仓库路径|远程|分支] 拉取远程更新（需用户确认）；\n": "[GIT_PULL: repo_path|remote|branch] Pull remote changes (requires confirmation);\n",
+    "[GIT_PUSH: 仓库路径|远程|分支] 推送本地提交（需用户确认）。\n": "[GIT_PUSH: repo_path|remote|branch] Push local commits (requires confirmation).\n",
     "可以在同一回复中包含多个操作命令。": "Multiple operation commands may appear in the same reply.",
     "你可以自由使用以下工具指令：\n": "You may freely use these tool commands:\n",
     "[READ_FILE: 路径] 读文件（优先读 .c/.h 源代码）；": "[READ_FILE: path] Read file (prefer .c/.h source);\n",
@@ -545,6 +607,10 @@ _LANG_EN = {
     "[LIST_DIR: 路径] 列目录（仅在不知道源码位置时使用）；": "[LIST_DIR: path] List dir (use only when source location is unknown);",
     "[OPEN_DIR: 路径] [MKDIR: 路径] [WRITE_FILE: 路径|内容]（仅用于创建新文件） [DELETE: 路径]。\n":
         "[OPEN_DIR: path] [MKDIR: path] [WRITE_FILE: path|content] (new files only) [DELETE: path].\n",
+    "[GIT_STATUS: 路径] [GIT_DIFF: 路径] [GIT_LOG: 路径] [GIT_BRANCH: 路径] [GIT_ADD: 路径|目标] [GIT_COMMIT: 路径|提交信息] [GIT_SWITCH: 路径|分支名]。\n":
+        "[GIT_STATUS: path] [GIT_DIFF: path] [GIT_LOG: path] [GIT_BRANCH: path] [GIT_ADD: path|target] [GIT_COMMIT: path|message] [GIT_SWITCH: path|branch].\n",
+    "[GIT_RESTORE: 路径|目标] [GIT_RESET_SOFT: 路径|目标提交] [GIT_PULL: 路径|远程|分支] [GIT_PUSH: 路径|远程|分支]。\n":
+        "[GIT_RESTORE: path|target] [GIT_RESET_SOFT: path|target_commit] [GIT_PULL: path|remote|branch] [GIT_PUSH: path|remote|branch].\n",
     "ℹ️ 工作原则：得到目录列表后尽快选择源代码文件直接阅读，":
         "ℹ️ Workflow: after listing a directory, immediately select and read source files,",
     "而不要反复展开子目录；修改文件时优先使用 PATCH_FILE 安全替换具体代码段。\n":
@@ -1199,6 +1265,12 @@ class SearchResultsTableModel(QAbstractTableModel):
             return self._rows[row].get('path', '')
         return ''
 
+    def snapshot_rows(self, limit=None):
+        rows = list(self._rows)
+        if isinstance(limit, int) and limit > 0:
+            return rows[:limit]
+        return rows
+
 # Everything 搜索引擎集成
 def detect_everything():
     """检测系统中是否安装了Everything"""
@@ -1360,6 +1432,11 @@ class SearchDialog(QDialog):
         self.stop_btn.clicked.connect(self.stop_search)
         self.stop_btn.setEnabled(False)
         search_options.addWidget(self.stop_btn)
+
+        # AI 总结按钮
+        self.ai_summary_btn = QPushButton(tr("🤖 AI总结结果"))
+        self.ai_summary_btn.clicked.connect(self.request_ai_search_summary)
+        search_options.addWidget(self.ai_summary_btn)
         
         layout.addLayout(search_options)
         
@@ -2461,6 +2538,11 @@ class SearchDialog(QDialog):
 
             menu.addSeparator()
 
+            analyze_action = menu.addAction(tr("🤖 AI分析此文件"))
+            analyze_action.triggered.connect(lambda: self.request_ai_file_analysis(file_path))
+
+            menu.addSeparator()
+
             notepad_action = menu.addAction(tr("用记事本打开"))
             notepad_action.triggered.connect(lambda: self.open_result_with_notepad(file_path))
 
@@ -2476,6 +2558,85 @@ class SearchDialog(QDialog):
             system_dialog_action.triggered.connect(lambda: self.open_result_with_system_dialog(file_path))
 
         menu.exec_(self.result_list.viewport().mapToGlobal(pos))
+
+    def request_ai_file_analysis(self, file_path):
+        if not file_path or not os.path.isfile(file_path):
+            show_toast(self, tr("提示"), tr("该搜索结果不是可打开的文件"), level="warning")
+            return
+        if not self.main_window or not hasattr(self.main_window, 'send_prompt_to_ai'):
+            show_toast(self, tr("提示"), tr("AI 助手未启用，请先在设置中开启"), level="warning")
+            return
+
+        max_chars = 12000
+        try:
+            file_size = os.path.getsize(file_path)
+            ext = os.path.splitext(file_path)[1].lower() or "(none)"
+            enc = 'utf-8'
+            try:
+                with open(file_path, 'r', encoding='utf-8') as _f:
+                    _f.read(1)
+            except UnicodeDecodeError:
+                enc = 'gbk'
+
+            with open(file_path, 'r', encoding=enc, errors='replace') as f:
+                preview = f.read(max_chars)
+
+            omitted_hint = ""
+            if len(preview) >= max_chars:
+                omitted_hint = f"\n\n[内容已截断，最多展示 {max_chars} 字符]"
+
+            prompt = (
+                "请对下面文件做结构化分析，输出以下小节：\n"
+                "1) 文件用途\n2) 关键逻辑\n3) 风险点\n4) 建议下一步查看的相关文件\n"
+                "如果信息不足，可以在结尾给出需要进一步读取的文件路径建议。\n\n"
+                f"文件路径: {file_path}\n"
+                f"文件扩展名: {ext}\n"
+                f"文件大小: {file_size} bytes\n"
+                f"预览编码: {enc}\n"
+                "文件内容预览:\n"
+                f"{preview}{omitted_hint}"
+            )
+        except Exception as e:
+            show_toast(self, tr("错误"), tr("读取文件预览失败: {}").format(e), level="error")
+            return
+
+        if self.main_window.send_prompt_to_ai(prompt):
+            show_toast(self, tr("提示"), tr("✅ 已发送到 AI 分析: {}").format(os.path.basename(file_path)), level="info")
+
+    def request_ai_search_summary(self):
+        rows = self.result_model.snapshot_rows(limit=120)
+        if not rows:
+            show_toast(self, tr("提示"), tr("请先完成搜索后再进行 AI 总结"), level="warning")
+            return
+        if not self.main_window or not hasattr(self.main_window, 'send_prompt_to_ai'):
+            show_toast(self, tr("提示"), tr("AI 助手未启用，请先在设置中开启"), level="warning")
+            return
+
+        keyword = self.search_input.currentText().strip()
+        file_types = self.file_type_input.text().strip()
+        lines = []
+        for row in rows:
+            path = row.get('path', '')
+            ftype = row.get('file_type', '')
+            lines.append(f"- [{ftype}] {path}")
+
+        prompt = (
+            "请对下面的搜索结果做总结，输出以下小节：\n"
+            "1) 结果分布（哪些目录最集中）\n"
+            "2) 可能的核心实现文件（Top 10）\n"
+            "3) 噪音/次要结果类型\n"
+            "4) 建议的阅读顺序\n"
+            "5) 如需后续动作，请给出可执行建议\n\n"
+            f"搜索根路径: {self.search_path}\n"
+            f"关键词: {keyword or '(空，当前为列目录模式)'}\n"
+            f"文件类型过滤: {file_types or '(无)'}\n"
+            f"结果总数(当前已加载): {self.result_model.rowCount()}\n"
+            f"用于总结的样本数: {len(rows)}\n\n"
+            "结果样本:\n" + "\n".join(lines)
+        )
+
+        if self.main_window.send_prompt_to_ai(prompt):
+            show_toast(self, tr("提示"), tr("✅ 已发送搜索结果到 AI，总计 {} 条").format(len(rows)), level="info")
 
     def _open_result_parent_folder(self, file_path):
         if not file_path or not os.path.exists(file_path):
@@ -9832,6 +9993,8 @@ class ChatPanel(QWidget):
         self.messages = []   # 对话历史（不含 system prompt）
         self.worker = None
         self.history_file = get_app_data_path("chat_history.json")
+        self.workflow_file = get_app_data_path("ai_workflows.json")
+        self.workflow_templates = self._load_workflow_templates()
         self._is_loading_history = False
         # 给 ChatPanel 独立的 Win32 HWND，避免 QAxWidget(Shell Explorer) 抢占鼠标/键盘头
         self.setAttribute(Qt.WA_NativeWindow, True)
@@ -9923,6 +10086,28 @@ class ChatPanel(QWidget):
         btn_row.addWidget(self.send_btn)
         layout.addLayout(btn_row)
 
+        # 快捷工作流按钮（过渡版 AI workflow）
+        wf_row = QHBoxLayout()
+        wf_row.setSpacing(6)
+        wf_row.addWidget(QLabel(tr("快捷工作流:")))
+
+        self.wf_dir_btn = QPushButton(tr("目录巡检"))
+        self.wf_dir_btn.setFixedHeight(24)
+        self.wf_dir_btn.clicked.connect(lambda: self._run_quick_workflow('dir_audit'))
+        wf_row.addWidget(self.wf_dir_btn)
+
+        self.wf_review_btn = QPushButton(tr("代码审阅"))
+        self.wf_review_btn.setFixedHeight(24)
+        self.wf_review_btn.clicked.connect(lambda: self._run_quick_workflow('code_review'))
+        wf_row.addWidget(self.wf_review_btn)
+
+        self.wf_change_btn = QPushButton(tr("变更说明"))
+        self.wf_change_btn.setFixedHeight(24)
+        self.wf_change_btn.clicked.connect(lambda: self._run_quick_workflow('change_summary'))
+        wf_row.addWidget(self.wf_change_btn)
+        wf_row.addStretch()
+        layout.addLayout(wf_row)
+
         # 状态提示
         self.status_lbl = QLabel("")
         self.status_lbl.setStyleSheet("color:#888;font-size:8.5pt;")
@@ -9958,6 +10143,114 @@ class ChatPanel(QWidget):
         if path:
             display = path if len(path) <= 55 else '…' + path[-52:]
             self.context_label.setText(tr("当前目录: {}").format(display))
+
+    def submit_external_prompt(self, prompt: str) -> bool:
+        """外部入口：将预置问题发送到 AI 对话。"""
+        text = (prompt or "").strip()
+        if not text:
+            return False
+        if not self.send_btn.isEnabled():
+            show_toast(self, tr("提示"), tr("请等待当前 AI 任务完成后再启动新的工作流"), level="warning")
+            return False
+        self.input_box.setPlainText(text)
+        self.send_message()
+        return True
+
+    def _default_workflow_templates(self):
+        return {
+            "dir_audit": (
+                "请执行目录巡检工作流。\n"
+                "目标目录: {target_dir}\n"
+                "请按需先使用 [LIST_DIR] / [READ_FILE] 收集必要信息，再输出：\n"
+                "1) 目录分层概览\n"
+                "2) 核心模块与职责\n"
+                "3) 潜在风险（命名、耦合、结构、可维护性）\n"
+                "4) 建议优先阅读的文件/目录清单（Top 10）\n"
+                "5) 后续可执行改进建议\n"
+                "如需读取文件，优先读关键实现文件，不要无意义重复列目录。"
+            ),
+            "code_review": (
+                "请执行代码审阅工作流。\n"
+                "目标目录: {target_dir}\n"
+                "请按需使用 [LIST_DIR] / [READ_FILE] / [GIT_STATUS] / [GIT_DIFF] 收集信息，"
+                "重点识别真实风险而非样式问题，并输出：\n"
+                "1) 高风险问题（按严重级别排序）\n"
+                "2) 可能的行为回归点\n"
+                "3) 缺失的测试建议\n"
+                "4) 最小改动修复建议\n"
+                "如果未发现明显问题，请明确说明并给出残余风险。"
+            ),
+            "change_summary": (
+                "请执行变更说明工作流。\n"
+                "目标目录: {target_dir}\n"
+                "请优先使用 [GIT_STATUS] [GIT_DIFF] [GIT_LOG] 收集变更上下文，然后输出：\n"
+                "1) 本次改动摘要（面向开发者）\n"
+                "2) 用户可感知变化\n"
+                "3) 风险与回滚关注点\n"
+                "4) 建议的提交信息（Conventional Commits 风格）\n"
+                "5) 建议的验证清单\n"
+                "输出请简洁、可直接用于发布说明或 MR 描述。"
+            ),
+        }
+
+    def _write_default_workflow_file(self, templates):
+        payload = {
+            "version": 1,
+            "workflows": templates,
+        }
+        try:
+            with open(self.workflow_file, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            debug_print(f"[AI] Failed to write ai_workflows.json: {e}")
+
+    def _load_workflow_templates(self):
+        defaults = self._default_workflow_templates()
+        try:
+            if not os.path.exists(self.workflow_file):
+                self._write_default_workflow_file(defaults)
+                return defaults
+
+            with open(self.workflow_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            workflows = data.get('workflows') if isinstance(data, dict) else None
+            if not isinstance(workflows, dict):
+                self._write_default_workflow_file(defaults)
+                return defaults
+
+            merged = dict(defaults)
+            for key, value in workflows.items():
+                if isinstance(key, str) and isinstance(value, str) and value.strip():
+                    merged[key] = value
+            return merged
+        except Exception as e:
+            debug_print(f"[AI] Failed to load ai_workflows.json, using defaults: {e}")
+            return defaults
+
+    def _build_quick_workflow_prompt(self, workflow_key: str) -> str:
+        target_dir = self._get_action_base_dir()
+        template = self.workflow_templates.get(workflow_key, "") if isinstance(self.workflow_templates, dict) else ""
+        if not template:
+            return ""
+        try:
+            return template.format(target_dir=target_dir)
+        except Exception:
+            # 模板格式错误时回退默认模板
+            fallback = self._default_workflow_templates().get(workflow_key, "")
+            return fallback.format(target_dir=target_dir) if fallback else ""
+
+    def _run_quick_workflow(self, workflow_key: str):
+        name_map = {
+            'dir_audit': tr('目录巡检'),
+            'code_review': tr('代码审阅'),
+            'change_summary': tr('变更说明'),
+        }
+        prompt = self._build_quick_workflow_prompt(workflow_key)
+        if not prompt:
+            return
+        if self.submit_external_prompt(prompt):
+            show_toast(self, tr("提示"), tr("已启动工作流: {}").format(name_map.get(workflow_key, workflow_key)), level="info")
 
     def _show_context_menu(self, pos):
         """显示右键菜单（复制、全选等）。"""
@@ -10318,6 +10611,17 @@ class ChatPanel(QWidget):
                 tr("[LIST_DIR: 目录路径] 列出目录；\n") +
                 tr("[MKDIR: 目录路径] 创建目录；\n") +
                 tr("[DELETE: 路径] 删除文件或目录（需用户确认）。\n") +
+                tr("[GIT_STATUS: 仓库路径] 查看 git 状态；\n") +
+                tr("[GIT_DIFF: 仓库路径] 查看未提交 diff；\n") +
+                tr("[GIT_LOG: 仓库路径] 查看最近提交日志；\n") +
+                tr("[GIT_BRANCH: 仓库路径] 查看分支列表；\n") +
+                tr("[GIT_ADD: 仓库路径|目标] 暂存变更（需用户确认）；\n") +
+                tr("[GIT_COMMIT: 仓库路径|提交信息] 提交变更（需用户确认）；\n") +
+                tr("[GIT_SWITCH: 仓库路径|分支名] 切换分支（需用户确认）。\n") +
+                tr("[GIT_RESTORE: 仓库路径|目标] 还原工作区改动（需用户确认）；\n") +
+                tr("[GIT_RESET_SOFT: 仓库路径|目标提交] 软重置 HEAD（需用户确认）；\n") +
+                tr("[GIT_PULL: 仓库路径|远程|分支] 拉取远程更新（需用户确认）；\n") +
+                tr("[GIT_PUSH: 仓库路径|远程|分支] 推送本地提交（需用户确认）。\n") +
                 tr("路径使用 Windows 格式，例如 D:\\project\\src。\n") +
                 tr("可以在同一回复中包含多个操作命令。")
             )
@@ -10500,6 +10804,8 @@ class ChatPanel(QWidget):
                     tr("[PATCH_FILE: 路径|旧文本|新文本] 局部修改文件（修改已有文件时必须用此，禁止用 WRITE_FILE 覆盖已有大文件）；") +
                     tr("[LIST_DIR: 路径] 列目录（仅在不知道源码位置时使用）；") +
                     tr("[OPEN_DIR: 路径] [MKDIR: 路径] [WRITE_FILE: 路径|内容]（仅用于创建新文件） [DELETE: 路径]。\n") +
+                    tr("[GIT_STATUS: 路径] [GIT_DIFF: 路径] [GIT_LOG: 路径] [GIT_BRANCH: 路径] [GIT_ADD: 路径|目标] [GIT_COMMIT: 路径|提交信息] [GIT_SWITCH: 路径|分支名]。\n") +
+                    tr("[GIT_RESTORE: 路径|目标] [GIT_RESET_SOFT: 路径|目标提交] [GIT_PULL: 路径|远程|分支] [GIT_PUSH: 路径|远程|分支]。\n") +
                     tr("ℹ️ 工作原则：得到目录列表后尽快选择源代码文件直接阅读，") +
                     tr("而不要反复展开子目录；修改文件时优先使用 PATCH_FILE 安全替换具体代码段。\n") +
                     tr("⚠️ PATCH_FILE 最小改动规范：\n") +
@@ -10540,31 +10846,146 @@ class ChatPanel(QWidget):
     def dropEvent(self, event):
         """拖拽释放事件 - 读取文件内容"""
         if event.mimeData().hasUrls():
+            auto_analyze = not bool(self.input_box.toPlainText().strip())
+            loaded_files = []
+            loaded_dirs = []
             for url in event.mimeData().urls():
                 if url.isLocalFile():
-                    file_path = url.toLocalFile()
-                    self._read_and_display_file(file_path)
+                    local_path = url.toLocalFile()
+                    if os.path.isfile(local_path):
+                        if self._read_and_display_file(local_path):
+                            loaded_files.append(local_path)
+                    elif os.path.isdir(local_path):
+                        dir_preview = self._read_and_display_directory(local_path)
+                        if dir_preview:
+                            loaded_dirs.append((local_path, dir_preview))
                 else:
                     # 尝试从 URL 字符串中提取本地路径
                     url_str = url.toString()
                     if url_str.startswith('file:///'):
                         from urllib.parse import unquote
-                        file_path = unquote(url_str[8:])
-                        if os.name == 'nt' and file_path.startswith('/'):
-                            file_path = file_path[1:]
-                        self._read_and_display_file(file_path)
+                        local_path = unquote(url_str[8:])
+                        if os.name == 'nt' and local_path.startswith('/'):
+                            local_path = local_path[1:]
+                        if os.path.isfile(local_path):
+                            if self._read_and_display_file(local_path):
+                                loaded_files.append(local_path)
+                        elif os.path.isdir(local_path):
+                            dir_preview = self._read_and_display_directory(local_path)
+                            if dir_preview:
+                                loaded_dirs.append((local_path, dir_preview))
+
+            # 输入框为空时，自动发起分析；若用户已手打内容，则不打断用户操作
+            if auto_analyze and (loaded_files or loaded_dirs):
+                if loaded_dirs and not loaded_files:
+                    if len(loaded_dirs) == 1:
+                        dir_path, dir_preview = loaded_dirs[0]
+                        prompt = (
+                            f"请分析我刚拖拽的目录结构：{dir_path}\n"
+                            "请基于下面的目录结构预览输出：\n"
+                            "1) 目录分层概览\n2) 可能的核心模块\n3) 潜在风险点（过深目录/职责混杂/命名问题）\n"
+                            "4) 建议的阅读顺序与重构建议\n\n"
+                            f"目录结构预览:\n{dir_preview}"
+                        )
+                    else:
+                        dir_lines = "\n\n".join([f"目录: {p}\n{pv}" for p, pv in loaded_dirs[:3]])
+                        prompt = (
+                            f"请综合分析我刚拖拽的 {len(loaded_dirs)} 个目录结构。\n"
+                            "请输出：\n1) 各目录职责\n2) 共同结构模式\n3) 风险点\n4) 建议的查看优先级\n\n"
+                            f"目录结构预览:\n{dir_lines}"
+                        )
+                elif loaded_files and not loaded_dirs:
+                    if len(loaded_files) == 1:
+                        prompt = tr("请分析我刚拖拽的文件：{}\n请按以下结构输出：\n1) 文件用途\n2) 关键逻辑\n3) 风险点\n4) 建议下一步查看的相关文件").format(loaded_files[0])
+                    else:
+                        file_list = "\n".join(f"- {p}" for p in loaded_files[:8])
+                        prompt = tr("请综合分析我刚拖拽的 {} 个文件：\n{}\n请按以下结构输出：\n1) 文件分工\n2) 关键逻辑链路\n3) 主要风险点\n4) 建议的阅读顺序").format(len(loaded_files), file_list)
+                else:
+                    file_list = "\n".join(f"- {p}" for p in loaded_files[:6])
+                    dir_list = "\n\n".join([f"目录: {p}\n{pv}" for p, pv in loaded_dirs[:2]])
+                    prompt = (
+                        "请综合分析我刚拖拽的文件和目录。\n"
+                        "请输出：\n1) 文件与目录的关系\n2) 核心实现链路\n3) 风险点\n4) 建议阅读顺序\n\n"
+                        f"文件列表:\n{file_list}\n\n目录结构预览:\n{dir_list}"
+                    )
+                if self.submit_external_prompt(prompt):
+                    pass
             event.acceptProposedAction()
+
+    def _read_and_display_directory(self, dir_path):
+        """读取目录结构摘要并在聊天窗口中显示。返回用于 AI 提示词的结构文本。"""
+        if not os.path.isdir(dir_path):
+            return ""
+
+        max_depth = 2
+        max_total_entries = 180
+        max_entries_per_dir = 30
+        total_entries = 0
+        total_dirs = 0
+        total_files = 0
+        truncated = False
+        lines = []
+
+        def _walk(path, depth, indent):
+            nonlocal total_entries, total_dirs, total_files, truncated
+            if depth > max_depth or truncated:
+                return
+            try:
+                with os.scandir(path) as it:
+                    entries = sorted(list(it), key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+            except Exception as e:
+                lines.append(f"{indent}⚠ 无法读取: {e}")
+                return
+
+            if len(entries) > max_entries_per_dir:
+                visible_entries = entries[:max_entries_per_dir]
+                hidden = len(entries) - max_entries_per_dir
+            else:
+                visible_entries = entries
+                hidden = 0
+
+            for entry in visible_entries:
+                if total_entries >= max_total_entries:
+                    truncated = True
+                    break
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except Exception:
+                    is_dir = False
+                icon = "📁" if is_dir else "📄"
+                lines.append(f"{indent}{icon} {entry.name}")
+                total_entries += 1
+                if is_dir:
+                    total_dirs += 1
+                    _walk(entry.path, depth + 1, indent + "  ")
+                else:
+                    total_files += 1
+
+            if hidden > 0 and not truncated:
+                lines.append(f"{indent}... 其余 {hidden} 项省略")
+
+        root_name = os.path.basename(os.path.normpath(dir_path)) or dir_path
+        lines.append(f"📁 {root_name}")
+        _walk(dir_path, 0, "  ")
+
+        if truncated:
+            lines.append(f"... 已达到预览上限（最多 {max_total_entries} 项）")
+
+        preview = "\n".join(lines)
+        summary = f"目录: {dir_path}\n子目录: {total_dirs}，文件: {total_files}\n\n{preview}"
+        self.append_bubble("system", f"📁 目录结构预览\n{'='*50}\n{summary}")
+        return summary
     
     def _read_and_display_file(self, file_path):
         """读取文件并在聊天窗口中显示"""
         if not os.path.isfile(file_path):
             self.append_bubble("system", tr("❌ 文件不存在: {}").format(file_path))
-            return
+            return False
         
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
         if file_size_mb > 10:  # 超过10MB不读取
             self.append_bubble("system", tr("⚠️ 文件太大（{:.1f}MB），无法读取").format(file_size_mb))
-            return
+            return False
         
         try:
             # 尝试以 UTF-8 编码读取
@@ -10583,7 +11004,7 @@ class ChatPanel(QWidget):
                     content = f"[二进制文件，前 {len(raw)} 字节]\n{raw[:200]}"
                 except Exception as e:
                     self.append_bubble("system", tr("❌ 无法读取文件: {}").format(e))
-                    return
+                    return False
         
         # 截断长内容（超过5000字符）
         max_chars = 5000
@@ -10596,6 +11017,7 @@ class ChatPanel(QWidget):
         # 显示文件内容
         display_text = f"📄 {file_name}\n" + "="*50 + "\n" + content
         self.append_bubble("system", display_text)
+        return True
 
     # ── 聊天记录持久化 ──────────────────────────────────────────────────────────
     def _save_history(self):
@@ -10689,6 +11111,42 @@ class ChatPanel(QWidget):
             # 任何异常都按拒绝处理，确保安全
             return False
 
+    def _resolve_git_repo_dir(self, raw_path: str):
+        """解析 Git 操作目录，限制在当前目录范围内。"""
+        path, err = self._resolve_action_path(raw_path)
+        if err:
+            return None, err
+        repo_dir = path if os.path.isdir(path) else os.path.dirname(path)
+        if not repo_dir or not os.path.isdir(repo_dir):
+            return None, tr("❌ 目录不存在: {}").format(path)
+        return repo_dir, None
+
+    def _run_git_command(self, repo_dir: str, git_args: list, timeout_sec: int = 20):
+        """执行 Git 命令并返回 (ok, stdout, stderr)。"""
+        import shutil
+        import subprocess
+        if not shutil.which("git"):
+            return False, "", tr("未检测到 Git，请先安装 Git for Windows")
+        try:
+            proc = subprocess.run(
+                ["git", "-C", repo_dir] + list(git_args),
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=timeout_sec,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            )
+            stdout = (proc.stdout or "").strip()
+            stderr = (proc.stderr or "").strip()
+            if proc.returncode != 0:
+                return False, stdout, (stderr or tr("❌ Git 执行失败: {}").format(" ".join(git_args)))
+            return True, stdout, stderr
+        except subprocess.TimeoutExpired:
+            return False, "", tr("❌ Git 执行超时: {}").format(" ".join(git_args))
+        except Exception as e:
+            return False, "", tr("❌ Git 执行失败: {}").format(e)
+
     # ── 解析并执行 AI 操作命令 ────────────────────────────────────────────────
     def _apply_actions(self, content: str) -> tuple:
         """解析 AI 回复中的操作标记并按出现顺序执行。
@@ -10709,11 +11167,22 @@ class ChatPanel(QWidget):
             'LIST_DIR':   re.compile(r'\[LIST_DIR:\s*([^\]]+)\]'),
             'READ_FILE':  re.compile(r'\[READ_FILE:\s*([^\]]+)\]'),
             'MKDIR':      re.compile(r'\[MKDIR:\s*([^\]]+)\]'),
+            'GIT_STATUS': re.compile(r'\[GIT_STATUS:\s*([^\]]+)\]'),
+            'GIT_DIFF':   re.compile(r'\[GIT_DIFF:\s*([^\]]+)\]'),
+            'GIT_LOG':    re.compile(r'\[GIT_LOG:\s*([^\]]+)\]'),
+            'GIT_BRANCH': re.compile(r'\[GIT_BRANCH:\s*([^\]]+)\]'),
             # PATCH_FILE / WRITE_FILE 内容可含代码中的 ] (如 arr[i])，
             # 用 .*? + 行末 lookahead 确保只在真正的指令结束处停止
             'PATCH_FILE': re.compile(r'\[PATCH_FILE:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
             'WRITE_FILE': re.compile(r'\[WRITE_FILE:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
             'DELETE':     re.compile(r'\[DELETE:\s*([^\]]+)\]'),
+            'GIT_ADD':    re.compile(r'\[GIT_ADD:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
+            'GIT_COMMIT': re.compile(r'\[GIT_COMMIT:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
+            'GIT_SWITCH': re.compile(r'\[GIT_SWITCH:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
+            'GIT_RESTORE': re.compile(r'\[GIT_RESTORE:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
+            'GIT_RESET_SOFT': re.compile(r'\[GIT_RESET_SOFT:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
+            'GIT_PULL': re.compile(r'\[GIT_PULL:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
+            'GIT_PUSH': re.compile(r'\[GIT_PUSH:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
         }
         for atype, pat in patterns.items():
             for m in pat.finditer(content):
@@ -10963,6 +11432,230 @@ class ChatPanel(QWidget):
                     notes.append(tr("✅ 已删除{}: {}").format(type_label, path))
                 except Exception as e:
                     notes.append(tr("❌ 删除失败: {}（{}）").format(path, e))
+
+            # ── GIT_STATUS / GIT_DIFF / GIT_LOG / GIT_BRANCH ───────────────
+            elif atype in ('GIT_STATUS', 'GIT_DIFF', 'GIT_LOG', 'GIT_BRANCH'):
+                raw = m.group(1).strip()
+                repo_dir, err = self._resolve_git_repo_dir(raw)
+                if err:
+                    _emsg = tr("❌ Git 执行失败: {}").format(err)
+                    notes.append(_emsg)
+                    feedable.append(_emsg)
+                    continue
+
+                git_map = {
+                    'GIT_STATUS': (['status', '--short', '--branch'], tr("✅ Git 状态 ({})\n{}")),
+                    'GIT_DIFF': (['diff'], tr("✅ Git Diff ({})\n{}")),
+                    'GIT_LOG': (['log', '--oneline', '-n', '20'], tr("✅ Git Log ({})\n{}")),
+                    'GIT_BRANCH': (['branch', '--all', '--verbose', '--no-abbrev'], tr("✅ Git Branch ({})\n{}")),
+                }
+                args, fmt = git_map[atype]
+                ok, out, err_msg = self._run_git_command(repo_dir, args)
+                if ok:
+                    text = out if out else tr("⚠️ Git 无输出")
+                    if len(text) > 30000:
+                        text = text[:30000] + tr("\n\n【已截断 {} 个字符】").format(len(text) - 30000)
+                    msg = fmt.format(repo_dir, text)
+                    notes.append(msg)
+                    feedable.append(msg)
+                else:
+                    _emsg = tr("❌ Git 执行失败: {}").format(err_msg)
+                    notes.append(_emsg)
+                    feedable.append(_emsg)
+
+            # ── GIT_ADD ─────────────────────────────────────────────────────
+            elif atype == 'GIT_ADD':
+                raw = m.group(1)
+                parts = raw.split('|', 1)
+                if len(parts) < 2:
+                    notes.append(tr("❌ Git 指令格式应为 [GIT_ADD: 路径|目标]"))
+                    continue
+                repo_raw, target = parts[0].strip(), parts[1].strip() or '.'
+                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
+                if err:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err))
+                    continue
+                if not self._confirm_danger_action(
+                    tr("确认 Git 暂存"),
+                    tr("AI 请求暂存变更：\n仓库: {}\n目标: {}\n\n是否继续？").format(repo_dir, target)
+                ):
+                    notes.append(tr("⏸ 已取消 Git 暂存: {}").format(repo_dir))
+                    continue
+                ok, _, err_msg = self._run_git_command(repo_dir, ['add', '--', target])
+                if ok:
+                    notes.append(tr("✅ Git 已暂存 ({}) 目标: {}").format(repo_dir, target))
+                else:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
+
+            # ── GIT_COMMIT ──────────────────────────────────────────────────
+            elif atype == 'GIT_COMMIT':
+                raw = m.group(1)
+                parts = raw.split('|', 1)
+                if len(parts) < 2:
+                    notes.append(tr("❌ Git 指令格式应为 [GIT_COMMIT: 路径|提交信息]"))
+                    continue
+                repo_raw, commit_msg = parts[0].strip(), parts[1].strip()
+                if not commit_msg:
+                    notes.append(tr("❌ Git 指令格式应为 [GIT_COMMIT: 路径|提交信息]"))
+                    continue
+                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
+                if err:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err))
+                    continue
+                if not self._confirm_danger_action(
+                    tr("确认 Git 提交"),
+                    tr("AI 请求提交变更：\n仓库: {}\n提交信息: {}\n\n是否继续？").format(repo_dir, commit_msg)
+                ):
+                    notes.append(tr("⏸ 已取消 Git 提交: {}").format(repo_dir))
+                    continue
+                ok, out, err_msg = self._run_git_command(repo_dir, ['commit', '-m', commit_msg])
+                if ok:
+                    notes.append(tr("✅ Git 提交成功 ({})\n{}").format(repo_dir, out or tr("⚠️ Git 无输出")))
+                else:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
+
+            # ── GIT_SWITCH ──────────────────────────────────────────────────
+            elif atype == 'GIT_SWITCH':
+                raw = m.group(1)
+                parts = raw.split('|', 1)
+                if len(parts) < 2:
+                    notes.append(tr("❌ Git 指令格式应为 [GIT_SWITCH: 路径|分支名]"))
+                    continue
+                repo_raw, branch = parts[0].strip(), parts[1].strip()
+                if not branch:
+                    notes.append(tr("❌ Git 指令格式应为 [GIT_SWITCH: 路径|分支名]"))
+                    continue
+                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
+                if err:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err))
+                    continue
+                if not self._confirm_danger_action(
+                    tr("确认 Git 切换分支"),
+                    tr("AI 请求切换分支：\n仓库: {}\n分支: {}\n\n是否继续？").format(repo_dir, branch)
+                ):
+                    notes.append(tr("⏸ 已取消 Git 切换分支: {}").format(repo_dir))
+                    continue
+                ok, _, err_msg = self._run_git_command(repo_dir, ['switch', branch])
+                if ok:
+                    notes.append(tr("✅ Git 已切换到分支 ({}) -> {}").format(repo_dir, branch))
+                else:
+                    ok2, _, err_msg2 = self._run_git_command(repo_dir, ['checkout', branch])
+                    if ok2:
+                        notes.append(tr("✅ Git 已切换到分支 ({}) -> {}").format(repo_dir, branch))
+                    else:
+                        notes.append(tr("❌ Git 执行失败: {}").format(err_msg2 or err_msg))
+
+            # ── GIT_RESTORE ────────────────────────────────────────────────
+            elif atype == 'GIT_RESTORE':
+                raw = m.group(1)
+                parts = raw.split('|', 1)
+                if len(parts) < 2:
+                    notes.append(tr("❌ Git 指令格式应为 [GIT_RESTORE: 路径|目标]"))
+                    continue
+                repo_raw, target = parts[0].strip(), (parts[1].strip() or '.')
+                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
+                if err:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err))
+                    continue
+                if not self._confirm_danger_action(
+                    tr("确认 Git 还原"),
+                    tr("AI 请求还原工作区改动：\n仓库: {}\n目标: {}\n\n是否继续？").format(repo_dir, target)
+                ):
+                    notes.append(tr("⏸ 已取消 Git 还原: {}").format(repo_dir))
+                    continue
+                ok, _, err_msg = self._run_git_command(repo_dir, ['restore', '--', target])
+                if ok:
+                    notes.append(tr("✅ Git 已还原 ({}) 目标: {}").format(repo_dir, target))
+                else:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
+
+            # ── GIT_RESET_SOFT ─────────────────────────────────────────────
+            elif atype == 'GIT_RESET_SOFT':
+                raw = m.group(1)
+                parts = raw.split('|', 1)
+                repo_raw = parts[0].strip() if parts else ''
+                target = (parts[1].strip() if len(parts) > 1 else '') or 'HEAD~1'
+                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
+                if err:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err))
+                    continue
+                if not self._confirm_danger_action(
+                    tr("确认 Git 软重置"),
+                    tr("AI 请求软重置 HEAD：\n仓库: {}\n目标: {}\n\n是否继续？").format(repo_dir, target)
+                ):
+                    notes.append(tr("⏸ 已取消 Git 软重置: {}").format(repo_dir))
+                    continue
+                ok, _, err_msg = self._run_git_command(repo_dir, ['reset', '--soft', target])
+                if ok:
+                    notes.append(tr("✅ Git 软重置成功 ({}) -> {}").format(repo_dir, target))
+                else:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
+
+            # ── GIT_PULL ───────────────────────────────────────────────────
+            elif atype == 'GIT_PULL':
+                raw = m.group(1)
+                parts = [p.strip() for p in raw.split('|')]
+                if not parts or not parts[0]:
+                    notes.append(tr("❌ Git 执行失败: {}").format(tr("空路径")))
+                    continue
+                repo_raw = parts[0]
+                remote = parts[1] if len(parts) > 1 and parts[1] else ''
+                branch = parts[2] if len(parts) > 2 and parts[2] else ''
+                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
+                if err:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err))
+                    continue
+                if not self._confirm_danger_action(
+                    tr("确认 Git 拉取"),
+                    tr("AI 请求拉取远程更新：\n仓库: {}\n远程: {}\n分支: {}\n\n是否继续？").format(
+                        repo_dir, remote or '(default)', branch or '(default)'
+                    )
+                ):
+                    notes.append(tr("⏸ 已取消 Git 拉取: {}").format(repo_dir))
+                    continue
+                args = ['pull']
+                if remote:
+                    args.append(remote)
+                if branch:
+                    args.append(branch)
+                ok, out, err_msg = self._run_git_command(repo_dir, args, timeout_sec=60)
+                if ok:
+                    notes.append(tr("✅ Git 拉取成功 ({})\n{}").format(repo_dir, out or tr("⚠️ Git 无输出")))
+                else:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
+
+            # ── GIT_PUSH ───────────────────────────────────────────────────
+            elif atype == 'GIT_PUSH':
+                raw = m.group(1)
+                parts = [p.strip() for p in raw.split('|')]
+                if not parts or not parts[0]:
+                    notes.append(tr("❌ Git 执行失败: {}").format(tr("空路径")))
+                    continue
+                repo_raw = parts[0]
+                remote = parts[1] if len(parts) > 1 and parts[1] else ''
+                branch = parts[2] if len(parts) > 2 and parts[2] else ''
+                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
+                if err:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err))
+                    continue
+                if not self._confirm_danger_action(
+                    tr("确认 Git 推送"),
+                    tr("AI 请求推送本地提交：\n仓库: {}\n远程: {}\n分支: {}\n\n是否继续？").format(
+                        repo_dir, remote or '(default)', branch or '(default)'
+                    )
+                ):
+                    notes.append(tr("⏸ 已取消 Git 推送: {}").format(repo_dir))
+                    continue
+                args = ['push']
+                if remote:
+                    args.append(remote)
+                if branch:
+                    args.append(branch)
+                ok, out, err_msg = self._run_git_command(repo_dir, args, timeout_sec=60)
+                if ok:
+                    notes.append(tr("✅ Git 推送成功 ({})\n{}").format(repo_dir, out or tr("⚠️ Git 无输出")))
+                else:
+                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
 
         if notes:
             content = content + "\n\n" + "\n".join(notes)
@@ -12017,6 +12710,22 @@ class MainWindow(QMainWindow):
             # 更新当前目录提示
             self.update_chat_context()
             self.chat_panel.input_box.setFocus()
+
+    def send_prompt_to_ai(self, prompt: str) -> bool:
+        """确保 AI 面板可见并发送一条预置提示词。"""
+        cfg = self.config.get("ai_chat", {})
+        if not cfg.get("enabled", False):
+            show_toast(self, tr("提示"), tr("AI 助手未启用，请先在设置中开启"), level="warning")
+            return False
+        self._ensure_chat_panel_created()
+        if not self.chat_panel.isVisible():
+            self.toggle_chat_panel()
+        self.update_chat_context()
+        try:
+            return bool(self.chat_panel.submit_external_prompt(prompt))
+        except Exception as e:
+            show_toast(self, tr("错误"), tr("❌ 请求失败: {}").format(e), level="error")
+            return False
 
     def toggle_split_view(self):
         """切换左右分屏：把当前标签移动到右侧标签组；再次触发则把右侧标签移回左侧并关闭分屏。
@@ -16408,7 +17117,7 @@ class SettingsDialog(QDialog):
         ai_layout.addWidget(sp_label)
         self.ai_system_prompt_edit = _PE()
         self.ai_system_prompt_edit.setFixedHeight(56)
-        self.ai_system_prompt_edit.setPlaceholderText(tr("留空则使用内置提示词（支持 [OPEN_DIR:] 和 [RUN_SCRIPT:] 指令）"))
+        self.ai_system_prompt_edit.setPlaceholderText(tr("留空则使用内置提示词（支持文件、目录、脚本与 Git 指令）"))
         self.ai_system_prompt_edit.setPlainText(config.get("ai_chat", {}).get("system_prompt", ""))
         ai_layout.addWidget(self.ai_system_prompt_edit)
         # 面板宽度
