@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.68"
+APP_VERSION = "3.69"
 
 
 # TabEx i18n module
@@ -210,6 +210,8 @@ _LANG_EN = {
     "设置从路径栏拷贝时使用的分隔符": "Separator used when copying from path bar",
     "Explorer监听设置": "Explorer Monitor",
     "监听新Explorer窗口": "Monitor New Explorer Windows",
+    "显示底部状态栏（状态/CPU信息）": "Show Bottom Status Bar (Status/CPU)",
+    "显示或隐藏每个标签页底部的状态栏（含状态文本、取消按钮和CPU/内存信息）": "Show or hide the bottom status bar for each tab (status text, cancel button, and CPU/memory info)",
     "状态栏显示 CPU/内存占用": "Show CPU/Memory in Status Bar",
     "内存": "Mem",
     "在状态栏右侧实时显示整机 CPU 与内存占用，每2秒刷新": "Show system-wide CPU and memory on the right of the status bar, refreshed every 2s",
@@ -6081,22 +6083,44 @@ class FileExplorerTab(QWidget):
                     if drive_match:
                         local_path = self._normalize_local_path(drive_match.group(1))
                 current_path = self._normalize_local_path(getattr(self, 'current_path', ''))
+                shell_activation_alive = False
                 if local_path and local_path != current_path:
+                    if self._is_mycomputer_shell_target(current_path):
+                        allow_until = float(getattr(self, '_shell_item_activation_until', 0.0) or 0.0)
+                        now = time.monotonic()
+                        if allow_until <= now:
+                            debug_print(
+                                f"[Keepalive] REJECT shell->local '{local_path}' "
+                                f"reason=no-user-activation current='{current_path}'"
+                            )
+                            self._keepalive_candidate_path = None
+                            self._keepalive_candidate_count = 0
+                            return
+                        remain_ms = int((allow_until - now) * 1000.0)
+                        debug_print(
+                            f"[Keepalive] ALLOW shell->local candidate '{local_path}' "
+                            f"reason=user-activation remain={remain_ms}ms"
+                        )
+                        shell_activation_alive = True
                     # shell 虚拟路径（如此电脑）下，LocationURL 可能短暂返回上一次文件路径。
                     # 这里要求同一候选路径连续出现两次再纠正，避免瞬态误判导致路径回跳。
                     if str(current_path).lower().startswith('shell:'):
-                        candidate = getattr(self, '_keepalive_candidate_path', None)
-                        count = int(getattr(self, '_keepalive_candidate_count', 0) or 0)
-                        if candidate == local_path:
-                            count += 1
+                        if shell_activation_alive:
+                            self._keepalive_candidate_path = None
+                            self._keepalive_candidate_count = 0
                         else:
-                            candidate = local_path
-                            count = 1
-                        self._keepalive_candidate_path = candidate
-                        self._keepalive_candidate_count = count
-                        if count < 2:
-                            debug_print(f"[Keepalive] Candidate path from shell view: {local_path!r} (count={count})")
-                            return
+                            candidate = getattr(self, '_keepalive_candidate_path', None)
+                            count = int(getattr(self, '_keepalive_candidate_count', 0) or 0)
+                            if candidate == local_path:
+                                count += 1
+                            else:
+                                candidate = local_path
+                                count = 1
+                            self._keepalive_candidate_path = candidate
+                            self._keepalive_candidate_count = count
+                            if count < 2:
+                                debug_print(f"[Keepalive] Candidate path from shell view: {local_path!r} (count={count})")
+                                return
                     else:
                         self._keepalive_candidate_path = None
                         self._keepalive_candidate_count = 0
@@ -6111,6 +6135,7 @@ class FileExplorerTab(QWidget):
                     self.current_path = local_path
                     if hasattr(self, 'path_bar') and self.path_bar:
                         self.path_bar.set_path(local_path)
+                    self._force_details_view_for_local_path(local_path)
                     self.update_tab_title()
                     self._schedule_status_update(track_selection=True)
                     if not getattr(self, '_navigating_programmatically', False) and hasattr(self, '_add_to_history'):
@@ -6175,6 +6200,22 @@ class FileExplorerTab(QWidget):
                 current_path = self._normalize_local_path(self.current_path)
 
                 if local_path and local_path != current_path:
+                    if self._is_mycomputer_shell_target(current_path):
+                        allow_until = float(getattr(self, '_shell_item_activation_until', 0.0) or 0.0)
+                        now = time.monotonic()
+                        if allow_until <= now:
+                            debug_print(
+                                f"[PathSync] REJECT shell->local '{local_path}' "
+                                f"reason=no-user-activation current='{current_path}'"
+                            )
+                            return
+                        remain_ms = int((allow_until - now) * 1000.0)
+                        debug_print(
+                            f"[PathSync] ACCEPT shell->local '{local_path}' "
+                            f"reason=user-activation remain={remain_ms}ms"
+                        )
+                        # 仅允许消费一次，避免旧事件连锁放行。
+                        self._clear_shell_item_activation("path-sync-accept")
                     # 程序化导航期间（Navigate2 已发出但 Shell.Explorer 尚未完成），
                     # LocationURL 可能仍返回旧路径，此时不回写，避免路径栏倒退。
                     # NavigateComplete2 信号会在导航真正完成后更新路径。
@@ -6191,6 +6232,7 @@ class FileExplorerTab(QWidget):
                     self.current_path = local_path
                     if hasattr(self, 'path_bar'):
                         self.path_bar.set_path(local_path)
+                    self._force_details_view_for_local_path(local_path)
                     self.update_tab_title()
                     self._schedule_status_update(track_selection=True)
                     # 只在非程序化导航时添加到历史记录
@@ -6363,11 +6405,16 @@ class FileExplorerTab(QWidget):
         status_row.addWidget(self.status_bar, 1)
         status_row.addWidget(self.resource_label, 0)
         layout.addLayout(status_row)
+        self._bottom_statusbar_visible = True
+        self.set_bottom_statusbar_visible(
+            bool(getattr(getattr(self, 'main_window', None), 'config', {}).get('show_bottom_statusbar', True))
+        )
 
         
         # 异步加载相关
         self.folder_checker = None  # 文件夹大小检查线程
         self.pending_navigation = None  # 待处理的导航请求
+
         # 慢盘异步导航状态：_nav_in_progress 表示后台 PIDL 解析未完成（用于显示 loading
         # 与拦截重复点击）；_nav_in_progress_path 记录当前正在解析的目标路径。
         self._nav_in_progress = False
@@ -6437,6 +6484,28 @@ class FileExplorerTab(QWidget):
         # 初始导航到当前路径（在setup_ui最后调用，确保所有设置已应用）
         self.explorer.dynamicCall('Navigate(const QString&)', QDir.toNativeSeparators(self.current_path))
 
+    def set_bottom_statusbar_visible(self, visible):
+        """显示/隐藏标签页底部状态栏（状态文本、取消按钮、资源信息）。"""
+        visible = bool(visible)
+        self._bottom_statusbar_visible = visible
+        if hasattr(self, 'status_bar') and self.status_bar:
+            self.status_bar.setVisible(visible)
+        if hasattr(self, 'cancel_file_op_btn') and self.cancel_file_op_btn:
+            if visible and getattr(self, '_file_op_worker', None) and self._file_op_worker.isRunning():
+                self.cancel_file_op_btn.show()
+            else:
+                self.cancel_file_op_btn.hide()
+        if hasattr(self, 'resource_label') and self.resource_label:
+            if not visible:
+                self.resource_label.hide()
+                return
+            mw = getattr(self, 'main_window', None)
+            show_res = bool(mw and mw.config.get("show_resource_usage_in_statusbar", False))
+            if show_res and self.resource_label.text().strip():
+                self.resource_label.show()
+            else:
+                self.resource_label.hide()
+
     def _on_async_nav_started(self, path):
         """慢盘异步导航开始：显示 loading 并进入导航中锁定状态。"""
         self._nav_in_progress = True
@@ -6480,6 +6549,22 @@ class FileExplorerTab(QWidget):
             self._expected_nav_is_shell = False
             self._expected_nav_until = 0.0
 
+    def _mark_shell_item_activation(self, ttl_sec=2.5):
+        """标记用户刚在“此电脑”内激活了一个条目（通常是盘符）。"""
+        try:
+            self._shell_item_activation_until = time.monotonic() + float(ttl_sec)
+            remain_ms = int(max(0.0, (self._shell_item_activation_until - time.monotonic()) * 1000.0))
+            debug_print(f"[ShellActivation] armed ttl={remain_ms}ms")
+        except Exception:
+            self._shell_item_activation_until = 0.0
+            debug_print("[ShellActivation] arm failed, reset to 0")
+
+    def _clear_shell_item_activation(self, reason=""):
+        """清理“此电脑条目激活”许可窗口。"""
+        self._shell_item_activation_until = 0.0
+        if reason:
+            debug_print(f"[ShellActivation] cleared reason={reason}")
+
     def _should_accept_nav_completion(self, local_path, raw_url):
         """判断本次导航完成事件是否应被接收。"""
         exp = getattr(self, '_expected_nav_path', None)
@@ -6499,9 +6584,28 @@ class FileExplorerTab(QWidget):
         if exp_is_shell:
             # 期望是 shell 目标时，短窗口内拒绝 file 路径完成，避免“此电脑 -> D:\”回跳。
             if local_path is not None:
+                if self._is_mycomputer_shell_target(exp):
+                    allow_until = float(getattr(self, '_shell_item_activation_until', 0.0) or 0.0)
+                    now = time.monotonic()
+                    if allow_until > now:
+                        remain_ms = int((allow_until - now) * 1000.0)
+                        debug_print(
+                            f"[ShellActivation] ACCEPT shell->local '{local_path}' "
+                            f"reason=user-item-activation remain={remain_ms}ms exp='{exp}' raw='{raw}'"
+                        )
+                        self._expected_nav_path = None
+                        self._expected_nav_is_shell = False
+                        self._expected_nav_until = 0.0
+                        self._clear_shell_item_activation("accept-shell-to-local")
+                        return True
+                    debug_print(
+                        f"[ShellActivation] REJECT shell->local '{local_path}' "
+                        f"reason=activation-expired exp='{exp}' raw='{raw}'"
+                    )
                 debug_print(f"[NavigateComplete2] Ignored stale file completion during shell target: {local_path}")
                 return False
             if raw.startswith('shell:') or '::' in raw:
+                debug_print(f"[ShellActivation] keep shell completion accepted raw='{raw}'")
                 self._expected_nav_path = None
                 self._expected_nav_is_shell = False
                 self._expected_nav_until = 0.0
@@ -6539,6 +6643,9 @@ class FileExplorerTab(QWidget):
                 url = str(args[-1])
             if not url:
                 return
+            # 每次进入“此电脑”都强制切换到平铺视图。
+            if self._is_mycomputer_shell_target(url):
+                self._force_tile_view_for_this_pc()
             local_path = None
             if url.startswith('file:'):
                 # 统一解析 file: URL，正确还原本地盘符路径与 UNC 网络路径。
@@ -6563,6 +6670,30 @@ class FileExplorerTab(QWidget):
                     local_path = self._normalize_local_path(drive_match.group(1))
                     debug_print(f"[NavigateComplete2] Extracted drive path from CLSID URL: {local_path}")
             if local_path is not None:
+                # 保护“此电脑”场景：没有明确用户激活时，不接受 shell->盘符的意外完成。
+                current_before = self._normalize_local_path(getattr(self, 'current_path', ''))
+                if self._is_mycomputer_shell_target(current_before):
+                    exp_path = getattr(self, '_expected_nav_path', None)
+                    exp_is_shell = bool(getattr(self, '_expected_nav_is_shell', False))
+                    expecting_local_target = bool(exp_path) and (not exp_is_shell)
+                    if not expecting_local_target:
+                        allow_until = float(getattr(self, '_shell_item_activation_until', 0.0) or 0.0)
+                        now = time.monotonic()
+                        if allow_until <= now:
+                            debug_print(
+                                f"[ShellActivation] REJECT nav-complete shell->local '{local_path}' "
+                                f"reason=no-user-activation current='{current_before}'"
+                            )
+                            return
+                        remain_ms = int((allow_until - now) * 1000.0)
+                        debug_print(
+                            f"[ShellActivation] ACCEPT nav-complete shell->local '{local_path}' "
+                            f"reason=user-item-activation remain={remain_ms}ms"
+                        )
+                        # 已确认用户意图：清空 shell 期望，避免后续 _should_accept 再次误拒绝。
+                        self._expected_nav_path = None
+                        self._expected_nav_is_shell = False
+                        self._expected_nav_until = 0.0
                 if not self._should_accept_nav_completion(local_path, url):
                     return
                 current = self._normalize_local_path(getattr(self, 'current_path', ''))
@@ -6583,6 +6714,7 @@ class FileExplorerTab(QWidget):
                     self.path_bar.set_path(local_path)
                 # 导航真正完成：解除慢盘异步导航的“导航中”锁定并隐藏 loading
                 self._clear_async_nav_lock()
+                self._force_details_view_for_local_path(local_path)
                 # 延迟安装/更新 IExplorerBrowser 双击钩子（SysListView32 在首次导航后才创建）
                 QTimer.singleShot(200, self._install_listview_dblclick_hook)
                 if local_path and local_path != current:
@@ -6601,9 +6733,114 @@ class FileExplorerTab(QWidget):
                                 self.main_window.update_chat_context()
                         except Exception:
                             pass
+                    self._clear_shell_item_activation("nav-complete-committed")
                     debug_print(f"[NavigateComplete2] Path updated: {local_path}")
         except Exception as ex:
             debug_print(f"[NavigateComplete2] Error: {ex}")
+
+    def _is_mycomputer_shell_target(self, raw_path_or_url):
+        """判断目标是否为“此电脑”（shell:MyComputerFolder）。"""
+        s = str(raw_path_or_url or '').strip().lower()
+        if not s:
+            return False
+        if s == 'shell:mycomputerfolder':
+            return True
+        # This PC CLSID
+        return '{20d04fe0-3aea-1069-a2d8-08002b30309d}' in s
+
+    def _set_ieb_current_view_mode(self, view_mode):
+        """通过 IFolderView::SetCurrentViewMode 设置 IExplorerBrowser 视图模式。"""
+        try:
+            if not isinstance(self.explorer, IExplorerBrowserWidget):
+                return False
+            if not getattr(self.explorer, '_browser', None):
+                return False
+
+            from comtypes import GUID as _GUID
+            iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
+            ppv_sv = self.explorer._browser.GetCurrentView(ctypes.byref(iid_sv))
+            sv_ptr = int(ppv_sv) if ppv_sv else 0
+            if not sv_ptr:
+                return False
+
+            _vp_size = ctypes.sizeof(ctypes.c_void_p)
+            try:
+                # QI(IShellView -> IFolderView)
+                iid_fv = _GUID("{CDE725B0-CCC9-4519-917E-325D72FAB4CE}")
+                vtable_ptr = ctypes.c_void_p.from_address(sv_ptr).value
+                qi_addr = ctypes.c_void_p.from_address(vtable_ptr).value
+                _QI = ctypes.WINFUNCTYPE(
+                    ctypes.c_long,
+                    ctypes.c_void_p,
+                    ctypes.POINTER(type(iid_fv)),
+                    ctypes.POINTER(ctypes.c_void_p),
+                )
+                qi_fn = _QI(qi_addr)
+
+                fv_ptr = ctypes.c_void_p(0)
+                hr_qi = qi_fn(sv_ptr, ctypes.byref(iid_fv), ctypes.byref(fv_ptr))
+                if hr_qi != 0 or not fv_ptr.value:
+                    return False
+
+                try:
+                    # IFolderView vtable: QI(0), AddRef(1), Release(2),
+                    # GetCurrentViewMode(3), SetCurrentViewMode(4)
+                    fv_vtbl = ctypes.c_void_p.from_address(fv_ptr.value).value
+                    set_mode_addr = ctypes.c_void_p.from_address(fv_vtbl + 4 * _vp_size).value
+                    _SET_VIEW_MODE = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint)
+                    hr_set = _SET_VIEW_MODE(set_mode_addr)(fv_ptr.value, int(view_mode))
+                    return hr_set == 0
+                finally:
+                    rel_addr = ctypes.c_void_p.from_address(fv_vtbl + 2 * _vp_size).value
+                    _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                    _REL(rel_addr)(fv_ptr.value)
+            finally:
+                sv_vtbl = ctypes.c_void_p.from_address(sv_ptr).value
+                rel_addr = ctypes.c_void_p.from_address(sv_vtbl + 2 * _vp_size).value
+                _REL = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                _REL(rel_addr)(sv_ptr)
+        except Exception as e:
+            debug_print(f"[ViewMode] _set_ieb_current_view_mode error: {e}")
+            return False
+
+    def _force_tile_view_for_this_pc(self):
+        """将“此电脑”视图强制切换到平铺（FVM_TILE=6）。"""
+        FVM_TILE = 6
+        delays_ms = (0, 140, 320, 620, 980, 1450)
+
+        def _try_force():
+            ok = self._set_ieb_current_view_mode(FVM_TILE)
+            debug_print(f"[ViewMode] force tile attempt ok={ok}")
+
+        for d in delays_ms:
+            QTimer.singleShot(d, _try_force)
+
+    def _force_details_view_for_local_path(self, local_path):
+        """进入本地/UNC目录时强制详细视图（FVM_DETAILS=4）。"""
+        try:
+            p = self._normalize_local_path(local_path)
+            s = str(p or '')
+            if not s:
+                return
+            # 仅对真实文件系统路径生效；shell:MyComputerFolder 仍保持平铺模式。
+            if s.startswith('shell:') or '::' in s:
+                return
+            is_drive = len(s) >= 3 and s[1:3] in (':\\', ':/')
+            is_unc = s.startswith('\\\\') or s.startswith('//')
+            if not (is_drive or is_unc):
+                return
+        except Exception:
+            return
+
+        FVM_DETAILS = 4
+        delays_ms = (0, 120, 280, 520)
+
+        def _try_force():
+            ok = self._set_ieb_current_view_mode(FVM_DETAILS)
+            debug_print(f"[ViewMode] force details attempt ok={ok} path='{local_path}'")
+
+        for d in delays_ms:
+            QTimer.singleShot(d, _try_force)
 
     def event(self, e):
         # 捕获QAxWidget的NavigateComplete2事件（MetaCall备用通道，type=43）
@@ -7665,6 +7902,9 @@ class FileExplorerTab(QWidget):
                         # “双击 D 盘进入后又立即退回此电脑”的抖动。
                         _tab_at_click = _get_current_tab()
                         _path_at_click = getattr(_tab_at_click, 'current_path', None) if _tab_at_click else None
+                        if _tab_at_click and _tab_at_click._is_mycomputer_shell_target(_path_at_click):
+                            _tab_at_click._mark_shell_item_activation(ttl_sec=1.6)
+                            debug_print("[ShellActivation] tentative arm from low-level dblclick on MyComputer")
 
                         def _check(_px=px, _py=py, _path_at_click=_path_at_click):
                             try:
@@ -7704,6 +7944,8 @@ class FileExplorerTab(QWidget):
                                         res = ctypes.windll.user32.SendMessageW(
                                             lv, 0x1012, 0, ctypes.byref(hi))
                                         if int(res) != -1:
+                                            if tab._is_mycomputer_shell_target(getattr(tab, 'current_path', '')):
+                                                tab._mark_shell_item_activation()
                                             tab._suppress_auto_refresh = False
                                             tab._resume_path_sync_after_navigation()
                                             return
@@ -7715,6 +7957,8 @@ class FileExplorerTab(QWidget):
                                     return
 
                                 debug_print("[DoubleClick/IEB] Blank area → go_up")
+                                if tab._is_mycomputer_shell_target(getattr(tab, 'current_path', '')):
+                                    tab._clear_shell_item_activation("blank-dblclick-go-up")
                                 tab.go_up(force=True)
                             except Exception as _e:
                                 debug_print(f"[DoubleClick/IEB] check: {_e}")
@@ -7839,11 +8083,16 @@ class FileExplorerTab(QWidget):
                     # False = 点在空白区，触发 go_up
                     double_click_pos = QCursor.pos()
                     path_before = getattr(self, 'current_path', None)
+                    if self._is_mycomputer_shell_target(path_before):
+                        self._mark_shell_item_activation(ttl_sec=1.6)
+                        debug_print("[ShellActivation] tentative arm from Qt dblclick on MyComputer")
 
                     if HAS_PYWIN:
                         hit = self._native_listview_hit_test(double_click_pos.x(), double_click_pos.y())
                         debug_print(f"[DoubleClick] hit-test={hit}, path_before='{path_before}'")
                         if hit:
+                            if self._is_mycomputer_shell_target(path_before):
+                                self._mark_shell_item_activation()
                             # 点中了项目，让 Explorer 自己处理（打开文件夹/文件）
                             # 无论是否能立即检测到选中项，都启动路径同步定时器，
                             # 确保进入子目录后地址栏及时更新（Explorer可能在双击瞬间已清除选中状态）
@@ -7867,6 +8116,8 @@ class FileExplorerTab(QWidget):
                                     if cnt and int(cnt) > 0:
                                         return
                                     debug_print(f"[DoubleClick] Blank area confirmed, executing go_up")
+                                    if self._is_mycomputer_shell_target(getattr(self, 'current_path', '')):
+                                        self._clear_shell_item_activation("qt-blank-dblclick-go-up")
                                     self.go_up(force=True)
                                 except Exception as e:
                                     debug_print(f"[DoubleClick] go_up exception: {e}")
@@ -8000,6 +8251,8 @@ class FileExplorerTab(QWidget):
         # 判断是否为盘符根目录，导航到"此电脑"
         if path.endswith(":\\") or path.endswith(":/"):
             debug_print(f"[go_up] Root directory, navigate to MyComputer")
+            # 避免残留许可窗口把“回到此电脑”又立即放行回盘符。
+            self._clear_shell_item_activation("go_up-root-to-mycomputer")
             self.navigate_to('shell:MyComputerFolder', is_shell=True, skip_async_check=True)
             return
         
@@ -8047,6 +8300,8 @@ class FileExplorerTab(QWidget):
         self.history_index = -1
         # 标志：是否正在程序化导航（用于防止sync时重复添加历史）
         self._navigating_programmatically = False
+        # “此电脑”内项目激活许可窗口：仅在窗口内允许 shell -> 盘符切换。
+        self._shell_item_activation_until = 0.0
         # 用于跟踪待处理的双击检查定时器
         self._pending_double_click_timers = []
         # 双击事件唯一ID，用于区分不同的双击操作
@@ -8112,7 +8367,10 @@ class FileExplorerTab(QWidget):
             # 延迟首次导航：仅在路径栏显示占位路径，暂存导航参数；
             # 不创建 IExplorerBrowser、不导航、不 scandir、不 overlay 预加载，
             # 直到该标签首次可见（showEvent）时才真正导航。
-            self._deferred_nav = (self.current_path, is_shell)
+            deferred_is_shell = bool(
+                is_shell or str(self.current_path).lower().startswith('shell:')
+            )
+            self._deferred_nav = (self.current_path, deferred_is_shell)
             if hasattr(self, 'path_bar') and self.path_bar:
                 try:
                     self.path_bar.set_path(self.current_path)
@@ -8340,6 +8598,8 @@ class FileExplorerTab(QWidget):
             self.current_path = path
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(path)
+            if self._is_mycomputer_shell_target(path):
+                self._force_tile_view_for_this_pc()
             self.update_tab_title()
             # 添加到历史记录
             if add_to_history:
@@ -9165,7 +9425,10 @@ class FileExplorerTab(QWidget):
         if hasattr(self, 'cancel_file_op_btn') and self.cancel_file_op_btn:
             self.cancel_file_op_btn.setText(tr("取消"))
             self.cancel_file_op_btn.setEnabled(True)
-            self.cancel_file_op_btn.show()
+            if getattr(self, '_bottom_statusbar_visible', True):
+                self.cancel_file_op_btn.show()
+            else:
+                self.cancel_file_op_btn.hide()
         if op_type == 'copy':
             show_toast(self, tr("提示"), tr("后台复制已开始，可继续操作其他标签页（Alt+Q 可取消）"), level="info", duration=2600)
         elif op_type == 'delete':
@@ -12971,6 +13234,8 @@ class MainWindow(QMainWindow):
             # 大量 IExplorerBrowser 同时创建/导航导致的 CPU 洪峰。
             tab = FileExplorerTab(self, path, is_shell=is_shell, select_file=select_file,
                                   defer_nav=(not activate))
+            if hasattr(tab, 'set_bottom_statusbar_visible'):
+                tab.set_bottom_statusbar_visible(self.config.get("show_bottom_statusbar", True))
         except Exception as e:
             debug_print(f"[MainWindow] Failed to create embedded explorer tab for '{path}': {e}")
             try:
@@ -14691,6 +14956,8 @@ class MainWindow(QMainWindow):
                         is_shell = path.startswith('shell:')
                         # 懒加载：固定标签也延迟首次导航，避免启动瞬间多个 Shell 视图同时创建
                         tab = FileExplorerTab(self, path, is_shell=is_shell, defer_nav=True)
+                        if hasattr(tab, 'set_bottom_statusbar_visible'):
+                            tab.set_bottom_statusbar_visible(self.config.get("show_bottom_statusbar", True))
                         tab.is_pinned = True
                         short = path[-12:] if len(path) > 12 else path
                         pin_prefix = "📌"
@@ -14787,6 +15054,7 @@ class MainWindow(QMainWindow):
         # 状态栏右侧 CPU/内存占用显示（默认关闭，可在设置中开启）
         self._resource_usage_timer = QTimer(self)
         self._resource_usage_timer.timeout.connect(self._update_resource_usage_display)
+        self.apply_bottom_statusbar_config()
         self.apply_resource_usage_config()
 
         
@@ -14821,6 +15089,7 @@ class MainWindow(QMainWindow):
             "resource_snapshot_logging": False,  # 默认关闭运行资源快照日志
             "resource_snapshot_interval_ms": HOUSEKEEPING_INTERVAL_MS,
             "file_op_max_workers": 0,  # 后台文件操作并发数：0=自动
+            "show_bottom_statusbar": True,  # 默认显示底部状态栏（状态/CPU信息区域）
             "show_resource_usage_in_statusbar": False,  # 默认关闭状态栏右侧 CPU/内存占用显示
             "pinned_tabs": [],  # 默认没有固定标签页
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
@@ -15222,7 +15491,8 @@ class MainWindow(QMainWindow):
         timer = getattr(self, '_resource_usage_timer', None)
         if timer is None:
             return
-        enabled = self.config.get("show_resource_usage_in_statusbar", False)
+        enabled = self.config.get("show_resource_usage_in_statusbar", False) and \
+            self.config.get("show_bottom_statusbar", True)
         if enabled:
             if not timer.isActive():
                 timer.start(2000)  # 每2秒刷新一次，足够直观又低开销
@@ -15238,9 +15508,21 @@ class MainWindow(QMainWindow):
                     lbl.hide()
                     lbl.setText("")
 
+    def apply_bottom_statusbar_config(self):
+        """根据配置显示/隐藏所有标签页底部状态栏。"""
+        visible = bool(self.config.get("show_bottom_statusbar", True))
+        for _tw, cs in self._all_groups():
+            if cs is None:
+                continue
+            for i in range(cs.count()):
+                tab = cs.widget(i)
+                if tab and hasattr(tab, 'set_bottom_statusbar_visible'):
+                    tab.set_bottom_statusbar_visible(visible)
+
     def _update_resource_usage_display(self):
         """显示整机 CPU/内存占用到当前活动标签的资源标签上，占用过高时变色预警。"""
-        if not self.config.get("show_resource_usage_in_statusbar", False):
+        if (not self.config.get("show_resource_usage_in_statusbar", False) or
+                not self.config.get("show_bottom_statusbar", True)):
             return
 
         def _color(pct):
@@ -15263,7 +15545,7 @@ class MainWindow(QMainWindow):
         text = f"{cpu_html}&nbsp;&nbsp;&nbsp;{mem_html}".strip()
         tab = self.get_current_tab_widget()
         lbl = getattr(tab, 'resource_label', None) if tab else None
-        if lbl:
+        if lbl and getattr(tab, '_bottom_statusbar_visible', True):
             lbl.setText(text)
             lbl.show()
 
@@ -16736,6 +17018,11 @@ class SettingsDialog(QDialog):
         self.resource_usage_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.resource_usage_cb.setToolTip(tr("在状态栏右侧实时显示整机 CPU 与内存占用，每2秒刷新"))
         monitor_layout.addWidget(self.resource_usage_cb)
+        self.bottom_statusbar_cb = QCheckBox(tr("显示底部状态栏（状态/CPU信息）"), self)
+        self.bottom_statusbar_cb.setChecked(config.get("show_bottom_statusbar", True))
+        self.bottom_statusbar_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.bottom_statusbar_cb.setToolTip(tr("显示或隐藏每个标签页底部的状态栏（含状态文本、取消按钮和CPU/内存信息）"))
+        monitor_layout.addWidget(self.bottom_statusbar_cb)
         # 监听间隔设置
         interval_layout = QHBoxLayout()
         interval_layout.addWidget(QLabel(tr("监听间隔（秒）:")))
@@ -17313,6 +17600,7 @@ class SettingsDialog(QDialog):
             self.parent().config["resource_snapshot_logging"] = self.resource_snapshot_logging_cb.isChecked()
             self.parent().config["resource_snapshot_interval_ms"] = self.resource_snapshot_interval_spin.value() * 60 * 1000
             self.parent().config["file_op_max_workers"] = self.file_op_workers_spin.value()
+            self.parent().config["show_bottom_statusbar"] = self.bottom_statusbar_cb.isChecked()
             self.parent().config["show_resource_usage_in_statusbar"] = self.resource_usage_cb.isChecked()
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
@@ -17355,6 +17643,8 @@ class SettingsDialog(QDialog):
             set_explorer_monitor_debug(self.parent().config.get("explorer_monitor_debug", False))
             if hasattr(self.parent(), '_housekeeping_timer') and self.parent()._housekeeping_timer:
                 self.parent()._housekeeping_timer.start(self.parent()._get_housekeeping_interval_ms())
+            if hasattr(self.parent(), 'apply_bottom_statusbar_config'):
+                self.parent().apply_bottom_statusbar_config()
             if hasattr(self.parent(), 'apply_resource_usage_config'):
                 self.parent().apply_resource_usage_config()
             self.parent().apply_tortoisegit_buttons_config()
