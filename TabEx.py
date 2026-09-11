@@ -6,7 +6,7 @@ import os
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.69"
+APP_VERSION = "3.71"
 
 
 # TabEx i18n module
@@ -259,6 +259,8 @@ _LANG_EN = {
     "Alt+Up - 返回上级目录": "Alt+Up - Go Up",
     "F5 - 刷新当前路径": "F5 - Refresh",
     "Ctrl+D - 添加当前路径到书签": "Ctrl+D - Add Bookmark",
+    "F4 - 插入分组书签": "F4 - Insert Group Bookmark",
+    "F4 - 插入标签分组": "F4 - Insert Tab Group",
     "Alt+Z - 复制选中文件名（含后缀）": "Alt+Z - Copy File Name (with ext)",
     "Alt+X - 复制文件路径\\文件名": "Alt+X - Copy File Path",
     "💡 提示：取消勾选可禁用对应的快捷键": "💡 Tip: Uncheck to disable a shortcut",
@@ -400,6 +402,43 @@ _LANG_EN = {
     "打开计算器": "Open Calculator",
     # ── Split view (F3) ───────────────────────────────────────────────────
     "分屏对比 (F3)": "Split View (F3)",
+    "插入分组 (F4)": "Insert Group (F4)",
+    "插入分组": "Insert Group",
+    "在左侧插入分组": "Insert Group on Left",
+    "在右侧插入分组": "Insert Group on Right",
+    "重命名分组": "Rename Group",
+    "折叠分组": "Collapse Group",
+    "展开分组": "Expand Group",
+    "关闭该分组标签页": "Close This Group Tabs",
+    "仅保留当前分组标签页": "Keep Only Current Group Tabs",
+    "整组移动": "Move Group As Block",
+    "不可放置": "Cannot Drop Here",
+    "分组名称": "Group Name",
+    "请输入分组名称：": "Enter group name:",
+    "分组已重命名": "Group Renamed",
+    "已重命名为：{}": "Renamed to: {}",
+    "已关闭分组标签页": "Group Tabs Closed",
+    "已关闭 {} 个标签页": "Closed {} tab(s)",
+    "已保留当前分组": "Kept Current Group",
+    "已关闭其它分组 {} 个标签页": "Closed {} tab(s) in other groups",
+    "没有已打开的该分组标签页": "No opened tabs in this group",
+    "成员 {} | 开页 {}": "Members {} | Open {}",
+    "该分组目前已展开": "This group is now expanded",
+    "该分组目前已折叠": "This group is now collapsed",
+    "请先选择一个书签后再插入分组": "Please select a bookmark before inserting a group",
+    "请先选择一个标签页后再插入分组": "Please select a tab before inserting a group",
+    "固定标签不参与分组": "Pinned tabs do not participate in grouping",
+    "显示标签分组标记（颜色）": "Show tab group markers (color)",
+    "在标签页上显示分组颜色，关闭后仅保留分组逻辑不显示颜色": "Show group colors on tabs; when off, grouping logic remains but colors are hidden",
+    "分组已插入": "Group Inserted",
+    "当前标签及其左侧已创建分组（{}）": "Group created for current tab and tabs on its left ({})",
+    "当前标签及其左侧已取消分组（{}）": "Group removed for current tab and tabs on its left ({})",
+    "当前标签已取消分组": "Group removed for current tab",
+    "已在“{}”{}插入分组": "Inserted group {} of \"{}\"",
+    "左侧": "left side",
+    "右侧": "right side",
+    "该分组为分隔标记，不打开路径": "This group is a separator marker and cannot be opened",
+    "插入分组书签": "Insert Group Bookmark",
     "分屏对比": "Split View",
     "分屏失败": "Split Failed",
     "已将右侧标签合并回左侧。": "Merged the right-side tab back to the left.",
@@ -5115,6 +5154,8 @@ class _IEBKeyboardFilter(QAbstractNativeEventFilter):
                     return False, 0
                 if not ctrl and not alt and vk == 0x72:  # F3 分屏
                     return False, 0
+                if not ctrl and not alt and vk == 0x73:  # F4 插入分组书签
+                    return False, 0
 
             # 通过 IShellView::TranslateAccelerator 转发键盘消息
             # 这是 Shell 控件处理 Ctrl+C/V/X, Delete, F2 等的正确 COM 方式
@@ -5904,6 +5945,8 @@ class FileExplorerTab(QWidget):
 
                 if idx != -1:
                     target_tw.setTabText(idx, title)
+                    if hasattr(mw, '_apply_tab_group_color'):
+                        mw._apply_tab_group_color(target_tw, idx, self)
                     debug_print(f"DEBUG: Set tab {idx} text to '{title}'")
                     if hasattr(mw, '_schedule_session_snapshot'):
                         mw._schedule_session_snapshot()
@@ -9794,6 +9837,11 @@ class CustomMenuBar(QMenuBar):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.main_window = parent
+        self._action_group_colors = {}
+
+    def set_action_group_colors(self, action_colors):
+        self._action_group_colors = dict(action_colors or {})
+        self.update()
     
     def mousePressEvent(self, event):
         """处理菜单栏的鼠标点击"""
@@ -9828,6 +9876,26 @@ class CustomMenuBar(QMenuBar):
         
         super().mousePressEvent(event)
 
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._action_group_colors:
+            return
+        try:
+            from PyQt5.QtGui import QPainter, QColor
+            painter = QPainter(self)
+            for action in self.actions():
+                color_hex = self._action_group_colors.get(action)
+                if not color_hex:
+                    continue
+                rect = self.actionGeometry(action)
+                if not rect.isValid() or rect.width() <= 8:
+                    continue
+                marker_rect = rect.adjusted(4, rect.height() - 4, -4, -1)
+                painter.fillRect(marker_rect, QColor(color_hex))
+            painter.end()
+        except Exception:
+            pass
+
 # 自定义 TabBar 以支持双击空白区域打开新标签页和悬停显示关闭按钮
 from PyQt5.QtWidgets import QTabBar, QToolButton
 from PyQt5.QtCore import QEvent, QPoint
@@ -9852,13 +9920,114 @@ class CustomTabBar(QTabBar):
         self._press_title = ""
         self._press_index = -1
         self._press_pos = None
+        self._drag_button = None
+        self._press_group_block = None
         self._dragging = False
         self._drag_preview = None
+        self._suppress_context_menu_once = False
+        self._drop_indicator_active = False
+        self._drop_indicator_index = -1
         from PyQt5.QtCore import QTimer
         self._drag_end_timer = QTimer(self)
         self._drag_end_timer.setSingleShot(True)
         self._drag_end_timer.setInterval(150)
         self._drag_end_timer.timeout.connect(self._on_drag_end_timeout)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        try:
+            mw = getattr(self, 'main_window', None)
+            if mw is None:
+                return
+            show_markers = bool(getattr(mw, 'config', {}).get('show_tab_group_markers', True))
+            if not show_markers:
+                return
+            cs = mw._content_stack_for(self._owner_tw()) if hasattr(mw, '_content_stack_for') else None
+            if cs is None:
+                return
+
+            from PyQt5.QtCore import QPoint
+            from PyQt5.QtGui import QPainter, QColor, QPainterPath, QPen
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            count = min(self.count(), cs.count())
+            dpi_scale = float(getattr(mw, 'dpi_scale', 1.0) or 1.0)
+            corner_radius = max(4.0, float(int(6 * dpi_scale)) - 0.5)
+            for i in range(count):
+                tab = cs.widget(i)
+                if tab is None:
+                    continue
+                color_hex = str(getattr(tab, 'bookmark_group_color', '') or '').strip()
+                if not color_hex:
+                    continue
+                rect = self.tabRect(i)
+                if not rect.isValid() or rect.width() <= 4:
+                    continue
+
+                # 分组使用圆角背景高亮，并内缩到标签内部，避免出现“比标签更大/尖角”的视觉问题。
+                base = QColor(color_hex)
+                fill = QColor(base)
+                fill.setAlpha(72 if i == self.currentIndex() else 52)
+                inner = rect.adjusted(2, 2, -2, -1)
+                if inner.width() <= 4 or inner.height() <= 4:
+                    continue
+                path = QPainterPath()
+                path.addRoundedRect(float(inner.x()), float(inner.y()), float(inner.width()), float(inner.height()),
+                                    corner_radius, corner_radius)
+                painter.fillPath(path, fill)
+
+            # 拖拽时明确显示“将插入到这里”的位置指示线。
+            if self._drop_indicator_active:
+                insert_idx = int(self._drop_indicator_index)
+                insert_idx = max(0, min(insert_idx, self.count()))
+                x = 6
+                if self.count() > 0:
+                    if insert_idx >= self.count():
+                        last_rect = self.tabRect(self.count() - 1)
+                        if last_rect.isValid():
+                            x = int(last_rect.right()) + 1
+                    else:
+                        target_rect = self.tabRect(insert_idx)
+                        if target_rect.isValid():
+                            x = int(target_rect.left())
+                line_pen = QPen(QColor("#D32F2F"))
+                line_pen.setWidth(4)
+                painter.setPen(line_pen)
+                y1 = 8
+                y2 = max(y1 + 10, self.height() - 3)
+                painter.drawLine(x, y1, x, y2)
+
+                dot_color = QColor("#D32F2F")
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(dot_color)
+                # 倒三角箭头，明确指示插入点
+                painter.drawPolygon(
+                    QPoint(x - 8, 1),
+                    QPoint(x + 8, 1),
+                    QPoint(x, y1)
+                )
+            painter.end()
+        except Exception:
+            pass
+
+    def set_drop_insert_indicator(self, insert_index):
+        try:
+            idx = int(insert_index)
+        except Exception:
+            idx = -1
+        idx = max(0, min(idx, self.count()))
+        if self._drop_indicator_active and self._drop_indicator_index == idx:
+            return
+        self._drop_indicator_active = True
+        self._drop_indicator_index = idx
+        self.update()
+
+    def clear_drop_insert_indicator(self):
+        if not self._drop_indicator_active and self._drop_indicator_index < 0:
+            return
+        self._drop_indicator_active = False
+        self._drop_indicator_index = -1
+        self.update()
 
     def _owner_tw(self):
         """返回所属标签组的 QTabWidget；优先显式 owner，回退到父控件。"""
@@ -9882,6 +10051,8 @@ class CustomTabBar(QTabBar):
         self._press_title = ""
         self._press_index = -1
         self._press_pos = None
+        self._drag_button = None
+        self._press_group_block = None
         self._dragging = False
         try:
             if event.button() == Qt.LeftButton and self.main_window is not None:
@@ -9900,6 +10071,29 @@ class CustomTabBar(QTabBar):
                         self._press_title = self.tabText(idx)
                         self._press_index = idx
                         self._press_pos = event.pos()
+                        self._drag_button = Qt.LeftButton
+            elif event.button() == Qt.RightButton and self.main_window is not None:
+                if hasattr(self.main_window, 'set_active_pane_to_group'):
+                    try:
+                        self.main_window.set_active_pane_to_group(self._owner_tw())
+                    except Exception:
+                        pass
+                idx = self.tabAt(event.pos())
+                if idx >= 0:
+                    cs = self.main_window._content_stack_for(self._owner_tw())
+                    if cs is not None and idx < cs.count():
+                        pressed_tab = cs.widget(idx)
+                        if pressed_tab is not None and not bool(getattr(pressed_tab, 'is_pinned', False)):
+                            block = None
+                            if hasattr(self.main_window, '_get_tab_group_block_for_drag'):
+                                block = self.main_window._get_tab_group_block_for_drag(self._owner_tw(), idx)
+                            if block is not None:
+                                self._press_group_block = block
+                                self._press_content = pressed_tab
+                                self._press_title = tr("整组移动")
+                                self._press_index = idx
+                                self._press_pos = event.pos()
+                                self._drag_button = Qt.RightButton
         except Exception:
             self._press_content = None
         super().mousePressEvent(event)
@@ -9908,7 +10102,12 @@ class CustomTabBar(QTabBar):
         # 悬停追踪：更新鼠标下的标签索引（供关闭按钮显示等）
         self.hovered_tab = self.tabAt(event.pos())
         # 拖拽判定：左键按住并移动超过阈值 → 进入拖拽，显示跟随光标的浮动预览
-        if (self._press_index >= 0 and (event.buttons() & Qt.LeftButton)
+        expected_btn = None
+        if self._drag_button == Qt.LeftButton:
+            expected_btn = Qt.LeftButton
+        elif self._drag_button == Qt.RightButton:
+            expected_btn = Qt.RightButton
+        if (self._press_index >= 0 and expected_btn is not None and (event.buttons() & expected_btn)
                 and self._press_pos is not None):
             if not self._dragging:
                 try:
@@ -9922,17 +10121,25 @@ class CustomTabBar(QTabBar):
                     if self.main_window is not None:
                         self.main_window._tab_drag_in_progress = True
             if self._dragging:
-                self._update_drag_preview(event.globalPos())
+                dest_tw, dest_index = None, -1
+                try:
+                    if self.main_window is not None and hasattr(self.main_window, '_pane_group_hit_test'):
+                        dest_tw, dest_index = self.main_window._pane_group_hit_test(event.globalPos())
+                except Exception:
+                    dest_tw, dest_index = None, -1
+                if self.main_window is not None and hasattr(self.main_window, '_update_drag_insert_indicators'):
+                    self.main_window._update_drag_insert_indicators(dest_tw, dest_index)
+                self._update_drag_preview(event.globalPos(), dest_tw)
         super().mouseMoveEvent(event)
 
-    def _update_drag_preview(self, gpos):
+    def _update_drag_preview(self, gpos, dest_tw=None):
         """拖拽中显示跟随光标的浮动预览（标签标题气泡），并按目标组区分提示样式。"""
-        dest_tw = None
-        try:
-            if self.main_window is not None and hasattr(self.main_window, '_pane_group_hit_test'):
-                dest_tw, _idx = self.main_window._pane_group_hit_test(gpos)
-        except Exception:
-            dest_tw = None
+        if dest_tw is None:
+            try:
+                if self.main_window is not None and hasattr(self.main_window, '_pane_group_hit_test'):
+                    dest_tw, _idx = self.main_window._pane_group_hit_test(gpos)
+            except Exception:
+                dest_tw = None
         prev = getattr(self, '_drag_preview', None)
         if prev is None:
             from PyQt5.QtWidgets import QLabel
@@ -9963,16 +10170,22 @@ class CustomTabBar(QTabBar):
 
     def mouseReleaseEvent(self, event):
         was_dragging = self._dragging
+        drag_button = self._drag_button
         press_content = self._press_content
         press_index = self._press_index
+        press_group_block = self._press_group_block
         self._press_content = None
         self._press_index = -1
         self._press_pos = None
+        self._drag_button = None
+        self._press_group_block = None
         self._dragging = False
         self._hide_drag_preview()
+        if self.main_window is not None and hasattr(self.main_window, '_clear_drag_insert_indicators'):
+            self.main_window._clear_drag_insert_indicators()
         super().mouseReleaseEvent(event)
 
-        if not was_dragging or press_content is None or event.button() != Qt.LeftButton:
+        if not was_dragging or press_content is None:
             # 普通点击（未触发拖拽）：清理拖拽标志即可
             if self._is_dragging_tab:
                 self._is_dragging_tab = False
@@ -9980,34 +10193,80 @@ class CustomTabBar(QTabBar):
                     self.main_window._tab_drag_in_progress = False
             return
 
-        # 确定落点目标组与插入位置
+        owner = self._owner_tw()
+        moved = False
         dest_tw, dest_index = None, -1
         try:
             if self.main_window is not None and hasattr(self.main_window, '_pane_group_hit_test'):
                 dest_tw, dest_index = self.main_window._pane_group_hit_test(event.globalPos())
         except Exception:
             dest_tw, dest_index = None, -1
-        owner = self._owner_tw()
-        moved = False
-        if dest_tw is not None and dest_tw is not owner:
-            # 跨组转移
-            try:
-                moved = self.main_window.move_tab_across_groups(
-                    owner, press_content, dest_tw, dest_index)
-            except Exception as _e:
-                debug_print(f"[CrossGroupDrag] transfer failed: {_e}")
-        elif dest_tw is owner:
-            # 组内重排：按光标位置计算目标索引，move 到该位置（tabMoved → on_tab_moved 同步内容栈）
-            try:
-                target = self.tabAt(self.mapFromGlobal(event.globalPos()))
-                if target < 0:
-                    target = self.count() - 1
-                if 0 <= press_index < self.count() and target != press_index:
-                    self.moveTab(press_index, target)
-                    moved = True
-            except Exception as _e:
-                debug_print(f"[TabReorder] failed: {_e}")
-        # dest_tw 为 None（释放在任何标签组之外，如标题栏）→ 视为取消，不移动
+
+        if drag_button == Qt.LeftButton:
+            if event.button() != Qt.LeftButton:
+                if self._is_dragging_tab:
+                    self._is_dragging_tab = False
+                    if self.main_window is not None:
+                        self.main_window._tab_drag_in_progress = False
+                return
+
+            if dest_tw is not None and dest_tw is not owner:
+                # 跨组转移
+                try:
+                    moved = self.main_window.move_tab_across_groups(
+                        owner, press_content, dest_tw, dest_index)
+                except Exception as _e:
+                    debug_print(f"[CrossGroupDrag] transfer failed: {_e}")
+            elif dest_tw is owner:
+                # 组内重排：按光标位置计算目标索引，move 到该位置（tabMoved → on_tab_moved 同步内容栈）
+                try:
+                    insert_slot = -1
+                    if self.main_window is not None and hasattr(self.main_window, '_tabbar_insert_index_from_global'):
+                        insert_slot = self.main_window._tabbar_insert_index_from_global(owner, event.globalPos())
+                    if insert_slot < 0:
+                        insert_slot = self.count()
+                    if 0 <= press_index < self.count():
+                        target = insert_slot if insert_slot <= press_index else (insert_slot - 1)
+                        target = max(0, min(target, self.count() - 1))
+                    else:
+                        target = -1
+                    if 0 <= target < self.count() and target != press_index:
+                        # 单拖边界标签时，落位后应视为普通成员，不保留边界定义。
+                        if bool(getattr(press_content, 'tab_group_separator_after', False)):
+                            press_content.tab_group_separator_after = False
+                            press_content.tab_group_separator_color = ""
+                            press_content.tab_group_separator_name = ""
+                        self.moveTab(press_index, target)
+                        if hasattr(self.main_window, '_apply_right_neighbor_grouping_for_moved_tabs'):
+                            self.main_window._apply_right_neighbor_grouping_for_moved_tabs(owner, [press_content])
+                        moved = True
+                except Exception as _e:
+                    debug_print(f"[TabReorder] failed: {_e}")
+        elif drag_button == Qt.RightButton:
+            if event.button() != Qt.RightButton:
+                if self._is_dragging_tab:
+                    self._is_dragging_tab = False
+                    if self.main_window is not None:
+                        self.main_window._tab_drag_in_progress = False
+                return
+
+            if press_group_block is None:
+                moved = False
+            elif dest_tw is not None and dest_tw is not owner:
+                try:
+                    moved = self.main_window.move_tab_group_across_groups(
+                        owner, press_group_block, press_content, dest_tw, dest_index)
+                except Exception as _e:
+                    debug_print(f"[GroupDrag] cross-group transfer failed: {_e}")
+            elif dest_tw is owner:
+                try:
+                    moved = self.main_window.reorder_tab_group_within_group(
+                        owner, press_group_block, dest_index, press_content)
+                except Exception as _e:
+                    debug_print(f"[GroupDrag] reorder failed: {_e}")
+            # 右键拖动发生移动时，抑制这次右键菜单弹出
+            if moved:
+                self._suppress_context_menu_once = True
 
         # 结束拖拽：恢复正常刷新状态
         self._is_dragging_tab = False
@@ -10019,6 +10278,12 @@ class CustomTabBar(QTabBar):
                 self.main_window._on_group_tab_changed(owner, owner.currentIndex())
             except Exception:
                 pass
+
+    def consume_context_menu_suppression(self):
+        if self._suppress_context_menu_once:
+            self._suppress_context_menu_once = False
+            return True
+        return False
     
     def event(self, event):
         # 拦截所有事件，确保双击事件能被处理
@@ -10131,6 +10396,10 @@ class CustomTabBar(QTabBar):
                 content_stack.removeWidget(moved_widget)
                 content_stack.insertWidget(to_index, moved_widget)
                 debug_print(f"[TabMoved] Synced content_stack: moved widget from {from_index} to {to_index}")
+        try:
+            self.main_window._apply_tab_grouping_for_pane(tw)
+        except Exception:
+            pass
         # 移动后自动检测鼠标下的tab并显示关闭按钮
         self.show_close_button_under_cursor()
         # 固定标签纠正仅适用于左侧主标签组
@@ -12446,6 +12715,549 @@ class MainWindow(QMainWindow):
         bar['children'] = [make_bm(icon, name, url) for icon, name, url in icon_map] + bar['children']
         bm.save_bookmarks()
 
+    def _group_palette(self):
+        return [
+            "#E57373", "#64B5F6", "#81C784", "#FFB74D", "#BA68C8",
+            "#4DB6AC", "#F06292", "#7986CB", "#AED581", "#FFD54F",
+        ]
+
+    def _is_group_separator_node(self, node):
+        return bool(isinstance(node, dict) and node.get('type') == 'url' and node.get('is_group_separator'))
+
+    def _compute_effective_group_colors(self, children):
+        """按“分组在右，成员在左”的规则计算每个顶层书签的有效分组色。"""
+        node_colors = {}
+        if not isinstance(children, list):
+            return node_colors
+        current_color = None
+        for node in reversed(children):
+            if not isinstance(node, dict):
+                continue
+            node_id = node.get('id')
+            if self._is_group_separator_node(node):
+                current_color = node.get('group_color') or "#64B5F6"
+                if node_id:
+                    node_colors[node_id] = current_color
+            elif current_color and node_id:
+                node_colors[node_id] = current_color
+        return node_colors
+
+    def _pick_next_group_color(self, children):
+        palette = self._group_palette()
+        used = set()
+        for node in children or []:
+            if self._is_group_separator_node(node):
+                c = str(node.get('group_color', '')).strip()
+                if c:
+                    used.add(c)
+        for c in palette:
+            if c not in used:
+                return c
+        return palette[len(used) % len(palette)]
+
+    def _pick_next_tab_group_color(self, tab_widget):
+        palette = self._group_palette()
+        cs = self._content_stack_for(tab_widget)
+        used = set()
+        if cs is not None:
+            for i in range(cs.count()):
+                tab = cs.widget(i)
+                if tab is None:
+                    continue
+                if bool(getattr(tab, 'is_pinned', False)):
+                    continue
+                c = str(getattr(tab, 'bookmark_group_color', '') or '').strip()
+                if c:
+                    used.add(c)
+        for c in palette:
+            if c not in used:
+                return c
+        return palette[len(used) % len(palette)]
+
+    def _apply_tab_grouping_for_pane(self, tab_widget):
+        """按标签自身 bookmark_group_color 刷新分组视觉（固定标签不参与分组）。"""
+        if tab_widget is None:
+            return
+        cs = self._content_stack_for(tab_widget)
+        if cs is None:
+            return
+        for i in range(cs.count()):
+            tab = cs.widget(i)
+            if tab is None:
+                continue
+            if bool(getattr(tab, 'is_pinned', False)):
+                tab.bookmark_group_color = ""
+                tab.tab_group_separator_after = False
+                tab.tab_group_separator_color = ""
+                tab.tab_group_separator_name = ""
+                self._apply_tab_group_color(tab_widget, i, tab)
+                continue
+            # 新策略下不再使用边界元数据，统一清空，分组仅由连续同色决定。
+            tab.tab_group_separator_after = False
+            tab.tab_group_separator_color = ""
+            tab.tab_group_separator_name = ""
+            tab.bookmark_group_color = str(getattr(tab, 'bookmark_group_color', '') or '').strip()
+            self._apply_tab_group_color(tab_widget, i, tab)
+
+    def insert_tab_group_marker(self, side='right'):
+        """F4 分组切换：创建/取消“当前标签及其左侧连续同色（或未分组）标签”的分组。"""
+        tw = self.get_active_group_tabwidget()
+        cs = self._content_stack_for(tw)
+        if tw is None or cs is None or tw.count() <= 0:
+            debug_print("[TabGroup] Insert failed: no active tab group")
+            show_toast(self, tr("提示"), tr("请先选择一个标签页后再插入分组"), level="warning")
+            return False
+
+        cur = tw.currentIndex()
+        if cur < 0 or cur >= cs.count():
+            debug_print(f"[TabGroup] Insert failed: invalid current index={cur}, tab_count={cs.count()}")
+            show_toast(self, tr("提示"), tr("请先选择一个标签页后再插入分组"), level="warning")
+            return False
+
+        current_tab = cs.widget(cur)
+        if current_tab is None:
+            show_toast(self, tr("提示"), tr("请先选择一个标签页后再插入分组"), level="warning")
+            return False
+        if bool(getattr(current_tab, 'is_pinned', False)):
+            debug_print(f"[TabGroup] Insert skipped: current pinned index={cur}")
+            show_toast(self, tr("提示"), tr("固定标签不参与分组"), level="warning")
+            return False
+
+        cur_color = str(getattr(current_tab, 'bookmark_group_color', '') or '').strip()
+        affected_tabs = []
+        if cur_color:
+            # 取消分组：仅影响当前标签，不连带左侧同色标签
+            t = cs.widget(cur)
+            if t is not None and not bool(getattr(t, 'is_pinned', False)):
+                t.bookmark_group_color = ""
+                t.tab_group_separator_after = False
+                t.tab_group_separator_color = ""
+                t.tab_group_separator_name = ""
+                affected_tabs.append(t)
+            created = False
+        else:
+            # 创建分组：影响当前标签及其左侧连续未分组标签
+            start = cur
+            while start - 1 >= 0:
+                left_tab = cs.widget(start - 1)
+                if left_tab is None or bool(getattr(left_tab, 'is_pinned', False)):
+                    break
+                left_color = str(getattr(left_tab, 'bookmark_group_color', '') or '').strip()
+                if left_color:
+                    break
+                start -= 1
+            color = self._pick_next_tab_group_color(tw)
+            for i in range(start, cur + 1):
+                t = cs.widget(i)
+                if t is None or bool(getattr(t, 'is_pinned', False)):
+                    continue
+                t.bookmark_group_color = color
+                t.tab_group_separator_after = False
+                t.tab_group_separator_color = ""
+                t.tab_group_separator_name = ""
+                affected_tabs.append(t)
+            created = True
+
+        self._apply_tab_grouping_for_pane(tw)
+        moved_ungrouped = 0
+        if not created and affected_tabs:
+            moved_ungrouped = self._move_ungrouped_tabs_before_existing_ungrouped(tw, affected_tabs)
+        self.save_pinned_tabs()
+        self._schedule_session_snapshot()
+
+        if not created:
+            debug_print(
+                f"[TabGroup] Removed group: pane={'right' if tw is getattr(self, 'split_tab_widget', None) else 'left'}, "
+                f"current={cur}, color={cur_color}, moved_ungrouped={moved_ungrouped}"
+            )
+            show_toast(self, tr("分组已取消"), tr("当前标签已取消分组"), level="info")
+        else:
+            debug_print(
+                f"[TabGroup] Created group: pane={'right' if tw is getattr(self, 'split_tab_widget', None) else 'left'}, "
+                f"current={cur}, color={color}"
+            )
+            show_toast(self, tr("分组已插入"), tr("当前标签及其左侧已创建分组"), level="info")
+        return True
+
+    def _get_bookmark_bar_children(self):
+        tree = self.bookmark_manager.get_tree()
+        bar = tree.get('bookmark_bar') if isinstance(tree, dict) else None
+        children = bar.get('children') if isinstance(bar, dict) else None
+        return children if isinstance(children, list) else None
+
+    def _find_top_level_anchor_by_descendant_id(self, bookmark_id, children):
+        """根据任意层级节点 ID，找到其所在的顶层书签栏节点（用于分组插入锚点）。"""
+        if not bookmark_id or not isinstance(children, list):
+            return None
+
+        def _contains_id(node, target_id):
+            if not isinstance(node, dict):
+                return False
+            if node.get('id') == target_id:
+                return True
+            for child in node.get('children', []) or []:
+                if _contains_id(child, target_id):
+                    return True
+            return False
+
+        for top_node in children:
+            if _contains_id(top_node, bookmark_id):
+                return top_node
+        return None
+
+    def _find_bookmark_anchor_from_path(self, current_path, children):
+        """按路径递归匹配书签，返回(顶层锚点节点, 命中的URL节点)。"""
+        if not current_path or not isinstance(children, list):
+            return None, None
+
+        target_key = self._normalize_path_for_compare(current_path)
+        if not target_key:
+            return None, None
+
+        def _match_url_node(node):
+            if not (isinstance(node, dict) and node.get('type') == 'url'):
+                return None
+            if self._is_group_separator_node(node):
+                return None
+            url_key = self._normalize_bookmark_url_for_compare(node.get('url', ''))
+            if url_key and url_key == target_key:
+                return node
+            return None
+
+        def _walk(node):
+            direct = _match_url_node(node)
+            if direct is not None:
+                return direct
+            if not isinstance(node, dict):
+                return None
+            for child in node.get('children', []) or []:
+                found = _walk(child)
+                if found is not None:
+                    return found
+            return None
+
+        for top_node in children:
+            found = _walk(top_node)
+            if found is not None:
+                return top_node, found
+        return None, None
+
+    def _find_bookmark_node_by_id(self, bookmark_id):
+        if not bookmark_id:
+            return None
+        tree = self.bookmark_manager.get_tree()
+
+        def _walk(node):
+            if not isinstance(node, dict):
+                return None
+            if node.get('id') == bookmark_id:
+                return node
+            for child in node.get('children', []) or []:
+                found = _walk(child)
+                if found is not None:
+                    return found
+            return None
+
+        for root in (tree or {}).values():
+            found = _walk(root)
+            if found is not None:
+                return found
+        return None
+
+    def _find_top_level_bookmark_info(self, bookmark_id):
+        children = self._get_bookmark_bar_children()
+        if not children:
+            return None, -1, None
+        for idx, node in enumerate(children):
+            if isinstance(node, dict) and node.get('id') == bookmark_id:
+                return children, idx, node
+        return children, -1, None
+
+    def _group_member_indices(self, children, separator_index):
+        members = []
+        if not isinstance(children, list) or separator_index < 0 or separator_index >= len(children):
+            return members
+        for i in range(separator_index - 1, -1, -1):
+            node = children[i]
+            if self._is_group_separator_node(node):
+                break
+            members.append(i)
+        return members
+
+    def _count_group_member_map(self, children):
+        member_map = {}
+        if not isinstance(children, list):
+            return member_map
+        for i, node in enumerate(children):
+            if self._is_group_separator_node(node):
+                member_map[node.get('id')] = len(self._group_member_indices(children, i))
+        return member_map
+
+    def _count_open_tabs_by_group_color(self):
+        color_count = {}
+
+        def _collect(cs):
+            if cs is None:
+                return
+            for i in range(cs.count()):
+                tab = cs.widget(i)
+                color = str(getattr(tab, 'bookmark_group_color', '') or '').strip().lower()
+                if color:
+                    color_count[color] = color_count.get(color, 0) + 1
+
+        _collect(getattr(self, 'content_stack', None))
+        _collect(getattr(self, 'split_content_stack', None))
+        return color_count
+
+    def _close_tabs_matching_group_color(self, group_color, invert=False):
+        """按组色批量关标签。invert=False 关闭同组；invert=True 关闭非同组。"""
+        color = str(group_color or '').strip().lower()
+        if not color:
+            return 0
+
+        left_indices = []
+        right_indices = []
+        for i in range(self.content_stack.count()):
+            tab = self.content_stack.widget(i)
+            tab_color = str(getattr(tab, 'bookmark_group_color', '') or '').strip().lower()
+            matched = (tab_color == color)
+            if (matched and not invert) or ((not matched) and invert):
+                left_indices.append(i)
+        if getattr(self, 'split_content_stack', None) is not None:
+            for i in range(self.split_content_stack.count()):
+                tab = self.split_content_stack.widget(i)
+                tab_color = str(getattr(tab, 'bookmark_group_color', '') or '').strip().lower()
+                matched = (tab_color == color)
+                if (matched and not invert) or ((not matched) and invert):
+                    right_indices.append(i)
+
+        total = len(left_indices) + len(right_indices)
+        if total <= 0:
+            return 0
+
+        # 防止把左侧主组全部关闭导致程序直接退出。
+        if len(left_indices) >= self.tab_widget.count():
+            self.add_new_tab()
+
+        closed = 0
+        for i in sorted(right_indices, reverse=True):
+            if i < self.split_tab_widget.count():
+                self.close_tab(i, target_tabwidget=self.split_tab_widget)
+                closed += 1
+        for i in sorted(left_indices, reverse=True):
+            if i < self.tab_widget.count():
+                self.close_tab(i, target_tabwidget=self.tab_widget)
+                closed += 1
+        return closed
+
+    def _resolve_group_node(self, bookmark_id):
+        node = self._find_bookmark_node_by_id(bookmark_id)
+        if self._is_group_separator_node(node):
+            return node
+        return None
+
+    def rename_group_bookmark(self, bookmark_id):
+        node = self._resolve_group_node(bookmark_id)
+        if node is None:
+            return False
+        old_name = str(node.get('name', '') or tr("插入分组"))
+        text, ok = QInputDialog.getText(self, tr("分组名称"), tr("请输入分组名称："), text=old_name)
+        if not ok:
+            return False
+        new_name = str(text or '').strip()
+        if not new_name:
+            return False
+        node['name'] = new_name
+        self.bookmark_manager.save_bookmarks()
+        self.populate_bookmark_bar_menu()
+        show_toast(self, tr("分组已重命名"), tr("已重命名为：{}").format(new_name), level="info")
+        return True
+
+    def toggle_group_collapsed(self, bookmark_id):
+        children, idx, node = self._find_top_level_bookmark_info(bookmark_id)
+        if node is None or not self._is_group_separator_node(node):
+            return False
+        collapsed = bool(node.get('group_collapsed', False))
+        node['group_collapsed'] = not collapsed
+        self.bookmark_manager.save_bookmarks()
+        self.populate_bookmark_bar_menu()
+        show_toast(
+            self,
+            tr("提示"),
+            tr("该分组目前已展开") if collapsed else tr("该分组目前已折叠"),
+            level="info"
+        )
+        return True
+
+    def close_group_tabs(self, bookmark_id):
+        children, idx, node = self._find_top_level_bookmark_info(bookmark_id)
+        if node is None or not self._is_group_separator_node(node):
+            return False
+        group_color = str(node.get('group_color', '') or '').strip().lower()
+        if not group_color:
+            show_toast(self, tr("提示"), tr("没有已打开的该分组标签页"), level="info")
+            return False
+
+        closed = self._close_tabs_matching_group_color(group_color, invert=False)
+        if closed <= 0:
+            show_toast(self, tr("提示"), tr("没有已打开的该分组标签页"), level="info")
+            return False
+
+        show_toast(self, tr("已关闭分组标签页"), tr("已关闭 {} 个标签页").format(closed), level="info")
+        return True
+
+    def keep_only_current_group_tabs(self, bookmark_id):
+        children, idx, node = self._find_top_level_bookmark_info(bookmark_id)
+        if node is None or not self._is_group_separator_node(node):
+            return False
+        group_color = str(node.get('group_color', '') or '').strip().lower()
+        if not group_color:
+            show_toast(self, tr("提示"), tr("没有已打开的该分组标签页"), level="info")
+            return False
+        closed = self._close_tabs_matching_group_color(group_color, invert=True)
+        show_toast(self, tr("已保留当前分组"), tr("已关闭其它分组 {} 个标签页").format(closed), level="info")
+        return True
+
+    def _find_bookmark_bar_anchor(self):
+        """返回用于插入分组的锚点书签：优先最后一次交互书签，其次当前路径匹配书签。"""
+        tree = self.bookmark_manager.get_tree()
+        bar = tree.get('bookmark_bar') if isinstance(tree, dict) else None
+        children = bar.get('children') if isinstance(bar, dict) else None
+        if not isinstance(children, list) or not children:
+            debug_print("[GroupInsert] Anchor resolve failed: bookmark_bar children empty")
+            return None
+
+        last_id = getattr(self, '_last_bookmark_node_id', None)
+        if last_id:
+            anchor = self._find_top_level_anchor_by_descendant_id(last_id, children)
+            if anchor is not None:
+                debug_print(
+                    f"[GroupInsert] Anchor from last bookmark id={last_id}, top='{anchor.get('name', '')}'"
+                )
+                return anchor
+
+        current_tab = self.get_active_pane()
+        current_path = str(getattr(current_tab, 'current_path', '') or '') if current_tab else ''
+        if current_path:
+            anchor, matched = self._find_bookmark_anchor_from_path(current_path, children)
+            if anchor is not None:
+                matched_id = matched.get('id') if isinstance(matched, dict) else None
+                if matched_id:
+                    self._last_bookmark_node_id = matched_id
+                debug_print(
+                    f"[GroupInsert] Anchor from current tab path='{current_path}', "
+                    f"matched_id={matched_id}, top='{anchor.get('name', '')}'"
+                )
+                return anchor
+
+        debug_print(
+            f"[GroupInsert] Anchor resolve failed: last_id={last_id}, "
+            f"current_path='{current_path}'"
+        )
+        return None
+
+    def _normalize_bookmark_url_for_compare(self, url):
+        """将书签 URL 归一化为可与 current_path 比较的键。"""
+        from urllib.parse import unquote
+        u = str(url or '').strip()
+        if not u:
+            return ""
+        try:
+            if u.startswith('file:'):
+                if u.startswith('file://///'):
+                    local_path = '\\\\' + unquote(u[10:]).replace('/', '\\')
+                elif u.startswith('file:////'):
+                    local_path = '\\\\' + unquote(u[9:]).replace('/', '\\')
+                elif u.startswith('file:///'):
+                    local_path = unquote(u[8:])
+                    if os.name == 'nt' and local_path.startswith('/'):
+                        local_path = local_path[1:]
+                    local_path = local_path.replace('/', '\\')
+                else:
+                    local_path = '\\\\' + unquote(u[7:]).replace('/', '\\')
+                return self._normalize_path_for_compare(local_path)
+            if u.startswith('shell:'):
+                return self._normalize_path_for_compare(u)
+            if os.path.isabs(u):
+                return self._normalize_path_for_compare(u)
+        except Exception:
+            pass
+        return self._normalize_path_for_compare(u)
+
+    def insert_group_bookmark(self, side='right'):
+        """兼容旧入口：改为操作当前标签分组，不再依赖书签。"""
+        return self.insert_tab_group_marker()
+
+    def show_insert_group_menu(self):
+        # 入口简化：仅保留默认分组动作，不再弹出左右选项。
+        self.insert_tab_group_marker()
+
+    def _get_tab_group_icon(self, color_hex, separator=False):
+        """为标签分组生成小色块图标（separator 使用不同形状）。"""
+        from PyQt5.QtCore import QPoint
+        from PyQt5.QtGui import QPixmap, QPainter, QColor, QIcon
+        key = (str(color_hex or '').lower(), bool(separator))
+        cache = getattr(self, '_tab_group_icon_cache', None)
+        if cache is None:
+            cache = {}
+            self._tab_group_icon_cache = cache
+        if key in cache:
+            return cache[key]
+
+        pix = QPixmap(10, 10)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        c = QColor(key[0] if key[0] else '#64B5F6')
+        p.setBrush(c)
+        if separator:
+            # 分隔符：菱形，和普通成员点做区分
+            pts = [
+                QPoint(5, 1),
+                QPoint(9, 5),
+                QPoint(5, 9),
+                QPoint(1, 5),
+            ]
+            p.drawPolygon(*pts)
+        else:
+            # 成员：圆点
+            p.drawEllipse(1, 1, 8, 8)
+        p.end()
+        icon = QIcon(pix)
+        cache[key] = icon
+        return icon
+
+    def _apply_tab_group_color(self, tab_widget, index, tab_obj=None):
+        if tab_widget is None or index < 0:
+            return
+        tab_ref = tab_obj
+        if tab_ref is None:
+            try:
+                cs = self._content_stack_for(tab_widget)
+                if cs is not None and index < cs.count():
+                    tab_ref = cs.widget(index)
+            except Exception:
+                tab_ref = None
+        color_hex = str(getattr(tab_ref, 'bookmark_group_color', '') or '').strip() if tab_ref is not None else ''
+        from PyQt5.QtGui import QColor
+        show_markers = bool(getattr(self, 'config', {}).get('show_tab_group_markers', True))
+        if color_hex and show_markers:
+            tab_widget.tabBar().setTabTextColor(index, QColor(color_hex).darker(125))
+            tab_widget.setTabIcon(index, QIcon())
+        else:
+            tab_widget.tabBar().setTabTextColor(index, QColor("#505050"))
+            tab_widget.setTabIcon(index, QIcon())
+        try:
+            tab_widget.tabBar().update()
+        except Exception:
+            pass
+
+    def apply_tab_group_markers_config(self):
+        """根据配置刷新标签分组视觉标记（左右标签组）。"""
+        self._apply_tab_grouping_for_pane(self.tab_widget)
+        self._apply_tab_grouping_for_pane(getattr(self, 'split_tab_widget', None))
+
     def tabbar_mouse_double_click(self, event):
         tabbar = self.tab_widget.tabBar()
         pos = event.pos()
@@ -12509,12 +13321,449 @@ class MainWindow(QMainWindow):
                     return tw, -1
                 # 内容区正上方（标签栏/书签栏行）：按该组内容的水平范围归属，使拖放命中更容易
                 if cs_rect.left() <= gpos.x() <= cs_rect.right() and gpos.y() < cs_rect.top():
-                    bar = tw.tabBar() if tw is not None else None
-                    insert_idx = bar.tabAt(bar.mapFromGlobal(gpos)) if bar is not None else -1
+                    insert_idx = self._tabbar_insert_index_from_global(tw, gpos)
                     return tw, insert_idx
             except Exception:
                 continue
         return None, None
+
+    def _tabbar_insert_index_from_global(self, tab_widget, gpos):
+        """根据全局坐标计算标签栏插入槽位（0..count）。
+
+        命中标签左半返回该标签索引（插到其前），命中右半返回索引+1（插到其后）。"""
+        if tab_widget is None:
+            return -1
+        bar = tab_widget.tabBar() if hasattr(tab_widget, 'tabBar') else None
+        if bar is None:
+            return -1
+        count = bar.count()
+        if count <= 0:
+            return 0
+        local = bar.mapFromGlobal(gpos)
+        idx = bar.tabAt(local)
+        if idx < 0:
+            first_rect = bar.tabRect(0)
+            last_rect = bar.tabRect(count - 1)
+            if first_rect.isValid() and local.x() <= first_rect.left():
+                return 0
+            if last_rect.isValid() and local.x() >= last_rect.right():
+                return count
+            return count
+        rect = bar.tabRect(idx)
+        if not rect.isValid():
+            return min(max(idx, 0), count)
+        return idx if local.x() < rect.center().x() else idx + 1
+
+    def _normalize_drop_insert_index(self, tab_widget, raw_index):
+        if tab_widget is None:
+            return -1
+        count = tab_widget.count()
+        try:
+            idx = int(raw_index)
+        except Exception:
+            idx = -1
+        if idx < 0 or idx > count:
+            return count
+        return idx
+
+    def _update_drag_insert_indicators(self, dest_tabwidget, dest_index):
+        for tw, _cs in self._all_groups():
+            bar = tw.tabBar() if tw is not None else None
+            if bar is None:
+                continue
+            if tw is dest_tabwidget and hasattr(bar, 'set_drop_insert_indicator'):
+                idx = self._normalize_drop_insert_index(tw, dest_index)
+                bar.set_drop_insert_indicator(idx)
+            elif hasattr(bar, 'clear_drop_insert_indicator'):
+                bar.clear_drop_insert_indicator()
+
+    def _clear_drag_insert_indicators(self):
+        for tw, _cs in self._all_groups():
+            bar = tw.tabBar() if tw is not None else None
+            if bar is not None and hasattr(bar, 'clear_drop_insert_indicator'):
+                bar.clear_drop_insert_indicator()
+
+    def _get_tab_group_ranges_for_drag(self, tab_widget):
+        """返回可拖拽分组块区间列表（start, end）。
+
+        新策略：连续同色标签为一组；未分组标签按单个块处理。"""
+        cs = self._content_stack_for(tab_widget)
+        if cs is None:
+            return []
+
+        ranges = []
+        i = 0
+        while i < cs.count():
+            tab = cs.widget(i)
+            if tab is None or bool(getattr(tab, 'is_pinned', False)):
+                i += 1
+                continue
+            color = str(getattr(tab, 'bookmark_group_color', '') or '').strip()
+            if not color:
+                ranges.append((i, i))
+                i += 1
+                continue
+            end = i
+            while end + 1 < cs.count():
+                nxt = cs.widget(end + 1)
+                if nxt is None or bool(getattr(nxt, 'is_pinned', False)):
+                    break
+                nxt_color = str(getattr(nxt, 'bookmark_group_color', '') or '').strip()
+                if nxt_color != color:
+                    break
+                end += 1
+            ranges.append((i, end))
+            i = end + 1
+        return ranges
+
+    def _get_tab_group_block_for_drag(self, tab_widget, index):
+        """根据任意索引返回可拖拽区块；有组色时返回连续同色块，否则返回单标签块。"""
+        cs = self._content_stack_for(tab_widget)
+        if cs is None or index < 0 or index >= cs.count():
+            return None
+        tab = cs.widget(index)
+        if tab is None or bool(getattr(tab, 'is_pinned', False)):
+            return None
+        color = str(getattr(tab, 'bookmark_group_color', '') or '').strip()
+        if not color:
+            return (index, index)
+        start = index
+        while start - 1 >= 0:
+            left = cs.widget(start - 1)
+            if left is None or bool(getattr(left, 'is_pinned', False)):
+                break
+            if str(getattr(left, 'bookmark_group_color', '') or '').strip() != color:
+                break
+            start -= 1
+        end = index
+        while end + 1 < cs.count():
+            right = cs.widget(end + 1)
+            if right is None or bool(getattr(right, 'is_pinned', False)):
+                break
+            if str(getattr(right, 'bookmark_group_color', '') or '').strip() != color:
+                break
+            end += 1
+        return (start, end)
+
+    def _apply_right_neighbor_grouping_for_moved_tabs(self, tab_widget, moved_tabs):
+        """拖动落位后，以新位置右侧相邻标签为准更新被拖动标签的分组。"""
+        tw, cs, _is_right = self._resolve_group(tab_widget)
+        if tw is None or cs is None or not moved_tabs:
+            return
+
+        tabs = [t for t in moved_tabs if t is not None and not bool(getattr(t, 'is_pinned', False))]
+        if not tabs:
+            return
+
+        first_idx = cs.indexOf(tabs[0])
+        if first_idx < 0:
+            return
+
+        right_idx = first_idx + len(tabs)
+        target_color = ""
+        if 0 <= right_idx < cs.count():
+            right_tab = cs.widget(right_idx)
+            if right_tab is not None and not bool(getattr(right_tab, 'is_pinned', False)):
+                target_color = str(getattr(right_tab, 'bookmark_group_color', '') or '').strip()
+
+        for t in tabs:
+            t.bookmark_group_color = target_color
+            t.tab_group_separator_after = False
+            t.tab_group_separator_color = ""
+            t.tab_group_separator_name = ""
+
+        self._apply_tab_grouping_for_pane(tw)
+
+    def _split_group_color_after_insertion_if_needed(self, tab_widget, insert_start, insert_len):
+        """当插入位置把同色分组切开时，将右半段改为新颜色，形成两个不同分组。"""
+        tw, cs, _is_right = self._resolve_group(tab_widget)
+        if tw is None or cs is None:
+            return False
+        if insert_start is None or insert_len is None:
+            return False
+        insert_start = int(insert_start)
+        insert_len = int(insert_len)
+        if insert_len <= 0:
+            return False
+
+        left_idx = insert_start - 1
+        right_idx = insert_start + insert_len
+        if left_idx < 0 or right_idx >= cs.count():
+            return False
+
+        left_tab = cs.widget(left_idx)
+        right_tab = cs.widget(right_idx)
+        if left_tab is None or right_tab is None:
+            return False
+        if bool(getattr(left_tab, 'is_pinned', False)) or bool(getattr(right_tab, 'is_pinned', False)):
+            return False
+
+        split_color = str(getattr(left_tab, 'bookmark_group_color', '') or '').strip()
+        right_color = str(getattr(right_tab, 'bookmark_group_color', '') or '').strip()
+        if not split_color or right_color != split_color:
+            return False
+
+        new_color = self._pick_next_tab_group_color(tw)
+        if new_color == split_color:
+            palette = self._group_palette()
+            for cand in palette:
+                if cand != split_color:
+                    new_color = cand
+                    break
+        if not new_color or new_color == split_color:
+            return False
+
+        changed = 0
+        idx = right_idx
+        while idx < cs.count():
+            tab = cs.widget(idx)
+            if tab is None or bool(getattr(tab, 'is_pinned', False)):
+                break
+            color = str(getattr(tab, 'bookmark_group_color', '') or '').strip()
+            if color != split_color:
+                break
+            tab.bookmark_group_color = new_color
+            tab.tab_group_separator_after = False
+            tab.tab_group_separator_color = ""
+            tab.tab_group_separator_name = ""
+            changed += 1
+            idx += 1
+
+        return changed > 0
+
+    def _move_ungrouped_tabs_before_existing_ungrouped(self, tab_widget, candidate_tabs):
+        """将候选中的非固定且无分组色标签移到“现有非分组标签”左侧，保持相对顺序。
+
+        若当前顺序已满足，或不存在可对齐的现有非分组标签，则不执行移动。"""
+        tw, cs, _is_right = self._resolve_group(tab_widget)
+        if tw is None or cs is None or not candidate_tabs:
+            return 0
+
+        candidate_set = {tab for tab in candidate_tabs if tab is not None}
+        if not candidate_set:
+            return 0
+
+        all_tabs = []
+        for i in range(cs.count()):
+            w = cs.widget(i)
+            if w is not None:
+                all_tabs.append(w)
+
+        move_tabs = []
+        for w in all_tabs:
+            if (w in candidate_set and
+                    not bool(getattr(w, 'is_pinned', False)) and
+                    not str(getattr(w, 'bookmark_group_color', '') or '').strip()):
+                move_tabs.append(w)
+
+        if not move_tabs:
+            return 0
+
+        move_set = set(move_tabs)
+
+        # 目标插入点：当前列表中“非候选的首个非分组标签”位置。
+        first_existing_ungrouped_idx = -1
+        for i, w in enumerate(all_tabs):
+            if w in move_set:
+                continue
+            if bool(getattr(w, 'is_pinned', False)):
+                continue
+            if not str(getattr(w, 'bookmark_group_color', '') or '').strip():
+                first_existing_ungrouped_idx = i
+                break
+
+        keep_tabs = [w for w in all_tabs if w not in move_set]
+        if first_existing_ungrouped_idx < 0:
+            # 尚无未分组区域：把本次取消得到的未分组块放到最右侧，形成未分组区域。
+            insert_pos = len(keep_tabs)
+        else:
+            insert_pos = 0
+            for w in all_tabs[:first_existing_ungrouped_idx]:
+                if w not in move_set:
+                    insert_pos += 1
+
+        current_idx = tw.currentIndex()
+        current_tab = cs.widget(current_idx) if current_idx >= 0 else None
+        new_tabs = keep_tabs[:insert_pos] + move_tabs + keep_tabs[insert_pos:]
+
+        # 顺序无变化则不动作。
+        if len(new_tabs) == len(all_tabs) and all(a is b for a, b in zip(new_tabs, all_tabs)):
+            return 0
+
+        tw.clear()
+        while cs.count() > 0:
+            w = cs.widget(0)
+            cs.removeWidget(w)
+
+        for w in new_tabs:
+            tw.addTab(QWidget(), "")
+            cs.addWidget(w)
+            try:
+                w.update_tab_title()
+            except Exception:
+                pass
+
+        if current_tab is not None:
+            new_idx = cs.indexOf(current_tab)
+            if new_idx >= 0:
+                tw.setCurrentIndex(new_idx)
+
+        self._apply_tab_grouping_for_pane(tw)
+        return len(move_tabs)
+
+    def _clear_tab_group_separator_metadata(self, tabs):
+        """将拖动块中的分组边界降级为普通成员，落位后按新位置边界重新归组。"""
+        for tab in tabs or []:
+            if tab is None:
+                continue
+            tab.tab_group_separator_after = False
+            tab.tab_group_separator_color = ""
+            tab.tab_group_separator_name = ""
+
+    def reorder_tab_group_within_group(self, tab_widget, block, dest_index, anchor_widget=None):
+        """同组内整块移动标签分组（右键拖拽）。"""
+        tw, cs, _is_right = self._resolve_group(tab_widget)
+        if tw is None or cs is None or not block or len(block) != 2:
+            return False
+        start, end = int(block[0]), int(block[1])
+        if start < 0 or end >= cs.count() or start > end:
+            return False
+        if start <= int(dest_index) <= end + 1:
+            return False
+
+        moving = []
+        for i in range(start, end + 1):
+            w = cs.widget(i)
+            if w is None or bool(getattr(w, 'is_pinned', False)):
+                return False
+            moving.append(w)
+
+        for i in range(end, start - 1, -1):
+            w = cs.widget(i)
+            cs.removeWidget(w)
+            tw.removeTab(i)
+
+        # 整组拖动时，原分组边界随块移动后应视为普通成员，避免在新位置重建旧边界。
+        self._clear_tab_group_separator_metadata(moving)
+
+        if dest_index is None:
+            dest_index = tw.count()
+        if dest_index > end:
+            dest_index -= len(moving)
+        dest_index = max(0, min(int(dest_index), tw.count()))
+
+        pinned_count = 0
+        for i in range(cs.count()):
+            w = cs.widget(i)
+            if w is not None and bool(getattr(w, 'is_pinned', False)):
+                pinned_count += 1
+        dest_index = max(dest_index, pinned_count)
+
+        for offset, w in enumerate(moving):
+            insert_at = dest_index + offset
+            cs.insertWidget(insert_at, w)
+            tw.insertTab(insert_at, QWidget(), "")
+            try:
+                w.update_tab_title()
+            except Exception:
+                pass
+
+        # 整组拖动保持原分组颜色，不受目标位置分组颜色影响。
+        self._split_group_color_after_insertion_if_needed(tw, dest_index, len(moving))
+
+        new_current = dest_index
+        if anchor_widget in moving:
+            new_current = dest_index + moving.index(anchor_widget)
+        tw.setCurrentIndex(new_current)
+
+        self._apply_tab_grouping_for_pane(tw)
+        self.save_pinned_tabs()
+        self._schedule_session_snapshot()
+        return True
+
+    def move_tab_group_across_groups(self, source_tabwidget, block, anchor_widget, dest_tabwidget, dest_index):
+        """跨组整块移动标签分组（右键拖拽）。"""
+        src_tw, src_cs, src_is_right = self._resolve_group(source_tabwidget)
+        dst_tw, dst_cs, dst_is_right = self._resolve_group(dest_tabwidget)
+        if src_tw is dst_tw or src_cs is None or dst_cs is None:
+            return False
+        if not block or len(block) != 2:
+            return False
+
+        start, end = int(block[0]), int(block[1])
+        if start < 0 or end >= src_cs.count() or start > end:
+            return False
+
+        moving = []
+        for i in range(start, end + 1):
+            w = src_cs.widget(i)
+            if w is None or bool(getattr(w, 'is_pinned', False)):
+                return False
+            moving.append(w)
+        block_len = len(moving)
+        if block_len <= 0:
+            return False
+
+        if not src_is_right and (src_tw.count() - block_len) < 1:
+            show_toast(self, tr("拖拽标签"), tr("左侧至少需要保留一个标签页。"), level="warning", duration=2000)
+            return False
+
+        dst_count = dst_tw.count()
+        if dest_index is None or dest_index < 0 or dest_index > dst_count:
+            dest_index = dst_count
+
+        dst_pinned_count = 0
+        for i in range(dst_cs.count()):
+            w = dst_cs.widget(i)
+            if w is not None and bool(getattr(w, 'is_pinned', False)):
+                dst_pinned_count += 1
+        dest_index = max(int(dest_index), dst_pinned_count)
+        dest_index = min(dest_index, dst_tw.count())
+
+        for i in range(end, start - 1, -1):
+            w = src_cs.widget(i)
+            src_cs.removeWidget(w)
+            src_tw.removeTab(i)
+
+        # 整组跨组拖动同样不保留原边界，整组保持原颜色插入。
+        self._clear_tab_group_separator_metadata(moving)
+
+        for offset, w in enumerate(moving):
+            insert_at = dest_index + offset
+            dst_cs.insertWidget(insert_at, w)
+            dst_tw.insertTab(insert_at, QWidget(), "")
+            try:
+                w.update_tab_title()
+            except Exception:
+                pass
+
+        # 整组拖动保持原分组颜色，不受目标位置分组颜色影响。
+        self._split_group_color_after_insertion_if_needed(dst_tw, dest_index, len(moving))
+
+        new_current = dest_index
+        if anchor_widget in moving:
+            new_current = dest_index + moving.index(anchor_widget)
+        dst_tw.setCurrentIndex(new_current)
+        self._active_pane = dst_cs.widget(new_current) if new_current >= 0 else self._active_pane
+
+        if src_is_right and src_tw.count() == 0:
+            self._teardown_split_group()
+
+        try:
+            self._apply_tab_grouping_for_pane(src_tw)
+        except Exception:
+            pass
+        try:
+            self._apply_tab_grouping_for_pane(dst_tw)
+        except Exception:
+            pass
+        try:
+            self.update_navigation_buttons()
+        except Exception:
+            pass
+        self.save_pinned_tabs()
+        self._schedule_session_snapshot()
+        return True
 
     def move_tab_across_groups(self, source_tabwidget, content_widget, dest_tabwidget, dest_index):
         """把一个标签（连同其嵌入内容/历史/状态）从源标签组转移到目标标签组。
@@ -12539,6 +13788,7 @@ class MainWindow(QMainWindow):
         self._tab_drag_in_progress = False
         title = src_tw.tabText(src_index)
         is_pinned = getattr(content_widget, 'is_pinned', False)
+        was_separator = bool(getattr(content_widget, 'tab_group_separator_after', False))
         # 计算目标插入位置，并保持“固定标签在前”不变量
         dst_count = dst_tw.count()
         if dest_index is None or dest_index < 0 or dest_index > dst_count:
@@ -12552,6 +13802,11 @@ class MainWindow(QMainWindow):
             dest_index = min(dest_index, pinned_count)
         else:
             dest_index = max(dest_index, pinned_count)
+        if was_separator:
+            # 单拖边界标签跨组时按普通成员处理，避免在目标位置重建旧分组边界。
+            content_widget.tab_group_separator_after = False
+            content_widget.tab_group_separator_color = ""
+            content_widget.tab_group_separator_name = ""
         # 从源组移除（先内容栈后标签栏，保持索引同步）
         src_cs.removeWidget(content_widget)
         src_tw.removeTab(src_index)
@@ -12563,6 +13818,7 @@ class MainWindow(QMainWindow):
             content_widget.update_tab_title()
         except Exception:
             pass
+        self._apply_right_neighbor_grouping_for_moved_tabs(dst_tw, [content_widget])
         try:
             content_widget.set_refresh_active(True)
         except Exception:
@@ -13221,7 +14477,9 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     @pyqtSlot(str)
     @pyqtSlot(str, bool)
-    def add_new_tab(self, path="", is_shell=False, select_file=None, target_tabwidget=None, activate=True):
+    def add_new_tab(self, path="", is_shell=False, select_file=None, target_tabwidget=None, activate=True,
+                    bookmark_group_color=None, bookmark_source_node_id=None,
+                    tab_group_separator_after=False, tab_group_separator_color="", tab_group_separator_name=""):
         # 默认新建标签页为“此电脑”
         if not path:
             path = 'shell:MyComputerFolder'
@@ -13246,16 +14504,33 @@ class MainWindow(QMainWindow):
             show_toast(self, tr("打开失败"), tr("无法嵌入该窗口，已尝试用系统资源管理器打开。\n{}").format(e), level="error", duration=3500)
             return -1
         tab.is_pinned = False
-        short = path[-16:] if len(path) > 16 else path
+        tab.bookmark_group_color = bookmark_group_color or ""
+        tab.bookmark_source_node_id = str(bookmark_source_node_id or "")
+        tab.tab_group_separator_after = bool(tab_group_separator_after)
+        tab.tab_group_separator_color = str(tab_group_separator_color or "")
+        tab.tab_group_separator_name = str(tab_group_separator_name or "")
         
         # 同时添加到 tab_widget（占位标签）和 content_stack（实际内容）
-        tab_index = tab_widget.addTab(QWidget(), short)
+        tab_index = tab_widget.addTab(QWidget(), "")
         content_stack.addWidget(tab)
+        # 启动恢复时也立即用统一逻辑生成短标题，避免显示全路径。
+        try:
+            tab.update_tab_title()
+        except Exception:
+            pass
         
         # activate=True：切到该标签（触发 showEvent → 首次导航）。
         # activate=False：不激活，标签保持隐藏，其导航延迟到用户首次切过去（懒加载）。
         if activate:
             tab_widget.setCurrentIndex(tab_index)
+
+        self._apply_tab_group_color(tab_widget, tab_index, tab)
+        self._apply_tab_grouping_for_pane(tab_widget)
+        if getattr(tab, 'bookmark_group_color', ''):
+            try:
+                self.populate_bookmark_bar_menu()
+            except Exception:
+                pass
         
         # 更新导航按钮状态（确保新标签页的按钮状态正确）
         self.update_navigation_buttons()
@@ -13268,6 +14543,7 @@ class MainWindow(QMainWindow):
     def close_tab(self, index, target_tabwidget=None):
         tab_widget, content_stack, is_right = self._resolve_group(target_tabwidget)
         tab = content_stack.widget(index) if (content_stack and 0 <= index < content_stack.count()) else None
+        closed_group_color = str(getattr(tab, 'bookmark_group_color', '') or '').strip()
         if tab and hasattr(tab, 'cleanup'):
             try:
                 tab.cleanup()
@@ -13318,6 +14594,7 @@ class MainWindow(QMainWindow):
                 if widget:
                     widget.deleteLater()
             tab_widget.removeTab(index)
+            self._apply_tab_grouping_for_pane(tab_widget)
             self._schedule_session_snapshot()
         else:
             # 该组仅剩一个标签
@@ -13330,9 +14607,16 @@ class MainWindow(QMainWindow):
                         widget.deleteLater()
                 tab_widget.removeTab(index)
                 self._teardown_split_group()
+                self._apply_tab_grouping_for_pane(self.tab_widget)
                 self._schedule_session_snapshot()
             else:
                 self.close()
+
+        if closed_group_color:
+            try:
+                self.populate_bookmark_bar_menu()
+            except Exception:
+                pass
 
 
     def close_current_tab(self):
@@ -13420,6 +14704,22 @@ class MainWindow(QMainWindow):
             # 从 content_stack 获取实际的标签页内容
             tab = self.content_stack.widget(index) if hasattr(self, 'content_stack') else self.tab_widget.widget(index)
             if hasattr(tab, 'current_path'):
+                current_path = str(getattr(tab, 'current_path', '') or '')
+                source_id = str(getattr(tab, 'bookmark_source_node_id', '') or '').strip()
+                if source_id:
+                    self._last_bookmark_node_id = source_id
+                    debug_print(f"[GroupInsert] Active tab carries bookmark source id={source_id}")
+                elif current_path:
+                    children = self._get_bookmark_bar_children()
+                    _anchor, matched = self._find_bookmark_anchor_from_path(current_path, children)
+                    matched_id = matched.get('id') if isinstance(matched, dict) else ''
+                    if matched_id:
+                        tab.bookmark_source_node_id = str(matched_id)
+                        self._last_bookmark_node_id = str(matched_id)
+                        debug_print(
+                            f"[GroupInsert] Active tab path matched bookmark id={matched_id}, "
+                            f"path='{current_path}'"
+                        )
                 # 切换标签时强制刷新该标签路径栏，避免显示上一个标签路径
                 try:
                     if hasattr(tab, 'path_bar') and tab.path_bar:
@@ -13776,6 +15076,30 @@ class MainWindow(QMainWindow):
         """)
         self.search_button.clicked.connect(self.show_search_dialog)
         titlebar_layout.addWidget(self.search_button)
+
+        # 插入分组按钮
+        self.insert_group_btn = QPushButton("☰")
+        self.insert_group_btn.setToolTip(tr("插入分组 (F4)"))
+        self.insert_group_btn.setFixedSize(btn_size, btn_size)
+        self.insert_group_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: none;
+                border-radius: {btn_radius}px;
+                font-size: {btn_font_size}pt;
+                color: #202020;
+            }}
+            QPushButton:hover {{
+                background: #e5e5e5;
+                color: #000000;
+            }}
+            QPushButton:pressed {{
+                background: #d5d5d5;
+                color: #000000;
+            }}
+        """)
+        self.insert_group_btn.clicked.connect(self.insert_tab_group_marker)
+        titlebar_layout.addWidget(self.insert_group_btn)
         
         # 分屏对比按钮（切换右侧第二个独立浏览面板）
         self.split_view_btn = QPushButton("◫")
@@ -14616,6 +15940,16 @@ class MainWindow(QMainWindow):
             else:
                 self._last_keys_state["F3"] = False
 
+            # F4 - 默认分组切换
+            if is_key_pressed(0x73) and hotkeys.get("insert_group_bookmark", True):
+                key_combo = "F4"
+                if not self._last_keys_state.get(key_combo, False):
+                    self.insert_tab_group_marker()
+                    self._last_keys_state[key_combo] = True
+                return
+            else:
+                self._last_keys_state["F4"] = False
+
         except Exception as e:
             # 如果轮询出错，不影响程序运行
             pass
@@ -14643,6 +15977,7 @@ class MainWindow(QMainWindow):
             self.config["enable_title_shortcuts"] = dlg.title_shortcuts_cb.isChecked()
             self.config["enable_mouse_gestures"] = dlg.mouse_gestures_cb.isChecked()
             self.config["file_op_max_workers"] = dlg.file_op_workers_spin.value()
+            self.config["show_tab_group_markers"] = dlg.show_tab_group_markers_cb.isChecked()
 
             # 更新全局调试开关
             set_debug_mode(self.config["debug_mode"])
@@ -14668,12 +16003,14 @@ class MainWindow(QMainWindow):
             self.config["hotkeys"]["copy_filepath"] = dlg.hotkey_copy_filepath.isChecked()
             self.config["hotkeys"]["quick_find_current_dir"] = dlg.hotkey_quick_find_current_dir.isChecked()
             self.config["hotkeys"]["split_view"] = dlg.hotkey_split_view.isChecked()
+            self.config["hotkeys"]["insert_group_bookmark"] = dlg.hotkey_insert_group_bookmark.isChecked()
             
             self.save_config()
 
             # 同步标题栏按钮可见性
             self.apply_tortoisegit_buttons_config()
             self.apply_title_shortcuts_config()
+            self.apply_tab_group_markers_config()
             
             # 重新设置快捷键
             # 清除旧的快捷键
@@ -14782,6 +16119,13 @@ class MainWindow(QMainWindow):
 
     def tab_context_menu(self, pos, target_tabwidget=None):
         tw, cs, is_right = self._resolve_group(target_tabwidget)
+        bar = tw.tabBar() if tw is not None else None
+        if bar is not None and hasattr(bar, 'consume_context_menu_suppression'):
+            try:
+                if bar.consume_context_menu_suppression():
+                    return
+            except Exception:
+                pass
         tab_index = tw.tabBar().tabAt(pos)
         if tab_index < 0:
             return
@@ -14875,6 +16219,10 @@ class MainWindow(QMainWindow):
         if tab is None:
             return
         tab.is_pinned = True
+        tab.tab_group_separator_after = False
+        tab.tab_group_separator_color = ""
+        tab.tab_group_separator_name = ""
+        tab.bookmark_group_color = ""
         # 重新排序：所有固定的在最左侧（仅作用于该标签组）
         self.sort_tabs_by_pinned(tw)
         self.save_pinned_tabs()
@@ -14922,6 +16270,7 @@ class MainWindow(QMainWindow):
                 if tab is current_tab:
                     tw.setCurrentIndex(i)
                     break
+        self._apply_tab_grouping_for_pane(tw)
 
     def save_pinned_tabs(self):
         """保存固定标签页到config.json（扫描左右两个标签组）"""
@@ -14932,7 +16281,10 @@ class MainWindow(QMainWindow):
             for i in range(cs.count()):
                 tab = cs.widget(i)
                 if tab and getattr(tab, 'is_pinned', False) and hasattr(tab, 'current_path'):
-                    pinned_paths.append(tab.current_path)
+                    current_path = getattr(tab, 'current_path', '')
+                    if not current_path:
+                        continue
+                    pinned_paths.append(current_path)
 
         # 更新config并保存
         self.config["pinned_tabs"] = pinned_paths
@@ -14946,25 +16298,35 @@ class MainWindow(QMainWindow):
         has_pinned = False
         
         # 从config.json读取
-        pinned_paths = self.config.get("pinned_tabs", [])
+        pinned_entries = self.config.get("pinned_tabs", [])
         
-        if pinned_paths:
-            print(f"[Config] Loading {len(pinned_paths)} pinned tabs from config.json")
-            for path in pinned_paths:
+        if pinned_entries:
+            print(f"[Config] Loading {len(pinned_entries)} pinned tabs from config.json")
+            for entry in pinned_entries:
+                if isinstance(entry, dict):
+                    path = entry.get('path', '')
+                    is_shell = bool(entry.get('is_shell', False)) or str(path).startswith('shell:')
+                else:
+                    path = entry
+                    is_shell = str(path).startswith('shell:')
                 if os.path.exists(path) or path.startswith('shell:'):
                     try:
-                        is_shell = path.startswith('shell:')
                         # 懒加载：固定标签也延迟首次导航，避免启动瞬间多个 Shell 视图同时创建
                         tab = FileExplorerTab(self, path, is_shell=is_shell, defer_nav=True)
                         if hasattr(tab, 'set_bottom_statusbar_visible'):
                             tab.set_bottom_statusbar_visible(self.config.get("show_bottom_statusbar", True))
                         tab.is_pinned = True
-                        short = path[-12:] if len(path) > 12 else path
-                        pin_prefix = "📌"
-                        title = pin_prefix + short
+                        tab.tab_group_separator_after = False
+                        tab.tab_group_separator_color = ""
+                        tab.tab_group_separator_name = ""
+                        tab.bookmark_group_color = ""
                         # 同时添加到 tab_widget 和 content_stack
-                        self.tab_widget.addTab(QWidget(), title)  # tab_widget 只显示标签，内容用占位widget
+                        self.tab_widget.addTab(QWidget(), "")  # tab_widget 只显示标签，内容用占位widget
                         self.content_stack.addWidget(tab)  # 实际内容添加到 content_stack
+                        try:
+                            tab.update_tab_title()
+                        except Exception:
+                            pass
                         has_pinned = True
                         print(f"[Config] ✓ Loaded pinned tab: {path}")
                     except Exception as e:
@@ -14973,6 +16335,8 @@ class MainWindow(QMainWindow):
                     print(f"[Config] ⚠ Skipping non-existent path: {path}")
         else:
             print("[Config] No pinned tabs found in config.json")
+
+        self._apply_tab_grouping_for_pane(self.tab_widget)
         
         return has_pinned
 
@@ -15001,6 +16365,8 @@ class MainWindow(QMainWindow):
         
         # 初始化书签管理器
         self.bookmark_manager = BookmarkManager()
+        self._last_bookmark_node_id = None
+        self._bookmark_effective_colors = {}
         # 检查并自动添加常用书签
         self.ensure_default_bookmarks()
         
@@ -15101,6 +16467,7 @@ class MainWindow(QMainWindow):
             "enable_title_shortcuts": True,  # 默认启用标题栏快捷方式区域
             "title_shortcuts": [],  # 标题栏快捷方式（.lnk/.exe/.bat/.cmd/.ps1 路径）
             "enable_mouse_gestures": True,  # 默认启用鼠标手势（右键画线导航）
+            "show_tab_group_markers": True,  # 默认显示标签分组颜色
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
@@ -15119,7 +16486,8 @@ class MainWindow(QMainWindow):
                 "cancel_file_op": True,    # Alt+Q - 取消后台复制/删除
                 "copy_filename": True,     # Alt+Z - 复制选中文件名
                 "copy_filepath": True,     # Alt+X - 复制文件路径\文件名
-                "split_view": True         # F3 - 左右分屏对比
+                "split_view": True,        # F3 - 左右分屏对比
+                "insert_group_bookmark": True  # F4 - 插入标签分组（保留旧键名兼容已有配置）
             },
             "language": "zh",              # 界面语言：zh / en
         }
@@ -15227,12 +16595,24 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _get_pinned_paths_from_config(self):
+        """兼容 pinned_tabs 的新旧格式，统一提取路径列表。"""
+        paths = []
+        for entry in self.config.get("pinned_tabs", []) or []:
+            if isinstance(entry, dict):
+                p = entry.get('path', '')
+            else:
+                p = entry
+            if p:
+                paths.append(p)
+        return paths
+
     def _collect_cached_tabs(self):
         cached_tabs = []
-        seen_paths = set()
+        pinned_paths = self._get_pinned_paths_from_config()
         pinned_norm = {
             self._normalize_path_for_compare(p)
-            for p in self.config.get("pinned_tabs", []) if p
+            for p in pinned_paths if p
         }
 
         if not hasattr(self, 'tab_widget'):
@@ -15254,13 +16634,15 @@ class MainWindow(QMainWindow):
                 continue
 
             norm = self._normalize_path_for_compare(current_path)
-            if norm in pinned_norm or norm in seen_paths:
+            if norm in pinned_norm:
                 continue
-
-            seen_paths.add(norm)
             cached_tabs.append({
                 'path': current_path,
                 'is_shell': current_path.startswith('shell:'),
+                'bookmark_group_color': str(getattr(tab, 'bookmark_group_color', '') or ''),
+                'tab_group_separator_after': bool(getattr(tab, 'tab_group_separator_after', False)),
+                'tab_group_separator_color': str(getattr(tab, 'tab_group_separator_color', '') or ''),
+                'tab_group_separator_name': str(getattr(tab, 'tab_group_separator_name', '') or ''),
             })
 
         return cached_tabs
@@ -15277,11 +16659,11 @@ class MainWindow(QMainWindow):
         stw = getattr(self, 'split_tab_widget', None)
         if scs is None or stw is None or stw.count() == 0:
             return state
+        pinned_paths = self._get_pinned_paths_from_config()
         pinned_norm = {
             self._normalize_path_for_compare(p)
-            for p in self.config.get("pinned_tabs", []) if p
+            for p in pinned_paths if p
         }
-        seen = set()
         tabs = []
         for i in range(scs.count()):
             tab = scs.widget(i)
@@ -15293,12 +16675,15 @@ class MainWindow(QMainWindow):
             if not current_path:
                 continue
             norm = self._normalize_path_for_compare(current_path)
-            if norm in pinned_norm or norm in seen:
+            if norm in pinned_norm:
                 continue
-            seen.add(norm)
             tabs.append({
                 'path': current_path,
                 'is_shell': current_path.startswith('shell:'),
+                'bookmark_group_color': str(getattr(tab, 'bookmark_group_color', '') or ''),
+                'tab_group_separator_after': bool(getattr(tab, 'tab_group_separator_after', False)),
+                'tab_group_separator_color': str(getattr(tab, 'tab_group_separator_color', '') or ''),
+                'tab_group_separator_name': str(getattr(tab, 'tab_group_separator_name', '') or ''),
             })
         if not tabs:
             return state
@@ -15589,6 +16974,13 @@ class MainWindow(QMainWindow):
                     is_shell=tab_info.get('is_shell', False),
                     target_tabwidget=self.split_tab_widget,
                     activate=False,
+                    bookmark_group_color=(
+                        tab_info.get('bookmark_group_color', '')
+                        or tab_info.get('tab_group_separator_color', '')
+                    ),
+                    tab_group_separator_after=tab_info.get('tab_group_separator_after', False),
+                    tab_group_separator_color=tab_info.get('tab_group_separator_color', ''),
+                    tab_group_separator_name=tab_info.get('tab_group_separator_name', ''),
                 )
                 added += 1
             except Exception as e:
@@ -15600,6 +16992,7 @@ class MainWindow(QMainWindow):
         active_index = state.get("active_index", 0)
         if 0 <= active_index < self.split_tab_widget.count():
             self.split_tab_widget.setCurrentIndex(active_index)
+        self._apply_tab_grouping_for_pane(self.split_tab_widget)
         return True
 
     def save_session_snapshot(self, immediate=False):
@@ -15842,12 +17235,13 @@ class MainWindow(QMainWindow):
                 border-color: #c0c0c0;
             }}
             QTabBar::tab:selected {{
-                background: #FFF9CC;
-                border: 1px solid #c0c0c0;
+                background: #f5f5f5;
+                border: 1px solid #2F6FDB;
                 border-bottom: none;
                 margin-top: 0px;
                 padding-top: {tab_padding_v + 1}px;
-                color: #000000;
+                color: #2F6FDB;
+                font-weight: bold;
             }}
             QTabBar::tab:!selected {{
                 font-weight: normal;
@@ -16092,9 +17486,10 @@ class MainWindow(QMainWindow):
                 cached_tabs = self.config.get("cached_tabs", [])
                 debug_print(f"[App] 待恢复的缓存标签页数: {len(cached_tabs)}")
                 if cached_tabs:
+                    pinned_paths = self._get_pinned_paths_from_config()
                     pinned_norm = {
                         self._normalize_path_for_compare(p)
-                        for p in self.config.get("pinned_tabs", []) if p
+                        for p in pinned_paths if p
                     }
                     debug_print(f"[App] 恢复 {len(cached_tabs)} 个缓存标签页")
                     for tab_info in cached_tabs:
@@ -16104,11 +17499,18 @@ class MainWindow(QMainWindow):
                             if norm in pinned_norm:
                                 debug_print(tr("[App] 跳过缓存标签（已固定）: {}").format(path))
                                 continue
-                            if self.is_path_open(path):
-                                debug_print(tr("[App] 跳过缓存标签（已打开）: {}").format(path))
-                                continue
                             # 懒加载：恢复的缓存标签不逐个激活，后台标签首次可见时才导航
-                            self.add_new_tab(path, activate=False)
+                            self.add_new_tab(
+                                path,
+                                activate=False,
+                                bookmark_group_color=(
+                                    tab_info.get('bookmark_group_color', '')
+                                    or tab_info.get('tab_group_separator_color', '')
+                                ),
+                                tab_group_separator_after=tab_info.get('tab_group_separator_after', False),
+                                tab_group_separator_color=tab_info.get('tab_group_separator_color', ''),
+                                tab_group_separator_name=tab_info.get('tab_group_separator_name', ''),
+                            )
                     debug_print(f"[App] 恢复缓存标签后标签页数: {self.tab_widget.count()}")
                 else:
                     # 没有缓存标签且没有固定标签，现在添加默认标签
@@ -16146,6 +17548,8 @@ class MainWindow(QMainWindow):
         restored_active = self._restore_last_active_tab()
         if restored_active:
             debug_print(tr("[App] 已恢复上次激活的标签页"))
+        self._apply_tab_grouping_for_pane(self.tab_widget)
+        self._apply_tab_grouping_for_pane(getattr(self, 'split_tab_widget', None))
         # 兜底：懒加载下所有恢复标签均未激活时，_restore_last_active_tab 可能未选中任何标签，
         # 导致左侧当前标签仍处于延迟态（界面空白）。这里强制激活一次左侧当前标签，
         # 触发其 showEvent → 首次导航，保证启动后左侧有一个已加载的可见标签。
@@ -16667,11 +18071,20 @@ class MainWindow(QMainWindow):
         
         super().closeEvent(event)
 
+    def open_bookmark_node(self, node):
+        if not isinstance(node, dict):
+            return
+        self._last_bookmark_node_id = node.get('id')
+        if self._is_group_separator_node(node):
+            show_toast(self, tr("提示"), tr("该分组为分隔标记，不打开路径"), level="info")
+            return
+        group_color = self._bookmark_effective_colors.get(node.get('id'))
+        self.open_bookmark_url(node.get('url', ''), group_color=group_color, bookmark_node_id=node.get('id'))
 
-
-    def open_bookmark_url(self, url):
+    def open_bookmark_url(self, url, group_color=None, bookmark_node_id=None):
         # 支持 file:///、file://、shell: 路径和本地绝对路径
         from urllib.parse import unquote
+        target_tw = self.get_active_group_tabwidget()
         if url.startswith('file:'):
             # 处理各种file URL格式
             if url.startswith('file://///'):
@@ -16692,9 +18105,11 @@ class MainWindow(QMainWindow):
             
             # 检查是否是 shell: 路径
             if local_path.startswith('shell:'):
-                self.add_new_tab(local_path, is_shell=True)
+                self.add_new_tab(local_path, is_shell=True, target_tabwidget=target_tw,
+                                 bookmark_group_color=group_color, bookmark_source_node_id=bookmark_node_id)
             elif os.path.exists(local_path):
-                self.add_new_tab(local_path)
+                self.add_new_tab(local_path, target_tabwidget=target_tw,
+                                 bookmark_group_color=group_color, bookmark_source_node_id=bookmark_node_id)
             else:
                 show_toast(self, tr("路径错误"), tr("路径不存在: {}").format(local_path), level="warning")
         elif url.startswith('shell:'):
@@ -16702,13 +18117,16 @@ class MainWindow(QMainWindow):
             if url.lower() == 'shell:onedrive':
                 onedrive_path = os.environ.get('OneDrive', '')
                 if onedrive_path and os.path.exists(onedrive_path):
-                    self.add_new_tab(onedrive_path)
+                    self.add_new_tab(onedrive_path, target_tabwidget=target_tw,
+                                     bookmark_group_color=group_color, bookmark_source_node_id=bookmark_node_id)
                 else:
                     show_toast(self, tr("路径错误"), tr("未找到 OneDrive 文件夹"), level="warning")
             else:
-                self.add_new_tab(url, is_shell=True)
+                self.add_new_tab(url, is_shell=True, target_tabwidget=target_tw,
+                                 bookmark_group_color=group_color, bookmark_source_node_id=bookmark_node_id)
         elif os.path.isabs(url) and os.path.exists(url):
-            self.add_new_tab(url)
+            self.add_new_tab(url, target_tabwidget=target_tw,
+                             bookmark_group_color=group_color, bookmark_source_node_id=bookmark_node_id)
         else:
             show_toast(self, tr("不支持的书签"), tr("暂不支持打开此类型书签: {}").format(url), level="warning")
 
@@ -16740,14 +18158,52 @@ class MainWindow(QMainWindow):
     def show_bookmark_context_menu(self, pos, bookmark_id, bookmark_name):
         """显示书签右键菜单"""
         debug_print(f"[DEBUG] show_bookmark_context_menu called: pos={pos}, id={bookmark_id}, name={bookmark_name}")
+        self._last_bookmark_node_id = bookmark_id
+        node = self._find_bookmark_node_by_id(bookmark_id)
+        is_group_separator = self._is_group_separator_node(node)
         menu = QMenu(self)
+
+        insert_left_action = menu.addAction(tr("在左侧插入分组"))
+        insert_right_action = menu.addAction(tr("在右侧插入分组"))
+
+        if is_group_separator:
+            menu.addSeparator()
+            rename_group_action = menu.addAction(tr("重命名分组"))
+            collapse_group_action = menu.addAction(
+                tr("展开分组") if bool(node.get('group_collapsed', False)) else tr("折叠分组")
+            )
+            close_group_tabs_action = menu.addAction(tr("关闭该分组标签页"))
+            keep_only_group_tabs_action = menu.addAction(tr("仅保留当前分组标签页"))
+        else:
+            rename_group_action = None
+            collapse_group_action = None
+            close_group_tabs_action = None
+            keep_only_group_tabs_action = None
+
+        menu.addSeparator()
         
         delete_action = menu.addAction(tr("🗑️ 删除书签"))
+        insert_left_action.triggered.connect(lambda: self._insert_group_relative_to(bookmark_id, side='left'))
+        insert_right_action.triggered.connect(lambda: self._insert_group_relative_to(bookmark_id, side='right'))
+        if rename_group_action is not None:
+            rename_group_action.triggered.connect(lambda: self.rename_group_bookmark(bookmark_id))
+        if collapse_group_action is not None:
+            collapse_group_action.triggered.connect(lambda: self.toggle_group_collapsed(bookmark_id))
+        if close_group_tabs_action is not None:
+            close_group_tabs_action.triggered.connect(lambda: self.close_group_tabs(bookmark_id))
+        if keep_only_group_tabs_action is not None:
+            keep_only_group_tabs_action.triggered.connect(lambda: self.keep_only_current_group_tabs(bookmark_id))
         delete_action.triggered.connect(lambda: self.confirm_delete_bookmark(bookmark_id, bookmark_name))
         
         debug_print(f"[DEBUG] Showing menu...")
         menu.exec_(pos)
         debug_print(f"[DEBUG] Menu closed")
+
+    def _insert_group_relative_to(self, bookmark_id, side='right'):
+        if not bookmark_id:
+            return False
+        self._last_bookmark_node_id = bookmark_id
+        return self.insert_group_bookmark(side=side)
     
     def confirm_delete_bookmark(self, bookmark_id, bookmark_name):
         """直接删除书签并给出轻量提示"""
@@ -16763,10 +18219,28 @@ class MainWindow(QMainWindow):
         bookmark_bar = tree.get('bookmark_bar')
         if not bookmark_bar or 'children' not in bookmark_bar:
             return
+
+        children = bookmark_bar.get('children', [])
+        self._bookmark_effective_colors = self._compute_effective_group_colors(children)
+        group_member_map = self._count_group_member_map(children)
+        open_count_map = self._count_open_tabs_by_group_color()
+        hidden_top_level_ids = set()
+        group_collapsed = False
+        for node in reversed(children):
+            if not isinstance(node, dict):
+                continue
+            if self._is_group_separator_node(node):
+                group_collapsed = bool(node.get('group_collapsed', False))
+                continue
+            if group_collapsed:
+                node_id = node.get('id')
+                if node_id:
+                    hidden_top_level_ids.add(node_id)
         
         # 存储action/menu到节点的映射
         self.bookmark_actions = {}
         self.bookmark_menus = {}  # 存储QMenu到节点的映射
+        action_group_colors = {}
         
         def add_menu_items(parent_menu, node):
             if node.get('type') == 'folder':
@@ -16784,35 +18258,56 @@ class MainWindow(QMainWindow):
                 special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
                 name = node.get('name', '')
                 is_special = any(name.startswith(icon) for icon in special_icons)
+                is_group_separator = self._is_group_separator_node(node)
                 if is_special:
                     action = parent_menu.addAction(name)
+                elif is_group_separator:
+                    prefix = "◨" if bool(node.get('group_collapsed', False)) else "◧"
+                    member_count = int(group_member_map.get(node.get('id'), 0))
+                    open_count = int(open_count_map.get(str(node.get('group_color', '')).strip().lower(), 0))
+                    badge = tr("成员 {} | 开页 {}").format(member_count, open_count)
+                    action = parent_menu.addAction(f"{prefix} {name} [{badge}]")
                 else:
                     action = parent_menu.addAction(f"📑 {name}")
-                url = node.get('url', '')
-                action.triggered.connect(lambda checked, u=url: self.open_bookmark_url(u))
+                action.triggered.connect(lambda checked, n=node: self.open_bookmark_node(n))
                 # 存储action和节点的映射
                 self.bookmark_actions[action] = node
         # 直接在菜单栏顶层添加
         menubar = self.menu_bar
         # 先添加所有书签和文件夹
         for child in bookmark_bar['children']:
+            if child.get('id') in hidden_top_level_ids:
+                continue
             if child.get('type') == 'folder':
                 add_menu_items(menubar, child)
+                effective_color = self._bookmark_effective_colors.get(child.get('id'))
+                if effective_color and menubar.actions():
+                    action_group_colors[menubar.actions()[-1]] = effective_color
             elif child.get('type') == 'url':
                 # 判断是否为四个常用项目
                 special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
                 name = child.get('name', '')
                 is_special = any(name.startswith(icon) for icon in special_icons)
+                is_group_separator = self._is_group_separator_node(child)
                 if is_special:
                     action = menubar.addAction(name)
+                elif is_group_separator:
+                    prefix = "◨" if bool(child.get('group_collapsed', False)) else "◧"
+                    member_count = int(group_member_map.get(child.get('id'), 0))
+                    open_count = int(open_count_map.get(str(child.get('group_color', '')).strip().lower(), 0))
+                    badge = tr("成员 {} | 开页 {}").format(member_count, open_count)
+                    action = menubar.addAction(f"{prefix} {name} [{badge}]")
                 else:
                     action = menubar.addAction(f"📑 {name}")
-                url = child.get('url', '')
-                action.triggered.connect(lambda checked, u=url: self.open_bookmark_url(u))
+                action.triggered.connect(lambda checked, n=child: self.open_bookmark_node(n))
                 # 存储action和节点的映射
                 self.bookmark_actions[action] = child
-                # 存储action和节点的映射
-                self.bookmark_actions[action] = child
+                effective_color = self._bookmark_effective_colors.get(child.get('id'))
+                if effective_color:
+                    action_group_colors[action] = effective_color
+
+        if hasattr(self.menu_bar, 'set_action_group_colors'):
+            self.menu_bar.set_action_group_colors(action_group_colors)
         # 仅显示书签内容，不在菜单栏添加“设置”或“书签管理”入口
     
     def on_menubar_context_menu(self, pos):
@@ -17121,6 +18616,13 @@ class SettingsDialog(QDialog):
         self.cache_tabs_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.cache_tabs_cb.setToolTip(tr("关闭软件时保存非固定标签，下次启动时自动恢复（不包括固定标签）"))
         tabs_layout.addWidget(self.cache_tabs_cb)
+        self.show_tab_group_markers_cb = QCheckBox(tr("显示标签分组标记（颜色）"), self)
+        self.show_tab_group_markers_cb.setChecked(config.get("show_tab_group_markers", True))
+        self.show_tab_group_markers_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.show_tab_group_markers_cb.setToolTip(
+            tr("在标签页上显示分组颜色，关闭后仅保留分组逻辑不显示颜色")
+        )
+        tabs_layout.addWidget(self.show_tab_group_markers_cb)
         tabs_group.setLayout(tabs_layout)
         compact_groupbox(tabs_group)
         for i in range(tabs_layout.count()):
@@ -17269,6 +18771,9 @@ class SettingsDialog(QDialog):
         self.hotkey_split_view = QCheckBox(tr("F3 - 左右分屏对比"))
         self.hotkey_split_view.setChecked(hotkeys.get("split_view", True))
         hotkey_layout.addWidget(self.hotkey_split_view)
+        self.hotkey_insert_group_bookmark = QCheckBox(tr("F4 - 插入标签分组"))
+        self.hotkey_insert_group_bookmark.setChecked(hotkeys.get("insert_group_bookmark", True))
+        hotkey_layout.addWidget(self.hotkey_insert_group_bookmark)
         # 提示信息（放在快捷键设置框内）
         tip_label = QLabel(tr("💡 提示：取消勾选可禁用对应的快捷键"))
         tip_label.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
@@ -17602,6 +19107,7 @@ class SettingsDialog(QDialog):
             self.parent().config["file_op_max_workers"] = self.file_op_workers_spin.value()
             self.parent().config["show_bottom_statusbar"] = self.bottom_statusbar_cb.isChecked()
             self.parent().config["show_resource_usage_in_statusbar"] = self.resource_usage_cb.isChecked()
+            self.parent().config["show_tab_group_markers"] = self.show_tab_group_markers_cb.isChecked()
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
             self.parent().config["preferred_terminal_tool"] = normalize_terminal_tool_name(self.preferred_terminal_combo.currentData())
@@ -17647,6 +19153,8 @@ class SettingsDialog(QDialog):
                 self.parent().apply_bottom_statusbar_config()
             if hasattr(self.parent(), 'apply_resource_usage_config'):
                 self.parent().apply_resource_usage_config()
+            if hasattr(self.parent(), 'apply_tab_group_markers_config'):
+                self.parent().apply_tab_group_markers_config()
             self.parent().apply_tortoisegit_buttons_config()
             # 重新设置快捷键
             self.parent().setup_shortcuts()
@@ -17688,7 +19196,333 @@ class SettingsDialog(QDialog):
 
 # 书签管理对话框（初步框架，后续可扩展重命名/新建/删除等功能）
 from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton, QHBoxLayout, QInputDialog, QLabel
+
+
+class _GroupAwareBookmarkTree(QTreeWidget):
+    """书签树拖拽增强：顶层分组块在拖拽阶段保持整体移动，不允许拆组。"""
+
+    def __init__(self, owner_dialog, parent=None):
+        super().__init__(parent)
+        self._owner_dialog = owner_dialog
+        self._drag_block = None
+        self._drag_anchor_id = None
+        self._preview_block = None
+        self._preview_insert_index = -1
+        self._preview_drop_valid = True
+        self._auto_scroll_edge_px = 24
+        self._auto_scroll_step_px = 22
+
+    def _auto_scroll_on_drag(self, pos):
+        """拖拽到视口上下边缘时自动滚动，便于长列表跨屏移动。"""
+        try:
+            bar = self.verticalScrollBar()
+            if bar is None:
+                return
+            y = int(pos.y())
+            vh = int(self.viewport().height())
+            edge = int(self._auto_scroll_edge_px)
+            step = int(self._auto_scroll_step_px)
+            if y < edge:
+                bar.setValue(max(bar.minimum(), bar.value() - step))
+            elif y > max(0, vh - edge):
+                bar.setValue(min(bar.maximum(), bar.value() + step))
+        except Exception:
+            pass
+
+    def startDrag(self, supportedActions):
+        self._drag_block = None
+        self._drag_anchor_id = None
+        self._preview_block = None
+        self._preview_insert_index = -1
+        self._preview_drop_valid = True
+        item = self.currentItem()
+        if item is not None and self._owner_dialog is not None:
+            self._drag_anchor_id = item.data(0, 1)
+            self._drag_block = self._owner_dialog._get_drag_group_block(item)
+            self._preview_block = self._drag_block
+        self.viewport().update()
+        try:
+            super().startDrag(supportedActions)
+        finally:
+            self._drag_block = None
+            self._drag_anchor_id = None
+            self._preview_block = None
+            self._preview_insert_index = -1
+            self._preview_drop_valid = True
+            self.viewport().update()
+
+    def dragMoveEvent(self, event):
+        if self._drag_block is not None:
+            self._auto_scroll_on_drag(event.pos())
+            self._preview_insert_index = self._owner_dialog._drop_target_top_level_index(event.pos())
+            start, end = self._drag_block
+            self._preview_drop_valid = not (start <= self._preview_insert_index <= (end + 1))
+            self.viewport().update()
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event):
+        self._preview_insert_index = -1
+        self._preview_drop_valid = True
+        self.viewport().update()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        if self._drag_block is not None and self._owner_dialog is not None:
+            moved = self._owner_dialog._move_group_block_in_tree(self._drag_block, event.pos(), self._drag_anchor_id)
+            self._drag_block = None
+            self._drag_anchor_id = None
+            self._preview_block = None
+            self._preview_insert_index = -1
+            self._preview_drop_valid = True
+            self.viewport().update()
+            if moved:
+                event.acceptProposedAction()
+                return
+            event.ignore()
+            return
+        super().dropEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._preview_block is None:
+            return
+        start, end = self._preview_block
+        if start < 0 or end < start or end >= self.topLevelItemCount():
+            return
+        try:
+            from PyQt5.QtGui import QPainter, QColor, QPen
+            first_item = self.topLevelItem(start)
+            last_item = self.topLevelItem(end)
+            if first_item is None or last_item is None:
+                return
+            first_rect = self.visualItemRect(first_item)
+            last_rect = self.visualItemRect(last_item)
+            if not first_rect.isValid() or not last_rect.isValid():
+                return
+
+            painter = QPainter(self.viewport())
+
+            # 被拖拽分组块高亮
+            block_rect = first_rect.united(last_rect).adjusted(1, 0, -1, 0)
+            painter.fillRect(block_rect, QColor(100, 181, 246, 48))
+            pen = QPen(QColor("#42A5F5"))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.drawRect(block_rect)
+
+            # 分组移动提示徽标
+            badge_text = tr("整组移动")
+            badge_h = 18
+            badge_w = max(70, self.fontMetrics().width(badge_text) + 16)
+            badge_rect = block_rect.adjusted(6, 4, -6, -(block_rect.height() - badge_h - 4))
+            badge_rect.setWidth(min(badge_w, max(60, block_rect.width() - 12)))
+            painter.fillRect(badge_rect, QColor(30, 136, 229, 220))
+            painter.setPen(QColor("#FFFFFF"))
+            painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
+
+            # 插入位置指示线
+            ins = int(self._preview_insert_index)
+            if 0 <= ins <= self.topLevelItemCount():
+                y = None
+                if ins == self.topLevelItemCount():
+                    tail_item = self.topLevelItem(self.topLevelItemCount() - 1)
+                    if tail_item is not None:
+                        tail_rect = self.visualItemRect(tail_item)
+                        if tail_rect.isValid():
+                            y = tail_rect.bottom() + 1
+                else:
+                    tgt_item = self.topLevelItem(ins)
+                    if tgt_item is not None:
+                        tgt_rect = self.visualItemRect(tgt_item)
+                        if tgt_rect.isValid():
+                            y = tgt_rect.top()
+                if y is not None:
+                    color_hex = "#1E88E5" if self._preview_drop_valid else "#9E9E9E"
+                    insert_pen = QPen(QColor(color_hex))
+                    insert_pen.setWidth(3)
+                    if not self._preview_drop_valid:
+                        insert_pen.setStyle(Qt.DashLine)
+                    painter.setPen(insert_pen)
+                    painter.drawLine(4, y, max(4, self.viewport().width() - 4), y)
+                    if not self._preview_drop_valid:
+                        tip_rect = badge_rect.adjusted(0, badge_rect.height() + 4, 48, badge_rect.height() + 20)
+                        painter.fillRect(tip_rect, QColor(120, 120, 120, 200))
+                        painter.setPen(QColor("#FFFFFF"))
+                        painter.drawText(tip_rect, Qt.AlignCenter, tr("不可放置"))
+
+            painter.end()
+        except Exception:
+            pass
+
 class BookmarkManagerDialog(QDialog):
+    def _is_group_separator_node(self, node):
+        return bool(isinstance(node, dict) and node.get('type') == 'url' and node.get('is_group_separator'))
+
+    def _find_node_by_id(self, node_id):
+        if not node_id:
+            return None
+
+        def _walk(node):
+            if isinstance(node, dict):
+                if node.get('id') == node_id:
+                    return node
+                for child in node.get('children', []) or []:
+                    found = _walk(child)
+                    if found is not None:
+                        return found
+            elif isinstance(node, list):
+                for child in node:
+                    found = _walk(child)
+                    if found is not None:
+                        return found
+            return None
+
+        tree = self.bookmark_manager.get_tree()
+        return _walk(tree.get('bookmark_bar')) if isinstance(tree, dict) else None
+
+    def _is_group_separator_id(self, node_id):
+        return self._is_group_separator_node(self._find_node_by_id(node_id))
+
+    def _top_level_block_ranges(self):
+        """按当前树的顶层顺序生成分组块区间（start, end，含分隔节点）。"""
+        ranges = []
+        pending_start = 0
+        top_count = self.tree.topLevelItemCount()
+        for i in range(top_count):
+            item = self.tree.topLevelItem(i)
+            node_id = item.data(0, 1)
+            if self._is_group_separator_id(node_id):
+                ranges.append((pending_start, i))
+                pending_start = i + 1
+        if pending_start < top_count:
+            for j in range(pending_start, top_count):
+                item = self.tree.topLevelItem(j)
+                if self._is_group_separator_id(item.data(0, 1)):
+                    break
+            else:
+                # 未遇到分隔符：尾部每个节点视为独立块，避免被错误合并
+                for k in range(pending_start, top_count):
+                    ranges.append((k, k))
+                return ranges
+            for k in range(pending_start, top_count):
+                ranges.append((k, k))
+        return ranges
+
+    def _get_drag_group_block(self, item):
+        """若拖拽的是顶层分组成员，则返回其分组块区间；否则返回 None。"""
+        if item is None or item.parent() is not None:
+            return None
+        idx = self.tree.indexOfTopLevelItem(item)
+        if idx < 0:
+            return None
+        for start, end in self._top_level_block_ranges():
+            if start <= idx <= end:
+                if end > start:
+                    return (start, end)
+                return None
+        return None
+
+    def _drop_target_top_level_index(self, pos):
+        target = self.tree.itemAt(pos)
+        if target is None:
+            return self.tree.topLevelItemCount()
+        while target.parent() is not None:
+            target = target.parent()
+        idx = self.tree.indexOfTopLevelItem(target)
+        if idx < 0:
+            return self.tree.topLevelItemCount()
+        rect = self.tree.visualItemRect(target)
+        return idx if pos.y() < rect.center().y() else idx + 1
+
+    def _move_group_block_in_tree(self, block, pos, anchor_id=None):
+        """在拖拽落点处整体移动顶层分组块（UI层），不拆分成员。"""
+        if not block or len(block) != 2:
+            return False
+        start, end = int(block[0]), int(block[1])
+        top_count = self.tree.topLevelItemCount()
+        if start < 0 or end >= top_count or start > end:
+            return False
+
+        target_index = self._drop_target_top_level_index(pos)
+        if start <= target_index <= end + 1:
+            return False
+
+        items = []
+        while self.tree.topLevelItemCount() > 0:
+            items.append(self.tree.takeTopLevelItem(0))
+        moving = items[start:end + 1]
+        remain = items[:start] + items[end + 1:]
+
+        if target_index > end:
+            target_index -= len(moving)
+        target_index = max(0, min(target_index, len(remain)))
+        reordered = remain[:target_index] + moving + remain[target_index:]
+
+        for it in reordered:
+            self.tree.addTopLevelItem(it)
+
+        if anchor_id:
+            self.reselect_item_by_id(anchor_id)
+        # 拖拽完成后立即把 UI 顺序同步回数据，避免“看起来动了但未保存”。
+        self.on_items_moved()
+        return True
+
+    def _rebuild_group_block_protected_order(self, original_children, new_children):
+        """按原始分组块重建顶层顺序，避免拖拽把“分组+成员”拆散。"""
+        if not isinstance(original_children, list) or not isinstance(new_children, list):
+            return new_children
+
+        id_to_pos = {}
+        for idx, node in enumerate(new_children):
+            if isinstance(node, dict) and node.get('id'):
+                id_to_pos[node.get('id')] = idx
+
+        blocks = []
+        pending = []
+        for node in original_children:
+            if not isinstance(node, dict):
+                continue
+            pending.append(node)
+            if self._is_group_separator_node(node):
+                blocks.append(list(pending))
+                pending = []
+        for node in pending:
+            blocks.append([node])
+
+        scored_blocks = []
+        fallback = len(id_to_pos) + 1000
+        for i, block in enumerate(blocks):
+            positions = []
+            for n in block:
+                nid = n.get('id') if isinstance(n, dict) else None
+                if nid in id_to_pos:
+                    positions.append(id_to_pos[nid])
+            score = (min(positions) if positions else (fallback + i), i)
+            scored_blocks.append((score, block))
+
+        scored_blocks.sort(key=lambda x: x[0])
+
+        result = []
+        emitted = set()
+        for _score, block in scored_blocks:
+            for n in block:
+                if not isinstance(n, dict):
+                    continue
+                nid = n.get('id')
+                if not nid or nid in emitted:
+                    continue
+                emitted.add(nid)
+                result.append(n)
+
+        for n in new_children:
+            nid = n.get('id') if isinstance(n, dict) else None
+            if nid and nid not in emitted:
+                emitted.add(nid)
+                result.append(n)
+        return result
+
     def __init__(self, bookmark_manager, parent=None):
         super().__init__(parent)
         self.setWindowTitle(tr("书签管理器"))
@@ -17812,11 +19646,16 @@ class BookmarkManagerDialog(QDialog):
             
             # 从树形控件重建书签结构
             new_structure = self._rebuild_bookmark_structure()
+
+            tree = self.bookmark_manager.get_tree()
+            original_children = []
+            if isinstance(tree, dict) and isinstance(tree.get('bookmark_bar'), dict):
+                original_children = list(tree.get('bookmark_bar', {}).get('children', []) or [])
+            new_structure = self._rebuild_group_block_protected_order(original_children, new_structure)
             
             debug_print(f"[BookmarkDrag] Rebuilt {len(new_structure)} top-level items")
             
             # 更新书签管理器
-            tree = self.bookmark_manager.get_tree()
             if 'bookmark_bar' in tree:
                 tree['bookmark_bar']['children'] = new_structure
                 self.bookmark_manager.save_bookmarks()
@@ -17875,13 +19714,20 @@ class BookmarkManagerDialog(QDialog):
                 return node
             elif node_type == tr('书签'):
                 url = item.text(2)
-                return {
+                node = {
                     'id': node_id,
                     'name': name,
                     'type': 'url',
                     'url': url,
                     'date_added': original.get('date_added', node_id)
                 }
+                if original.get('is_group_separator'):
+                    node['is_group_separator'] = True
+                    if 'group_color' in original:
+                        node['group_color'] = original.get('group_color')
+                    if 'group_collapsed' in original:
+                        node['group_collapsed'] = bool(original.get('group_collapsed', False))
+                return node
             return None
         
         # 处理所有顶层项
@@ -17903,7 +19749,7 @@ class BookmarkManagerDialog(QDialog):
         layout = QVBoxLayout(self)
         
         # 使用标准树形控件（拖拽不自动保存）
-        self.tree = QTreeWidget()
+        self.tree = _GroupAwareBookmarkTree(self)
         self.tree.setHeaderLabels([tr("名称"), tr("类型"), tr("路径")])
         self.tree.setColumnWidth(0, 250)  # 第一列宽一些
         
