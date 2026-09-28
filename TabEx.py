@@ -3,10 +3,13 @@
 from collections import OrderedDict
 import hashlib
 import os
+import queue
+import threading
+import time
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.71"
+APP_VERSION = "3.73"
 
 
 # TabEx i18n module
@@ -1043,36 +1046,105 @@ class SearchCache:
     def __init__(self, max_size=50):
         self.cache = OrderedDict()
         self.max_size = max_size
+        self._lock = threading.RLock()
+        self._timestamps = {}
     
-    def get_key(self, search_path, keyword, search_filename, search_content, file_types, force_metadata_degrade=False, match_case=False, match_whole_word=False):
+    def get_key(self, search_path, keyword, search_filename, search_content, file_types, force_metadata_degrade=False, match_case=False, match_whole_word=False, use_everything=False):
         """生成缓存键"""
-        key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}|{force_metadata_degrade}|{match_case}|{match_whole_word}"
+        key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}|{force_metadata_degrade}|{match_case}|{match_whole_word}|{use_everything}"
         return hashlib.md5(key_str.encode()).hexdigest()
     
     def get(self, key):
         """获取缓存结果"""
-        if key in self.cache:
-            # 移到末尾（最近使用）
-            self.cache.move_to_end(key)
-            return self.cache[key]
+        with self._lock:
+            if key in self.cache:
+                if time.monotonic() - self._timestamps.get(key, 0) > 5:
+                    self.cache.pop(key, None)
+                    self._timestamps.pop(key, None)
+                    return None
+                self.cache.move_to_end(key)
+                return self.cache[key]
         return None
     
     def put(self, key, value):
         """存储缓存结果"""
-        if key in self.cache:
-            self.cache.move_to_end(key)
-        else:
+        with self._lock:
             self.cache[key] = value
-            # 如果超过最大缓存数，删除最旧的
+            self._timestamps[key] = time.monotonic()
+            self.cache.move_to_end(key)
             if len(self.cache) > self.max_size:
-                self.cache.popitem(last=False)
+                expired_key, _value = self.cache.popitem(last=False)
+                self._timestamps.pop(expired_key, None)
     
     def clear(self):
         """清空缓存"""
-        self.cache.clear()
+        with self._lock:
+            self.cache.clear()
+            self._timestamps.clear()
 
 # 全局搜索缓存实例（使用配置常量）
 _search_cache = SearchCache(max_size=MAX_SEARCH_CACHE_SIZE)
+
+class _SearchCancelled(Exception):
+    pass
+
+
+class _SearchResultQueue(queue.Queue):
+    def __init__(self, cancel_event):
+        super().__init__(maxsize=SEARCH_RESULT_QUEUE_MAXSIZE)
+        self.cancel_event = cancel_event
+
+    def put(self, item, block=True, timeout=None):
+        while not self.cancel_event.is_set():
+            try:
+                return super().put(item, block=block, timeout=0.1 if block else None)
+            except queue.Full:
+                if not block:
+                    raise
+        raise _SearchCancelled()
+
+
+class _SearchTask:
+    def __init__(self, search_path, everything_path, max_results):
+        self.search_path = search_path
+        self.everything_path = everything_path
+        self.max_results = max_results
+        self.cancel_event = threading.Event()
+        self.result_queue = _SearchResultQueue(self.cancel_event)
+        self.queue_overflow_count = 0
+        self._running = True
+
+    @property
+    def is_searching(self):
+        return self._running and not self.cancel_event.is_set()
+
+    @is_searching.setter
+    def is_searching(self, value):
+        self._running = bool(value)
+
+    def add_search_results_batch(self, items, timeout=0.5):
+        self.result_queue.put({'type': 'result_batch', 'items': items})
+
+    def search_with_everything(self, *args, **kwargs):
+        return SearchDialog.search_with_everything(self, *args, **kwargs)
+
+    def run(self, *args):
+        try:
+            if not os.path.isdir(self.search_path):
+                raise ValueError(tr("路径不是文件夹:") + self.search_path)
+            SearchDialog.do_search(self, *args)
+        except _SearchCancelled:
+            pass
+        except Exception as error:
+            if not self.cancel_event.is_set():
+                self.result_queue.put({'type': 'status', 'text': str(error)})
+        finally:
+            self._running = False
+            if not self.cancel_event.is_set():
+                try:
+                    self.result_queue.put({'type': 'finished'})
+                except _SearchCancelled:
+                    pass
 
 from PyQt5.QtWidgets import QDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton
 # 多层结构书签弹窗
@@ -1597,17 +1669,14 @@ class SearchDialog(QDialog):
 
     def _release_search_resources(self):
         self.is_searching = False
+        task = getattr(self, '_search_task', None)
+        if task:
+            task.cancel_event.set()
         self.queue_overflow_count = 0
         self._queue_idle_ticks = 0
 
         if self.ui_update_timer:
             self.ui_update_timer.stop()
-
-        # 等待后台搜索线程优雅退出，避免关闭后仍占用磁盘IO
-        search_thread = getattr(self, 'search_thread', None)
-        if (search_thread and search_thread.is_alive()
-                and search_thread is not threading.current_thread()):
-            search_thread.join(timeout=2.0)
 
         self._drain_result_queue()
 
@@ -1678,6 +1747,8 @@ class SearchDialog(QDialog):
                             batch_count += len(items)
                     elif item['type'] == 'status':
                         self.status_label.setText(item['text'])
+                    elif item['type'] == 'error':
+                        self.status_label.setText(item['text'])
                     elif item['type'] == 'button':
                         if item['button'] == 'search':
                             self.search_btn.setEnabled(item['enabled'])
@@ -1685,6 +1756,11 @@ class SearchDialog(QDialog):
                             self.stop_btn.setEnabled(item['enabled'])
                     elif item['type'] == 'enable_sorting':
                         # 搜索完成后启用排序
+                        self.result_list.setSortingEnabled(True)
+                    elif item['type'] == 'finished':
+                        self.is_searching = False
+                        self.search_btn.setEnabled(True)
+                        self.stop_btn.setEnabled(False)
                         self.result_list.setSortingEnabled(True)
                 except Exception:
                     break  # 队列为空
@@ -1777,16 +1853,6 @@ class SearchDialog(QDialog):
             show_toast(self, tr("提示"), tr("请输入搜索路径"), level="warning")
             return
         
-        # 检查路径是否存在
-        if not os.path.exists(search_path):
-            show_toast(self, tr("路径错误"), tr("路径不存在:\n{}").format(search_path), level="warning")
-            return
-        
-        # 检查是否是目录
-        if not os.path.isdir(search_path):
-            show_toast(self, tr("路径错误"), tr("路径不是文件夹:\n{}").format(search_path), level="warning")
-            return
-        
         # 检查是否是特殊路径（不支持搜索）
         if search_path.startswith('shell:'):
             show_toast(self, tr("不支持"), tr("不支持搜索特殊路径（shell:）"), level="warning")
@@ -1794,6 +1860,12 @@ class SearchDialog(QDialog):
         
         # 更新搜索路径
         self.search_path = search_path
+        previous_task = getattr(self, '_search_task', None)
+        if previous_task:
+            previous_task.cancel_event.set()
+        self.is_searching = False
+        self._search_task = _SearchTask(search_path, self.everything_path, self.max_results)
+        self.result_queue = self._search_task.result_queue
         
         # 获取文件类型过滤
         file_types = self.file_type_input.text().strip()
@@ -1801,6 +1873,7 @@ class SearchDialog(QDialog):
         # 检查缓存
         global _search_cache
         force_metadata_degrade = self.force_lightweight_cb.isChecked()
+        use_everything = self.use_everything_cb.isChecked() if self.everything_path else False
         cache_key = _search_cache.get_key(
             search_path, keyword,
             do_search_filename,
@@ -1809,6 +1882,7 @@ class SearchDialog(QDialog):
             force_metadata_degrade,
             self.match_case_cb.isChecked(),
             self.match_whole_word_cb.isChecked(),
+            use_everything,
         )
         cached_results = _search_cache.get(cache_key)
         
@@ -1826,6 +1900,9 @@ class SearchDialog(QDialog):
             self._append_results_to_table(cached_results)
             
             self.result_list.setSortingEnabled(sorting_enabled)
+            self.result_list.setSortingEnabled(True)
+            self.search_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
             shown_count = min(len(cached_results), self.max_results)
             self.status_label.setText(tr("搜索完成（缓存），共显示 {} 个结果").format(shown_count))
             if self.ui_update_timer and self.ui_update_timer.isActive():
@@ -1857,7 +1934,7 @@ class SearchDialog(QDialog):
         match_case = self.match_case_cb.isChecked()
         match_whole_word = self.match_whole_word_cb.isChecked()
         self.search_thread = threading.Thread(
-            target=self.do_search,
+            target=self._search_task.run,
             args=(keyword, do_search_filename, do_search_content, file_types, cache_key, use_everything, force_metadata_degrade, match_case, match_whole_word)
         )
         self.search_thread.daemon = True
@@ -1865,6 +1942,11 @@ class SearchDialog(QDialog):
     
     def stop_search(self):
         self.is_searching = False
+        task = getattr(self, '_search_task', None)
+        if task:
+            task.cancel_event.set()
+        self._drain_result_queue()
+        self.result_list.setSortingEnabled(True)
         self.search_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status_label.setText(tr("已停止"))
@@ -1887,10 +1969,10 @@ class SearchDialog(QDialog):
         
         try:
             # 构建Everything命令
-            cmd = [self.everything_path]
+            cmd = [self.everything_path, '-max-results', str(self.max_results)]
             
             # 如果指定了搜索路径，添加路径过滤
-            if search_path and os.path.exists(search_path):
+            if search_path:
                 # Everything使用path:语法指定路径
                 search_pattern = f'path:"{search_path}" {keyword}'
             else:
@@ -1903,46 +1985,65 @@ class SearchDialog(QDialog):
                     ft = ft.strip()
                     if ft.startswith('*.'):
                         ft = ft[2:]  # 移除 *.
-                    extensions.append(f'ext:{ft}')
+                    extensions.append(ft.lstrip('.'))
                 if extensions:
-                    search_pattern += ' ' + ' | '.join(extensions)
+                    search_pattern += ' ext:' + ';'.join(extensions)
             
             cmd.append(search_pattern)
             
             # 执行Everything搜索
             if _DEBUG_MODE:
                 debug_print(f"[Everything] Executing: {' '.join(cmd)}")
-            result = subprocess.run(
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding='utf-8',
                 errors='ignore',
-                timeout=30
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             )
+            deadline = time.monotonic() + 30
+            try:
+                while True:
+                    if not self.is_searching:
+                        return []
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(cmd, 30)
+                    try:
+                        output, error_output = process.communicate(timeout=0.1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
             
-            if result.returncode == 0:
+            if process.returncode == 0:
                 # 解析结果（每行一个文件路径）
-                lines = result.stdout.strip().split('\n')
+                lines = output.strip().split('\n')
                 results = []
                 for line in lines:
                     line = line.strip()
                     # es.exe 输出本身来自索引，避免逐条 exists 造成大量额外 I/O
                     if line and _matches_filename(os.path.basename(line)):
                         results.append(line)
+                        if len(results) >= self.max_results:
+                            break
                 
                 debug_print(f"[Everything] Found {len(results)} results")
                 return results
             else:
-                debug_print(f"[Everything] Error: {result.stderr}")
-                return []
+                debug_print(f"[Everything] Error: {error_output}")
+                raise RuntimeError(error_output or tr("Everything 搜索失败"))
         
         except subprocess.TimeoutExpired:
             debug_print("[Everything] Search timeout")
-            return []
+            raise RuntimeError(tr("Everything 搜索超时"))
         except Exception as e:
             debug_print(f"[Everything] Error: {e}")
-            return []
+            raise
     
     def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None, use_everything=False, force_metadata_degrade=False, match_case=False, match_whole_word=False):
         import re
@@ -2458,7 +2559,7 @@ class SearchDialog(QDialog):
             debug_print(tr("[Search] ⚠️ 队列溢出 {} 次（部分结果未显示）").format(self.queue_overflow_count))
         
         # 将结果存入缓存（限制缓存大小，防止内存溢出）
-        if cache_key and all_results:
+        if cache_key and all_results and self.is_searching and found_count <= max_cached_results:
             global _search_cache
             cached_results = all_results
             _search_cache.put(cache_key, cached_results)
@@ -3343,9 +3444,33 @@ class GestureOverlay(QWidget):
 
 
 # ==================== 异步文件夹大小检查线程 ====================
+_retained_background_threads = set()
+
+
+def _retain_thread_until_finished(worker):
+    if worker in _retained_background_threads:
+        return
+    worker.setParent(None)
+    _retained_background_threads.add(worker)
+
+    def release():
+        if worker not in _retained_background_threads:
+            return
+        _retained_background_threads.discard(worker)
+        worker.deleteLater()
+
+    worker.finished.connect(release)
+    if not worker.isRunning():
+        try:
+            worker.finished.disconnect(release)
+        except (TypeError, RuntimeError):
+            pass
+        release()
+
+
 class GitStatusWorker(QThread):
     """后台线程获取 Git 状态，避免阻塞 UI"""
-    finished = pyqtSignal(str, str, object)  # dir_path, repo_root, summary_or_None
+    completed = pyqtSignal(str, str, object)  # dir_path, repo_root, summary_or_None
 
     def __init__(self, dir_path, repo_root, git_exe, parent=None):
         super().__init__(parent)
@@ -3362,7 +3487,7 @@ class GitStatusWorker(QThread):
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000),
             )
             if result.returncode != 0:
-                self.finished.emit(self.dir_path, self.repo_root, None)
+                self.completed.emit(self.dir_path, self.repo_root, None)
                 return
             lines = result.stdout.strip().splitlines()
             branch = ''
@@ -3401,14 +3526,14 @@ class GitStatusWorker(QThread):
                 ]
                 parts.append('  '.join(status_parts))
             summary = ' | '.join(parts) if parts else None
-            self.finished.emit(self.dir_path, self.repo_root, summary)
+            self.completed.emit(self.dir_path, self.repo_root, summary)
         except Exception:
-            self.finished.emit(self.dir_path, self.repo_root, None)
+            self.completed.emit(self.dir_path, self.repo_root, None)
 
 
 class FolderSizeChecker(QThread):
     """后台线程检查文件夹大小，避免阻塞UI"""
-    finished = pyqtSignal(str, int, bool)  # path, file_count, is_large
+    completed = pyqtSignal(str, int, bool)  # path, file_count, is_large
     
     def __init__(self, path, parent=None):
         super().__init__(parent)
@@ -3419,7 +3544,7 @@ class FolderSizeChecker(QThread):
     def run(self):
         """在后台线程中计算文件夹大小"""
         if not os.path.exists(self.path) or not os.path.isdir(self.path):
-            self.finished.emit(self.path, 0, False)
+            self.completed.emit(self.path, 0, False)
             return
         
         try:
@@ -3437,22 +3562,22 @@ class FolderSizeChecker(QThread):
                 # 超过阈值或超时则提前返回
                 if file_count > LARGE_FOLDER_THRESHOLD:
                     debug_print(f"[FolderSizeChecker] Large folder detected: {self.path} (>{LARGE_FOLDER_THRESHOLD} files)")
-                    self.finished.emit(self.path, file_count, True)
+                    self.completed.emit(self.path, file_count, True)
                     return
                 
                 # 超时检查
                 if (time.time() - start_time) * 1000 > FOLDER_CHECK_TIMEOUT:
                     debug_print(f"[FolderSizeChecker] Timeout checking {self.path}")
-                    self.finished.emit(self.path, file_count, file_count > LARGE_FOLDER_THRESHOLD)
+                    self.completed.emit(self.path, file_count, file_count > LARGE_FOLDER_THRESHOLD)
                     return
             
             is_large = file_count > LARGE_FOLDER_THRESHOLD
             debug_print(f"[FolderSizeChecker] Folder {self.path}: {file_count} files (large={is_large})")
-            self.finished.emit(self.path, file_count, is_large)
+            self.completed.emit(self.path, file_count, is_large)
             
         except Exception as e:
             debug_print(f"[FolderSizeChecker] Error checking {self.path}: {e}")
-            self.finished.emit(self.path, 0, False)
+            self.completed.emit(self.path, 0, False)
     
     def stop(self):
         """停止检查"""
@@ -3463,7 +3588,7 @@ class FolderSizeChecker(QThread):
 
 class FileBatchOpWorker(QThread):
     """后台执行批量复制/删除，避免系统 Shell 弹框阻塞 UI。"""
-    finished = pyqtSignal(str, int, int, list)  # op_type, ok_count, fail_count, errors
+    completed = pyqtSignal(str, int, int, list)
     progress = pyqtSignal(str, int, int, str)  # op_type, done_count, total_count, current_name
 
     def __init__(self, op_type, src_paths, dst_dir=None, parent=None, max_workers=0):
@@ -3479,6 +3604,12 @@ class FileBatchOpWorker(QThread):
         self.done_units = 0
         self.total_units = 0
         self.started_at = 0.0
+        self.bytes_done = 0
+        self.bytes_total = 0
+        self._progress_lock = threading.Lock()
+        self._last_progress_at = 0.0
+        self.failed_paths = []
+        self.rename_plan = {}
 
     def request_cancel(self):
         self._cancel_requested = True
@@ -3489,15 +3620,27 @@ class FileBatchOpWorker(QThread):
             raise RuntimeError("FILE_OP_CANCELLED")
 
     def _emit_progress(self, current_name):
+        now = time.monotonic()
+        with self._progress_lock:
+            if now - self._last_progress_at < 0.1:
+                return
+            self._last_progress_at = now
         self.progress.emit(self.op_type, self.done_units, max(1, self.total_units), current_name or "")
 
     def _get_io_workers(self, task_count):
+        if not self.max_workers and str(self.dst_dir or '').startswith('\\\\'):
+            return 1
+        if task_count is None:
+            return max(1, min(self.max_workers or 2, 16))
         if task_count <= 1:
             return 1
         if self.max_workers > 0:
             return max(1, min(self.max_workers, task_count))
-        cpu = os.cpu_count() or 4
-        return max(2, min(8, cpu * 2, task_count))
+        return min(2, task_count)
+
+    @staticmethod
+    def _is_reparse_path(path):
+        return os.path.islink(path) or bool(getattr(os.lstat(path), 'st_file_attributes', 0) & 0x400)
 
     @staticmethod
     def _make_unique_path(target_path):
@@ -3611,27 +3754,55 @@ class FileBatchOpWorker(QThread):
                 file_tasks.append((src_file, dst_file, fname))
         return dirs_to_create, file_tasks
 
-    @staticmethod
-    def _collect_delete_tasks(src_dir):
+    @classmethod
+    def _collect_delete_tasks(cls, src_dir):
         """收集目录删除任务：文件可并发删除，目录按深度逆序删除。"""
         file_tasks = []
         dirs_to_remove = []
-        for root, dirs, files in os.walk(src_dir, topdown=False):
+        def fail_walk(error):
+            raise error
+
+        for root, dirs, files in os.walk(src_dir, topdown=True, followlinks=False, onerror=fail_walk):
+            for name in dirs + files:
+                path = os.path.join(root, name)
+                if cls._is_reparse_path(path):
+                    raise ValueError(tr("永久删除拒绝包含链接的目录: ") + path)
             for fname in files:
                 fpath = os.path.join(root, fname)
                 file_tasks.append((fpath, fname))
             for dname in dirs:
                 dpath = os.path.join(root, dname)
                 dirs_to_remove.append((dpath, dname))
+        dirs_to_remove.sort(key=lambda entry: entry[0].count(os.sep), reverse=True)
         dirs_to_remove.append((src_dir, os.path.basename(src_dir.rstrip('\\/')) or src_dir))
         return file_tasks, dirs_to_remove
 
     def _copy_file_task(self, src_file, dst_file):
         self._raise_if_cancelled()
+        import tempfile
         parent = os.path.dirname(dst_file)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        shutil.copy2(src_file, dst_file)
+        descriptor, temporary = tempfile.mkstemp(prefix='.tabex-copy-', dir=parent or '.')
+        try:
+            with os.fdopen(descriptor, 'wb') as target, open(src_file, 'rb') as source:
+                while True:
+                    self._raise_if_cancelled()
+                    block = source.read(1024 * 1024)
+                    if not block:
+                        break
+                    target.write(block)
+                    with self._progress_lock:
+                        self.bytes_done += len(block)
+                    self._emit_progress(os.path.basename(src_file))
+            self._raise_if_cancelled()
+            shutil.copystat(src_file, temporary)
+            if os.path.lexists(dst_file):
+                raise FileExistsError(dst_file)
+            os.rename(temporary, dst_file)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
 
     def _delete_file_task(self, src_file):
         self._raise_if_cancelled()
@@ -3643,7 +3814,7 @@ class FileBatchOpWorker(QThread):
             return []
 
         errors = []
-        max_workers = self._get_io_workers(len(tasks))
+        max_workers = self._get_io_workers(len(tasks) if hasattr(tasks, '__len__') else None)
         if max_workers <= 1:
             for task in tasks:
                 self._raise_if_cancelled()
@@ -3665,51 +3836,70 @@ class FileBatchOpWorker(QThread):
                     self._emit_progress(name)
             return errors
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
         future_to_task = {}
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='file-op') as executor:
-            for task in tasks:
-                self._raise_if_cancelled()
-                future = executor.submit(task_runner, task)
-                future_to_task[future] = task
-
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                name = task_name_getter(task)
-                try:
-                    future.result()
-                except RuntimeError as e:
-                    if str(e) == "FILE_OP_CANCELLED":
-                        self.cancelled = True
-                    else:
-                        errors.append(f"{name}: {e}")
-                except Exception as e:
-                    errors.append(f"{name}: {e}")
-
-                self.done_units += 1
-                self._emit_progress(name)
-
+            task_iter = iter(tasks)
+            exhausted = False
+            while future_to_task or not exhausted:
                 if self._cancel_requested:
                     self.cancelled = True
+                    for pending in future_to_task:
+                        pending.cancel()
                     break
+                while not exhausted and len(future_to_task) < max_workers * 2:
+                    task = next(task_iter, None)
+                    if task is None:
+                        exhausted = True
+                        break
+                    future_to_task[executor.submit(task_runner, task)] = task
+                if not future_to_task:
+                    continue
+                ready, _pending = wait(future_to_task, timeout=0.1, return_when=FIRST_COMPLETED)
+                for future in ready:
+                    task = future_to_task.pop(future)
+                    name = task_name_getter(task)
+                    try:
+                        future.result()
+                    except RuntimeError as error:
+                        if str(error) == 'FILE_OP_CANCELLED':
+                            self.cancelled = True
+                        else:
+                            errors.append(f"{name}: {error}")
+                    except Exception as error:
+                        errors.append(f"{name}: {error}")
+                    self.done_units += 1
+                    self._emit_progress(name)
 
         return errors
 
     def _copy_dir_cancelable(self, src_dir, dst_dir):
-        dirs_to_create, file_tasks = self._collect_copy_tasks(src_dir, dst_dir)
+        def fail_walk(error):
+            raise error
 
-        for dpath in dirs_to_create:
-            self._raise_if_cancelled()
-            os.makedirs(dpath, exist_ok=True)
-            self.done_units += 1
-            self._emit_progress(os.path.basename(dpath.rstrip('\\/')) or dpath)
+        def tasks():
+            for root, dirs, files in os.walk(src_dir, followlinks=False, onerror=fail_walk):
+                self._raise_if_cancelled()
+                for dirname in dirs:
+                    candidate = os.path.join(root, dirname)
+                    if self._is_reparse_path(candidate):
+                        raise ValueError(tr("暂不支持复制目录链接: ") + candidate)
+                relative = os.path.relpath(root, src_dir)
+                destination = dst_dir if relative == '.' else os.path.join(dst_dir, relative)
+                os.makedirs(destination, exist_ok=True)
+                self.total_units += len(files) + len(dirs)
+                self.done_units += 1
+                for filename in files:
+                    self._raise_if_cancelled()
+                    source = os.path.join(root, filename)
+                    self.bytes_total += os.path.getsize(source)
+                    yield source, os.path.join(destination, filename), filename
 
-        copy_errors = self._run_parallel_file_tasks(
-            file_tasks,
+        return self._run_parallel_file_tasks(
+            tasks(),
             task_runner=lambda t: self._copy_file_task(t[0], t[1]),
             task_name_getter=lambda t: t[2]
         )
-        return copy_errors
 
     def _delete_dir_cancelable(self, src_dir):
         file_tasks, dirs_to_remove = self._collect_delete_tasks(src_dir)
@@ -3737,7 +3927,7 @@ class FileBatchOpWorker(QThread):
         self.ok_count = 0
         self.fail_count = 0
         errors = []
-        self.total_units = self._estimate_total_units()
+        self.total_units = max(1, len(self.src_paths))
         self.done_units = 0
 
         self._emit_progress("")
@@ -3745,7 +3935,8 @@ class FileBatchOpWorker(QThread):
         try:
             if self.op_type == 'copy':
                 if not self.dst_dir or not os.path.isdir(self.dst_dir):
-                    self.finished.emit(self.op_type, 0, len(self.src_paths), [tr("复制失败：目标目录无效")])
+                    self.failed_paths = list(self.src_paths)
+                    self.completed.emit(self.op_type, 0, len(self.src_paths), [tr("复制失败：目标目录无效")])
                     return
 
                 for src in self.src_paths:
@@ -3755,11 +3946,23 @@ class FileBatchOpWorker(QThread):
                         name = os.path.basename(src_norm) or os.path.basename(os.path.dirname(src_norm)) or 'item'
                         dst_path = self._make_unique_path(os.path.join(self.dst_dir, name))
                         if os.path.isdir(src_norm):
+                            if self._is_reparse_path(src_norm):
+                                raise ValueError(tr("暂不支持复制目录链接: ") + src_norm)
+                            source_real = os.path.normcase(os.path.realpath(src_norm))
+                            target_real = os.path.normcase(os.path.realpath(dst_path))
+                            try:
+                                nested = os.path.commonpath([source_real, target_real]) == source_real
+                            except ValueError:
+                                nested = False
+                            if nested:
+                                raise ValueError(tr("不能将目录复制到自身或其子目录"))
                             dir_errors = self._copy_dir_cancelable(src_norm, dst_path)
+                            self._raise_if_cancelled()
                             if dir_errors:
                                 raise RuntimeError("; ".join(dir_errors[:5]))
                         else:
-                            shutil.copy2(src_norm, dst_path)
+                            self.bytes_total += os.path.getsize(src_norm)
+                            self._copy_file_task(src_norm, dst_path)
                             self.done_units += 1
                             self._emit_progress(name)
                         self.ok_count += 1
@@ -3767,19 +3970,29 @@ class FileBatchOpWorker(QThread):
                         if str(e) == "FILE_OP_CANCELLED":
                             break
                         self.fail_count += 1
+                        self.failed_paths.append(src)
                         errors.append(f"{src}: {e}")
                     except Exception as e:
                         self.fail_count += 1
+                        self.failed_paths.append(src)
                         errors.append(f"{src}: {e}")
 
-            elif self.op_type == 'delete':
+            elif self.op_type in ('delete', 'permanent_delete'):
                 for src in self.src_paths:
                     try:
                         self._raise_if_cancelled()
                         src_norm = os.path.normpath(src)
                         name = os.path.basename(src_norm.rstrip('\\/')) or src_norm
-                        if os.path.isdir(src_norm):
+                        if self.op_type == 'delete':
+                            from send2trash import send2trash
+                            send2trash(os.path.abspath(src_norm))
+                            self.done_units += 1
+                            self._emit_progress(name)
+                        elif os.path.isdir(src_norm):
+                            if self._is_reparse_path(src_norm):
+                                raise ValueError(tr("永久删除拒绝目录链接: ") + src_norm)
                             dir_errors = self._delete_dir_cancelable(src_norm)
+                            self._raise_if_cancelled()
                             if dir_errors:
                                 raise RuntimeError("; ".join(dir_errors[:5]))
                         else:
@@ -3791,21 +4004,438 @@ class FileBatchOpWorker(QThread):
                         if str(e) == "FILE_OP_CANCELLED":
                             break
                         self.fail_count += 1
+                        self.failed_paths.append(src)
                         errors.append(f"{src}: {e}")
                     except Exception as e:
                         self.fail_count += 1
+                        self.failed_paths.append(src)
                         errors.append(f"{src}: {e}")
+            elif self.op_type == 'rename':
+                destinations = set()
+                for source in self.src_paths:
+                    self._raise_if_cancelled()
+                    target = self.rename_plan[source]
+                    normalized = os.path.normcase(os.path.abspath(target))
+                    if normalized in destinations or os.path.lexists(target):
+                        raise FileExistsError(target)
+                    if not os.path.lexists(source):
+                        raise FileNotFoundError(source)
+                    destinations.add(normalized)
+                for source in self.src_paths:
+                    self._raise_if_cancelled()
+                    try:
+                        os.rename(source, self.rename_plan[source])
+                        self.ok_count += 1
+                    except OSError as error:
+                        self.fail_count += 1
+                        self.failed_paths.append(source)
+                        errors.append(f"{source}: {error}")
+                    self.done_units += 1
+                    self._emit_progress(os.path.basename(source))
             else:
                 self.fail_count = len(self.src_paths)
                 errors.append(tr("不支持的操作类型"))
         except Exception as e:
-            self.fail_count = max(self.fail_count, len(self.src_paths))
-            errors.append(str(e))
+            if str(e) == 'FILE_OP_CANCELLED':
+                self.cancelled = True
+            else:
+                self.fail_count = max(self.fail_count, len(self.src_paths) - self.ok_count)
+                self.failed_paths = list(self.src_paths) if not self.ok_count else self.failed_paths
+                errors.append(str(e))
 
         if self.cancelled and self.done_units < self.total_units:
             errors.append(tr("操作已取消"))
 
-        self.finished.emit(self.op_type, self.ok_count, self.fail_count, errors)
+        self.completed.emit(self.op_type, self.ok_count, self.fail_count, errors)
+
+
+class FileTaskPanel(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle(tr("文件任务"))
+        self.resize(850, 380)
+        self.records = []
+        layout = QVBoxLayout(self)
+        self.table = QTreeWidget(self)
+        self.table.setHeaderLabels([tr("操作"), tr("目标 / 来源"), tr("状态"), tr("进度")])
+        self.table.setRootIsDecorated(False)
+        self.table.setSelectionMode(QTreeWidget.SingleSelection)
+        from PyQt5.QtWidgets import QHeaderView
+        self.table.header().setStretchLastSection(False)
+        self.table.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 90)
+        self.table.setColumnWidth(2, 180)
+        self.table.setColumnWidth(3, 220)
+        layout.addWidget(self.table)
+        controls = QHBoxLayout()
+        for label, callback in (("取消任务", self.cancel_selected), ("重试失败项", self.retry_selected),
+                                ("查看错误", self.show_errors), ("清除已完成", self.clear_completed)):
+            button = QPushButton(tr(label), self)
+            button.clicked.connect(callback)
+            controls.addWidget(button)
+        layout.addLayout(controls)
+        self.timer = QTimer(self)
+        self.timer.setInterval(250)
+        self.timer.timeout.connect(self.refresh_progress)
+
+    def start_task(self, op_type, paths, destination=None, max_workers=0, tab=None, rename_plan=None):
+        worker = FileBatchOpWorker(op_type, paths, destination, self, max_workers=max_workers)
+        worker.rename_plan = dict(rename_plan or {})
+        operation_name = {'copy': '复制', 'delete': '回收站', 'permanent_delete': '永久删除', 'rename': '重命名'}
+        row = QTreeWidgetItem([tr(operation_name.get(op_type, op_type)), destination or '\n'.join(paths), tr("运行中"), ''])
+        record = {'worker': worker, 'row': row, 'op': op_type, 'paths': list(paths),
+                  'destination': destination, 'max_workers': max_workers, 'errors': [],
+                  'failed': [], 'done': False, 'rename_plan': worker.rename_plan}
+        row.setData(0, Qt.UserRole, len(self.records))
+        self.records.append(record)
+        self.table.addTopLevelItem(row)
+        worker.completed.connect(self.task_completed)
+        worker.finished.connect(self.thread_finished)
+        if tab is not None:
+            worker.progress.connect(tab._on_file_batch_op_progress)
+            worker.completed.connect(tab._on_file_batch_op_finished)
+            tab._file_op_worker = worker
+        self.timer.start()
+        worker.start()
+        return worker
+
+    def task_completed(self, op_type, ok_count, fail_count, errors):
+        _search_cache.clear()
+        worker = self.sender()
+        record = next((entry for entry in self.records if entry['worker'] is worker), None)
+        if record is None:
+            return
+        record['errors'] = list(errors)
+        record['failed'] = list(worker.failed_paths)
+        state = tr("已取消") if worker.cancelled else tr("完成")
+        record['row'].setText(2, f"{state}: {ok_count} / {fail_count}")
+        record['row'].setText(3, format_file_size(worker.bytes_done) if op_type == 'copy' else str(worker.done_units))
+        record['row'].setToolTip(2, '\n'.join(errors))
+
+    def thread_finished(self):
+        worker = self.sender()
+        for record in self.records:
+            if record['worker'] is worker:
+                record['done'] = True
+                record['worker'] = None
+                break
+        worker.deleteLater()
+        if not self.has_running_tasks():
+            self.timer.stop()
+
+    def has_running_tasks(self):
+        return any(not entry['done'] for entry in self.records)
+
+    def refresh_progress(self):
+        for record in self.records:
+            worker = record['worker']
+            if worker is None or record['done']:
+                continue
+            if worker.op_type == 'copy':
+                elapsed = max(0.1, time.monotonic() - worker.started_at)
+                record['row'].setText(3, f"{format_file_size(worker.bytes_done)} / {format_file_size(worker.bytes_total)}  "
+                                       f"{format_file_size(worker.bytes_done / elapsed)}/s")
+            else:
+                record['row'].setText(3, f"{worker.done_units} / {worker.total_units}")
+
+    def selected_record(self):
+        row = self.table.currentItem()
+        return next((entry for entry in self.records if entry['row'] is row), None)
+
+    def cancel_selected(self):
+        record = self.selected_record()
+        if record and record['worker']:
+            record['worker'].request_cancel()
+            record['row'].setText(2, tr("取消中"))
+
+    def retry_selected(self):
+        record = self.selected_record()
+        if not record or not record['done'] or not record['failed']:
+            return
+        from PyQt5.QtWidgets import QMessageBox
+        if QMessageBox.question(self, tr("重试失败项"), '\n'.join(record['failed']),
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.start_task(record['op'], record['failed'], record['destination'], record['max_workers'],
+                rename_plan=record['rename_plan'])
+
+    def show_errors(self):
+        record = self.selected_record()
+        if record:
+            from PyQt5.QtWidgets import QMessageBox
+            box = QMessageBox(self)
+            box.setWindowTitle(tr("任务详情"))
+            box.setText(record['row'].text(2))
+            box.setDetailedText('\n'.join(record['errors']) or tr("无错误"))
+            box.exec_()
+
+    def clear_completed(self):
+        for record in list(self.records):
+            if record['done']:
+                self.table.takeTopLevelItem(self.table.indexOfTopLevelItem(record['row']))
+                self.records.remove(record)
+
+
+def _plan_batch_rename(paths, find_text, replacement):
+    import ntpath
+    if not find_text:
+        raise ValueError(tr("查找文本不能为空"))
+    plan = {}
+    targets = set()
+    sources = {ntpath.normcase(ntpath.abspath(path)) for path in paths}
+    reserved = {'CON', 'PRN', 'AUX', 'NUL'} | {f'{prefix}{number}' for prefix in ('COM', 'LPT') for number in range(1, 10)}
+    for source in paths:
+        old_name = ntpath.basename(source)
+        new_name = old_name.replace(find_text, replacement)
+        if old_name == new_name:
+            continue
+        if (not new_name or new_name in ('.', '..') or new_name.endswith((' ', '.'))
+                or any(character in '<>:"/\\|?*' or ord(character) < 32 for character in new_name)
+                or new_name.split('.')[0].upper() in reserved):
+            raise ValueError(tr("非法文件名: ") + new_name)
+        target = ntpath.join(ntpath.dirname(source), new_name)
+        normalized = ntpath.normcase(ntpath.abspath(target))
+        if normalized in targets or normalized in sources:
+            raise ValueError(tr("重命名目标冲突: ") + target)
+        targets.add(normalized)
+        plan[source] = target
+    return plan
+
+
+def _compare_directories(left_root, right_root, cancel_event, emit):
+    import filecmp
+
+    def scan(root):
+        if not os.path.isdir(root):
+            raise ValueError(tr("目录不存在: ") + root)
+        entries = {}
+
+        def onerror(error):
+            raise error
+
+        for directory, directories, filenames in os.walk(root, followlinks=False, onerror=onerror):
+            if cancel_event.is_set():
+                return entries
+            for name in directories + filenames:
+                path = os.path.join(directory, name)
+                relative = os.path.relpath(path, root)
+                key = os.path.normcase(relative)
+                is_link = os.path.islink(path) or bool(getattr(os.lstat(path), 'st_file_attributes', 0) & 0x400)
+                kind = 'link' if is_link else ('directory' if name in directories else 'file')
+                entries[key] = (relative, kind, path)
+                if len(entries) > 100000:
+                    raise ValueError(tr("目录比较超过 100000 项上限，请选择更小的目录"))
+            directories[:] = [name for name in directories
+                              if entries[os.path.normcase(os.path.relpath(os.path.join(directory, name), root))][1] != 'link']
+        return entries
+
+    left_entries = scan(left_root)
+    if cancel_event.is_set():
+        return
+    right_entries = scan(right_root)
+    for key in sorted(left_entries.keys() | right_entries.keys()):
+        if cancel_event.is_set():
+            return
+        left = left_entries.get(key)
+        right = right_entries.get(key)
+        relative = (left or right)[0]
+        if left is None:
+            state = tr("仅右侧")
+        elif right is None:
+            state = tr("仅左侧")
+        elif left[1] != right[1]:
+            state = tr("类型不同")
+        elif left[1] == 'link':
+            state = tr("链接未比较")
+        elif left[1] == 'directory':
+            continue
+        else:
+            try:
+                before_left, before_right = os.stat(left[2]), os.stat(right[2])
+                same = filecmp.cmp(left[2], right[2], shallow=False)
+                after_left, after_right = os.stat(left[2]), os.stat(right[2])
+                signatures = lambda info: (info.st_size, info.st_mtime_ns)
+                if signatures(before_left) != signatures(after_left) or signatures(before_right) != signatures(after_right):
+                    state = tr("比较期间文件发生变化")
+                elif same:
+                    continue
+                else:
+                    state = tr("内容不同")
+            except OSError as error:
+                state = tr("读取失败: ") + str(error)
+        emit((relative, state, left[2] if left else '', right[2] if right else ''))
+
+
+class DirectoryCompareDialog(QDialog):
+    def __init__(self, parent, left_path, right_path):
+        super().__init__(parent)
+        self.setWindowTitle(tr("目录差异比较"))
+        self.resize(900, 500)
+        self.cancel_event = threading.Event()
+        self.results = None
+        self.running = False
+        layout = QVBoxLayout(self)
+        self.paths = []
+        for label, path in (("左侧", left_path), ("右侧", right_path)):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(tr(label), self))
+            edit = QLineEdit(path, self)
+            self.paths.append(edit)
+            row.addWidget(edit)
+            browse = QPushButton(tr("浏览..."), self)
+            browse.clicked.connect(lambda checked=False, target=edit: self.browse(target))
+            row.addWidget(browse)
+            layout.addLayout(row)
+        self.table = QTreeWidget(self)
+        self.table.setHeaderLabels([tr("相对路径"), tr("差异"), tr("左侧"), tr("右侧")])
+        self.table.setRootIsDecorated(False)
+        self.table.header().setStretchLastSection(False)
+        self.table.header().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.header().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 200)
+        self.table.setColumnWidth(1, 140)
+        self.table.itemDoubleClicked.connect(self.open_item)
+        layout.addWidget(self.table)
+        controls = QHBoxLayout()
+        self.start_button = QPushButton(tr("比较"), self)
+        self.stop_button = QPushButton(tr("停止"), self)
+        self.stop_button.setEnabled(False)
+        self.status = QLabel('', self)
+        self.start_button.clicked.connect(self.start_compare)
+        self.stop_button.clicked.connect(self.stop_compare)
+        controls.addWidget(self.start_button)
+        controls.addWidget(self.stop_button)
+        controls.addWidget(self.status, 1)
+        layout.addLayout(controls)
+        self.timer = QTimer(self)
+        self.timer.setInterval(60)
+        self.timer.timeout.connect(self.consume_results)
+
+    def browse(self, target):
+        from PyQt5.QtWidgets import QFileDialog
+        path = QFileDialog.getExistingDirectory(self, tr("选择目录"), target.text())
+        if path:
+            target.setText(path)
+
+    def start_compare(self):
+        if self.running:
+            return
+        left, right = [edit.text().strip() for edit in self.paths]
+        if not left or not right:
+            return
+        self.cancel_event = threading.Event()
+        self.results = _SearchResultQueue(self.cancel_event)
+        cancel_event, results = self.cancel_event, self.results
+        self.table.clear()
+        self.running = True
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.status.setText(tr("比较中"))
+
+        def work():
+            try:
+                _compare_directories(left, right, cancel_event, lambda row: results.put(('row', row)))
+                results.put(('done', ''))
+            except _SearchCancelled:
+                pass
+            except Exception as error:
+                try:
+                    results.put(('error', str(error)))
+                except _SearchCancelled:
+                    pass
+
+        threading.Thread(target=work, daemon=True, name='DirectoryCompare').start()
+        self.timer.start()
+
+    def consume_results(self):
+        for _index in range(100):
+            try:
+                kind, payload = self.results.get_nowait()
+            except queue.Empty:
+                break
+            if kind == 'row':
+                row = QTreeWidgetItem(list(payload))
+                for column, value in enumerate(payload):
+                    row.setToolTip(column, value)
+                self.table.addTopLevelItem(row)
+            else:
+                self.running = False
+                self.timer.stop()
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+                self.status.setText(payload if kind == 'error' else tr("比较完成，差异项: ") + str(self.table.topLevelItemCount()))
+                break
+
+    def stop_compare(self):
+        self.cancel_event.set()
+        self.running = False
+        self.timer.stop()
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.status.setText(tr("已停止"))
+
+    def open_item(self, item, column):
+        path = item.text(3 if column == 3 else 2) or item.text(3)
+        if path:
+            self.parent().add_new_tab(os.path.dirname(path), select_file=os.path.basename(path))
+
+    def closeEvent(self, event):
+        self.stop_compare()
+        super().closeEvent(event)
+
+
+def _confirm_file_preview(parent, title, description, before, after):
+    import difflib
+    from PyQt5.QtWidgets import QPlainTextEdit, QDialogButtonBox
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.resize(900, 550)
+    layout = QVBoxLayout(dialog)
+    label = QLabel(description, dialog)
+    label.setWordWrap(True)
+    layout.addWidget(label)
+    preview = QPlainTextEdit(dialog)
+    preview.setReadOnly(True)
+    preview.setLineWrapMode(QPlainTextEdit.NoWrap)
+    difference = ''.join(difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),
+                                            fromfile='Before', tofile='After'))
+    preview.setPlainText(difference or tr("无变化"))
+    layout.addWidget(preview)
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    buttons.button(QDialogButtonBox.Ok).setText(tr("确定"))
+    buttons.button(QDialogButtonBox.Cancel).setText(tr("取消"))
+    buttons.button(QDialogButtonBox.Cancel).setDefault(True)
+    layout.addWidget(buttons)
+    return dialog.exec_() == QDialog.Accepted
+
+
+def _atomic_reviewed_write(path, expected, content):
+    import tempfile
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix='.tabex-write-', dir=parent)
+    try:
+        with os.fdopen(descriptor, 'wb') as target:
+            target.write(content)
+            target.flush()
+            os.fsync(target.fileno())
+        if expected is None:
+            if os.path.lexists(path):
+                raise FileExistsError(path)
+            os.rename(temporary, path)
+        else:
+            if os.path.islink(path):
+                raise ValueError(tr("拒绝覆盖文件链接"))
+            with open(path, 'rb') as source:
+                if source.read() != expected:
+                    raise ValueError(tr("文件在预览后已变化，请重新读取"))
+            shutil.copymode(path, temporary)
+            os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 
 class _PidlResolver(QThread):
@@ -5366,9 +5996,9 @@ class IExplorerBrowserWidget(QWidget):
             pass
         resolver = _PidlResolver(path, gen, self)
         resolver.resolved.connect(self._on_pidl_resolved)
-        resolver.finished.connect(resolver.deleteLater)
         self._nav_resolver = resolver
         resolver.start()
+        _retain_thread_until_finished(resolver)
 
     def _on_pidl_resolved(self, path, pidl_val, hr, generation):
         """后台 PIDL 解析完成（UI 线程）：作废过期结果，否则浏览到该 PIDL。"""
@@ -5673,10 +6303,7 @@ class FileExplorerTab(QWidget):
         纯计算逻辑委托给模块级 _compute_dir_snapshot()，以便定时兜底轮询可在后台线程
         复用同一算法（见 _poll_directory_changes 的 QRunnable 异步路径），避免 UI 线程逐项 stat。"""
         try:
-            if not path or not os.path.isdir(path):
-                return None
-            # OneDrive/网络路径的os.scandir()会阻塞UI线程（云同步），直接跳过
-            if self._is_slow_path(path):
+            if not path or self._is_slow_path(path):
                 return None
             return _compute_dir_snapshot(path, self._should_ignore_internal_dir_entry)
         except Exception:
@@ -5743,12 +6370,11 @@ class FileExplorerTab(QWidget):
         current_path = getattr(self, 'current_path', '')
 
         if self._refresh_active:
-            if current_path and os.path.isdir(current_path):
+            if current_path and not current_path.startswith(('shell:', '::')):
                 is_slow = self._is_slow_path(current_path)
                 # OneDrive/网络路径：跳过os.scandir操作，避免阻塞UI线程和COM消息泵
                 if not is_slow:
-                    self._refresh_file_watch_paths(current_path)
-                    self._last_dir_snapshot = self._build_dir_snapshot(current_path)
+                    self._poll_directory_changes()
                 if hasattr(self, 'dir_poll_timer') and self.dir_poll_timer and not self.dir_poll_timer.isActive():
                     if not is_slow:
                         self.dir_poll_timer.start()
@@ -7086,10 +7712,10 @@ class FileExplorerTab(QWidget):
                 git_exe = candidate
         self._git_status_pending_path = dir_path
         worker = GitStatusWorker(dir_path, repo_root, git_exe, parent=self)
-        worker.finished.connect(self._on_git_status_finished)
-        worker.finished.connect(worker.deleteLater)
+        worker.completed.connect(self._on_git_status_finished)
         self._git_status_worker = worker  # prevent GC
         worker.start()
+        _retain_thread_until_finished(worker)
 
     def _on_git_status_finished(self, dir_path, repo_root, summary):
         """Git 状态查询完成回调（主线程）"""
@@ -8435,7 +9061,7 @@ class FileExplorerTab(QWidget):
         if not checker:
             return
         try:
-            checker.finished.disconnect()
+            checker.completed.disconnect()
         except Exception:
             pass
         try:
@@ -8448,7 +9074,7 @@ class FileExplorerTab(QWidget):
         except Exception:
             pass
         try:
-            checker.deleteLater()
+            _retain_thread_until_finished(checker)
         except Exception:
             pass
 
@@ -8730,8 +9356,11 @@ class FileExplorerTab(QWidget):
 
         # 创建并启动检查线程
         self.folder_checker = FolderSizeChecker(path, self)
+        checker = self.folder_checker
 
         def _on_checker_finished(p, count, is_large):
+            if self._is_cleaning_up or self.folder_checker is not checker:
+                return
             if getattr(self, '_folder_checker_done', False):
                 self._release_folder_checker(wait_ms=0)
                 return  # 已由超时保护处理
@@ -8739,12 +9368,14 @@ class FileExplorerTab(QWidget):
             self._on_folder_size_checked(p, count, is_large, add_to_history)
             self._release_folder_checker(wait_ms=0)
 
-        self.folder_checker.finished.connect(_on_checker_finished)
+        self.folder_checker.completed.connect(_on_checker_finished)
         self.folder_checker.start()
 
         # 超时保护：若线程在 FOLDER_CHECK_TIMEOUT+500ms 内未完成则强制导航
         # 防止云存储/网络路径的os.scandir()永久阻塞
         def _checker_timeout():
+            if self._is_cleaning_up or self.folder_checker is not checker:
+                return
             if getattr(self, '_folder_checker_done', True):
                 return  # 线程已正常结束
             debug_print(f"[AsyncLoad] FolderSizeChecker timeout, forcing navigation: {path}")
@@ -8974,11 +9605,9 @@ class FileExplorerTab(QWidget):
         """文件系统监控：目录内容发生变化（带防抖+风暴检测）"""
         import time, os
         current_time = time.time() * 1000  # 转为毫秒
-        # 目录已不存在，强制移除watcher，防止事件风暴
-        if not os.path.exists(path):
-            debug_print(f"[FileWatcher] Directory not exist, remove watcher: {path}")
-            self._force_remove_watcher(path)
+        if self._is_slow_path(path):
             return
+        _search_cache.clear()
 
         # ── 风暴计数：记录短时间内收到的事件数 ──
         storm_times = getattr(self, '_watcher_storm_times', [])
@@ -9004,15 +9633,9 @@ class FileExplorerTab(QWidget):
             self._last_watcher_event = {path: current_time}
         # 事件风暴（批量拷贝/解压/删除等）期间：跳过 UI 线程上的同步快照扫描。
         # 内嵌视图在拷贝过程中会自行刷新，这里仅走延后调度，等待风暴平息后统一补刷。
-        if not is_storm and os.path.isdir(path) and not self._is_slow_path(path):
-            current_snapshot = self._build_dir_snapshot(path)
-            if current_snapshot is not None:
-                previous_snapshot = getattr(self, '_last_dir_snapshot', None)
-                if previous_snapshot == current_snapshot:
-                    debug_print(f"[FileWatcher] Ignored internal-only directory change: {path}")
-                    return
-                if path == getattr(self, 'current_path', None):
-                    self._last_dir_snapshot = current_snapshot
+        if not is_storm and path == self.current_path and getattr(self, '_refresh_active', True):
+            self._poll_directory_changes()
+            return
         debug_print(f"[FileWatcher] Directory changed: {path} (storm={is_storm})")
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
@@ -9096,7 +9719,7 @@ class FileExplorerTab(QWidget):
             except Exception as e:
                 debug_print(f"[FileWatcher] Refresh error: {e}")
         # 刷新后更新快照（此处已排除风暴：风暴时前面已提前 return）
-        self._last_dir_snapshot = self._build_dir_snapshot(self.current_path)
+        self._poll_directory_changes()
         self.update_explorer_status()
 
     def _poll_directory_changes(self):
@@ -9118,7 +9741,7 @@ class FileExplorerTab(QWidget):
             return
 
         path = self.current_path
-        if not path or not os.path.isdir(path):
+        if not path or path.startswith(('shell:', '::')):
             return
         # OneDrive/网络路径的os.scandir()会阻塞UI线程，不做轮询
         if self._is_slow_path(path):
@@ -9141,6 +9764,8 @@ class FileExplorerTab(QWidget):
     def _on_dir_snapshot_ready(self, snap_path, current_snapshot):
         """后台快照计算完成（回到 UI 线程）：与上次快照比较，变化则调度刷新。"""
         self._snapshot_inflight = False
+        if getattr(self, '_is_cleaning_up', False):
+            return
         # 计算期间已切换目录：丢弃过期结果
         if snap_path != getattr(self, 'current_path', None):
             return
@@ -9148,6 +9773,7 @@ class FileExplorerTab(QWidget):
             return
         if self._last_dir_snapshot is None:
             self._last_dir_snapshot = current_snapshot
+            self._request_refresh(reason="snapshot_ready")
             return
         if current_snapshot != self._last_dir_snapshot:
             debug_print(f"[DirPoll] Detected snapshot change for {snap_path}, scheduling refresh")
@@ -9433,7 +10059,8 @@ class FileExplorerTab(QWidget):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle(tr("确认删除"))
-        box.setText(tr("确认删除选中的 {} 项？\n\n将直接删除，不经过系统回收站。\n此操作不可撤销。").format(total))
+        box.setText(tr("将选中的 {} 项移入回收站？").format(total))
+        box.setDetailedText('\n'.join(selected_paths))
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         box.setDefaultButton(QMessageBox.No)
         box.setWindowModality(Qt.NonModal)
@@ -9447,7 +10074,10 @@ class FileExplorerTab(QWidget):
             self._run_file_batch_op('delete', selected_paths)
 
     def _run_file_batch_op(self, op_type, selected_paths, dst_dir=None):
-        paths = [p for p in (selected_paths or []) if p and os.path.exists(p)]
+        if getattr(self, '_file_op_worker', None) and self._file_op_worker.isRunning():
+            show_toast(self, tr("提示"), tr("已有后台文件操作进行中，请稍后"), level="warning")
+            return
+        paths = list(dict.fromkeys(p for p in (selected_paths or []) if isinstance(p, str) and p))
         if not paths:
             show_toast(self, tr("提示"), tr("未找到可操作的文件或文件夹"), level="warning")
             return
@@ -9460,11 +10090,8 @@ class FileExplorerTab(QWidget):
         except Exception:
             configured_workers = 0
 
-        worker = FileBatchOpWorker(op_type, paths, dst_dir, self, max_workers=configured_workers)
-        worker.progress.connect(self._on_file_batch_op_progress)
-        worker.finished.connect(self._on_file_batch_op_finished)
-        worker.finished.connect(worker.deleteLater)
-        self._file_op_worker = worker
+        panel = self.main_window.get_file_task_panel()
+        panel.start_task(op_type, paths, dst_dir, configured_workers, tab=self)
         if hasattr(self, 'cancel_file_op_btn') and self.cancel_file_op_btn:
             self.cancel_file_op_btn.setText(tr("取消"))
             self.cancel_file_op_btn.setEnabled(True)
@@ -9474,9 +10101,8 @@ class FileExplorerTab(QWidget):
                 self.cancel_file_op_btn.hide()
         if op_type == 'copy':
             show_toast(self, tr("提示"), tr("后台复制已开始，可继续操作其他标签页（Alt+Q 可取消）"), level="info", duration=2600)
-        elif op_type == 'delete':
-            show_toast(self, tr("提示"), tr("后台删除已开始，可继续操作其他标签页（Alt+Q 可取消）"), level="info", duration=2600)
-        worker.start()
+        elif op_type in ('delete', 'permanent_delete'):
+            show_toast(self, tr("提示"), tr("删除任务已开始，可在文件任务面板查看进度"), level="info", duration=2600)
 
     def cancel_current_file_batch_op(self):
         worker = getattr(self, '_file_op_worker', None)
@@ -9510,7 +10136,7 @@ class FileExplorerTab(QWidget):
             msg = tr("后台复制: {}/{} ({}%) 剩余{} | 用时 {} | 成功{} 失败{} | 当前: {}" ).format(
                 done_count, total_count, percent, remain_count, elapsed_text, ok_count, fail_count, current_label
             )
-        elif op_type == 'delete':
+        elif op_type in ('delete', 'permanent_delete'):
             msg = tr("后台删除: {}/{} ({}%) 剩余{} | 用时 {} | 成功{} 失败{} | 当前: {}" ).format(
                 done_count, total_count, percent, remain_count, elapsed_text, ok_count, fail_count, current_label
             )
@@ -9539,7 +10165,7 @@ class FileExplorerTab(QWidget):
                 show_toast(self, tr("成功"), tr("复制完成，共 {} 项").format(ok_count), level="success")
             else:
                 show_toast(self, tr("警告"), tr("复制完成：成功 {} 项，失败 {} 项").format(ok_count, fail_count), level="warning")
-        elif op_type == 'delete':
+        elif op_type in ('delete', 'permanent_delete'):
             if cancelled:
                 show_toast(self, tr("提示"), tr("删除已取消：成功 {} 项，失败 {} 项").format(ok_count, fail_count), level="warning")
             elif fail_count == 0:
@@ -11880,22 +12506,33 @@ class ChatPanel(QWidget):
                     notes.append(tr("❌ 文件不存在: {}").format(path))
                     continue
                 try:
-                    enc = 'utf-8'
+                    if os.path.getsize(path) > 5 * 1024 * 1024:
+                        raise ValueError(tr("预览文件上限为 5 MB"))
+                    with open(path, 'rb') as source:
+                        original_bytes = source.read()
+                    enc = 'utf-8-sig' if original_bytes.startswith(b'\xef\xbb\xbf') else 'utf-8'
                     try:
-                        with open(path, 'r', encoding='utf-8') as _f: _f.read(1)
+                        file_src = original_bytes.decode(enc)
                     except UnicodeDecodeError:
                         enc = 'gbk'
-                    with open(path, 'r', encoding=enc, errors='replace') as _f:
-                        file_src = _f.read()
+                        file_src = original_bytes.decode(enc)
+                    if not old_text:
+                        raise ValueError(tr("补丁目标文本不能为空"))
                     count = file_src.count(old_text)
                     if count == 0:
                         notes.append(tr("❌ 补丁失败：在 {} 中未找到目标文本").format(path))
                         continue
                     if count > 1:
-                        notes.append(f"⚠️ 目标文本在 {os.path.basename(path)} 中出现 {count} 次，仅替换第一处")
+                        notes.append(tr("补丁目标不唯一，请提供更多上下文"))
+                        continue
                     patched = file_src.replace(old_text, new_text, 1)
-                    with open(path, 'w', encoding=enc) as _f:
-                        _f.write(patched)
+                    if not _confirm_file_preview(self, tr("确认 AI 补丁"), path, file_src, patched):
+                        notes.append(tr("已取消补丁: ") + path)
+                        continue
+                    checked_path, checked_error = self._resolve_action_path(raw_path.strip())
+                    if checked_error or checked_path != path:
+                        raise ValueError(tr("文件路径已变化"))
+                    _atomic_reviewed_write(path, original_bytes, patched.encode(enc))
                     notes.append(tr("✅ 补丁成功: {}").format(path))
                 except Exception as e:
                     notes.append(tr("❌ 补丁失败: {}（{}）").format(path, e))
@@ -11921,18 +12558,19 @@ class ChatPanel(QWidget):
                             tr("请改用 [PATCH_FILE: 路径|旧文本|新文本] 进行局部修改。")
                         )
                         continue
+                    original_bytes = None
+                    before = ''
                     if file_exists:
-                        if not self._confirm_danger_action(
-                            tr("确认覆盖文件"),
-                            tr("AI 请求覆盖文件：\n{}\n\n是否继续？").format(path)
-                        ):
-                            notes.append(tr("⏸ 已取消覆盖文件: {}").format(path))
-                            continue
-                    parent = os.path.dirname(path)
-                    if parent and not os.path.exists(parent):
-                        os.makedirs(parent, exist_ok=True)
-                    with open(path, 'w', encoding='utf-8') as f:
-                        f.write(file_content)
+                        with open(path, 'rb') as source:
+                            original_bytes = source.read()
+                        before = original_bytes.decode('utf-8-sig')
+                    if not _confirm_file_preview(self, tr("确认 AI 写入"), path, before, file_content):
+                        notes.append(tr("已取消写入: ") + path)
+                        continue
+                    checked_path, checked_error = self._resolve_action_path(raw_path)
+                    if checked_error or checked_path != path:
+                        raise ValueError(tr("文件路径已变化"))
+                    _atomic_reviewed_write(path, original_bytes, file_content.encode('utf-8'))
                     notes.append(tr("✅ 已写入文件: {}").format(path))
                 except Exception as e:
                     notes.append(tr("❌ 写入失败: {}（{}）").format(path, e))
@@ -11951,16 +12589,13 @@ class ChatPanel(QWidget):
                 type_label = tr("目录（及其所有内容）") if is_dir else tr("文件")
                 if not self._confirm_danger_action(
                     tr("确认删除"),
-                    tr("AI 请求删除{}：\n{}\n\n⚠️ 此操作不可撤销！是否继续？").format(type_label, path)
+                    tr("AI 请求将{}移入回收站：\n{}\n\n是否继续？").format(type_label, path)
                 ):
                     notes.append(tr("⏸ 已取消删除: {}").format(path))
                     continue
                 try:
-                    if is_dir:
-                        import shutil
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
+                    from send2trash import send2trash
+                    send2trash(path)
                     notes.append(tr("✅ 已删除{}: {}").format(type_label, path))
                 except Exception as e:
                     notes.append(tr("❌ 删除失败: {}（{}）").format(path, e))
@@ -14542,6 +15177,11 @@ class MainWindow(QMainWindow):
 
     def close_tab(self, index, target_tabwidget=None):
         tab_widget, content_stack, is_right = self._resolve_group(target_tabwidget)
+        if not is_right and tab_widget.count() == 1:
+            panel = getattr(self, '_file_task_panel', None)
+            if panel and panel.has_running_tasks():
+                self.show_file_tasks()
+                return
         tab = content_stack.widget(index) if (content_stack and 0 <= index < content_stack.count()) else None
         closed_group_color = str(getattr(tab, 'bookmark_group_color', '') or '').strip()
         if tab and hasattr(tab, 'cleanup'):
@@ -15077,6 +15717,24 @@ class MainWindow(QMainWindow):
         self.search_button.clicked.connect(self.show_search_dialog)
         titlebar_layout.addWidget(self.search_button)
 
+        from PyQt5.QtWidgets import QStyle
+        self.workspace_tools_button = QToolButton(self)
+        self.workspace_tools_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.workspace_tools_button.setToolTip(tr("工作区与文件工具"))
+        self.workspace_tools_button.setFixedSize(btn_size, btn_size)
+        self.workspace_tools_button.setPopupMode(QToolButton.InstantPopup)
+        tools_menu = QMenu(self.workspace_tools_button)
+        tools_menu.addAction(tr("文件任务"), self.show_file_tasks)
+        tools_menu.addAction(tr("目录差异比较..."), self.show_directory_compare)
+        tools_menu.addAction(tr("批量重命名预览..."), self.preview_batch_rename)
+        tools_menu.addAction(tr("保存命名工作区..."), self.save_named_workspace)
+        tools_menu.addAction(tr("打开命名工作区..."), self.open_named_workspace)
+        tools_menu.addAction(tr("删除命名工作区..."), self.delete_named_workspace)
+        tools_menu.addAction(tr("永久删除选中项..."), self.permanently_delete_selected)
+        self.workspace_tools_menu = tools_menu
+        self.workspace_tools_button.setMenu(tools_menu)
+        titlebar_layout.addWidget(self.workspace_tools_button)
+
         # 插入分组按钮
         self.insert_group_btn = QPushButton("☰")
         self.insert_group_btn.setToolTip(tr("插入分组 (F4)"))
@@ -15498,7 +16156,7 @@ class MainWindow(QMainWindow):
             return
 
         dst_dir = getattr(current_tab, 'current_path', '')
-        if not dst_dir or not os.path.isdir(dst_dir):
+        if not dst_dir or dst_dir.startswith(('shell:', '::')):
             show_toast(self, tr("提示"), tr("当前目录无效，无法粘贴"), level="warning")
             return
 
@@ -15510,13 +16168,13 @@ class MainWindow(QMainWindow):
         current_tab._run_file_batch_op('copy', alive_paths, dst_dir)
 
     def quick_delete_selected_items(self):
-        """Alt+Delete：快速删除选中项（不弹确认框，直接后台删除）。"""
+        """Alt+Delete：将选中项移入回收站。"""
         current_tab = self.get_active_pane()
         if not current_tab or not hasattr(current_tab, '_get_selected_paths'):
             show_toast(self, tr("提示"), tr("当前标签不支持快速删除"), level="warning")
             return
         selected_paths = current_tab._get_selected_paths()
-        selected_paths = [p for p in (selected_paths or []) if p and os.path.exists(p)]
+        selected_paths = [p for p in (selected_paths or []) if p]
         if not selected_paths:
             show_toast(self, tr("提示"), tr("请先选择要删除的文件或文件夹"), level="warning")
             return
@@ -15954,6 +16612,175 @@ class MainWindow(QMainWindow):
             # 如果轮询出错，不影响程序运行
             pass
     
+    def preview_batch_rename(self):
+        tab = self.get_active_pane()
+        if tab is None:
+            return
+        paths = tab._get_selected_paths()
+        if not paths:
+            show_toast(self, tr("提示"), tr("未选择"), level="warning")
+            return
+        find_text, accepted = QInputDialog.getText(self, tr("批量重命名"), tr("查找文件名中的文本"))
+        if not accepted:
+            return
+        replacement, accepted = QInputDialog.getText(self, tr("批量重命名"), tr("替换为"))
+        if not accepted:
+            return
+        try:
+            plan = _plan_batch_rename(paths, find_text, replacement)
+            if not plan:
+                show_toast(self, tr("提示"), tr("无变化"), level="info")
+                return
+            before = '\n'.join(plan) + '\n'
+            after = '\n'.join(plan.values()) + '\n'
+            if _confirm_file_preview(self, tr("批量重命名预览"), tr("确认重命名以下项目"), before, after):
+                self.get_file_task_panel().start_task('rename', list(plan), rename_plan=plan)
+                self.show_file_tasks()
+        except Exception as error:
+            show_toast(self, tr("重命名失败"), str(error), level="error")
+
+    def show_directory_compare(self):
+        left = getattr(self.get_current_tab_widget(), 'current_path', '')
+        right = ''
+        if getattr(self, '_split_active', False):
+            right_tab = self.split_content_stack.currentWidget()
+            right = getattr(right_tab, 'current_path', '')
+        dialog = getattr(self, '_directory_compare_dialog', None)
+        if dialog is None:
+            dialog = DirectoryCompareDialog(self, left, right)
+            self._directory_compare_dialog = dialog
+        elif not dialog.running:
+            dialog.paths[0].setText(left)
+            dialog.paths[1].setText(right)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _capture_named_workspace(self):
+        groups = []
+        for tab_widget, content_stack in self._all_groups():
+            tabs = []
+            for index in range(content_stack.count()):
+                tab = content_stack.widget(index)
+                if not getattr(tab, 'current_path', ''):
+                    continue
+                tabs.append({
+                    'path': tab.current_path,
+                    'is_shell': tab.current_path.startswith('shell:'),
+                    'is_pinned': bool(getattr(tab, 'is_pinned', False)),
+                    'bookmark_group_color': str(getattr(tab, 'bookmark_group_color', '') or ''),
+                    'tab_group_separator_after': bool(getattr(tab, 'tab_group_separator_after', False)),
+                    'tab_group_separator_color': str(getattr(tab, 'tab_group_separator_color', '') or ''),
+                    'tab_group_separator_name': str(getattr(tab, 'tab_group_separator_name', '') or ''),
+                })
+            if tabs:
+                groups.append({'tabs': tabs, 'active_index': tab_widget.currentIndex()})
+        return {'version': 1, 'groups': groups}
+
+    def save_named_workspace(self):
+        from PyQt5.QtWidgets import QMessageBox
+        name, accepted = QInputDialog.getText(self, tr("保存工作区"), tr("名称"))
+        name = name.strip()
+        if not accepted or not name:
+            return
+        workspaces = self.config.setdefault('named_workspaces', {})
+        if name in workspaces and QMessageBox.question(
+                self, tr("覆盖工作区"), name, QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+        workspaces[name] = self._capture_named_workspace()
+        self.save_config(immediate=True)
+        show_toast(self, tr("工作区"), tr("已保存"), level="success")
+
+    def _choose_named_workspace(self):
+        workspaces = self.config.get('named_workspaces', {})
+        if not workspaces:
+            show_toast(self, tr("工作区"), tr("尚未保存工作区"), level="info")
+            return None
+        name, accepted = QInputDialog.getItem(self, tr("工作区"), tr("名称"), sorted(workspaces), 0, False)
+        return name if accepted else None
+
+    def open_named_workspace(self):
+        name = self._choose_named_workspace()
+        if name is None:
+            return
+        state = self.config['named_workspaces'][name]
+        groups = state.get('groups', [])
+        if not isinstance(groups, list) or not groups:
+            return
+        failures = []
+        for group_index, group in enumerate(groups[:2]):
+            if group_index == 1 and not getattr(self, '_split_active', False):
+                self._activate_split_layout()
+            target = self.tab_widget if group_index == 0 else self.split_tab_widget
+            stack = self._content_stack_for(target)
+            opened = []
+            for entry in group.get('tabs', []):
+                path = entry.get('path', '')
+                if not isinstance(path, str) or not path:
+                    continue
+                index = self.add_new_tab(
+                    path, is_shell=bool(entry.get('is_shell')), target_tabwidget=target,
+                    activate=False, bookmark_group_color=entry.get('bookmark_group_color', ''),
+                    tab_group_separator_after=entry.get('tab_group_separator_after', False),
+                    tab_group_separator_color=entry.get('tab_group_separator_color', ''),
+                    tab_group_separator_name=entry.get('tab_group_separator_name', ''))
+                opened.append(index)
+                if index < 0:
+                    failures.append(path)
+                    continue
+                tab = stack.widget(index)
+                tab.is_pinned = bool(entry.get('is_pinned', False))
+                tab.update_tab_title()
+            selected = int(group.get('active_index', 0))
+            if opened:
+                selected = max(0, min(selected, len(opened) - 1))
+                if opened[selected] >= 0:
+                    target.setCurrentIndex(opened[selected])
+            self._apply_tab_grouping_for_pane(target)
+        self.save_pinned_tabs()
+        self._schedule_session_snapshot()
+        if failures:
+            show_toast(self, tr("工作区"), tr("部分目录无法打开") + ': ' + '\n'.join(failures), level="warning")
+
+    def delete_named_workspace(self):
+        from PyQt5.QtWidgets import QMessageBox
+        name = self._choose_named_workspace()
+        if name is not None and QMessageBox.question(
+                self, tr("删除工作区记录"), name, QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) == QMessageBox.Yes:
+            del self.config['named_workspaces'][name]
+            self.save_config(immediate=True)
+
+    def get_file_task_panel(self):
+        if getattr(self, '_file_task_panel', None) is None:
+            self._file_task_panel = FileTaskPanel(self)
+        return self._file_task_panel
+
+    def show_file_tasks(self):
+        panel = self.get_file_task_panel()
+        panel.show()
+        panel.raise_()
+        panel.activateWindow()
+
+    def permanently_delete_selected(self):
+        from PyQt5.QtWidgets import QMessageBox
+        tab = self.get_active_pane()
+        if tab is None:
+            return
+        paths = tab._get_selected_paths()
+        if not paths:
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(tr("永久删除"))
+        box.setText(tr("选中的文件将永久删除，不进入回收站，无法撤销。是否继续？"))
+        box.setDetailedText('\n'.join(paths))
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        if box.exec_() == QMessageBox.Yes:
+            tab._run_file_batch_op('permanent_delete', paths)
+
     def show_settings_menu(self):
         """显示设置对话框"""
         self.settings_dialog = SettingsDialog(self.config, self)
@@ -17958,6 +18785,15 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭时停止服务器和监听"""
+        panel = getattr(self, '_file_task_panel', None)
+        if panel is not None and panel.has_running_tasks():
+            event.ignore()
+            self.show_file_tasks()
+            show_toast(self, tr("提示"), tr("仍有文件任务运行，请等待完成或取消任务后再退出"), level="warning")
+            return
+        comparison = getattr(self, '_directory_compare_dialog', None)
+        if comparison is not None:
+            comparison.close()
         try:
             app = QApplication.instance()
             if app:
