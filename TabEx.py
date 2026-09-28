@@ -9,7 +9,7 @@ import time
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.73"
+APP_VERSION = "3.74"
 
 
 # TabEx i18n module
@@ -2813,9 +2813,31 @@ import ctypes.wintypes
 # 全局调试开关
 _DEBUG_MODE = False  # 生产环境关闭，避免性能损耗
 _EXPLORER_MONITOR_DEBUG = False  # Explorer Monitor 单独的日志开关
-_DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TabEx_debug_latest.log")
+_DEBUG_LOG_PATH = get_app_data_path("TabEx_debug_latest.log")
 _DEBUG_LOG_LOCK = threading.Lock()
 _DEBUG_LOG_READY = False
+_diagnostics = None
+
+
+def _start_diagnostics():
+    global _diagnostics
+    from tabex_diagnostics import Diagnostics
+    import tempfile
+    for base in (os.environ.get('LOCALAPPDATA'), tempfile.gettempdir()):
+        if not base:
+            continue
+        try:
+            _diagnostics = Diagnostics(os.path.join(base, 'TabEx', 'diagnostics'), APP_VERSION)
+            _diagnostics.install()
+            _diagnostics.capture_debug(_DEBUG_LOG_PATH)
+            return
+        except OSError:
+            continue
+
+
+def _diagnostic_event(kind, details):
+    if _diagnostics is not None:
+        _diagnostics.record(kind, details)
 
 
 def _init_debug_log_file():
@@ -2845,6 +2867,9 @@ def _append_debug_log_line(message):
 
 def debug_print(*args, **kwargs):
     """根据调试开关输出调试信息，并写入本地日志文件。"""
+    if _diagnostics is not None and args and isinstance(args[0], str):
+        if args[0].startswith(('[ClosedTabs]', '[TabSwitch]', '[AsyncLoad]', '[PidlResolver]')):
+            _diagnostic_event('navigation', ' '.join(str(value) for value in args))
     should_emit = False
     if _DEBUG_MODE:
         # 检查是否是 Explorer Monitor 日志
@@ -3468,6 +3493,21 @@ def _retain_thread_until_finished(worker):
         release()
 
 
+class DiagnosticExportWorker(QThread):
+    def __init__(self, diagnostics, destination, debug_path):
+        super().__init__()
+        self.diagnostics = diagnostics
+        self.destination = destination
+        self.debug_path = debug_path
+        self.error = ''
+
+    def run(self):
+        try:
+            self.diagnostics.export(self.destination, self.debug_path)
+        except Exception as error:
+            self.error = f'{type(error).__name__}: {error}'
+
+
 class GitStatusWorker(QThread):
     """后台线程获取 Git 状态，避免阻塞 UI"""
     completed = pyqtSignal(str, str, object)  # dir_path, repo_root, summary_or_None
@@ -4089,6 +4129,7 @@ class FileTaskPanel(QDialog):
         row.setData(0, Qt.UserRole, len(self.records))
         self.records.append(record)
         self.table.addTopLevelItem(row)
+        _diagnostic_event('file_task_start', f'operation={op_type} items={len(paths)}')
         worker.completed.connect(self.task_completed)
         worker.finished.connect(self.thread_finished)
         if tab is not None:
@@ -4101,6 +4142,7 @@ class FileTaskPanel(QDialog):
 
     def task_completed(self, op_type, ok_count, fail_count, errors):
         _search_cache.clear()
+        _diagnostic_event('file_task_complete', f'operation={op_type} ok={ok_count} failed={fail_count}')
         worker = self.sender()
         record = next((entry for entry in self.records if entry['worker'] is worker), None)
         if record is None:
@@ -4496,6 +4538,12 @@ def set_debug_mode(enabled):
 
 def qt_message_handler(mode, context, message):
     """自定义 Qt 消息处理器，过滤 QAxBase 等不需要的警告"""
+    from PyQt5.QtCore import QtCriticalMsg, QtFatalMsg
+    if mode in (QtCriticalMsg, QtFatalMsg) and _diagnostics is not None:
+        _diagnostics.record('qt_fatal' if mode == QtFatalMsg else 'qt_critical', message)
+        if mode == QtFatalMsg:
+            _diagnostics.mark('fatal')
+            _diagnostics.dump_threads()
     # 只在调试模式下输出 Qt 警告
     if _DEBUG_MODE:
         # 如果是调试模式，输出所有消息
@@ -15731,6 +15779,8 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(tr("打开命名工作区..."), self.open_named_workspace)
         tools_menu.addAction(tr("删除命名工作区..."), self.delete_named_workspace)
         tools_menu.addAction(tr("永久删除选中项..."), self.permanently_delete_selected)
+        tools_menu.addSeparator()
+        self.export_diagnostics_action = tools_menu.addAction(tr("导出崩溃诊断包..."), self.export_diagnostics)
         self.workspace_tools_menu = tools_menu
         self.workspace_tools_button.setMenu(tools_menu)
         titlebar_layout.addWidget(self.workspace_tools_button)
@@ -16756,6 +16806,83 @@ class MainWindow(QMainWindow):
         if getattr(self, '_file_task_panel', None) is None:
             self._file_task_panel = FileTaskPanel(self)
         return self._file_task_panel
+
+    def _capture_diagnostic_snapshot(self):
+        if _diagnostics is None:
+            return
+        from PyQt5.QtCore import QT_VERSION_STR, PYQT_VERSION_STR
+        try:
+            panel = getattr(self, '_file_task_panel', None)
+            records = panel.records if panel is not None else []
+            tasks = []
+            for record in records[-50:]:
+                worker = record['worker']
+                tasks.append({
+                    'operation': record['op'], 'done': record['done'],
+                    'sources': len(record['paths']), 'failures': len(record['failed']),
+                    'bytes_done': worker.bytes_done if worker is not None else None,
+                    'bytes_total': worker.bytes_total if worker is not None else None,
+                    'cancel_requested': worker._cancel_requested if worker is not None else False,
+                })
+            retained = []
+            for worker in list(_retained_background_threads):
+                try:
+                    retained.append({'type': type(worker).__name__, 'running': worker.isRunning()})
+                except RuntimeError:
+                    pass
+            groups = [stack.count() for _tabs, stack in self._all_groups()]
+            _diagnostics.snapshot({
+                'qt': QT_VERSION_STR, 'pyqt': PYQT_VERSION_STR,
+                'tabs_per_group': groups, 'split': bool(getattr(self, '_split_active', False)),
+                'python_threads': threading.active_count(), 'rss_mb': get_process_memory_usage_mb(),
+                'retained_threads': retained[:100], 'tasks': tasks, 'task_count': len(records),
+                'search_windows': len(getattr(self, 'search_dialogs', []) or []),
+            })
+        except Exception as error:
+            _diagnostics.record('snapshot_failed', type(error).__name__)
+
+    def export_diagnostics(self):
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox
+        if _diagnostics is None:
+            QMessageBox.warning(self, tr("诊断包"), tr("诊断记录不可用，请检查本地目录写入权限。"))
+            return
+        if getattr(self, '_diagnostic_export_worker', None) is not None:
+            return
+        text = tr("诊断包包含最近运行的版本、异常调用栈、任务状态和筛选后的日志。\n"
+                  "不收集配置、聊天、书签或文件内容；路径和常见凭据会自动脱敏。\n"
+                  "自动脱敏无法保证识别所有敏感信息，请检查 ZIP 内容后再分享。\n"
+                  "仅保存到本地，不会自动上传。是否继续？")
+        if QMessageBox.question(self, tr("导出崩溃诊断包"), text,
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        destination, _selected = QFileDialog.getSaveFileName(
+            self, tr("导出崩溃诊断包"), f'TabEx-diagnostics-{time.strftime("%Y%m%d-%H%M%S")}.zip',
+            'ZIP (*.zip)')
+        if not destination:
+            return
+        if not destination.lower().endswith('.zip'):
+            destination += '.zip'
+            if os.path.exists(destination):
+                if QMessageBox.question(self, tr("覆盖文件"), destination,
+                                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                    return
+        self._capture_diagnostic_snapshot()
+        worker = DiagnosticExportWorker(_diagnostics, destination, _DEBUG_LOG_PATH)
+        self._diagnostic_export_worker = worker
+        self.export_diagnostics_action.setEnabled(False)
+        worker.finished.connect(self._diagnostic_export_finished)
+        worker.start()
+        _retain_thread_until_finished(worker)
+
+    def _diagnostic_export_finished(self):
+        from PyQt5.QtWidgets import QMessageBox
+        worker = self._diagnostic_export_worker
+        self._diagnostic_export_worker = None
+        self.export_diagnostics_action.setEnabled(True)
+        if worker.error:
+            QMessageBox.warning(self, tr("诊断包导出失败"), worker.error)
+        else:
+            QMessageBox.information(self, tr("诊断包已保存"), worker.destination)
 
     def show_file_tasks(self):
         panel = self.get_file_task_panel()
@@ -18785,6 +18912,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭时停止服务器和监听"""
+        if getattr(self, '_diagnostic_export_worker', None) is not None:
+            event.ignore()
+            show_toast(self, tr("提示"), tr("诊断包正在导出，请完成后再退出"), level="warning")
+            return
         panel = getattr(self, '_file_task_panel', None)
         if panel is not None and panel.has_running_tasks():
             event.ignore()
@@ -21017,7 +21148,10 @@ def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
+    _start_diagnostics()
     _init_debug_log_file()
+    from PyQt5.QtCore import qInstallMessageHandler
+    qInstallMessageHandler(qt_message_handler)
     
     # 启动新实例
     app = QApplication(sys.argv)
@@ -21039,10 +21173,6 @@ def main():
     app.setFont(app_font)
     debug_print(f"[DPI] Global font size: {scaled_font_size}pt")
     
-    # 安装自定义 Qt 消息处理器，过滤 QAxBase 等警告
-    from PyQt5.QtCore import qInstallMessageHandler
-    qInstallMessageHandler(qt_message_handler)
-
     # 安装 IExplorerBrowser 键盘消息过滤器
     app.installNativeEventFilter(_ieb_keyboard_filter)
     
@@ -21059,6 +21189,11 @@ def main():
 
     # 创建窗口（图标在 MainWindow.__init__ 内部生成）
     window = MainWindow()
+    window._diagnostic_timer = QTimer(window)
+    window._diagnostic_timer.setInterval(10000)
+    window._diagnostic_timer.timeout.connect(window._capture_diagnostic_snapshot)
+    window._diagnostic_timer.start()
+    window._capture_diagnostic_snapshot()
     
     
     # 如果有路径参数，在新窗口中打开
@@ -21079,9 +21214,10 @@ def main():
 
     # No HKCU cleanup needed – overlay fix is vtable-only (process-local).
 
-    sys.exit(app.exec_())
-
-    sys.exit(app.exec_())
+    exit_code = app.exec_()
+    if _diagnostics is not None:
+        _diagnostics.close()
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()

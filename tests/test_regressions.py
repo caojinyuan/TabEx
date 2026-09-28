@@ -361,6 +361,7 @@ class TaskPanelTests(unittest.TestCase):
             QTreeWidget=QTreeWidget, QTreeWidgetItem=QTreeWidgetItem, QPushButton=QPushButton,
             QTimer=QTimer, Qt=Qt, format_file_size=lambda value: str(value))
         namespace['_search_cache'] = types.SimpleNamespace(clear=lambda: None)
+        namespace['_diagnostic_event'] = lambda *args: None
         panel = namespace['FileTaskPanel'](None)
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / 'source'
