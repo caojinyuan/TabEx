@@ -14,6 +14,7 @@ setUp：每个用例执行前准备环境；setUpClass：同一组用例共用�
 
 import ast
 from collections import OrderedDict
+from contextlib import ExitStack
 import hashlib
 import os
 from pathlib import Path
@@ -375,6 +376,14 @@ class TaskPanelTests(unittest.TestCase):
             self.assertFalse(panel.has_running_tasks())
             self.assertIsNone(panel.records[0]['worker'])
             self.assertTrue((destination / 'source').exists())
+            self.assertIn('成功 1 项，失败 0 项', panel.records[0]['row'].text(2))
+            self.assertFalse(panel.cancel_button.isEnabled())
+            self.assertFalse(panel.retry_button.isEnabled())
+            self.assertFalse(panel.errors_button.isEnabled())
+            self.assertTrue(panel.clear_button.isEnabled())
+            self.assertEqual(panel.task_counts(), (0, 0))
+            panel.clear_completed()
+            self.assertFalse(panel.clear_button.isEnabled())
         panel.close()
 
 
@@ -1148,6 +1157,656 @@ class NormalUsageTests(unittest.TestCase):
         self.assertEqual(dialog.table.topLevelItem(0).text(0), 'only.txt')
         self.assertTrue(dialog.start_button.isEnabled())
         self.assertFalse(dialog.stop_button.isEnabled())
+
+
+class InterfaceTests(unittest.TestCase):
+    """交互回归：真实 Qt 控件验证可用状态、活动侧和布局，不启动原生 Explorer。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        import TabEx
+        cls.module = TabEx
+
+    def pump_until(self, predicate):
+        deadline = time.monotonic() + 5
+        while not predicate() and time.monotonic() < deadline:
+            self.app.processEvents()
+        self.assertTrue(predicate())
+
+    def pinning_host(self):
+        """真实 Qt 标签及内容栈，隔离配置写入与原生 Shell，只保留固定和分组逻辑。"""
+        from PyQt5.QtWidgets import QWidget, QTabWidget, QStackedWidget
+        module = self.module
+
+        class Host(QWidget):
+            pin_tab = module.MainWindow.pin_tab
+            unpin_tab = module.MainWindow.unpin_tab
+            sort_tabs_by_pinned = module.MainWindow.sort_tabs_by_pinned
+            _refresh_tab_labels = module.MainWindow._refresh_tab_labels
+            _apply_tab_grouping_for_pane = module.MainWindow._apply_tab_grouping_for_pane
+            _apply_tab_group_color = module.MainWindow._apply_tab_group_color
+
+        owner = Host()
+        self.addCleanup(owner.deleteLater)
+        owner.config = {'show_tab_group_markers': True}
+        groups = [(QTabWidget(owner), QStackedWidget(owner)) for _index in range(2)]
+        owner.tab_widget, owner.content_stack = groups[0]
+        owner.split_tab_widget, owner.split_content_stack = groups[1]
+        owner._all_groups = lambda: groups
+        owner._resolve_group = lambda target: (groups[1] + (True,) if target is groups[1][0] else groups[0] + (False,))
+        owner._content_stack_for = lambda target: groups[1][1] if target is groups[1][0] else groups[0][1]
+        owner.save_pinned_tabs = Mock()
+        owner._schedule_session_snapshot = Mock()
+        for side, (tabs, stack) in enumerate(groups):
+            bar = module.CustomTabBar()
+            bar.main_window = owner
+            bar.owner_tabwidget = tabs
+            tabs.setTabBar(bar)
+            for name, pinned, color in (('first', True, ''), ('second', True, ''),
+                                        ('group-one', False, '#64B5F6'), ('group-two', False, '#64B5F6'),
+                                        ('plain', False, '')):
+                pane = QWidget()
+                pane.current_path = rf'C:\side-{side}\{name}'
+                pane.is_pinned = pinned
+                pane.bookmark_group_color = color
+                pane.update_tab_title = owner._refresh_tab_labels
+                stack.addWidget(pane)
+                tabs.addTab(QWidget(), name)
+            tabs.setCurrentIndex(4)
+        owner._refresh_tab_labels()
+        return owner, groups
+
+    def test_pinning_preserves_existing_red_pin_after_group_refresh(self):
+        """再固定一个标签后，旧固定标签仍显示原红色图钉；重复分组刷新和标题缓存不清除它。"""
+        owner, groups = self.pinning_host()
+        for tabs, stack in groups:
+            with self.subTest(side=groups.index((tabs, stack))):
+                original_pins = [stack.widget(0), stack.widget(1)]
+                newly_pinned = stack.widget(4)
+                owner.pin_tab(4, target_tabwidget=tabs)
+                owner._apply_tab_grouping_for_pane(tabs)
+                owner._refresh_tab_labels()
+                for pane in original_pins + [newly_pinned]:
+                    self.assertTrue(pane.is_pinned)
+                    icon = tabs.tabIcon(stack.indexOf(pane))
+                    self.assertEqual(icon.cacheKey(), self.module._pinned_tab_icon().cacheKey())
+                self.assertIs(stack.widget(tabs.currentIndex()), newly_pinned)
+                self.assertEqual(newly_pinned.bookmark_group_color, '')
+
+    def test_unpin_moves_plain_tab_to_end_and_preserves_other_order(self):
+        """取消固定且无分组的标签移到所属侧最右端，其他固定/分组/普通标签顺序和当前选中不变。"""
+        owner, groups = self.pinning_host()
+        for tabs, stack in groups:
+            with self.subTest(side=groups.index((tabs, stack))):
+                before = [stack.widget(index) for index in range(stack.count())]
+                pages = [tabs.widget(index) for index in range(tabs.count())]
+                tabs.setCurrentIndex(0)
+                owner.unpin_tab(0, target_tabwidget=tabs)
+                self.assertEqual([stack.widget(index) for index in range(stack.count())], before[1:] + before[:1])
+                self.assertEqual([tabs.widget(index) for index in range(tabs.count())], pages[1:] + pages[:1])
+                self.assertIs(stack.widget(tabs.currentIndex()), before[0])
+                self.assertTrue(tabs.tabIcon(tabs.currentIndex()).isNull())
+                self.assertEqual(tabs.tabIcon(0).cacheKey(), self.module._pinned_tab_icon().cacheKey())
+                self.assertEqual([pane.bookmark_group_color for pane in before[2:4]], ['#64B5F6', '#64B5F6'])
+
+    def test_long_pinned_tab_keeps_original_red_marker_visible(self):
+        """长名称左侧省略时保留独立红图钉；固定和取消固定不会改变红钉外观。"""
+        from PyQt5.QtWidgets import QStyle, QStyleOptionTab
+        owner, groups = self.pinning_host()
+        tabs, stack = groups[0]
+        bar = tabs.tabBar()
+        bar.setStyleSheet('QTabBar::tab { width: 120px; height: 28px; padding: 2px 4px; }')
+        bar.setElideMode(Qt.ElideLeft)
+        stack.widget(0).current_path = r'C:\some-very-long-parent\some-very-long-directory-name'
+        owner._refresh_tab_labels()
+        owner.resize(900, 100)
+        tabs.resize(880, 90)
+        tabs.show()
+        groups[1][0].hide()
+        owner.show()
+        self.app.processEvents()
+        option = QStyleOptionTab()
+        bar.initStyleOption(option, 0)
+        marker = bar.style().subElementRect(QStyle.SE_TabBarTabText, option, bar)
+        self.assertFalse(option.icon.isNull())
+        self.assertGreater(marker.left(), bar.tabRect(0).left())
+        image = bar.grab(bar.tabRect(0)).toImage()
+        red_pixels = sum(image.pixelColor(x_pos, y_pos).alpha() > 0
+                         and image.pixelColor(x_pos, y_pos).red() > 150
+                         and image.pixelColor(x_pos, y_pos).green() < 120
+                         for y_pos in range(image.height()) for x_pos in range(image.width()))
+        self.assertGreater(red_pixels, 5)
+        self.assertTrue(bar.grab().save(os.path.join(tempfile.gettempdir(), 'TabEx-pin-check.png')))
+        owner.close()
+
+    def test_task_partial_failure_success_and_notification_actions(self):
+        """部分失败可重试、查看记录，成功任务不能重试；通知动作打开真实目标位置。"""
+        from PyQt5.QtWidgets import QWidget
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'one.txt'
+            source.write_bytes(b'payload')
+            missing = Path(directory) / 'missing.txt'
+            destination = Path(directory) / 'destination'
+            destination.mkdir()
+            owner = QWidget()
+            owner.add_new_tab = Mock()
+            panel = self.module.FileTaskPanel(owner)
+            try:
+                with patch.object(self.module, 'show_toast') as toast:
+                    panel.start_task('copy', [str(source), str(missing)], str(destination))
+                    self.pump_until(lambda: not panel.has_running_tasks())
+                    self.assertIn('部分失败：成功 1 项，失败 1 项', panel.records[0]['row'].text(2))
+                    self.assertTrue(panel.retry_button.isEnabled())
+                    self.assertTrue(panel.errors_button.isEnabled())
+                    self.assertFalse(panel.cancel_button.isEnabled())
+                    self.assertEqual(panel.task_counts(), (0, 1))
+                    toast.assert_called_once()
+                    toast.call_args.kwargs['action']()
+                    self.assertTrue(panel.isVisible())
+                    self.assertEqual(panel.selected_record()['failed'], [str(missing)])
+                    panel.hide()
+                    toast.reset_mock()
+                    panel.start_task('copy', [str(source)], str(destination))
+                    self.pump_until(lambda: not panel.has_running_tasks())
+                    self.assertFalse(panel.retry_button.isEnabled())
+                    self.assertFalse(panel.errors_button.isEnabled())
+                    toast.assert_called_once()
+                    self.assertEqual(toast.call_args.kwargs['action_text'], '打开位置')
+                    toast.call_args.kwargs['action']()
+                    owner.add_new_tab.assert_called_once_with(str(destination))
+                    panel.table.setCurrentItem(panel.records[0]['row'])
+                    self.assertTrue(panel.retry_button.isEnabled())
+            finally:
+                for record in panel.records:
+                    if record['worker'] is not None:
+                        record['worker'].request_cancel()
+                        record['worker'].wait(5000)
+                self.app.processEvents()
+                panel.close()
+                owner.deleteLater()
+
+    def test_action_toast_is_nonmodal_clickable_and_pauses_on_hover(self):
+        """各级提示使用明显的实色背景和白字；不抢激活，动作可点击，悬停暂停且关闭清理。"""
+        from PyQt5.QtWidgets import QWidget, QLabel
+        from PyQt5.QtGui import QPalette
+        from PyQt5.QtCore import QEvent
+        owner = QWidget()
+        owner.resize(800, 600)
+        self.addCleanup(owner.deleteLater)
+        colors = {'info': '#1767b5', 'success': '#18733b', 'warning': '#946000',
+                  'error': '#b42318', 'critical': '#b42318', 'unknown': '#1767b5'}
+        for level, background in colors.items():
+            with self.subTest(level=level):
+                action = Mock()
+                toast = self.module.show_toast(owner, '文件任务', '成功 3 项，失败 0 项', level=level,
+                                               action_text='打开位置', action=action)
+                try:
+                    self.app.processEvents()
+                    self.assertTrue(toast.testAttribute(Qt.WA_ShowWithoutActivating))
+                    self.assertFalse(toast.testAttribute(Qt.WA_TransparentForMouseEvents))
+                    self.assertLessEqual(toast.width(), 420)
+                    self.assertFalse(toast.isModal())
+                    pixmap = toast.grab()
+                    image = pixmap.toImage()
+                    self.assertEqual(image.pixelColor(round(8 * pixmap.devicePixelRatio()),
+                                                      image.height() // 2).name(), background)
+                    for label in toast.findChildren(QLabel):
+                        self.assertEqual(label.palette().color(QPalette.WindowText).name(), '#ffffff')
+                    self.assertEqual(toast.action_button.palette().color(QPalette.ButtonText).name(), '#202020')
+                    self.assertTrue(pixmap.save(os.path.join(tempfile.gettempdir(), f'TabEx-toast-{level}.png')))
+                    self.app.sendEvent(toast, QEvent(QEvent.Enter))
+                    self.assertFalse(toast._timer.isActive())
+                    self.app.sendEvent(toast, QEvent(QEvent.Leave))
+                    self.assertTrue(toast._timer.isActive())
+                    toast.action_button.click()
+                    action.assert_called_once_with()
+                    self.assertFalse(toast._timer.isActive())
+                    self.assertNotIn(toast, self.module._active_toasts)
+                finally:
+                    toast.close()
+
+    def test_toasts_with_different_heights_do_not_overlap_after_dismissal(self):
+        """长短通知按实际高度叠放，关闭底部通知后重排；新通知不会覆盖剩余提示。"""
+        from PyQt5.QtWidgets import QWidget
+        owner = QWidget()
+        owner.resize(900, 700)
+        self.addCleanup(owner.deleteLater)
+        with patch.object(self.module, '_active_toasts', []):
+            toasts = []
+            try:
+                for message in ('长结果\n' * 4, '短结果'):
+                    toasts.append(self.module.show_toast(owner, '文件任务', message,
+                                                        action_text='打开位置', action=Mock()))
+                self.app.processEvents()
+                self.assertFalse(toasts[0].geometry().intersects(toasts[1].geometry()))
+                old_position = toasts[1].pos()
+                toasts[0].close()
+                self.assertGreater(toasts[1].y(), old_position.y())
+                toasts.append(self.module.show_toast(owner, '文件任务', '成功 3 项，失败 0 项',
+                                                    action_text='打开位置', action=Mock()))
+                self.assertFalse(toasts[1].geometry().intersects(toasts[2].geometry()))
+                image = toasts[2].grab()
+                self.assertFalse(image.isNull())
+                self.assertTrue(image.save(os.path.join(tempfile.gettempdir(), 'TabEx-toast-check.png')))
+            finally:
+                for toast in list(self.module._active_toasts):
+                    toast.close()
+
+    def test_address_bar_mouse_and_edit_focus_activate_owning_pane(self):
+        """鼠标点击路径栏、键盘进入编辑框都会激活所属侧，不改变当前目录。"""
+        from PyQt5.QtTest import QTest
+        from PyQt5.QtCore import QEvent
+        from PyQt5.QtWidgets import QWidget, QStackedWidget
+        stack = QStackedWidget()
+        self.addCleanup(stack.deleteLater)
+        pane = QWidget()
+        stack.addWidget(pane)
+        tabs = object()
+        owner = types.SimpleNamespace(_all_groups=lambda: [(tabs, stack)], set_active_pane_to_group=Mock())
+        pane.main_window = owner
+        bar = self.module.SimplePathBar(pane)
+        bar.set_path(r'C:\test')
+        bar.activated.connect(lambda: self.module.FileExplorerTab._activate_path_bar(pane))
+        QTest.mousePress(bar, Qt.LeftButton)
+        owner.set_active_pane_to_group.assert_called_with(tabs)
+        owner.set_active_pane_to_group.reset_mock()
+        self.app.sendEvent(bar._edit, QEvent(QEvent.FocusIn))
+        owner.set_active_pane_to_group.assert_called_once_with(tabs)
+        self.assertEqual(bar._current_path, r'C:\test')
+
+    def test_window_and_dialog_layouts_at_two_font_scales(self):
+        """真实主窗口及搜索窗口在中英文、100%/150% 字号下布局不重叠并保存截图。
+
+        主窗口使用空配置和内存书签，禁用延迟加载、Shell、全局快捷键轮询及持久化。
+        截图位于系统临时目录 tabex-ui-checks；不等同于原生 Explorer 的端到端测试。
+        """
+        from PyQt5.QtGui import QFont
+        from PyQt5.QtWidgets import QAbstractButton
+        output = Path(tempfile.gettempdir()) / 'tabex-ui-checks'
+        output.mkdir(exist_ok=True)
+        original_font = self.app.font()
+        original_language = self.module._app_language
+        try:
+            for language in ('zh', 'en'):
+                for scale in (1.0, 1.5):
+                    with self.subTest(language=language, scale=scale), tempfile.TemporaryDirectory() as directory, ExitStack() as patches:
+                        self.module._set_app_language(language)
+                        self.app.setFont(QFont('Segoe UI', round(9 * scale)))
+                        config = {'enable_explorer_monitor': False, 'enable_title_shortcuts': False,
+                                  'title_shortcuts': [], 'ai_chat': {'enabled': False, 'panel_visible': False}}
+                        patches.enter_context(patch.object(self.module.MainWindow, 'load_config', return_value=config))
+                        for method in ('ensure_default_bookmarks', '_delayed_initialization', '_check_shortcuts',
+                                       'save_config', 'save_session_snapshot', 'save_pinned_tabs', '_setup_window_icon',
+                                       'add_new_tab'):
+                            patches.enter_context(patch.object(self.module.MainWindow, method))
+                        manager = patches.enter_context(patch.object(self.module, 'BookmarkManager'))
+                        manager.return_value.get_tree.return_value = {
+                            'bookmark_bar': {'type': 'folder', 'children': [], 'id': '1'},
+                            'other': {'type': 'folder', 'children': [], 'id': '2'}}
+                        patches.enter_context(patch.object(self.module, 'get_app_data_path',
+                                                          side_effect=lambda *parts: os.path.join(directory, *parts)))
+                        patches.enter_context(patch.object(self.module, 'detect_everything', return_value=None))
+                        window = self.module.MainWindow()
+                        window.server_socket = Mock()
+                        search = self.module.SearchDialog(directory)
+                        try:
+                            width = 1000 if scale == 1 else 1280
+                            window.resize(width, 700)
+                            window.show()
+                            search.resize(680 if scale == 1 else 980, 580)
+                            search.show()
+                            search.advanced_button.click()
+                            self.app.processEvents()
+                            buttons = [button for button in window.titlebar_widget.findChildren(QAbstractButton)
+                                       if button.isVisibleTo(window.titlebar_widget)]
+                            previous_right = -1
+                            for button in sorted(buttons, key=lambda item: item.mapTo(window.titlebar_widget, item.rect().topLeft()).x()):
+                                position = button.mapTo(window.titlebar_widget, button.rect().topLeft())
+                                self.assertGreaterEqual(position.x(), previous_right)
+                                self.assertLessEqual(position.x() + button.width(), window.titlebar_widget.width())
+                                self.assertFalse(button.icon().isNull(), button.toolTip())
+                                self.assertTrue(button.accessibleName())
+                                previous_right = position.x() + button.width()
+                            self.assertEqual(search.width(), 680 if scale == 1 else 980)
+                            for control in (search.search_input, search.search_btn, search.stop_btn, search.path_input,
+                                            search.advanced_button, search.ai_summary_btn):
+                                self.assertTrue(search.rect().contains(control.geometry()))
+                            for name, widget in (('window', window), ('search', search)):
+                                image = widget.grab()
+                                self.assertFalse(image.isNull())
+                                self.assertTrue(image.save(str(output / f'{name}-{language}-{scale}.png')))
+                        finally:
+                            search.close()
+                            window.close()
+                            window.deleteLater()
+                            self.app.processEvents()
+        finally:
+            self.app.setFont(original_font)
+            self.module._set_app_language(original_language)
+
+    def test_search_advanced_options_keep_filters_and_fit_narrow_window(self):
+        """高级选项折叠不清除条件；窄窗口中搜索、停止和高级按钮互不重叠。"""
+        with patch.object(self.module, 'detect_everything', return_value=None):
+            dialog = self.module.SearchDialog(str(SOURCE.parent))
+        try:
+            dialog.resize(640, 520)
+            dialog.show()
+            self.app.processEvents()
+            self.assertTrue(dialog.advanced_options.isHidden())
+            dialog.advanced_button.click()
+            self.assertFalse(dialog.advanced_options.isHidden())
+            dialog.match_case_cb.setChecked(True)
+            dialog.match_whole_word_cb.setChecked(True)
+            dialog.advanced_button.click()
+            self.assertTrue(dialog.advanced_options.isHidden())
+            self.assertTrue(dialog.match_case_cb.isChecked())
+            self.assertTrue(dialog.match_whole_word_cb.isChecked())
+            self.assertEqual(dialog.advanced_button.text(), '高级 (2)')
+            self.app.processEvents()
+            self.assertLess(dialog.search_input.geometry().right(), dialog.search_btn.geometry().left())
+            self.assertLess(dialog.search_btn.geometry().right(), dialog.stop_btn.geometry().left())
+            for button in (dialog.search_btn, dialog.stop_btn, dialog.ai_summary_btn, dialog.advanced_button):
+                self.assertTrue(dialog.rect().contains(button.geometry()))
+            self.assertFalse(dialog.search_btn.icon().isNull())
+            self.assertFalse(dialog.stop_btn.icon().isNull())
+            self.assertEqual(dialog.file_type_input.text(), '*.c,*.h,*.xdm,*.arxml,*.xml')
+        finally:
+            dialog.close()
+
+    def test_toolbar_icons_and_scaled_dialog_layouts(self):
+        """中英文及放大字号下检查真实工具栏/搜索/任务控件不越界，截图供人工复核。
+
+        不创建原生 Explorer、不保存用户配置；布局模拟倍率并非真实多显示器 DPI 切换。
+        """
+        from PyQt5.QtCore import QSize
+        from PyQt5.QtGui import QFont
+        from PyQt5.QtWidgets import QWidget, QToolButton, QStyle
+        module = self.module
+
+        class Host(QWidget):
+            create_custom_titlebar = module.MainWindow.create_custom_titlebar
+            _populate_workspace_tools_menu = module.MainWindow._populate_workspace_tools_menu
+            _update_task_indicator = module.MainWindow._update_task_indicator
+
+        screenshot_dir = Path(tempfile.gettempdir()) / 'TabEx-ui-check'
+        screenshot_dir.mkdir(exist_ok=True)
+        saved_font = self.app.font()
+        saved_language = module._app_language
+        try:
+            for language, scale in (('zh', 1.0), ('en', 1.5)):
+                with self.subTest(language=language, scale=scale):
+                    module._set_app_language(language)
+                    font = QFont('Segoe UI', round(9 * scale))
+                    self.app.setFont(font)
+                    host = Host()
+                    host.config = {'ai_chat': {'enabled': True}, 'title_shortcuts': []}
+                    host.dpi_scale = scale
+                    for name in (
+                            'on_title_shortcut_dropped', 'open_title_shortcut', 'on_title_shortcuts_changed',
+                            'refresh_title_shortcuts_ui', 'open_tortoisegit_log_current_tab',
+                            'open_tortoisegit_commit_current_tab', 'open_git_bash_current_tab',
+                            'open_cmd_current_tab', 'open_powershell_current_tab', 'open_calculator',
+                            'go_back_current_tab', 'go_forward_current_tab', 'add_new_tab', 'reopen_closed_tab',
+                            'show_tab_list', 'show_search_dialog', 'show_file_tasks', 'show_directory_compare',
+                            'preview_batch_rename', 'save_named_workspace', 'open_named_workspace',
+                            'delete_named_workspace', 'permanently_delete_selected', 'export_diagnostics',
+                            'insert_tab_group_marker', 'toggle_split_view', 'show_bookmark_manager_dialog',
+                            'show_settings_menu', 'toggle_chat_panel'):
+                        setattr(host, name, Mock())
+                    layout = QVBoxLayout(host)
+                    host.create_custom_titlebar(layout)
+                    host.resize(int(1000 * scale), int(80 * scale))
+                    host.show()
+                    search = None
+                    panel = None
+                    try:
+                        self.app.processEvents()
+                        buttons = [getattr(host, name) for name in (
+                            'git_log_button', 'git_commit_button', 'git_bash_button', 'cmd_button',
+                            'powershell_button', 'calculator_button', 'back_button', 'forward_button',
+                            'add_tab_button', 'reopen_tab_button', 'tab_list_button', 'search_button',
+                            'workspace_tools_button', 'file_tasks_button', 'insert_group_btn', 'split_view_btn',
+                            'bookmark_button', 'settings_button', 'ai_chat_btn')]
+                        for button in buttons:
+                            self.assertFalse(button.icon().isNull(), button.toolTip())
+                            self.assertTrue(button.toolTip())
+                            self.assertTrue(host.titlebar_widget.rect().contains(button.geometry()), button.toolTip())
+                            if button is not host.file_tasks_button:
+                                self.assertEqual(button.size(), QSize(int(32 * scale), int(32 * scale)))
+                        for previous, following in zip(buttons, buttons[1:]):
+                            self.assertLess(previous.geometry().right(), following.geometry().left())
+                        self.assertTrue(host.grab().save(str(screenshot_dir / f'toolbar-{language}.png')))
+                        with patch.object(module, 'detect_everything', return_value=None):
+                            search = module.SearchDialog(str(screenshot_dir))
+                        search.resize(int(700 * scale), int(520 * scale))
+                        search.show()
+                        search.advanced_button.click()
+                        search.match_case_cb.setChecked(True)
+                        self.app.processEvents()
+                        label = search.layout().itemAt(0).layout().itemAt(0).widget()
+                        self.assertGreaterEqual(label.width(), label.fontMetrics().horizontalAdvance(label.text()))
+                        self.assertTrue(search.rect().contains(search.advanced_button.geometry()))
+                        self.assertGreater(search.advanced_button.width(),
+                                           search.advanced_button.fontMetrics().horizontalAdvance(search.advanced_button.text()))
+                        self.assertTrue(search.grab().save(str(screenshot_dir / f'search-{language}.png')))
+                        panel = module.FileTaskPanel(None)
+                        panel.resize(int(960 * scale), int(400 * scale))
+                        row = QTreeWidgetItem([module.tr('复制'), r'C:\work\destination',
+                                              module.tr('{}：成功 {} 项，失败 {} 项').format(module.tr('部分失败'), 8, 2),
+                                              '128 MB'])
+                        row.setIcon(2, panel.style().standardIcon(QStyle.SP_MessageBoxWarning))
+                        panel.table.addTopLevelItem(row)
+                        panel.show()
+                        self.app.processEvents()
+                        self.assertGreaterEqual(panel.table.columnWidth(2),
+                                                panel.table.fontMetrics().horizontalAdvance(row.text(2)) + 20)
+                        for button in (panel.cancel_button, panel.retry_button, panel.errors_button,
+                                       panel.open_button, panel.clear_button):
+                            self.assertTrue(panel.rect().contains(button.geometry()))
+                            self.assertGreaterEqual(button.width(), button.fontMetrics().horizontalAdvance(button.text()) + 20)
+                        self.assertTrue(panel.grab().save(str(screenshot_dir / f'tasks-{language}.png')))
+                    finally:
+                        if search is not None:
+                            search.close()
+                        if panel is not None:
+                            panel.close()
+                            panel.deleteLater()
+                        host.close()
+                        host.deleteLater()
+        finally:
+            module._set_app_language(saved_language)
+            self.app.setFont(saved_font)
+
+    def test_tools_menu_groups_danger_and_preserves_actions(self):
+        """工具菜单区分文件、工作区、危险操作和诊断，保留原操作连接。"""
+        from PyQt5.QtWidgets import QMenu, QToolButton
+        callbacks = {name: Mock() for name in (
+            'show_file_tasks', 'show_directory_compare', 'preview_batch_rename', 'save_named_workspace',
+            'open_named_workspace', 'delete_named_workspace', 'permanently_delete_selected', 'export_diagnostics')}
+        owner = types.SimpleNamespace(style=self.app.style, **callbacks)
+        menu = QMenu()
+        self.addCleanup(menu.deleteLater)
+        self.module.MainWindow._populate_workspace_tools_menu(owner, menu)
+        sections = [action.text() for action in menu.actions() if action.isSeparator()]
+        self.assertEqual(sections, ['文件操作', '危险操作', '诊断'])
+        workspaces = next(action.menu() for action in menu.actions() if action.menu())
+        self.assertEqual(len(workspaces.actions()), 3)
+        workspaces.actions()[1].trigger()
+        callbacks['open_named_workspace'].assert_called_once()
+        owner.export_diagnostics_action.trigger()
+        callbacks['export_diagnostics'].assert_called_once()
+        owner.file_tasks_button = QToolButton()
+        self.addCleanup(owner.file_tasks_button.deleteLater)
+        owner._file_task_panel = types.SimpleNamespace(task_counts=lambda: (2, 1))
+        self.module.MainWindow._update_task_indicator(owner)
+        self.assertEqual(owner.file_tasks_button.text(), '2')
+        self.assertIn('运行 2，失败 1', owner.file_tasks_button.toolTip())
+        self.assertIn('运行 2，失败 1', owner.file_tasks_action.text())
+
+    def test_tab_labels_disambiguate_paths_duplicates_and_roots_without_io(self):
+        """同名目录使用最短父路径区分，重复路径编号，根目录和特殊目录可读；不访问磁盘。"""
+        paths = [r'C:\alpha\src', r'C:\beta\src', r'C:\alpha\src', 'D:\\', 'shell:RecycleBinFolder']
+        with patch.object(os, 'scandir', side_effect=AssertionError('UI disk scan')), \
+                patch.object(os.path, 'exists', side_effect=AssertionError('UI disk stat')):
+            labels = self.module._tab_display_labels(paths)
+        self.assertEqual(labels, [r'alpha\src [1]', r'beta\src', r'alpha\src [2]', 'D:\\', '回收站'])
+
+    def test_toolbar_fallback_icons_are_distinct_and_render_without_native_apps(self):
+        """程序未安装时使用本地SVG，所有工具图标可渲染且不同操作不再共用通用图标。"""
+        from PyQt5.QtWidgets import QToolButton, QStyle
+        button = QToolButton()
+        self.addCleanup(button.deleteLater)
+        images = {}
+        with patch.object(self.module, '_native_tool_executable', return_value=None), \
+                patch.dict(self.module._TOOL_NATIVE_CACHE, {}, clear=True):
+            for name in self.module._TOOL_ICON_FILES:
+                self.module._set_tool_icon(button, name, QStyle.SP_FileIcon, 24)
+                image = button.icon().pixmap(24, 24).toImage()
+                self.assertFalse(image.isNull(), name)
+                pixels = tuple(image.pixel(x_pos, y_pos) for y_pos in range(image.height())
+                               for x_pos in range(image.width()))
+                self.assertTrue(any(image.pixelColor(x_pos, y_pos).alpha() for y_pos in range(image.height())
+                                    for x_pos in range(image.width())), name)
+                self.assertNotIn(pixels, images.values(), name)
+                images[name] = pixels
+
+    def test_native_program_icons_are_cached_and_tortoise_commit_is_distinct(self):
+        """读取本机EXE图标但不启动程序；缺少安装时使用后备图标，提取成功则缓存并区分提交入口。"""
+        from PyQt5.QtGui import QIcon, QPixmap, QColor
+        from PyQt5.QtWidgets import QToolButton, QStyle
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(QColor('#a72942'))
+        native = QIcon(pixmap)
+        button = QToolButton()
+        self.addCleanup(button.deleteLater)
+        with patch.dict(self.module._TOOL_NATIVE_CACHE, {}, clear=True), \
+                patch.object(self.module, '_native_tool_executable', return_value='local-program.exe'), \
+                patch.object(self.module.TitleShortcutBar, '_extract_icon_fast', return_value=native) as extract:
+            self.module._set_tool_icon(button, 'app-tortoisegit-log', QStyle.SP_FileIcon, 32)
+            plain = button.icon().pixmap(32, 32).toImage()
+            self.module._set_tool_icon(button, 'app-tortoisegit-commit', QStyle.SP_FileIcon, 32)
+            commit = button.icon().pixmap(32, 32).toImage()
+            extract.assert_called_once_with('local-program.exe')
+            self.assertEqual(plain.pixelColor(0, 0), commit.pixelColor(0, 0))
+            self.assertNotEqual(plain, commit)
+        for program in ('cmd', 'powershell', 'git-bash', 'tortoisegit'):
+            with self.subTest(program=program):
+                path = self.module._native_tool_executable(program)
+                if path:
+                    icon = self.module.TitleShortcutBar._extract_icon_fast(path)
+                    self.assertIsNotNone(icon)
+                    self.assertFalse(icon.isNull())
+
+    def test_icon_assets_resolve_from_onefile_bundle_directory(self):
+        """模拟单文件EXE资源目录，图标从包内icons加载而不是依赖源码目录；缺失时仍有后备。"""
+        from PyQt5.QtWidgets import QToolButton, QStyle
+        with tempfile.TemporaryDirectory() as directory:
+            asset_dir = Path(directory) / 'icons'
+            asset_dir.mkdir()
+            shutil.copyfile(SOURCE.parent / 'icons' / 'bot.svg', asset_dir / 'bot.svg')
+            with patch.object(self.module.sys, '_MEIPASS', directory, create=True), \
+                    patch.dict(self.module._TOOL_ASSET_CACHE, {}, clear=True):
+                icon = self.module._tool_asset_icon('bot')
+                self.assertFalse(icon.pixmap(24, 24).isNull())
+                self.assertIn(str(asset_dir / 'bot.svg'), self.module._TOOL_ASSET_CACHE)
+                button = QToolButton()
+                try:
+                    with patch.object(self.module, '_tool_asset_icon', return_value=self.module.QIcon()):
+                        self.module._set_tool_icon(button, 'preferences-system', QStyle.SP_FileDialogInfoView)
+                        self.assertFalse(button.icon().isNull())
+                finally:
+                    button.deleteLater()
+
+    def test_tab_list_filters_and_resolves_moved_tab_by_identity(self):
+        """标签列表按路径筛选；标签移到另一组后仍按对象身份跳转，Enter 可执行。"""
+        from PyQt5.QtTest import QTest
+        from PyQt5.QtWidgets import QWidget, QTabWidget, QStackedWidget
+        module = self.module
+
+        class Host(QWidget):
+            _refresh_tab_labels = module.MainWindow._refresh_tab_labels
+
+        owner = Host()
+        self.addCleanup(owner.deleteLater)
+        groups = [(QTabWidget(owner), QStackedWidget(owner)) for _index in range(2)]
+        owner.content_stack = groups[0][1]
+        owner._all_groups = lambda: groups
+        owner.set_active_pane_to_group = Mock()
+        panes = []
+        for path in (r'C:\alpha\src', r'C:\beta\src'):
+            pane = QWidget()
+            pane.current_path = path
+            groups[0][1].addWidget(pane)
+            groups[0][0].addTab(QWidget(), 'src')
+            panes.append(pane)
+        dialog = module.TabListDialog(owner)
+        self.addCleanup(dialog.deleteLater)
+        dialog.filter_input.setText('beta src')
+        self.assertTrue(dialog.table.topLevelItem(0).isHidden())
+        self.assertFalse(dialog.table.topLevelItem(1).isHidden())
+        groups[0][1].removeWidget(panes[1])
+        groups[0][0].removeTab(1)
+        groups[1][1].addWidget(panes[1])
+        groups[1][0].addTab(QWidget(), 'src')
+        QTest.keyClick(dialog.filter_input, Qt.Key_Return)
+        owner.set_active_pane_to_group.assert_called_once_with(groups[1][0])
+        self.assertEqual(dialog.result(), QDialog.Accepted)
+
+    def test_tab_close_button_keeps_geometry_on_hover(self):
+        """关闭按钮使用图标并固定预留区域，悬停不改变标签矩形或按钮对象。"""
+        from PyQt5.QtTest import QTest
+        from PyQt5.QtCore import QPoint
+        bar = self.module.CustomTabBar()
+        self.addCleanup(bar.deleteLater)
+        bar.addTab('alpha')
+        bar.addTab('beta')
+        bar.resize(400, 34)
+        bar.show()
+        self.app.processEvents()
+        before = bar.tabRect(0)
+        button = bar.tabButton(0, bar.RightSide)
+        self.assertFalse(button.icon().isNull())
+        QTest.mouseMove(bar, before.center())
+        QTest.mouseMove(bar, QPoint(390, 15))
+        self.assertEqual(bar.tabRect(0), before)
+        self.assertIs(bar.tabButton(0, bar.RightSide), button)
+        bar.close()
+
+    def test_split_indicator_tracks_active_side_without_resizing(self):
+        """切换左右操作侧只切换标签与地址栏强调；关闭分屏后恢复单侧样式，尺寸不变。"""
+        from PyQt5.QtWidgets import QWidget, QTabWidget, QStackedWidget
+        groups = []
+        panes = []
+        for _index in range(2):
+            tabs, stack = QTabWidget(), QStackedWidget()
+            self.addCleanup(tabs.deleteLater)
+            self.addCleanup(stack.deleteLater)
+            pane = QWidget()
+            pane.path_bar = self.module.SimplePathBar(pane)
+            pane.path_bar.resize(500, 30)
+            stack.addWidget(pane)
+            tabs.addTab(QWidget(), 'test')
+            groups.append((tabs, stack))
+            panes.append(pane)
+        owner = types.SimpleNamespace(content_stack=groups[0][1], _split_active=True,
+                                      _all_groups=lambda: groups, get_active_pane=lambda: panes[1])
+        before = [pane.path_bar.size() for pane in panes]
+        update = self.module.MainWindow._update_active_pane_indicator
+        update(owner)
+        self.assertFalse(groups[0][0].tabBar().property('activePane'))
+        self.assertTrue(groups[1][0].tabBar().property('activePane'))
+        self.assertEqual([pane.path_bar._pane_active for pane in panes], [False, True])
+        for pane, color in zip(panes, ('#b7bcc4', '#2f6fdb')):
+            image = pane.path_bar.grab().toImage()
+            self.assertEqual(image.pixelColor(5, image.height() - 1).name(), color)
+        owner.get_active_pane = lambda: panes[0]
+        update(owner)
+        self.assertEqual([pane.path_bar._pane_active for pane in panes], [True, False])
+        self.assertEqual([pane.path_bar.size() for pane in panes], before)
+        owner._split_active = False
+        update(owner)
+        self.assertFalse(panes[0].path_bar._split_indicator)
 
 
 class PerformanceContractTests(unittest.TestCase):

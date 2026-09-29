@@ -277,6 +277,7 @@ class QtDiagnosticsTests(unittest.TestCase):
         from PyQt5.QtWidgets import QFileDialog, QMessageBox
         host = self.host()
         target = self.root / 'support.zip'
+        host.add_new_tab = Mock()
         entered, release = threading.Event(), threading.Event()
         original = self.diagnostics.export
 
@@ -289,6 +290,7 @@ class QtDiagnosticsTests(unittest.TestCase):
         with patch.object(QMessageBox, 'question', return_value=QMessageBox.Yes), \
                 patch.object(QFileDialog, 'getSaveFileName', return_value=(str(target), '')), \
                 patch.object(QMessageBox, 'information') as information, \
+                patch.object(self.module, 'show_toast') as toast, \
                 patch.object(QMessageBox, 'warning') as warning, \
                 patch.object(self.diagnostics, 'export', side_effect=export), \
                 patch.object(self.module, '_DEBUG_LOG_PATH', str(self.root / 'missing.log')):
@@ -304,7 +306,11 @@ class QtDiagnosticsTests(unittest.TestCase):
                 release.set()
                 self.pump_until(lambda: getattr(host, '_diagnostic_export_worker', None) is None)
             self.assertTrue(host.export_diagnostics_action.isEnabled())
-            information.assert_called_once()
+            information.assert_not_called()
+            toast.assert_called_once()
+            self.assertEqual(toast.call_args.kwargs['action_text'], self.module.tr('打开位置'))
+            toast.call_args.kwargs['action']()
+            host.add_new_tab.assert_called_once_with(str(self.root))
             warning.assert_not_called()
         with zipfile.ZipFile(target) as archive:
             self.assertIsNone(archive.testzip())

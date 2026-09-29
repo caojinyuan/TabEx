@@ -9,7 +9,7 @@ import time
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.74"
+APP_VERSION = "3.75"
 
 
 # TabEx i18n module
@@ -29,6 +29,48 @@ def tr(zh_text):
     return _LANG_EN.get(zh_text, zh_text)
 
 _LANG_EN = {
+    "全部成功": "Completed",
+    "部分失败": "Partially Failed",
+    "{}：成功 {} 项，失败 {} 项": "{}: {} succeeded, {} failed",
+    "文件任务：运行 {}，失败 {}": "File Tasks: {} running, {} failed",
+    "查找标签": "Find Tab",
+    "名称或路径": "Name or path",
+    "高级 ({})": "Advanced ({})",
+    "停止": "Stop",
+    "操作": "Operation",
+    "状态": "Status",
+    "进度": "Progress",
+    "运行中": "Running",
+    "失败": "Failed",
+    "位置": "Pane",
+    "标签": "Tab",
+    "关闭标签": "Close Tab",
+    "任务详情": "Task Details",
+    "无错误": "No Errors",
+    "打开位置": "Open Location",
+    "查看任务": "View Task",
+    "已固定": "Pinned",
+    "文件操作": "File Operations",
+    "危险操作": "Destructive Actions",
+    "诊断": "Diagnostics",
+    "文件任务": "File Tasks",
+    "取消任务": "Cancel Task",
+    "重试失败项": "Retry Failed Items",
+    "查看错误": "View Errors",
+    "清除已完成": "Clear Completed",
+    "工作区": "Workspace",
+    "工作区与文件工具": "Workspace and File Tools",
+    "保存命名工作区...": "Save Workspace...",
+    "打开命名工作区...": "Open Workspace...",
+    "删除命名工作区...": "Delete Workspace...",
+    "永久删除选中项...": "Permanently Delete Selected...",
+    "目录差异比较...": "Compare Directories...",
+    "批量重命名预览...": "Preview Batch Rename...",
+    "导出崩溃诊断包...": "Export Crash Diagnostics...",
+    "目标 / 来源": "Destination / Source",
+    "取消中": "Cancelling",
+    "已取消": "Cancelled",
+    "AI总结结果": "Summarize Results",
     # ── Common buttons / actions ──────────────────────────────────────────
     "关闭": "Close",
     "后退": "Back",
@@ -1521,13 +1563,12 @@ class SearchDialog(QDialog):
         
         # 搜索关键词（改为QComboBox支持历史记录）
         search_label = QLabel(tr("搜索:"))
-        search_label.setFixedWidth(40)  # 固定标签宽度
         search_options.addWidget(search_label)
-        from PyQt5.QtWidgets import QComboBox
+        from PyQt5.QtWidgets import QComboBox, QGridLayout, QToolButton, QStyle
         self.search_input = QComboBox()
         self.search_input.setEditable(True)
         self.search_input.setInsertPolicy(QComboBox.NoInsert)  # 不自动插入新条目
-        self.search_input.setMinimumWidth(300)  # 设置最小宽度300像素
+        self.search_input.setMinimumWidth(140)
         self.search_input.lineEdit().setPlaceholderText(tr("输入搜索关键词..."))
         self.search_input.lineEdit().returnPressed.connect(self.start_search)
         # 填充历史记录
@@ -1536,20 +1577,22 @@ class SearchDialog(QDialog):
         search_options.addWidget(self.search_input, 1)  # 添加stretch factor，让搜索框可以拉伸
         
         # 搜索按钮
-        self.search_btn = QPushButton(tr("🔍 搜索"))
+        self.search_btn = QPushButton(tr("搜索"))
+        _set_tool_icon(self.search_btn, 'edit-find', QStyle.SP_FileDialogContentsView)
         self.search_btn.clicked.connect(self.start_search)
         search_options.addWidget(self.search_btn)
         
         # 停止按钮
-        self.stop_btn = QPushButton(tr("⏹ 停止"))
+        self.stop_btn = QPushButton(tr("停止"))
+        _set_tool_icon(self.stop_btn, 'process-stop', QStyle.SP_BrowserStop)
         self.stop_btn.clicked.connect(self.stop_search)
         self.stop_btn.setEnabled(False)
         search_options.addWidget(self.stop_btn)
 
         # AI 总结按钮
-        self.ai_summary_btn = QPushButton(tr("🤖 AI总结结果"))
+        self.ai_summary_btn = QPushButton(tr("AI总结结果"))
+        _set_tool_icon(self.ai_summary_btn, 'help-contents', QStyle.SP_FileDialogInfoView)
         self.ai_summary_btn.clicked.connect(self.request_ai_search_summary)
-        search_options.addWidget(self.ai_summary_btn)
         
         layout.addLayout(search_options)
         
@@ -1557,6 +1600,7 @@ class SearchDialog(QDialog):
         path_layout = QHBoxLayout()
         path_layout.addWidget(QLabel(tr("搜索路径:")))
         self.path_input = QLineEdit(search_path)
+        self.path_input.setClearButtonEnabled(True)
         self.path_input.setStyleSheet("QLineEdit { color: #0066cc; font-weight: bold; padding: 5px; }")
         self.path_input.setPlaceholderText(tr("输入要搜索的文件夹路径..."))
         path_layout.addWidget(self.path_input)
@@ -1572,13 +1616,16 @@ class SearchDialog(QDialog):
         self.search_content_cb.setChecked(True)  # 默认也选中
         type_options.addWidget(self.search_content_cb)
 
+        self.advanced_options = QWidget(self)
+        advanced_layout = QGridLayout(self.advanced_options)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
         self.match_case_cb = QCheckBox(tr("区分大小写"))
         self.match_case_cb.setToolTip(tr("区分大小写匹配文件名和文件内容"))
-        type_options.addWidget(self.match_case_cb)
+        advanced_layout.addWidget(self.match_case_cb, 0, 0)
 
         self.match_whole_word_cb = QCheckBox(tr("全词匹配"))
         self.match_whole_word_cb.setToolTip(tr("仅匹配完整单词，避免命中更长字符串的一部分"))
-        type_options.addWidget(self.match_whole_word_cb)
+        advanced_layout.addWidget(self.match_whole_word_cb, 0, 1)
         
         # Everything搜索选项
         self.use_everything_cb = QCheckBox(tr("使用 Everything (极速)"))
@@ -1595,15 +1642,28 @@ class SearchDialog(QDialog):
         self.force_lightweight_cb = QCheckBox(tr("轻量模式(更快)"))
         self.force_lightweight_cb.setChecked(False)
         self.force_lightweight_cb.setToolTip(tr("勾选后搜索结果将优先显示核心路径信息，可能省略修改时间/大小"))
-        type_options.addWidget(self.force_lightweight_cb)
+        advanced_layout.addWidget(self.force_lightweight_cb, 1, 0, 1, 2)
         
         type_options.addStretch(1)
+        self.advanced_button = QToolButton(self)
+        self.advanced_button.setText(tr('高级'))
+        self.advanced_button.setCheckable(True)
+        self.advanced_button.setArrowType(Qt.DownArrow)
+        self.advanced_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.advanced_button.setFixedWidth(self.advanced_button.fontMetrics().horizontalAdvance(tr('高级 ({})').format(3)) + 38)
+        self.advanced_button.toggled.connect(self._toggle_advanced_options)
+        for checkbox in (self.match_case_cb, self.match_whole_word_cb, self.force_lightweight_cb):
+            checkbox.toggled.connect(self._update_advanced_count)
+        type_options.addWidget(self.advanced_button)
         layout.addLayout(type_options)
+        layout.addWidget(self.advanced_options)
+        self.advanced_options.hide()
         
         # 文件类型过滤
         file_type_layout = QHBoxLayout()
         file_type_layout.addWidget(QLabel(tr("文件类型:")))
         self.file_type_input = QLineEdit()
+        self.file_type_input.setClearButtonEnabled(True)
         self.file_type_input.setPlaceholderText(tr("例如: *.c,*.h,*.xml (留空表示搜索所有类型)"))
         self.file_type_input.setText("*.c,*.h,*.xdm,*.arxml,*.xml")  # 默认值
         self.file_type_input.setStyleSheet("QLineEdit { padding: 5px; }")
@@ -1612,7 +1672,12 @@ class SearchDialog(QDialog):
         
         # 状态标签
         self.status_label = QLabel(tr("就绪"))
-        layout.addWidget(self.status_label)
+        self.status_label.setWordWrap(True)
+        self.status_label.setMinimumWidth(0)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.ai_summary_btn)
+        layout.addLayout(status_row)
         
         # 结果表格
         self.result_model = SearchResultsTableModel(self)
@@ -1638,8 +1703,8 @@ class SearchDialog(QDialog):
         # 设置自定义委托，让文件名列的省略号显示在开头
         self.result_list.setItemDelegateForColumn(0, ElideLeftDelegate(self.result_list))
         # 设置行高和网格线
-        self.result_list.verticalHeader().setDefaultSectionSize(24)  # 设置默认行高为24像素
-        self.result_list.setShowGrid(True)  # 显示网格线
+        self.result_list.verticalHeader().setDefaultSectionSize(max(28, self.fontMetrics().height() + 10))
+        self.result_list.setShowGrid(False)
         self.result_list.setAlternatingRowColors(True)  # 启用交替行颜色
         # 设置表头样式
         self.result_list.setStyleSheet("""
@@ -1657,6 +1722,16 @@ class SearchDialog(QDialog):
         self.ui_update_timer = QTimer(self)
         self.ui_update_timer.timeout.connect(self.update_ui_from_queue)
         self.ui_update_timer.start(80)  # 搜索时动态提速，空闲时降频
+
+    def _toggle_advanced_options(self, expanded):
+        self.advanced_options.setVisible(expanded)
+        self.advanced_button.setArrowType(Qt.UpArrow if expanded else Qt.DownArrow)
+
+    def _update_advanced_count(self, *args):
+        count = sum(checkbox.isChecked() for checkbox in (
+            self.match_case_cb, self.match_whole_word_cb, self.force_lightweight_cb))
+        self.advanced_button.setText(tr('高级 ({})').format(count) if count else tr('高级'))
+        self.advanced_button.setToolTip(self.advanced_button.text())
 
     def _drain_result_queue(self):
         if not self.result_queue:
@@ -3245,10 +3320,132 @@ def normalize_terminal_tool_name(tool_name, default='cmd'):
 _active_toasts = []
 
 
+_TOOL_ICON_FILES = {
+    'go-previous': 'arrow-left', 'go-next': 'arrow-right', 'tab-new': 'square-plus',
+    'edit-undo': 'undo-2', 'edit-find': 'search', 'view-group': 'group',
+    'view-split-left-right': 'columns-2', 'user-bookmarks': 'bookmark',
+    'preferences-system': 'settings', 'help-contents': 'bot',
+    'view-list-details': 'list-filter', 'workspace-tools': 'panels-top-left',
+    'file-tasks': 'clipboard-list', 'task-warning': 'triangle-alert',
+    'window-close': 'x', 'document-open': 'folder-open', 'view-refresh': 'rotate-cw',
+    'process-stop': 'square', 'accessories-calculator': 'calculator',
+    'app-cmd': 'terminal', 'app-powershell': 'square-terminal', 'app-git-bash': 'git-fork',
+    'app-tortoisegit-log': 'git-branch', 'app-tortoisegit-commit': 'git-commit-horizontal',
+}
+_TOOL_ASSET_CACHE = {}
+_TOOL_NATIVE_CACHE = {}
+_RED_PIN_ICON = None
+
+
+def _pinned_tab_icon():
+    global _RED_PIN_ICON
+    if _RED_PIN_ICON is None:
+        from PyQt5.QtGui import QFont, QIcon, QPainter, QPixmap
+        icon = QIcon()
+        for size in (16, 24, 32, 48, 64):
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.transparent)
+            painter = QPainter(pixmap)
+            font = QFont('Segoe UI Emoji')
+            font.setPixelSize(max(12, round(size * 0.85)))
+            painter.setFont(font)
+            painter.drawText(pixmap.rect(), Qt.AlignCenter, '📌')
+            painter.end()
+            icon.addPixmap(pixmap)
+        _RED_PIN_ICON = icon
+    return _RED_PIN_ICON
+
+
+def _tool_asset_icon(name):
+    from PyQt5.QtGui import QIcon
+    from PyQt5.QtSvg import QSvgRenderer
+    root = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, 'icons', name + '.svg')
+    if path not in _TOOL_ASSET_CACHE:
+        _TOOL_ASSET_CACHE[path] = QIcon(path) if QSvgRenderer(path).isValid() else QIcon()
+    return _TOOL_ASSET_CACHE[path]
+
+
+def _native_tool_executable(tool_name):
+    if os.name != 'nt':
+        return None
+    system = os.environ.get('SystemRoot', r'C:\Windows')
+    if tool_name == 'cmd':
+        candidates = [os.environ.get('COMSPEC', ''), os.path.join(system, 'System32', 'cmd.exe')]
+    elif tool_name == 'powershell':
+        candidates = [os.path.join(system, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')]
+    elif tool_name == 'git-bash':
+        root = find_git_install_root()
+        candidates = [os.path.join(root, 'git-bash.exe')] if root else []
+    elif tool_name == 'tortoisegit':
+        candidates = [os.path.join(base, 'TortoiseGit', 'bin', 'TortoiseGitProc.exe') for base in (
+            os.environ.get('ProgramW6432', r'C:\Program Files'),
+            os.environ.get('ProgramFiles', r'C:\Program Files'),
+            os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'))]
+    else:
+        return None
+    return next((path for path in candidates if path and not path.startswith('\\\\')
+                 and os.path.isfile(path)), None)
+
+
+def _native_tool_icon(tool_name):
+    from PyQt5.QtGui import QIcon
+    if tool_name not in _TOOL_NATIVE_CACHE:
+        path = _native_tool_executable(tool_name)
+        icon = TitleShortcutBar._extract_icon_fast(path) if path else None
+        _TOOL_NATIVE_CACHE[tool_name] = icon if icon is not None and not icon.isNull() else QIcon()
+    return _TOOL_NATIVE_CACHE[tool_name]
+
+
+def _commit_badged_icon(native):
+    from PyQt5.QtGui import QColor, QIcon, QPainter, QPixmap
+    icon = QIcon()
+    badge = _tool_asset_icon('check')
+    for size in (16, 24, 32, 48, 64):
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        native.paint(painter, 0, 0, size, size)
+        badge_size = max(8, size // 2)
+        origin = size - badge_size
+        painter.fillRect(origin, origin, badge_size, badge_size, QColor('#e0f4e5'))
+        badge.paint(painter, origin, origin, badge_size, badge_size)
+        painter.end()
+        icon.addPixmap(pixmap)
+    return icon
+
+
+def _set_tool_icon(button, theme_name, fallback, size=18):
+    from PyQt5.QtGui import QIcon
+    native_tools = {'app-cmd': 'cmd', 'app-powershell': 'powershell', 'app-git-bash': 'git-bash',
+                    'app-tortoisegit-log': 'tortoisegit', 'app-tortoisegit-commit': 'tortoisegit'}
+    icon = _native_tool_icon(native_tools[theme_name]) if theme_name in native_tools else QIcon()
+    if theme_name == 'app-tortoisegit-commit' and not icon.isNull():
+        icon = _commit_badged_icon(icon)
+    if icon.isNull() and theme_name in _TOOL_ICON_FILES:
+        icon = _tool_asset_icon(_TOOL_ICON_FILES[theme_name])
+    if icon.isNull():
+        icon = QIcon.fromTheme(theme_name, button.style().standardIcon(fallback))
+    button.setIcon(icon)
+    button.setIconSize(QSize(size, size))
+    button.setAccessibleName(button.toolTip() or button.text())
+
+
+def _position_toasts():
+    offsets = {}
+    for toast in list(_active_toasts):
+        anchor = toast.parentWidget()
+        bounds = anchor.window().geometry() if anchor else QApplication.primaryScreen().availableGeometry()
+        offset = offsets.get(anchor, 0)
+        toast.move(bounds.right() - toast.width() - 20,
+                   bounds.bottom() - toast.height() - 20 - offset)
+        offsets[anchor] = offset + toast.height() + 10
+
+
 class ToastMessage(QWidget):
     """右下角弹出的轻量提示，5s 自动消失"""
 
-    def __init__(self, parent, title, message, level="info", duration=5000):
+    def __init__(self, parent, title, message, level="info", duration=5000, action_text='', action=None):
         super().__init__(parent)
         self.duration = duration
         self.level = level
@@ -3257,16 +3454,16 @@ class ToastMessage(QWidget):
             Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint
         )
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
 
         bg_map = {
-            "info": "#2d8cf0",
-            "warning": "#f0ad4e",
-            "error": "#d9534f",
-            "critical": "#d9534f",
-            "success": "#5cb85c",
+            "info": "#1767b5",
+            "warning": "#946000",
+            "error": "#b42318",
+            "critical": "#b42318",
+            "success": "#18733b",
         }
-        bg_color = bg_map.get(level, "#2d8cf0")
+        bg_color = bg_map.get(level, bg_map['info'])
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
@@ -3278,25 +3475,56 @@ class ToastMessage(QWidget):
         title_layout.setSpacing(8)
         
         title_label = QLabel(title)
-        title_label.setStyleSheet("font-weight: bold; color: white;")
+        title_label.setTextFormat(Qt.PlainText)
+        title_label.setWordWrap(True)
+        title_label.setStyleSheet("font-weight: bold; color: #ffffff; background: transparent;")
         title_layout.addWidget(title_label)
         
         title_layout.addStretch()
         
         self.countdown_label = QLabel(f"{self.remaining_seconds}s")
-        self.countdown_label.setStyleSheet("color: rgba(255, 255, 255, 0.8); font-size: 11px;")
+        self.countdown_label.setStyleSheet("color: #ffffff; background: transparent; font-size: 11px;")
         title_layout.addWidget(self.countdown_label)
+        from PyQt5.QtWidgets import QStyle
+        self.close_button = QToolButton(self)
+        self.close_button.setToolTip(tr('关闭'))
+        self.close_button.setFixedSize(24, 24)
+        _set_tool_icon(self.close_button, 'window-close', QStyle.SP_TitleBarCloseButton, 14)
+        self.close_button.clicked.connect(self.close)
+        title_layout.addWidget(self.close_button)
         
         layout.addLayout(title_layout)
         
         msg_label = QLabel(message)
+        msg_label.setTextFormat(Qt.PlainText)
         msg_label.setWordWrap(True)
-        msg_label.setStyleSheet("color: white;")
+        msg_label.setStyleSheet("color: #ffffff; background: transparent;")
+        msg_label.setMinimumWidth(0)
+        msg_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         layout.addWidget(msg_label)
+        self.action_button = None
+        if action is not None and action_text:
+            self.action_button = QToolButton(self)
+            self.action_button.setText(action_text)
+            self.action_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            self.action_button.setToolTip(action_text)
+            _set_tool_icon(self.action_button, 'document-open', QStyle.SP_DirOpenIcon, 16)
 
+            def activate():
+                self.close()
+                action()
+
+            self.action_button.clicked.connect(activate)
+            layout.addWidget(self.action_button, 0, Qt.AlignRight)
+
+        self.setObjectName('tabexToast')
         self.setStyleSheet(
-            f"background-color: {bg_color}; border-radius: 8px;"
+            f"QWidget#tabexToast {{ background: {bg_color}; border: 1px solid rgba(0, 0, 0, 40); border-radius: 6px; }}"
+            "QToolButton { color: #202020; background: #ffffff; padding: 3px; border: 1px solid #d3deea; border-radius: 3px; }"
+            "QToolButton:hover { background: #edf3f9; }"
+            "QToolButton:pressed { background: #d9e4f0; }"
+            "QToolButton:focus { border-color: #202020; }"
         )
 
         # 倒计时定时器（每秒更新一次）
@@ -3321,7 +3549,6 @@ class ToastMessage(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.adjustSize()
         anchor = self.parent() if isinstance(self.parent(), QWidget) else None
         
         # 使用软件窗口的几何信息，而不是屏幕的几何信息
@@ -3332,10 +3559,22 @@ class ToastMessage(QWidget):
             window_geo = QApplication.primaryScreen().availableGeometry()
         
         margin = 20
-        existing = len(_active_toasts) - 1 if self in _active_toasts else len(_active_toasts)
-        x = window_geo.right() - self.width() - margin
-        y = window_geo.bottom() - self.height() - margin - existing * (self.height() + 10)
-        self.move(x, y)
+        self.setFixedWidth(min(420, max(220, window_geo.width() - margin * 2)))
+        self.adjustSize()
+        _position_toasts()
+
+    def enterEvent(self, event):
+        if self._timer.isActive():
+            self._remaining_ms = max(1, self._timer.remainingTime())
+        self._timer.stop()
+        self._countdown_timer.stop()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self.isVisible():
+            self._timer.start(getattr(self, '_remaining_ms', self.duration))
+            self._countdown_timer.start(1000)
+        super().leaveEvent(event)
 
     def closeEvent(self, event):
         if self in _active_toasts:
@@ -3343,10 +3582,12 @@ class ToastMessage(QWidget):
         # 停止倒计时定时器
         if hasattr(self, '_countdown_timer'):
             self._countdown_timer.stop()
+        self._timer.stop()
         super().closeEvent(event)
+        _position_toasts()
 
 
-def show_toast(parent, title, message, level="info", duration=5000):
+def show_toast(parent, title, message, level="info", duration=5000, action_text='', action=None):
     """在右下角显示非阻塞提示"""
     anchor = parent.window() if isinstance(parent, QWidget) else None
     while len(_active_toasts) >= MAX_ACTIVE_TOASTS:
@@ -3355,9 +3596,11 @@ def show_toast(parent, title, message, level="info", duration=5000):
             old_toast.close()
         except Exception:
             pass
-    toast = ToastMessage(anchor, title, message, level=level, duration=duration)
+    toast = ToastMessage(anchor, title, message, level=level, duration=duration,
+                         action_text=action_text, action=action)
     _active_toasts.append(toast)
     toast.show()
+    return toast
 
 
 class GestureOverlay(QWidget):
@@ -4090,45 +4333,89 @@ class FileBatchOpWorker(QThread):
 
 
 class FileTaskPanel(QDialog):
+    tasks_changed = pyqtSignal()
+
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle(tr("文件任务"))
-        self.resize(850, 380)
+        self.resize(960, 400)
         self.records = []
         layout = QVBoxLayout(self)
         self.table = QTreeWidget(self)
         self.table.setHeaderLabels([tr("操作"), tr("目标 / 来源"), tr("状态"), tr("进度")])
         self.table.setRootIsDecorated(False)
         self.table.setSelectionMode(QTreeWidget.SingleSelection)
-        from PyQt5.QtWidgets import QHeaderView
+        self.table.setAlternatingRowColors(True)
+        self.table.setUniformRowHeights(True)
+        self.table.setTextElideMode(Qt.ElideMiddle)
+        from PyQt5.QtWidgets import QHeaderView, QStyle
         self.table.header().setStretchLastSection(False)
         self.table.header().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.setColumnWidth(0, 90)
-        self.table.setColumnWidth(2, 180)
-        self.table.setColumnWidth(3, 220)
+        for column in (0, 2, 3):
+            self.table.header().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.table.setStyleSheet(f'QTreeView::item {{ height: {max(28, self.fontMetrics().height() + 10)}px; }}')
         layout.addWidget(self.table)
         controls = QHBoxLayout()
-        for label, callback in (("取消任务", self.cancel_selected), ("重试失败项", self.retry_selected),
-                                ("查看错误", self.show_errors), ("清除已完成", self.clear_completed)):
+        for name, label, icon, callback in (
+                ('cancel_button', '取消任务', QStyle.SP_BrowserStop, self.cancel_selected),
+                ('retry_button', '重试失败项', QStyle.SP_BrowserReload, self.retry_selected),
+                ('errors_button', '查看错误', QStyle.SP_MessageBoxWarning, self.show_errors),
+                ('open_button', '打开位置', QStyle.SP_DirOpenIcon, self.open_selected_location),
+                ('clear_button', '清除已完成', QStyle.SP_DialogResetButton, self.clear_completed)):
             button = QPushButton(tr(label), self)
+            button.setIcon(self.style().standardIcon(icon))
+            button.setToolTip(tr(label))
+            button.setMinimumHeight(28)
             button.clicked.connect(callback)
+            setattr(self, name, button)
             controls.addWidget(button)
         layout.addLayout(controls)
         self.timer = QTimer(self)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self.refresh_progress)
+        self.table.currentItemChanged.connect(self._update_controls)
+        self._update_controls()
+
+    def _update_controls(self, *args):
+        record = self.selected_record()
+        worker = record['worker'] if record else None
+        self.cancel_button.setEnabled(bool(worker and not record.get('completed')
+                                           and not worker._cancel_requested))
+        self.retry_button.setEnabled(bool(record and record['done'] and record['failed']))
+        self.errors_button.setEnabled(bool(record and record['errors']))
+        self.open_button.setEnabled(bool(record and (record['destination'] or record['paths'])))
+        self.clear_button.setEnabled(any(entry['done'] for entry in self.records))
+
+    def open_selected_location(self):
+        record = self.selected_record()
+        if not record:
+            return
+        path = record['destination'] or (os.path.dirname(record['paths'][0]) if record['paths'] else '')
+        owner = self.parent()
+        if path and owner is not None and hasattr(owner, 'add_new_tab'):
+            owner.add_new_tab(path)
+
+    def task_counts(self):
+        running = sum(not record['done'] for record in self.records)
+        failed = sum(bool(record['failed'] or record['errors']) and not record.get('cancelled', False)
+                     for record in self.records)
+        return running, failed
 
     def start_task(self, op_type, paths, destination=None, max_workers=0, tab=None, rename_plan=None):
         worker = FileBatchOpWorker(op_type, paths, destination, self, max_workers=max_workers)
         worker.rename_plan = dict(rename_plan or {})
         operation_name = {'copy': '复制', 'delete': '回收站', 'permanent_delete': '永久删除', 'rename': '重命名'}
-        row = QTreeWidgetItem([tr(operation_name.get(op_type, op_type)), destination or '\n'.join(paths), tr("运行中"), ''])
+        location = destination or (paths[0] if paths else '')
+        row = QTreeWidgetItem([tr(operation_name.get(op_type, op_type)), location, tr("运行中"), ''])
+        row.setToolTip(1, '\n'.join(paths) + ('\n' + destination if destination else ''))
         record = {'worker': worker, 'row': row, 'op': op_type, 'paths': list(paths),
                   'destination': destination, 'max_workers': max_workers, 'errors': [],
-                  'failed': [], 'done': False, 'rename_plan': worker.rename_plan}
+              'failed': [], 'done': False, 'completed': False, 'cancelled': False,
+              'rename_plan': worker.rename_plan}
         row.setData(0, Qt.UserRole, len(self.records))
         self.records.append(record)
         self.table.addTopLevelItem(row)
+        self.table.setCurrentItem(row)
         _diagnostic_event('file_task_start', f'operation={op_type} items={len(paths)}')
         worker.completed.connect(self.task_completed)
         worker.finished.connect(self.thread_finished)
@@ -4138,9 +4425,12 @@ class FileTaskPanel(QDialog):
             tab._file_op_worker = worker
         self.timer.start()
         worker.start()
+        self._update_controls()
+        self.tasks_changed.emit()
         return worker
 
     def task_completed(self, op_type, ok_count, fail_count, errors):
+        from PyQt5.QtWidgets import QStyle
         _search_cache.clear()
         _diagnostic_event('file_task_complete', f'operation={op_type} ok={ok_count} failed={fail_count}')
         worker = self.sender()
@@ -4149,21 +4439,62 @@ class FileTaskPanel(QDialog):
             return
         record['errors'] = list(errors)
         record['failed'] = list(worker.failed_paths)
-        state = tr("已取消") if worker.cancelled else tr("完成")
-        record['row'].setText(2, f"{state}: {ok_count} / {fail_count}")
+        record['completed'] = True
+        record['cancelled'] = worker.cancelled
+        if worker.cancelled:
+            state, icon = tr('已取消'), QStyle.SP_BrowserStop
+        elif fail_count or errors:
+            state = tr('部分失败') if ok_count else tr('失败')
+            icon = QStyle.SP_MessageBoxWarning
+        else:
+            state, icon = tr('全部成功'), QStyle.SP_DialogApplyButton
+        summary = tr("{}：成功 {} 项，失败 {} 项").format(state, ok_count, fail_count)
+        record['summary'] = summary
+        record['row'].setText(2, summary)
+        record['row'].setIcon(2, self.style().standardIcon(icon))
         record['row'].setText(3, format_file_size(worker.bytes_done) if op_type == 'copy' else str(worker.done_units))
-        record['row'].setToolTip(2, '\n'.join(errors))
+        record['row'].setToolTip(2, summary + ('\n' + '\n'.join(errors) if errors else ''))
+        self._update_controls()
+        self.tasks_changed.emit()
 
     def thread_finished(self):
         worker = self.sender()
+        finished_record = None
         for record in self.records:
             if record['worker'] is worker:
                 record['done'] = True
                 record['worker'] = None
+                finished_record = record
                 break
         worker.deleteLater()
         if not self.has_running_tasks():
             self.timer.stop()
+        self._update_controls()
+        self.tasks_changed.emit()
+        if finished_record is not None:
+            self._notify_task_result(finished_record)
+
+    def _notify_task_result(self, record):
+        owner = self.parent()
+        if owner is None or self.isVisible():
+            return
+
+        def show_record():
+            if record in self.records:
+                self.table.setCurrentItem(record['row'])
+                self.show()
+                self.raise_()
+                self.activateWindow()
+
+        if record['errors'] or record['cancelled']:
+            show_toast(owner, tr('文件任务'), record.get('summary', ''), level='warning',
+                       action_text=tr('查看任务'), action=show_record)
+        else:
+            path = record['destination'] or (os.path.dirname(record['paths'][0]) if record['paths'] else '')
+            action = (lambda: owner.add_new_tab(path)) if path and hasattr(owner, 'add_new_tab') else show_record
+            show_toast(owner, tr('文件任务'), record.get('summary', ''), level='success',
+                       action_text=tr('打开位置') if path and hasattr(owner, 'add_new_tab') else tr('查看任务'),
+                       action=action)
 
     def has_running_tasks(self):
         return any(not entry['done'] for entry in self.records)
@@ -4186,9 +4517,10 @@ class FileTaskPanel(QDialog):
 
     def cancel_selected(self):
         record = self.selected_record()
-        if record and record['worker']:
+        if record and record['worker'] and not record.get('completed'):
             record['worker'].request_cancel()
             record['row'].setText(2, tr("取消中"))
+            self._update_controls()
 
     def retry_selected(self):
         record = self.selected_record()
@@ -4216,6 +4548,8 @@ class FileTaskPanel(QDialog):
             if record['done']:
                 self.table.takeTopLevelItem(self.table.indexOfTopLevelItem(record['row']))
                 self.records.remove(record)
+        self._update_controls()
+        self.tasks_changed.emit()
 
 
 def _plan_batch_rename(paths, find_text, replacement):
@@ -4606,6 +4940,7 @@ class SimplePathBar(QWidget):
     正确绘制，且没有子控件析构/创建开销。
     """
     pathChanged = pyqtSignal(str)
+    activated = pyqtSignal()
 
     _FONT   = "font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif; font-size: 11pt;"
     _S_BAR  = ("SimplePathBar { background: #ffffff; border: none; }")
@@ -4628,11 +4963,14 @@ class SimplePathBar(QWidget):
         self._display_regions = []     # 绘制时记录的命中区: dict(kind,x0,x1,payload,label,is_current)
         self._hover_idx = -1
         self._in_edit = False
+        self._pane_active = False
+        self._split_indicator = False
         self._completer = None         # 编辑模式路径自动补全（首次进入编辑时惰性创建）
         self._press_pos = None         # 左键按下位置（用于拖拽判定）
         self._press_idx = -1           # 按下时命中的区索引
         self._dragging = False
         self.setFixedHeight(30)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)    # hover 高亮需要
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(self._S_BAR)
@@ -4688,6 +5026,15 @@ class SimplePathBar(QWidget):
             self._segments = self._split_path(self._current_path)
         self.repaint()
 
+    def set_pane_active(self, active, split):
+        state = (bool(active), bool(split))
+        if state == (self._pane_active, self._split_indicator):
+            return
+        self._pane_active, self._split_indicator = state
+        border = '#2f6fdb' if active else '#a0a5ad'
+        self._edit.setStyleSheet(self._S_EDIT + (f'QLineEdit {{ border: 2px solid {border}; }}' if split else ''))
+        self.update()
+
     def enter_edit_mode(self):
         if self._in_edit:
             return
@@ -4738,6 +5085,9 @@ class SimplePathBar(QWidget):
         from PyQt5.QtCore import QRectF
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor('#ffffff'))
+        if self._split_indicator:
+            color = '#2f6fdb' if self._pane_active else '#b7bcc4'
+            painter.fillRect(0, self.height() - 2, self.width(), 2, QColor(color))
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.TextAntialiasing, True)
         painter.setFont(self._font)
@@ -4861,10 +5211,15 @@ class SimplePathBar(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and not self._in_edit:
+            self.activated.emit()
             self._press_pos = event.pos()
             self._press_idx = self._region_at(int(event.pos().x()))
             self._dragging = False
         super().mousePressEvent(event)
+
+    def focusInEvent(self, event):
+        self.activated.emit()
+        super().focusInEvent(event)
 
     def mouseReleaseEvent(self, event):
         if self._in_edit or event.button() != Qt.LeftButton:
@@ -5089,6 +5444,8 @@ class SimplePathBar(QWidget):
         super().resizeEvent(event)
 
     def eventFilter(self, obj, event):
+        if obj is self._edit and event.type() in (QEvent.FocusIn, QEvent.MouseButtonPress):
+            self.activated.emit()
         if obj is self._edit and event.type() == QEvent.KeyPress:
             if event.key() == Qt.Key_Escape:
                 debug_print(f"[SimplePathBar] eventFilter: Escape pressed, exit edit mode")
@@ -6537,6 +6894,14 @@ class FileExplorerTab(QWidget):
         except Exception as e:
             debug_print(f"[FileWatcher] on_file_changed error: {e}")
 
+    def _activate_path_bar(self):
+        owner = self.main_window
+        if owner is not None:
+            for tabs, stack in owner._all_groups():
+                if stack.indexOf(self) >= 0:
+                    owner.set_active_pane_to_group(tabs)
+                    break
+
     def update_tab_title(self):
         if hasattr(self, 'current_path'):
             # 兜底同步路径栏：有些导航路径变化来自 Explorer 内部事件，
@@ -6618,7 +6983,10 @@ class FileExplorerTab(QWidget):
                         idx = mw.tab_widget.indexOf(self)
 
                 if idx != -1:
-                    target_tw.setTabText(idx, title)
+                    if hasattr(mw, '_refresh_tab_labels'):
+                        mw._refresh_tab_labels()
+                    else:
+                        target_tw.setTabText(idx, title)
                     if hasattr(mw, '_apply_tab_group_color'):
                         mw._apply_tab_group_color(target_tw, idx, self)
                     debug_print(f"DEBUG: Set tab {idx} text to '{title}'")
@@ -7042,6 +7410,7 @@ class FileExplorerTab(QWidget):
         # 路径栏（极简单行输入框）
         self.path_bar = SimplePathBar(self)
         self.path_bar.pathChanged.connect(self.on_path_bar_changed)
+        self.path_bar.activated.connect(self._activate_path_bar)
         layout.addWidget(self.path_bar)
         
         # 加载指示器（初始隐藏）
@@ -10206,21 +10575,6 @@ class FileExplorerTab(QWidget):
             self.cancel_file_op_btn.setText(tr("取消"))
             self.cancel_file_op_btn.setEnabled(True)
 
-        if op_type == 'copy':
-            if cancelled:
-                show_toast(self, tr("提示"), tr("复制已取消：成功 {} 项，失败 {} 项").format(ok_count, fail_count), level="warning")
-            elif fail_count == 0:
-                show_toast(self, tr("成功"), tr("复制完成，共 {} 项").format(ok_count), level="success")
-            else:
-                show_toast(self, tr("警告"), tr("复制完成：成功 {} 项，失败 {} 项").format(ok_count, fail_count), level="warning")
-        elif op_type in ('delete', 'permanent_delete'):
-            if cancelled:
-                show_toast(self, tr("提示"), tr("删除已取消：成功 {} 项，失败 {} 项").format(ok_count, fail_count), level="warning")
-            elif fail_count == 0:
-                show_toast(self, tr("成功"), tr("删除完成，共 {} 项").format(ok_count), level="success")
-            else:
-                show_toast(self, tr("警告"), tr("删除完成：成功 {} 项，失败 {} 项").format(ok_count, fail_count), level="warning")
-
         try:
             self.update_explorer_status()
             self._request_refresh(reason='custom_file_op')
@@ -10574,6 +10928,116 @@ class CustomMenuBar(QMenuBar):
 from PyQt5.QtWidgets import QTabBar, QToolButton
 from PyQt5.QtCore import QEvent, QPoint
 from PyQt5.QtGui import QIcon
+def _tab_display_labels(paths):
+    from collections import Counter
+    from pathlib import PureWindowsPath
+    normalized = [str(PureWindowsPath(path)).casefold() for path in paths]
+    parts = [PureWindowsPath(path).parts for path in paths]
+    totals = Counter(normalized)
+    seen = Counter()
+    labels = []
+    special = {'shell:RecycleBinFolder': tr('回收站'), 'shell:MyComputerFolder': tr('此电脑'),
+               'shell:Desktop': tr('桌面'), 'shell:NetworkPlacesFolder': tr('网络')}
+    for index, path in enumerate(paths):
+        label = special.get(path)
+        if label is None:
+            label = path or tr('新标签页')
+            for depth in range(1, len(parts[index]) + 1):
+                suffix = parts[index][-depth:]
+                label = str(PureWindowsPath(*suffix))
+                if not any(normalized[other] != normalized[index]
+                           and tuple(part.casefold() for part in parts[other][-depth:])
+                           == tuple(part.casefold() for part in suffix)
+                           for other in range(len(paths))):
+                    break
+        seen[normalized[index]] += 1
+        if totals[normalized[index]] > 1:
+            label += f' [{seen[normalized[index]]}]'
+        labels.append(label)
+    return labels
+
+
+class TabListDialog(QDialog):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+        self.setWindowTitle(tr('查找标签'))
+        self.resize(720, 400)
+        layout = QVBoxLayout(self)
+        self.filter_input = QLineEdit(self)
+        self.filter_input.setPlaceholderText(tr('名称或路径'))
+        self.filter_input.setClearButtonEnabled(True)
+        layout.addWidget(self.filter_input)
+        self.table = QTreeWidget(self)
+        self.table.setHeaderLabels([tr('标签'), tr('路径'), tr('位置')])
+        self.table.setRootIsDecorated(False)
+        self.table.setUniformRowHeights(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionMode(QTreeWidget.SingleSelection)
+        self.table.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 180)
+        self.table.setColumnWidth(2, 70)
+        layout.addWidget(self.table)
+        self.entries = []
+        owner._refresh_tab_labels()
+        for side, (tabs, stack) in enumerate(owner._all_groups()):
+            for index in range(min(tabs.count(), stack.count())):
+                pane = stack.widget(index)
+                path = str(getattr(pane, 'current_path', '') or '')
+                item = QTreeWidgetItem([tabs.tabText(index), path, tr('左侧') if side == 0 else tr('右侧')])
+                item.setIcon(0, tabs.tabIcon(index))
+                item.setToolTip(1, path)
+                item.setData(0, Qt.UserRole, len(self.entries))
+                self.entries.append(pane)
+                self.table.addTopLevelItem(item)
+        self.filter_input.textChanged.connect(self.filter_tabs)
+        self.filter_input.returnPressed.connect(self.activate_selected)
+        self.filter_input.installEventFilter(self)
+        self.table.itemActivated.connect(self.activate_selected)
+        self.filter_tabs('')
+        self.filter_input.setFocus()
+
+    def filter_tabs(self, text):
+        words = text.casefold().split()
+        first = None
+        for index in range(self.table.topLevelItemCount()):
+            item = self.table.topLevelItem(index)
+            value = ' '.join(item.text(column) for column in range(3)).casefold()
+            visible = all(word in value for word in words)
+            item.setHidden(not visible)
+            if visible and first is None:
+                first = item
+        self.table.setCurrentItem(first)
+
+    def eventFilter(self, watched, event):
+        if watched is self.filter_input and event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Down, Qt.Key_Up):
+            visible = [self.table.topLevelItem(index) for index in range(self.table.topLevelItemCount())
+                       if not self.table.topLevelItem(index).isHidden()]
+            if visible:
+                selected = self.table.currentItem()
+                index = visible.index(selected) if selected in visible else 0
+                index = max(0, min(len(visible) - 1, index + (1 if event.key() == Qt.Key_Down else -1)))
+                self.table.setCurrentItem(visible[index])
+                self.table.scrollToItem(visible[index])
+            return True
+        return super().eventFilter(watched, event)
+
+    def activate_selected(self, *args):
+        item = self.table.currentItem()
+        if item is None or item.isHidden():
+            return
+        target = self.entries[item.data(0, Qt.UserRole)]
+        for tabs, stack in self.owner._all_groups():
+            for index in range(stack.count()):
+                if stack.widget(index) is target:
+                    tabs.setCurrentIndex(index)
+                    self.owner.set_active_pane_to_group(tabs)
+                    self.accept()
+                    return
+        item.setHidden(True)
+        self.table.setCurrentItem(None)
+
+
 class CustomTabBar(QTabBar):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -11004,9 +11468,12 @@ class CustomTabBar(QTabBar):
     
     def _make_close_btn(self, index):
         """创建关闭按钮，始终可见，hover 时变灰"""
+        from PyQt5.QtWidgets import QStyle
         close_btn = QToolButton(self)
-        close_btn.setText("×")
-        tab_close_btn_size = int(16 * getattr(self, 'parent_window', self).dpi_scale if hasattr(getattr(self, 'parent_window', self), 'dpi_scale') else 16)
+        close_btn.setToolTip(tr('关闭标签'))
+        scale = float(getattr(getattr(self, 'main_window', None), 'dpi_scale', 1.0))
+        tab_close_btn_size = max(16, int(16 * scale))
+        _set_tool_icon(close_btn, 'window-close', QStyle.SP_TitleBarCloseButton, max(12, int(12 * scale)))
         close_btn.setFixedSize(tab_close_btn_size, tab_close_btn_size)
         close_btn.setStyleSheet("""
             QToolButton {
@@ -11039,6 +11506,16 @@ class CustomTabBar(QTabBar):
         super().tabInserted(index)
         close_btn = self._make_close_btn(index)
         self.setTabButton(index, QTabBar.RightSide, close_btn)
+        self._schedule_labels()
+
+    def tabRemoved(self, index):
+        super().tabRemoved(index)
+        self._schedule_labels()
+
+    def _schedule_labels(self):
+        owner = getattr(self, 'main_window', None)
+        if owner is not None and hasattr(owner, '_schedule_tab_labels'):
+            owner._schedule_tab_labels()
 
     def close_tab_at_index(self, index):
         """关闭指定索引的标签页"""
@@ -11054,6 +11531,8 @@ class CustomTabBar(QTabBar):
     
     def on_tab_moved(self, from_index, to_index):
         """标签页移动后的处理，同步所属组的 content_stack；固定标签逻辑仅适用于左侧组。"""
+        if getattr(self, '_sorting_pinned_tabs', False):
+            return
         if not self.main_window:
             return
         debug_print(f"[TabMoved] Moving tab from {from_index} to {to_index}")
@@ -11076,6 +11555,7 @@ class CustomTabBar(QTabBar):
             pass
         # 移动后自动检测鼠标下的tab并显示关闭按钮
         self.show_close_button_under_cursor()
+        self._schedule_labels()
         # 固定标签纠正仅适用于左侧主标签组
         if tw is not self.main_window.tab_widget:
             return
@@ -13927,10 +14407,9 @@ class MainWindow(QMainWindow):
         show_markers = bool(getattr(self, 'config', {}).get('show_tab_group_markers', True))
         if color_hex and show_markers:
             tab_widget.tabBar().setTabTextColor(index, QColor(color_hex).darker(125))
-            tab_widget.setTabIcon(index, QIcon())
         else:
             tab_widget.tabBar().setTabTextColor(index, QColor("#505050"))
-            tab_widget.setTabIcon(index, QIcon())
+        tab_widget.setTabIcon(index, _pinned_tab_icon() if getattr(tab_ref, 'is_pinned', False) else QIcon())
         try:
             tab_widget.tabBar().update()
         except Exception:
@@ -14618,6 +15097,38 @@ class MainWindow(QMainWindow):
         if tab:
             tab._restore_guard_until = time.monotonic() + 2.0
 
+    def _schedule_tab_labels(self):
+        if not hasattr(self, '_tab_labels_timer'):
+            self._tab_labels_timer = QTimer(self)
+            self._tab_labels_timer.setSingleShot(True)
+            self._tab_labels_timer.timeout.connect(self._refresh_tab_labels)
+        self._tab_labels_timer.start(0)
+
+    def _refresh_tab_labels(self):
+        if not hasattr(self, 'content_stack'):
+            return
+        entries = [(tabs, index, stack.widget(index)) for tabs, stack in self._all_groups()
+                   for index in range(min(tabs.count(), stack.count()))]
+        state = [(_app_language, id(tabs), id(pane), getattr(pane, 'current_path', ''),
+                  bool(getattr(pane, 'is_pinned', False))) for tabs, _index, pane in entries]
+        if state == getattr(self, '_tab_label_state', None):
+            return
+        self._tab_label_state = state
+        from PyQt5.QtGui import QIcon
+        labels = _tab_display_labels([str(getattr(pane, 'current_path', '') or '') for _tabs, _index, pane in entries])
+        for (tabs, index, pane), label in zip(entries, labels):
+            pane._display_tab_label = label
+            pinned = bool(getattr(pane, 'is_pinned', False))
+            tabs.setTabText(index, label)
+            tabs.setTabIcon(index, _pinned_tab_icon() if pinned else QIcon())
+            path = str(getattr(pane, 'current_path', '') or '')
+            tabs.setTabToolTip(index, (tr('已固定') + '\n' if pinned else '') + path)
+
+    def show_tab_list(self):
+        dialog = TabListDialog(self)
+        dialog.exec_()
+        dialog.deleteLater()
+
     def _normalize_path_for_compare(self, path):
         """将路径标准化用于比较（Windows 不区分大小写）。"""
         if not path:
@@ -14675,6 +15186,27 @@ class MainWindow(QMainWindow):
             self.forward_button.setEnabled(current_tab.can_go_forward())
         else:
             self.forward_button.setEnabled(False)
+        self._update_active_pane_indicator()
+
+    def _update_active_pane_indicator(self):
+        if not hasattr(self, 'content_stack'):
+            return
+        split = bool(getattr(self, '_split_active', False))
+        current = self.get_active_pane()
+        for tab_widget, stack in self._all_groups():
+            if stack is None or tab_widget is None:
+                continue
+            pane = stack.widget(tab_widget.currentIndex())
+            active = not split or pane is current
+            tabbar = tab_widget.tabBar()
+            if tabbar.property('activePane') != active:
+                tabbar.setProperty('activePane', active)
+                tabbar.style().unpolish(tabbar)
+                tabbar.style().polish(tabbar)
+                tabbar.update()
+            path_bar = getattr(pane, 'path_bar', None)
+            if path_bar is not None:
+                path_bar.set_pane_active(active, split)
     
     def open_tortoisegit_log_current_tab(self):
         """打开当前标签页的 TortoiseGit 日志（作用于活动面板，分屏时跟随最近交互的一侧）"""
@@ -15107,6 +15639,7 @@ class MainWindow(QMainWindow):
                 pass
         self._active_pane = None
         # 恢复 splitter 折叠属性：content_stack(0) 不可折叠，AI 面板(1) 可折叠
+        self._update_active_pane_indicator()
         try:
             self.splitter.setCollapsible(0, False)
             self.splitter.setCollapsible(1, True)
@@ -15736,6 +16269,14 @@ class MainWindow(QMainWindow):
         self.reopen_tab_button.clicked.connect(self.reopen_closed_tab)
         self.reopen_tab_button.setEnabled(False)
         titlebar_layout.addWidget(self.reopen_tab_button)
+
+        from PyQt5.QtWidgets import QStyle
+        self.tab_list_button = QToolButton(self)
+        self.tab_list_button.setToolTip(tr('查找标签'))
+        self.tab_list_button.setFixedSize(btn_size, btn_size)
+        _set_tool_icon(self.tab_list_button, 'view-list-details', QStyle.SP_FileDialogListView)
+        self.tab_list_button.clicked.connect(self.show_tab_list)
+        titlebar_layout.addWidget(self.tab_list_button)
         
         # 搜索按钮
         self.search_button = QPushButton("⌕")
@@ -15767,23 +16308,22 @@ class MainWindow(QMainWindow):
 
         from PyQt5.QtWidgets import QStyle
         self.workspace_tools_button = QToolButton(self)
-        self.workspace_tools_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
         self.workspace_tools_button.setToolTip(tr("工作区与文件工具"))
+        _set_tool_icon(self.workspace_tools_button, 'workspace-tools', QStyle.SP_FileDialogDetailedView)
         self.workspace_tools_button.setFixedSize(btn_size, btn_size)
         self.workspace_tools_button.setPopupMode(QToolButton.InstantPopup)
         tools_menu = QMenu(self.workspace_tools_button)
-        tools_menu.addAction(tr("文件任务"), self.show_file_tasks)
-        tools_menu.addAction(tr("目录差异比较..."), self.show_directory_compare)
-        tools_menu.addAction(tr("批量重命名预览..."), self.preview_batch_rename)
-        tools_menu.addAction(tr("保存命名工作区..."), self.save_named_workspace)
-        tools_menu.addAction(tr("打开命名工作区..."), self.open_named_workspace)
-        tools_menu.addAction(tr("删除命名工作区..."), self.delete_named_workspace)
-        tools_menu.addAction(tr("永久删除选中项..."), self.permanently_delete_selected)
-        tools_menu.addSeparator()
-        self.export_diagnostics_action = tools_menu.addAction(tr("导出崩溃诊断包..."), self.export_diagnostics)
+        self._populate_workspace_tools_menu(tools_menu)
         self.workspace_tools_menu = tools_menu
         self.workspace_tools_button.setMenu(tools_menu)
         titlebar_layout.addWidget(self.workspace_tools_button)
+
+        self.file_tasks_button = QToolButton(self)
+        self.file_tasks_button.setFixedSize(int(64 * self.dpi_scale), btn_size)
+        self.file_tasks_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.file_tasks_button.clicked.connect(self.show_file_tasks)
+        titlebar_layout.addWidget(self.file_tasks_button)
+        self._update_task_indicator()
 
         # 插入分组按钮
         self.insert_group_btn = QPushButton("☰")
@@ -15923,7 +16463,41 @@ class MainWindow(QMainWindow):
         titlebar_layout.addWidget(self.ai_chat_btn)
         
         # 系统原生标题栏已提供最小化/最大化/关闭按钮，无需自定义
-        
+        from PyQt5.QtWidgets import QStyle
+        icons = (
+            (self.git_log_button, 'app-tortoisegit-log', QStyle.SP_DirLinkIcon),
+            (self.git_commit_button, 'app-tortoisegit-commit', QStyle.SP_ArrowUp),
+            (self.git_bash_button, 'app-git-bash', QStyle.SP_ComputerIcon),
+            (self.cmd_button, 'app-cmd', QStyle.SP_ComputerIcon),
+            (self.powershell_button, 'app-powershell', QStyle.SP_DesktopIcon),
+            (self.calculator_button, 'accessories-calculator', QStyle.SP_FileDialogDetailedView),
+            (self.back_button, 'go-previous', QStyle.SP_ArrowBack),
+            (self.forward_button, 'go-next', QStyle.SP_ArrowForward),
+            (self.add_tab_button, 'tab-new', QStyle.SP_FileDialogNewFolder),
+            (self.reopen_tab_button, 'edit-undo', QStyle.SP_BrowserReload),
+            (self.search_button, 'edit-find', QStyle.SP_FileDialogContentsView),
+            (self.insert_group_btn, 'view-group', QStyle.SP_DirOpenIcon),
+            (self.split_view_btn, 'view-split-left-right', QStyle.SP_TitleBarNormalButton),
+            (bookmark_btn, 'user-bookmarks', QStyle.SP_DirIcon),
+            (settings_btn, 'preferences-system', QStyle.SP_FileDialogInfoView),
+            (self.ai_chat_btn, 'help-contents', QStyle.SP_MessageBoxInformation),
+        )
+        toolbar_style = (
+            'QPushButton, QToolButton { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 0; }'
+            'QPushButton:hover:!disabled, QToolButton:hover:!disabled { background: #e5e9ee; }'
+            'QPushButton:checked, QToolButton:checked { background: #dceafa; border-color: #739bca; }'
+            'QPushButton:focus, QToolButton:focus { border-color: #2f6fdb; }'
+        )
+        for button, theme, fallback in icons:
+            button.setText('')
+            button.setFixedSize(btn_size, btn_size)
+            _set_tool_icon(button, theme, fallback, max(16, int(18 * self.dpi_scale)))
+            button.setStyleSheet(toolbar_style)
+        for button in (self.workspace_tools_button, self.file_tasks_button, self.tab_list_button):
+            button.setStyleSheet(toolbar_style)
+            button.setAccessibleName(button.toolTip())
+        self.bookmark_button = bookmark_btn
+        self.settings_button = settings_btn
         main_layout.addWidget(titlebar)
     
     def toggle_maximize(self):
@@ -16802,9 +17376,44 @@ class MainWindow(QMainWindow):
             del self.config['named_workspaces'][name]
             self.save_config(immediate=True)
 
+    def _populate_workspace_tools_menu(self, menu):
+        from PyQt5.QtWidgets import QStyle
+        menu.addSection(tr('文件操作'))
+        self.file_tasks_action = menu.addAction(tr('文件任务'), self.show_file_tasks)
+        menu.addAction(tr('目录差异比较...'), self.show_directory_compare)
+        menu.addAction(tr('批量重命名预览...'), self.preview_batch_rename)
+        workspace = menu.addMenu(tr('工作区'))
+        workspace.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
+        workspace.addAction(tr('保存命名工作区...'), self.save_named_workspace)
+        workspace.addAction(tr('打开命名工作区...'), self.open_named_workspace)
+        workspace.addAction(tr('删除命名工作区...'), self.delete_named_workspace)
+        menu.addSection(tr('危险操作'))
+        danger = menu.addAction(tr('永久删除选中项...'), self.permanently_delete_selected)
+        danger.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxWarning))
+        menu.addSection(tr('诊断'))
+        self.export_diagnostics_action = menu.addAction(tr('导出崩溃诊断包...'), self.export_diagnostics)
+
+    def _update_task_indicator(self):
+        from PyQt5.QtWidgets import QStyle
+        panel = getattr(self, '_file_task_panel', None)
+        running, failed = panel.task_counts() if panel is not None else (0, 0)
+        summary = tr('文件任务：运行 {}，失败 {}').format(running, failed)
+        button = getattr(self, 'file_tasks_button', None)
+        if button is not None:
+            _set_tool_icon(button, 'task-warning' if failed else 'file-tasks',
+                           QStyle.SP_MessageBoxWarning if failed else QStyle.SP_FileDialogDetailedView)
+            count = running if running else failed
+            button.setText(str(count) if count < 100 else '99+')
+            button.setToolTip(summary)
+            button.setAccessibleName(summary)
+        action = getattr(self, 'file_tasks_action', None)
+        if action is not None:
+            action.setText(summary if running or failed else tr('文件任务'))
+
     def get_file_task_panel(self):
         if getattr(self, '_file_task_panel', None) is None:
             self._file_task_panel = FileTaskPanel(self)
+            self._file_task_panel.tasks_changed.connect(self._update_task_indicator)
         return self._file_task_panel
 
     def _capture_diagnostic_snapshot(self):
@@ -16882,7 +17491,9 @@ class MainWindow(QMainWindow):
         if worker.error:
             QMessageBox.warning(self, tr("诊断包导出失败"), worker.error)
         else:
-            QMessageBox.information(self, tr("诊断包已保存"), worker.destination)
+            destination = worker.destination
+            show_toast(self, tr("诊断包已保存"), destination, level='success',
+                       action_text=tr('打开位置'), action=lambda: self.add_new_tab(os.path.dirname(destination)))
 
     def show_file_tasks(self):
         panel = self.get_file_task_panel()
@@ -17187,16 +17798,16 @@ class MainWindow(QMainWindow):
         if tab is None:
             return
         tab.is_pinned = False
-        self.sort_tabs_by_pinned(tw)
+        move_to_end = tab if not str(getattr(tab, 'bookmark_group_color', '') or '').strip() else None
+        self.sort_tabs_by_pinned(tw, move_to_end=move_to_end)
         self.save_pinned_tabs()
 
-    def sort_tabs_by_pinned(self, target_tabwidget=None):
+    def sort_tabs_by_pinned(self, target_tabwidget=None, move_to_end=None):
         tw, cs, _is_right = self._resolve_group(target_tabwidget)
         if cs is None:
             return
         pinned = []
         unpinned = []
-        # 记录当前tab对象
         current_index = tw.currentIndex()
         current_tab = cs.widget(current_index) if current_index >= 0 else None
         for i in range(tw.count()):
@@ -17205,26 +17816,32 @@ class MainWindow(QMainWindow):
                 pinned.append(tab)
             else:
                 unpinned.append(tab)
-        tw.clear()
-        # 清空该组 content_stack
-        while cs.count() > 0:
-            widget = cs.widget(0)
-            cs.removeWidget(widget)
+        if move_to_end in unpinned:
+            unpinned.remove(move_to_end)
+            unpinned.append(move_to_end)
         new_tabs = pinned + unpinned
-        for tab in new_tabs:
-            # 先添加标签页（临时标题）- 占位widget
-            tw.addTab(QWidget(), "")
-            # 将实际内容添加到 content_stack
-            cs.addWidget(tab)
-            # 然后调用update_tab_title更新标题（会考虑shell路径映射和图标）
-            tab.update_tab_title()
-        # 恢复原先的tab焦点
-        if current_tab is not None:
-            for i, tab in enumerate(new_tabs):
-                if tab is current_tab:
-                    tw.setCurrentIndex(i)
-                    break
+        tabbar = tw.tabBar()
+        was_sorting = getattr(tabbar, '_sorting_pinned_tabs', False)
+        tabbar._sorting_pinned_tabs = True
+        blocked = [(control, control.blockSignals(True)) for control in (tw, cs)]
+        try:
+            for index, tab in enumerate(new_tabs):
+                previous_index = cs.indexOf(tab)
+                if previous_index != index:
+                    cs.removeWidget(tab)
+                    cs.insertWidget(index, tab)
+                    tabbar.moveTab(previous_index, index)
+            if current_tab is not None:
+                tw.setCurrentIndex(cs.indexOf(current_tab))
+                cs.setCurrentWidget(current_tab)
+        finally:
+            tabbar._sorting_pinned_tabs = was_sorting
+            for control, was_blocked in reversed(blocked):
+                control.blockSignals(was_blocked)
         self._apply_tab_grouping_for_pane(tw)
+        self._refresh_tab_labels()
+        if hasattr(self, '_on_group_tab_changed'):
+            self._on_group_tab_changed(tw, tw.currentIndex())
 
     def save_pinned_tabs(self):
         """保存固定标签页到config.json（扫描左右两个标签组）"""
@@ -18200,6 +18817,10 @@ class MainWindow(QMainWindow):
             QTabBar::tab:!selected {{
                 font-weight: normal;
                 margin-top: {tab_margin + 1}px;
+            }}
+            QTabBar[activePane="false"]::tab:selected {{
+                border-color: #a0a5ad;
+                color: #505050;
             }}
         """)
         # 设置标签文本省略模式 - 左边省略，保留右侧文件/文件夹名称
