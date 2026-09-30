@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import Mock, patch
 import zipfile
 
-from tabex_diagnostics import Diagnostics, MAX_LOG_BYTES, redact
+from app_modules import app, patch_all
+from tabexplorer.diagnostics import Diagnostics, MAX_LOG_BYTES, redact
 
 
 class DiagnosticsTests(unittest.TestCase):
@@ -112,10 +113,10 @@ class DiagnosticsTests(unittest.TestCase):
             session = self.diagnostics.directory / f'20200101-00000{index}-12345678'
             session.mkdir()
             (session / 'session.json').write_text(json.dumps({'status': 'running', 'pid': 123}))
-        with patch('tabex_diagnostics._process_alive', return_value=True):
+        with patch('tabexplorer.diagnostics._process_alive', return_value=True):
             self.diagnostics._prune()
         self.assertEqual(len(list(self.diagnostics.directory.iterdir())), 9)
-        with patch('tabex_diagnostics._process_alive', return_value=False):
+        with patch('tabexplorer.diagnostics._process_alive', return_value=False):
             self.diagnostics._prune()
         self.assertEqual(len(list(self.diagnostics.directory.iterdir())), 5)
         self.assertTrue(self.diagnostics.session.exists())
@@ -124,7 +125,7 @@ class DiagnosticsTests(unittest.TestCase):
         """ZIP 提交失败时不损坏已有诊断包，临时文件会清理。"""
         target = self.root / 'bundle.zip'
         target.write_bytes(b'old-bundle')
-        with patch('tabex_diagnostics.os.replace', side_effect=PermissionError('busy')):
+        with patch('tabexplorer.diagnostics.os.replace', side_effect=PermissionError('busy')):
             with self.assertRaises(PermissionError):
                 self.diagnostics.export(target)
         self.assertEqual(target.read_bytes(), b'old-bundle')
@@ -150,7 +151,7 @@ class DiagnosticsTests(unittest.TestCase):
         main_hook, thread_hook = Mock(), Mock()
         with patch.object(sys, 'excepthook', main_hook), \
                 patch.object(threading, 'excepthook', thread_hook), \
-                patch('tabex_diagnostics.faulthandler.is_enabled', return_value=True):
+                patch('tabexplorer.diagnostics.faulthandler.is_enabled', return_value=True):
             self.diagnostics.install()
             try:
                 error = ValueError('HIDDEN-EXCEPTION-MESSAGE')
@@ -192,16 +193,16 @@ class DiagnosticsTests(unittest.TestCase):
     def test_process_probe_recognizes_current_process(self):
         """进程存活检查识别当前进程及无效 PID，不终止任何进程。"""
         import os
-        from tabex_diagnostics import _process_alive
+        from tabexplorer.diagnostics import _process_alive
         self.assertTrue(_process_alive(os.getpid()))
         self.assertFalse(_process_alive(-1))
 
     def test_external_fault_handler_is_preserved(self):
         """外部调试器已启用 faulthandler 时不覆盖或关闭它，仍提供 Qt 显式栈记录。"""
-        with patch('tabex_diagnostics.faulthandler.is_enabled', return_value=True), \
-                patch('tabex_diagnostics.faulthandler.enable') as enable, \
-                patch('tabex_diagnostics.faulthandler.disable') as disable, \
-                patch('tabex_diagnostics.faulthandler.dump_traceback') as dump:
+        with patch('tabexplorer.diagnostics.faulthandler.is_enabled', return_value=True), \
+                patch('tabexplorer.diagnostics.faulthandler.enable') as enable, \
+                patch('tabexplorer.diagnostics.faulthandler.disable') as disable, \
+                patch('tabexplorer.diagnostics.faulthandler.dump_traceback') as dump:
             self.diagnostics.install()
             try:
                 self.assertEqual(self.diagnostics.state['native_fault_capture'], 'external-handler')
@@ -219,9 +220,8 @@ class QtDiagnosticsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from PyQt5.QtWidgets import QApplication
-        import TabEx
         cls.app = QApplication.instance() or QApplication([])
-        cls.module = TabEx
+        cls.module = app
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -229,7 +229,7 @@ class QtDiagnosticsTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.diagnostics = Diagnostics(self.root / 'diagnostics', self.module.APP_VERSION)
         self.addCleanup(self.diagnostics.close)
-        service_patch = patch.object(self.module, '_diagnostics', self.diagnostics)
+        service_patch = patch_all('_diagnostics', self.diagnostics)
         service_patch.start()
         self.addCleanup(service_patch.stop)
 
@@ -268,7 +268,7 @@ class QtDiagnosticsTests(unittest.TestCase):
     def test_qt_fatal_is_recorded_with_debug_disabled(self):
         """关闭调试模式仍记录 Qt 致命错误和调用栈；不向 Qt 发送真正 abort。"""
         from PyQt5.QtCore import QtFatalMsg
-        with patch.object(self.module, '_DEBUG_MODE', False), \
+        with patch_all('_DEBUG_MODE', False), \
                 patch.object(self.diagnostics, 'dump_threads') as dump:
             self.module.qt_message_handler(QtFatalMsg, None, 'QThread: Destroyed while thread is still running')
         dump.assert_called_once()
@@ -312,16 +312,16 @@ class QtDiagnosticsTests(unittest.TestCase):
         with patch.object(QMessageBox, 'question', return_value=QMessageBox.Yes), \
                 patch.object(QFileDialog, 'getSaveFileName', return_value=(str(target), '')), \
                 patch.object(QMessageBox, 'information') as information, \
-                patch.object(self.module, 'show_toast') as toast, \
+                patch_all('show_toast') as toast, \
                 patch.object(QMessageBox, 'warning') as warning, \
                 patch.object(self.diagnostics, 'export', side_effect=export), \
-                patch.object(self.module, '_DEBUG_LOG_PATH', str(self.root / 'missing.log')):
+                patch_all('_DEBUG_LOG_PATH', str(self.root / 'missing.log')):
             try:
                 host.export_diagnostics_action.trigger()
                 self.pump_until(entered.is_set)
                 self.assertFalse(host.export_diagnostics_action.isEnabled())
                 event = QCloseEvent()
-                with patch.object(self.module, 'show_toast'):
+                with patch_all('show_toast'):
                     self.module.MainWindow.closeEvent(host, event)
                 self.assertFalse(event.isAccepted())
             finally:
@@ -396,7 +396,7 @@ class QtDiagnosticsTests(unittest.TestCase):
     def test_startup_falls_back_when_primary_directory_is_read_only(self):
         """首选目录无权限时回退临时目录；两处都失败时不阻止软件启动。"""
         service = Mock()
-        with patch('tabex_diagnostics.Diagnostics', side_effect=[PermissionError('denied'), service]) as factory, \
+        with patch('tabexplorer.diagnostics.Diagnostics', side_effect=[PermissionError('denied'), service]) as factory, \
                 patch.dict('os.environ', {'LOCALAPPDATA': str(self.root / 'readonly')}), \
                 patch('tempfile.gettempdir', return_value=str(self.root / 'fallback')):
             self.module._start_diagnostics()
@@ -404,8 +404,8 @@ class QtDiagnosticsTests(unittest.TestCase):
         self.assertEqual(Path(factory.call_args.args[0]), self.root / 'fallback' / 'TabEx' / 'diagnostics')
         service.install.assert_called_once()
         service.capture_debug.assert_called_once()
-        with patch.object(self.module, '_diagnostics', None), \
-                patch('tabex_diagnostics.Diagnostics', side_effect=PermissionError('denied')):
+        with patch_all('_diagnostics', None), \
+                patch('tabexplorer.diagnostics.Diagnostics', side_effect=PermissionError('denied')):
             self.module._start_diagnostics()
             self.assertIsNone(self.module._diagnostics)
 

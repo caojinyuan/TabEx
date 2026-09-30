@@ -1,115 +1,115 @@
 @echo off
 chcp 65001 > nul
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
-REM 从 TabEx.py 解析版本号（单一来源 APP_VERSION），避免多处版本不一致
+REM Prefer the project virtual environment so the build uses the same packages as running from source
+set "PY=python"
+if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
+
+REM Version comes from APP_VERSION in TabEx.py (single source)
 set VERSION=
 for /f "tokens=3 delims= " %%v in ('findstr /b /c:"APP_VERSION = " TabEx.py') do set VERSION=%%v
 set VERSION=%VERSION:"=%
 if "%VERSION%"=="" set VERSION=unknown
 
 echo ======================================
-echo TabExplorer v%VERSION% 打包工具
+echo  TabExplorer v%VERSION% - build EXE
 echo ======================================
 echo.
 
-REM 检查Python环境
-python --version >nul 2>&1
+"%PY%" --version >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 未找到Python环境！
-    echo 请先安装Python 3.9或更高版本
+    echo [ERROR] Python not found.
+    echo Install Python 3.9 or later, or run 0_install_requirements.bat first.
     pause
     exit /b 1
 )
 
-REM 安装/更新运行依赖，确保打包时能正确收集 PyQt5 等模块
-echo [步骤 1/5] 安装运行依赖 requirements.txt...
-python -m pip install -r requirements.txt
+REM Install runtime dependencies so PyInstaller can collect PyQt5 and the other packages
+echo [Step 1/5] Installing requirements.txt with %PY% ...
+"%PY%" -m pip install -r requirements.txt
 if errorlevel 1 (
-    echo [错误] requirements.txt 安装失败！
+    echo [ERROR] Failed to install requirements.txt.
     pause
     exit /b 1
 )
 
-REM 检查pyinstaller是否安装
-python -m pip show pyinstaller >nul 2>&1
+"%PY%" -m pip show pyinstaller >nul 2>&1
 if errorlevel 1 (
-    echo [步骤 2/5] 正在安装 PyInstaller...
-    python -m pip install pyinstaller
+    echo [Step 2/5] Installing PyInstaller...
+    "%PY%" -m pip install pyinstaller
     if errorlevel 1 (
-        echo [错误] PyInstaller 安装失败！
+        echo [ERROR] Failed to install PyInstaller.
         pause
         exit /b 1
     )
 ) else (
-    echo [步骤 2/5] PyInstaller 已安装
+    echo [Step 2/5] PyInstaller is already installed
 )
 
 echo.
-echo [步骤 3/5] 清理旧文件...
+echo [Step 3/5] Removing old build output...
 if exist TabExplorer.exe (
-    echo 删除旧的 TabExplorer.exe
+    echo Deleting old TabExplorer.exe
     del /q TabExplorer.exe
 )
 if exist build (
-    echo 删除旧的 build 目录
+    echo Deleting old build folder
     rmdir /s /q build
 )
 if exist dist (
-    echo 删除旧的 dist 目录
+    echo Deleting old dist folder
     rmdir /s /q dist
 )
 if exist *.spec (
-    echo 删除旧的 spec 文件
+    echo Deleting old spec files
     del /q *.spec
 )
 
 echo.
-echo [步骤 4/5] 正在打包程序...
-echo 这可能需要几分钟时间，请耐心等待...
+echo [Step 4/5] Building, this can take a few minutes...
 echo.
 
-REM 检查是否存在图标文件
 if exist "icons\TabExplorer.ico" (
-    echo 检测到自定义图标文件
+    echo Using icons\TabExplorer.ico
     set ICON_PARAM=--icon="icons\TabExplorer.ico"
 ) else (
-    echo 未找到 icons\TabExplorer.ico，将使用默认图标
+    echo icons\TabExplorer.ico not found, using the default icon
     set ICON_PARAM=
 )
 
-REM 打包成单个exe文件，直接输出到当前目录
-python -m PyInstaller --onefile --windowed --name TabExplorer %ICON_PARAM% --add-data "icons;icons" --distpath . TabEx.py
+REM Single-file EXE written to this folder
+"%PY%" -m PyInstaller --onefile --windowed --name TabExplorer %ICON_PARAM% --add-data "icons;icons" --distpath . TabEx.py
 
 if errorlevel 1 (
     echo.
-    echo [错误] 打包失败！请检查错误信息
+    echo [ERROR] Build failed, see the messages above.
     pause
     exit /b 1
 )
 
 echo.
-echo [步骤 5/5] 清理临时文件...
+echo [Step 5/5] Cleaning up temporary files...
 if exist build rmdir /s /q build
 if exist TabExplorer.spec del /q TabExplorer.spec
 
 echo.
 echo ======================================
-echo 打包完成！版本: v%VERSION%
+echo  Build finished: v%VERSION%
 echo ======================================
 echo.
-echo 可执行文件: TabExplorer.exe
+echo Output: TabExplorer.exe
 if exist TabExplorer.exe (
-    for %%A in (TabExplorer.exe) do echo 文件大小: %%~zA 字节
+    for %%A in (TabExplorer.exe) do echo Size: %%~zA bytes
 )
 echo.
-echo 注意事项：
-echo 1. config.json 和 bookmarks.json 会自动在exe同目录创建
-echo 2. 首次运行时会自动创建这些配置文件
-echo 3. 如需发布，建议配合 README.md 一起打包
+echo Notes:
+echo 1. config.json and bookmarks.json are created next to the EXE on first run
+echo 2. Ship README.md together with the EXE when publishing
 echo.
-echo 下一步：
-echo - 测试: 双击 TabExplorer.exe 运行
-echo - 发布: 上传到 GitHub Releases
+echo Next steps:
+echo - Test: double-click TabExplorer.exe
+echo - Publish: upload to GitHub Releases
 echo.
 pause

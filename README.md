@@ -45,13 +45,10 @@
 
 ## 🆕 最近更新(只保留最新)
 
-### v3.77 (2026-09-30)
-- **诊断**：资源快照日志并入崩溃诊断包。诊断记录每 10 分钟保存一次资源计数并随 ZIP 导出；设置中的开关、间隔和 `runtime_health.log` 已移除。
-- **检查更新**：自动检查改为默认关闭，v3.76 默认开启写入的旧设置不再生效；需要时在设置窗口底部勾选，手动检查不受影响。
-- **AI 安全**：AI 动作的路径范围按解析链接后的真实路径判断，阻止经由目录联接或符号链接访问当前目录以外的文件。
-- **数据保护**：`config.json` 或 `bookmarks.json` 无法解析时，原文件改名保留为 `*.broken-日期-时间` 并在启动后提示，不再被默认内容覆盖。导出书签直接使用内存中的最新数据；重复导入同一文件时重新编号，避免 ID 冲突；当前没有书签栏时导入会自动创建。
-- **网络路径**：地址栏输入 UNC 路径时不再同步探测中英文目录名，服务器不可达时不会卡住界面；修正网络共享标签自动刷新，以及捕获显示网络共享的 Explorer 窗口时的路径解析。
-- **回归验证**：共 148 项测试。
+### v3.78 (2026-09-30)
+- **代码结构**：原来约 2.2 万行的单个 `TabEx.py` 按功能拆分为 `tabexplorer/` 目录下的 21 个模块，`tabex_diagnostics.py` 移入该目录；`TabEx.py` 只保留版本号和启动入口。运行、打包方式及配置、书签文件位置均不变。
+- **脚本**：`1_TabEx.bat` 改名为 `1_run_TabEx.bat`（指向旧名称的快捷方式需重新创建）。三个脚本改为在自身目录运行，并优先使用项目虚拟环境 `.venv`，避免误用缺少依赖的系统 Python（此前可能导致删除到回收站失败）。脚本内容改为纯英文：cmd 执行含中文的 UTF-8 批处理时会错位读取，原打包脚本的部分提示因此被当作命令执行而报错。
+- **回归验证**：共 148 项测试；另已用重新打包的 EXE 验证启动与退出。
 
 ---
 
@@ -67,12 +64,12 @@
   - 配置或书签文件无法解析时，原文件保留为 `config.json.broken-日期-时间` 或 `bookmarks.json.broken-日期-时间`，可手动修复后改回原名
 
 **从源码运行**（需要 Python 3.9+）：
-1. 双击 `0_install_requirements.bat` 安装依赖
-2. 双击 `1_TabEx.bat` 启动程序
+1. 双击 `0_install_requirements.bat`：首次运行会在项目目录创建虚拟环境 `.venv` 并安装依赖，不影响系统 Python
+2. 双击 `1_run_TabEx.bat` 启动程序（优先使用 `.venv`，没有时回退到系统 Python）
 3. 若使用 AI 功能，确保 `requests` 已安装并在 `config.json` 或设置界面中填写 AI 服务配置
 
 **开机自启动**：
-将 `1_TabEx.bat` 的快捷方式放到 `shell:startup` 目录
+将 `TabExplorer.exe` 或 `1_run_TabEx.bat` 的快捷方式放到 `shell:startup` 目录
 
 ---
 
@@ -264,7 +261,7 @@ AI 的 `PATCH_FILE` 和 `WRITE_FILE` 在写入前展示差异；预览后发现�
 - 不收集配置、书签、聊天历史、浏览文件内容、完整环境变量或内存转储。导出时替换路径、URL、邮箱及常见凭据字段；自动脱敏不是绝对保密保证，分享前请检查 ZIP 内容。原生调用栈在本地可能含路径，不应直接分享原始诊断目录。
 - 原生故障使用 `faulthandler` 尽力捕获；若外部调试器已启用该处理器，则不覆盖它，并在会话中标明 `external-handler`，仍支持 Qt 致命错误的显式线程栈记录。强制结束、断电及部分原生崩溃可能没有调用栈，不能保证仅靠诊断包就定位所有问题。
 
-诊断核心在 [tabex_diagnostics.py](tabex_diagnostics.py)，仅使用 Python 标准库，无新增运行依赖。源码更新后重启生效；EXE 运行模式不关闭诊断，但已有 EXE 必须重新打包才能包含该功能。EXE 的旧式调试日志使用可执行文件所在目录，不再使用单文件包的临时解压目录。当前已测试源码流程和模拟 frozen 分支，尚未对重新打包后的 EXE 做实机验证。
+诊断核心在 [tabexplorer/diagnostics.py](tabexplorer/diagnostics.py)，仅使用 Python 标准库，无新增运行依赖。源码更新后重启生效；EXE 运行模式不关闭诊断，但已有 EXE 必须重新打包才能包含该功能。EXE 的旧式调试日志使用可执行文件所在目录，不再使用单文件包的临时解压目录。拆分模块后已用重新打包的 EXE 验证启动、诊断记录（`frozen: true`）与正常退出。
 
 ### 回归测试
 在项目 Python 环境执行 `python -m unittest discover -s tests -v`。测试使用临时目录和隔离的 Qt 窗口，不修改实际配置、书签或会话。
@@ -305,7 +302,7 @@ python -W ignore::DeprecationWarning -m unittest discover -s tests -k NormalUsag
 覆盖率工具仅用于开发验证，不属于软件运行依赖。安装后可在 PowerShell 中复测并将数据写入系统临时目录：
 ```powershell
 python -m pip install "coverage>=7,<8"
-python -W ignore::DeprecationWarning -m coverage run --branch --source=TabEx --data-file="$env:TEMP\tabex-coverage" -m unittest discover -s tests -v
+python -W ignore::DeprecationWarning -m coverage run --branch --source=tabexplorer --data-file="$env:TEMP\tabex-coverage" -m unittest discover -s tests -v
 python -m coverage report --data-file="$env:TEMP\tabex-coverage"
 python -m coverage html --data-file="$env:TEMP\tabex-coverage" -d "$env:TEMP\tabex-coverage-html"
 ```
@@ -321,7 +318,7 @@ python -m coverage html --data-file="$env:TEMP\tabex-coverage" -d "$env:TEMP\tab
 | 搜索缓存 SearchCache | 80.0% → 100.0% | 83.3% → 100.0% |
 | 目录比较窗口 DirectoryCompareDialog | 81.8% → 85.9% | 56.2% → 56.2% |
 
-全文件执行行数从 1964 增至 2218（共 14394 个可执行行），覆盖分支从 291 增至 421（共 5388 个分支）。大量原生 Explorer、AI、设置及其他界面路径尚未覆盖，不能将重点类的覆盖率解释为全软件覆盖率。`coverage report` 的 Cover 列在启用分支统计后是行与分支的混合指标，与上表分列百分比不同。部分单元测试通过 AST 提取主程序定义，保留原始文件与行号；前后使用相同采集方式。
+全文件执行行数从 1964 增至 2218（共 14394 个可执行行），覆盖分支从 291 增至 421（共 5388 个分支）。大量原生 Explorer、AI、设置及其他界面路径尚未覆盖，不能将重点类的覆盖率解释为全软件覆盖率。`coverage report` 的 Cover 列在启用分支统计后是行与分支的混合指标，与上表分列百分比不同。部分单元测试通过 AST 提取各模块中的定义，保留原始文件与行号；前后使用相同采集方式。上表为拆分模块前的单文件数据。
 
 ---
 
@@ -345,11 +342,19 @@ Remove-Item build, dist -Recurse -Force -ErrorAction SilentlyContinue
 ```
 
 ### 项目文件说明
-- `TabEx.py` - 主程序入口
+- `TabEx.py` - 启动入口，包含版本号 `APP_VERSION`（唯一来源，打包脚本与检查更新都读取这一行）
+- `tabexplorer/` - 功能模块（按依赖从底层到上层）：
+  - `paths.py`（数据目录与路径工具）、`i18n.py`（界面翻译）、`constants.py`（全局常量）
+  - `debuglog.py`（调试日志与诊断接入）、`diagnostics.py`（崩溃诊断记录）、`system.py`（进程资源与外部程序启动）
+  - `hotkeys.py`（快捷键与键盘钩子）、`title_shortcuts.py`（标题栏快捷方式）、`widgets.py`（提示、图标等通用控件）
+  - `updates.py`（检查更新）、`workers.py`（后台线程）、`search.py`（搜索）、`fileops.py`（文件任务与目录比较）
+  - `pathbar.py`（面包屑地址栏）、`bookmarks.py`（书签）、`shellview.py`（嵌入资源管理器视图）、`explorer_tab.py`（文件浏览标签页）
+  - `tabbar.py`（标签栏）、`chat.py`（AI 助手）、`settings.py`（设置窗口）、`mainwindow.py`（主窗口）、`app.py`（启动流程）
+- `tests/` - 回归测试；`tests/app_modules.py` 汇总各模块供测试读取，`patch_all()` 在所有导入了同一名称的模块中同时替换
 - `requirements.txt` - Python 运行依赖列表
-- `0_install_requirements.bat` - 依赖安装脚本
-- `1_TabEx.bat` - 源码运行脚本
-- `2_build_exe.bat` - PyInstaller 打包脚本
+- `0_install_requirements.bat` - 创建项目虚拟环境 `.venv` 并安装依赖
+- `1_run_TabEx.bat` - 源码运行脚本
+- `2_build_exe.bat` - PyInstaller 打包脚本（同样优先使用 `.venv`）
 - [icons/generate_icon.py](icons/generate_icon.py) - 应用图标生成脚本（需要 Pillow：`pip install pillow`）；在项目根目录运行 `python icons/generate_icon.py`
 - [icons/TabExplorer.ico](icons/TabExplorer.ico) - 应用图标，生成脚本输出到此位置，打包时直接使用
 

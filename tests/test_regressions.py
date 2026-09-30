@@ -31,16 +31,19 @@ from unittest.mock import Mock, patch
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt5.QtWidgets import QApplication, QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QPushButton
 
+from app_modules import MODULE_FILES, ROOT, app, patch_all
 
-SOURCE = Path(__file__).resolve().parents[1] / 'TabEx.py'
-TREE = ast.parse(SOURCE.read_text(encoding='utf-8-sig'))
+
+TREES = [(path, ast.parse(path.read_text(encoding='utf-8'))) for path in MODULE_FILES]
 
 
 def load_definitions(names, **namespace):
-    """从主程序提取指定类或函数，注入测试依赖，避免单元测试启动整个应用。"""
-    selected = [node for node in TREE.body
-                if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
-    exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), 'exec'), namespace)
+    """从各功能模块提取指定类或函数，注入测试依赖，避免单元测试启动整个应用。"""
+    for path, tree in TREES:
+        selected = [node for node in tree.body
+                    if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
+        if selected:
+            exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), 'exec'), namespace)
     return namespace
 
 
@@ -55,7 +58,7 @@ class SearchLifecycleTests(unittest.TestCase):
             SEARCH_RESULT_QUEUE_MAXSIZE=2, SearchDialog=self.search)
 
     def task(self):
-        return self.namespace['_SearchTask'](str(SOURCE.parent), '', 100)
+        return self.namespace['_SearchTask'](str(ROOT), '', 100)
 
     def test_finished_even_when_engine_returns_early(self):
         """搜索引擎提前返回后，任务仍正确结束。
@@ -395,8 +398,7 @@ class IntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     def pump_until(self, predicate):
         """持续处理 Qt 界面事件，等待指定条件成立；超过 5 秒仍未成立则测试失败。"""
@@ -413,7 +415,7 @@ class IntegrationTests(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / 'needle.txt').write_text('content', encoding='utf-8')
-            with patch.object(self.module, 'detect_everything', return_value=None):
+            with patch_all('detect_everything', return_value=None):
                 dialog = self.module.SearchDialog(directory)
             dialog.file_type_input.setText('txt')
             dialog.search_content_cb.setChecked(False)
@@ -435,7 +437,7 @@ class IntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'needle.txt'
             path.write_text('content', encoding='utf-8')
-            with patch.object(self.module, 'detect_everything', return_value='fake-es.exe'):
+            with patch_all('detect_everything', return_value='fake-es.exe'):
                 dialog = self.module.SearchDialog(directory)
             dialog.search_input.setEditText('needle')
             with patch.object(self.module._SearchTask, 'search_with_everything', return_value=[str(path)]):
@@ -456,7 +458,7 @@ class IntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / 'new.txt'
             source.write_text('new', encoding='utf-8')
-            with patch.object(self.module, 'detect_everything', return_value=None):
+            with patch_all('detect_everything', return_value=None):
                 dialog = self.module.SearchDialog(directory)
             dialog.search_content_cb.setChecked(False)
             dialog.file_type_input.setText('txt')
@@ -480,7 +482,7 @@ class IntegrationTests(unittest.TestCase):
         预期：搜索结束，状态栏包含错误原因，搜索按钮重新可用。
         """
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(self.module, 'detect_everything', return_value='missing-es.exe'):
+            with patch_all('detect_everything', return_value='missing-es.exe'):
                 dialog = self.module.SearchDialog(directory)
             with patch.object(self.module.subprocess, 'Popen', side_effect=OSError('ES unavailable')):
                 dialog.start_search()
@@ -610,8 +612,7 @@ class FunctionalBoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     def search_rows(self, directory, keyword, filename=True, content=False, **options):
         """运行普通搜索的实际实现并收集结果；小数据集不会填满结果队列。"""
@@ -663,7 +664,7 @@ class FunctionalBoundaryTests(unittest.TestCase):
                 (Path(directory) / f'needle-{index}.txt').write_bytes(b'text')
             self.assertEqual(len(self.search_rows(directory, 'needle', limit=7)), 7)
             cache = self.module.SearchCache()
-            with patch.object(self.module, '_search_cache', cache):
+            with patch_all('_search_cache', cache):
                 rows = self.search_rows(directory, 'needle', cache_key='test-key')
                 self.assertEqual(len(rows), 30)
                 self.assertEqual(cache.get('test-key'), rows)
@@ -836,14 +837,13 @@ class NormalUsageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        cache_patch = patch.object(self.module, '_search_cache', self.module.SearchCache())
+        cache_patch = patch_all('_search_cache', self.module.SearchCache())
         cache_patch.start()
         self.addCleanup(cache_patch.stop)
 
@@ -873,7 +873,7 @@ class NormalUsageTests(unittest.TestCase):
 
     def search_dialog(self, directory):
         """关闭 Everything，搜索结束或断言失败后都取消并回收本地搜索线程。"""
-        with patch.object(self.module, 'detect_everything', return_value=None):
+        with patch_all('detect_everything', return_value=None):
             dialog = self.module.SearchDialog(str(directory))
         dialog.search_content_cb.setChecked(False)
         dialog.file_type_input.setText('txt')
@@ -1089,7 +1089,9 @@ class NormalUsageTests(unittest.TestCase):
         namespace = load_definitions(
             {'SearchCache'}, OrderedDict=OrderedDict, threading=threading, hashlib=hashlib,
             time=types.SimpleNamespace(monotonic=lambda: 100.0))
-        self.module._search_cache = namespace['SearchCache']()
+        cache_patch = patch_all('_search_cache', namespace['SearchCache']())
+        cache_patch.start()
+        self.addCleanup(cache_patch.stop)
         for name in ('alpha.txt', 'beta.txt'):
             (self.root / name).write_bytes(b'content')
         for iteration in range(5):
@@ -1167,8 +1169,7 @@ class InterfaceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     def pump_until(self, predicate):
         deadline = time.monotonic() + 5
@@ -1295,7 +1296,7 @@ class InterfaceTests(unittest.TestCase):
             owner.add_new_tab = Mock()
             panel = self.module.FileTaskPanel(owner)
             try:
-                with patch.object(self.module, 'show_toast') as toast:
+                with patch_all('show_toast') as toast:
                     panel.start_task('copy', [str(source), str(missing)], str(destination))
                     self.pump_until(lambda: not panel.has_running_tasks())
                     self.assertIn('部分失败：成功 1 项，失败 1 项', panel.records[0]['row'].text(2))
@@ -1374,7 +1375,7 @@ class InterfaceTests(unittest.TestCase):
         owner = QWidget()
         owner.resize(900, 700)
         self.addCleanup(owner.deleteLater)
-        with patch.object(self.module, '_active_toasts', []):
+        with patch_all('_active_toasts', []):
             toasts = []
             try:
                 for message in ('长结果\n' * 4, '短结果'):
@@ -1443,13 +1444,13 @@ class InterfaceTests(unittest.TestCase):
                                        'save_config', 'save_session_snapshot', 'save_pinned_tabs', '_setup_window_icon',
                                        'add_new_tab'):
                             patches.enter_context(patch.object(self.module.MainWindow, method))
-                        manager = patches.enter_context(patch.object(self.module, 'BookmarkManager'))
+                        manager = patches.enter_context(patch_all('BookmarkManager'))
                         manager.return_value.get_tree.return_value = {
                             'bookmark_bar': {'type': 'folder', 'children': [], 'id': '1'},
                             'other': {'type': 'folder', 'children': [], 'id': '2'}}
-                        patches.enter_context(patch.object(self.module, 'get_app_data_path',
+                        patches.enter_context(patch_all('get_app_data_path',
                                                           side_effect=lambda *parts: os.path.join(directory, *parts)))
-                        patches.enter_context(patch.object(self.module, 'detect_everything', return_value=None))
+                        patches.enter_context(patch_all('detect_everything', return_value=None))
                         window = self.module.MainWindow()
                         window.server_socket = Mock()
                         search = self.module.SearchDialog(directory)
@@ -1497,8 +1498,8 @@ class InterfaceTests(unittest.TestCase):
 
     def test_search_advanced_options_keep_filters_and_fit_narrow_window(self):
         """高级选项折叠不清除条件；窄窗口中搜索、停止和高级按钮互不重叠。"""
-        with patch.object(self.module, 'detect_everything', return_value=None):
-            dialog = self.module.SearchDialog(str(SOURCE.parent))
+        with patch_all('detect_everything', return_value=None):
+            dialog = self.module.SearchDialog(str(ROOT))
         try:
             dialog.resize(640, 520)
             dialog.show()
@@ -1587,7 +1588,7 @@ class InterfaceTests(unittest.TestCase):
                         for previous, following in zip(buttons, buttons[1:]):
                             self.assertLess(previous.geometry().right(), following.geometry().left())
                         self.assertTrue(host.grab().save(str(screenshot_dir / f'toolbar-{language}.png')))
-                        with patch.object(module, 'detect_everything', return_value=None):
+                        with patch_all('detect_everything', return_value=None):
                             search = module.SearchDialog(str(screenshot_dir))
                         search.resize(int(700 * scale), int(520 * scale))
                         search.show()
@@ -1671,7 +1672,7 @@ class InterfaceTests(unittest.TestCase):
         button = QToolButton()
         self.addCleanup(button.deleteLater)
         images = {}
-        with patch.object(self.module, '_native_tool_executable', return_value=None), \
+        with patch_all('_native_tool_executable', return_value=None), \
                 patch.dict(self.module._TOOL_NATIVE_CACHE, {}, clear=True):
             for name in self.module._TOOL_ICON_FILES:
                 self.module._set_tool_icon(button, name, QStyle.SP_FileIcon, 24)
@@ -1694,7 +1695,7 @@ class InterfaceTests(unittest.TestCase):
         button = QToolButton()
         self.addCleanup(button.deleteLater)
         with patch.dict(self.module._TOOL_NATIVE_CACHE, {}, clear=True), \
-                patch.object(self.module, '_native_tool_executable', return_value='local-program.exe'), \
+                patch_all('_native_tool_executable', return_value='local-program.exe'), \
                 patch.object(self.module.TitleShortcutBar, '_extract_icon_fast', return_value=native) as extract:
             self.module._set_tool_icon(button, 'app-tortoisegit-log', QStyle.SP_FileIcon, 32)
             plain = button.icon().pixmap(32, 32).toImage()
@@ -1717,7 +1718,7 @@ class InterfaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             asset_dir = Path(directory) / 'icons'
             asset_dir.mkdir()
-            shutil.copyfile(SOURCE.parent / 'icons' / 'bot.svg', asset_dir / 'bot.svg')
+            shutil.copyfile(ROOT / 'icons' / 'bot.svg', asset_dir / 'bot.svg')
             with patch.object(self.module.sys, '_MEIPASS', directory, create=True), \
                     patch.dict(self.module._TOOL_ASSET_CACHE, {}, clear=True):
                 icon = self.module._tool_asset_icon('bot')
@@ -1725,7 +1726,7 @@ class InterfaceTests(unittest.TestCase):
                 self.assertIn(str(asset_dir / 'bot.svg'), self.module._TOOL_ASSET_CACHE)
                 button = QToolButton()
                 try:
-                    with patch.object(self.module, '_tool_asset_icon', return_value=self.module.QIcon()):
+                    with patch_all('_tool_asset_icon', return_value=self.module.QIcon()):
                         self.module._set_tool_icon(button, 'preferences-system', QStyle.SP_FileDialogInfoView)
                         self.assertFalse(button.icon().isNull())
                 finally:
@@ -1828,8 +1829,7 @@ class PerformanceContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     def test_progress_notifications_are_throttled(self):
         """密集文件进度通知被节流，跨过时间间隔后允许下一次通知。
@@ -2091,8 +2091,7 @@ class OptimizationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     def shortcut_host(self, hotkeys=None, count=5):
         tabs = Mock()
@@ -2155,7 +2154,7 @@ class OptimizationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             host = types.SimpleNamespace(config={'a': 1})
             path = Path(directory) / 'config.json'
-            with patch.object(self.module, 'get_app_data_path', side_effect=lambda *parts: os.path.join(directory, *parts)):
+            with patch_all('get_app_data_path', side_effect=lambda *parts: os.path.join(directory, *parts)):
                 flush = self.module.MainWindow._flush_config_to_disk
                 flush(host)
                 self.assertIn('"a": 1', path.read_text(encoding='utf-8'))
@@ -2275,8 +2274,7 @@ class HotkeyAndUpdateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     def test_hotkey_text_parsing_accepts_qt_names(self):
         """按键文本兼容 Qt 录制结果与手写配置，统一为规范写法；不支持的写法返回 None。"""
@@ -2389,7 +2387,7 @@ class HotkeyAndUpdateTests(unittest.TestCase):
         finished = self.module.MainWindow._on_update_check_finished
         host = self.update_host()
         newer = {'tag': 'v9', 'version': '99.0', 'url': self.module.UPDATE_RELEASES_PAGE}
-        with patch.object(self.module, 'show_toast') as toast:
+        with patch_all('show_toast') as toast:
             finished(host, dict(newer, manual=False))
             finished(host, dict(newer, manual=False))
             self.assertEqual(toast.call_count, 1)
@@ -2406,7 +2404,7 @@ class HotkeyAndUpdateTests(unittest.TestCase):
         """自动检查失败不打扰用户且不记录检查时间；手动检查失败给出警告。"""
         finished = self.module.MainWindow._on_update_check_finished
         host = self.update_host()
-        with patch.object(self.module, 'show_toast') as toast:
+        with patch_all('show_toast') as toast:
             finished(host, {'error': 'offline', 'manual': False})
             toast.assert_not_called()
             finished(host, {'error': 'offline', 'manual': True})
@@ -2431,7 +2429,7 @@ class HotkeyAndUpdateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, 'config.json').write_text(json.dumps(
                 {'auto_check_updates': True, 'language': self.module._app_language}), encoding='utf-8')
-            with patch.object(self.module, 'get_app_data_path',
+            with patch_all('get_app_data_path',
                               side_effect=lambda *parts: os.path.join(directory, *parts)):
                 config = self.module.MainWindow.load_config(types.SimpleNamespace())
         self.assertNotIn('auto_check_updates', config)
@@ -2444,8 +2442,7 @@ class AiActionSafetyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -2527,7 +2524,7 @@ class AiActionSafetyTests(unittest.TestCase):
                     '[GIT_PULL: .|origin|main]', '[GIT_PUSH: .|origin]']
         trash = Mock()
         with patch.dict(sys.modules, {'send2trash': types.SimpleNamespace(send2trash=trash)}), \
-                patch.object(self.module, 'launch_detached') as launch:
+                patch_all('launch_detached') as launch:
             refused = self.host(confirm=False)
             text, _ = refused._apply_actions('\n'.join(commands))
             self.assertEqual(refused._confirm_danger_action.call_count, len(commands))
@@ -2554,14 +2551,14 @@ class AiActionSafetyTests(unittest.TestCase):
         duplicate = self.base / 'dup.txt'
         duplicate.write_text('a-a', encoding='utf-8')
         host = self.host()
-        with patch.object(self.module, '_confirm_file_preview', return_value=True) as preview:
+        with patch_all('_confirm_file_preview', return_value=True) as preview:
             host._apply_actions('[WRITE_FILE: big.txt|small]\n[WRITE_FILE: note.txt|hello]\n'
                                 '[PATCH_FILE: note.txt|hello|hi]\n[PATCH_FILE: dup.txt|a|b]')
         self.assertEqual(big.read_text(encoding='utf-8'), 'x' * 6000)
         self.assertEqual((self.base / 'note.txt').read_text(encoding='utf-8'), 'hi')
         self.assertEqual(duplicate.read_text(encoding='utf-8'), 'a-a')
         self.assertEqual(preview.call_count, 2)
-        with patch.object(self.module, '_confirm_file_preview', return_value=False):
+        with patch_all('_confirm_file_preview', return_value=False):
             text, _ = host._apply_actions('[WRITE_FILE: other.txt|data]')
         self.assertFalse((self.base / 'other.txt').exists())
         self.assertIn(self.module.tr("已取消写入: "), text)
@@ -2573,8 +2570,7 @@ class BookmarkDataTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -2644,14 +2640,14 @@ class BookmarkDataTests(unittest.TestCase):
         config_path = self.root / 'config.json'
         config_path.write_text('{"pinned_tabs": [', encoding='utf-8')
         host = types.SimpleNamespace()
-        with patch.object(self.module, 'get_app_data_path',
+        with patch_all('get_app_data_path',
                           side_effect=lambda *parts: os.path.join(str(self.root), *parts)):
             config = self.module.MainWindow.load_config(host)
         self.assertIn('hotkeys', config)
         self.assertFalse(config_path.exists())
         self.assertEqual(Path(host._config_recovered_backup).read_text(encoding='utf-8'), '{"pinned_tabs": [')
         host.bookmark_manager = types.SimpleNamespace(recovered_backup='')
-        with patch.object(self.module, 'show_toast') as toast:
+        with patch_all('show_toast') as toast:
             self.module.MainWindow._warn_recovered_data_files(host)
         toast.assert_called_once()
         self.assertIn(Path(host._config_recovered_backup).name, toast.call_args.args[2])
@@ -2665,7 +2661,7 @@ class BookmarkDataTests(unittest.TestCase):
         exported = self.root / 'export.json'
         host = self.dialog_host(manager)
         dialog = self.module.BookmarkManagerDialog
-        with patch.object(self.module, 'show_toast'), \
+        with patch_all('show_toast'), \
                 patch.object(QFileDialog, 'getSaveFileName', return_value=(str(exported), '')), \
                 patch.object(QFileDialog, 'getOpenFileName', return_value=(str(exported), '')):
             dialog.export_bookmarks(host)
@@ -2693,7 +2689,7 @@ class BookmarkDataTests(unittest.TestCase):
         host = self.dialog_host(manager)
         source = self.root / 'import.json'
         with patch.object(QFileDialog, 'getOpenFileName', return_value=(str(source), '')), \
-                patch.object(self.module, 'show_toast') as toast:
+                patch_all('show_toast') as toast:
             source.write_text(json.dumps({'other': {}}), encoding='utf-8')
             self.module.BookmarkManagerDialog.import_bookmarks(host)
             self.assertEqual(toast.call_args.kwargs['level'], 'warning')
@@ -2712,8 +2708,7 @@ class SessionPersistenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     @staticmethod
     def tab(path, pinned=False, color=''):
@@ -2820,8 +2815,7 @@ class TabGroupTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     def make_tab(self, path, pinned=False, color=''):
         from PyQt5.QtWidgets import QWidget
@@ -2871,7 +2865,7 @@ class TabGroupTests(unittest.TestCase):
         tabs = [self.make_tab('P', pinned=True), self.make_tab('A'), self.make_tab('B', color='#E57373'),
                 self.make_tab('C'), self.make_tab('D')]
         host = self.host(tabs)
-        with patch.object(self.module, 'show_toast'):
+        with patch_all('show_toast'):
             host.tab_widget.setCurrentIndex(4)
             self.assertTrue(host.insert_tab_group_marker())
             color = tabs[4].bookmark_group_color
@@ -2903,7 +2897,7 @@ class TabGroupTests(unittest.TestCase):
         self.assertEqual(self.paths(host.content_stack), ['P', 'R1', 'A', 'R2'])
         host._teardown_split_group.assert_called_once()
         single = self.host([self.make_tab('only')], [self.make_tab('R')])
-        with patch.object(self.module, 'show_toast') as toast:
+        with patch_all('show_toast') as toast:
             self.assertFalse(single.move_tab_across_groups(
                 single.tab_widget, single.content_stack.widget(0), single.split_tab_widget, 0))
         toast.assert_called_once()
@@ -2951,8 +2945,7 @@ class PathParsingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        import TabEx
-        cls.module = TabEx
+        cls.module = app
 
     def test_file_urls_convert_to_local_and_unc_paths(self):
         """file: 链接支持本地盘、UNC 各种斜杠写法和百分号编码；嵌入视图刷新 UNC 标签时使用的地址也能还原。"""
@@ -3030,7 +3023,7 @@ class PathParsingTests(unittest.TestCase):
             target = Path(directory, 'Work Dir')
             target.mkdir()
             host, change = self.path_bar_host(directory)
-            with patch.object(self.module, 'show_toast') as toast, \
+            with patch_all('show_toast') as toast, \
                     patch('os.path.exists', wraps=os.path.exists) as exists:
                 change(target.as_uri())
                 host.navigate_to.assert_called_once_with(str(target))
@@ -3052,8 +3045,8 @@ class PathParsingTests(unittest.TestCase):
         """地址栏：shell: 地址与特殊名称按 Shell 路径打开；shell:OneDrive 解析为真实目录；cmd 在当前目录打开命令行。"""
         with tempfile.TemporaryDirectory() as directory:
             host, change = self.path_bar_host(directory)
-            with patch.object(self.module, 'show_toast') as toast, \
-                    patch.object(self.module, 'launch_shell_tool') as launch, \
+            with patch_all('show_toast') as toast, \
+                    patch_all('launch_shell_tool') as launch, \
                     patch.dict(os.environ, {'OneDrive': directory}):
                 for raw in ('shell:RecycleBinFolder', self.module.tr('回收站')):
                     change(raw)
@@ -3098,9 +3091,9 @@ class PathParsingTests(unittest.TestCase):
         editor, other = QLineEdit(), QWidget()
         with patch.object(QApplication, 'focusWidget', return_value=None), \
                 patch.object(QApplication, 'activeWindow', return_value=host), \
-                patch.object(self.module, '_foreground_pid', return_value=os.getpid()):
+                patch_all('_foreground_pid', return_value=os.getpid()):
             self.assertEqual(host._shortcut_gate(False), (False, True))
-            with patch.object(self.module, '_foreground_pid', return_value=0):
+            with patch_all('_foreground_pid', return_value=0):
                 self.assertEqual(host._shortcut_gate(False), (True, False))
             with patch.object(QApplication, 'focusWidget', return_value=editor):
                 self.assertEqual(host._shortcut_gate(False), (True, False))
