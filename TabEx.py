@@ -1,7 +1,6 @@
 ﻿# 全局搜索缓存（LRU缓存，最多缓存50个搜索结果）
 
 from collections import OrderedDict
-import hashlib
 import os
 import queue
 import threading
@@ -9,7 +8,7 @@ import time
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.75"
+APP_VERSION = "3.76"
 
 
 # TabEx i18n module
@@ -29,6 +28,83 @@ def tr(zh_text):
     return _LANG_EN.get(zh_text, zh_text)
 
 _LANG_EN = {
+    "切换到第 N 个标签（Ctrl+9 为最后一个）": "Switch to Nth tab (Ctrl+9 = last)",
+    "关闭当前标签页": "Close Current Tab",
+    "下一个标签": "Next Tab",
+    "上一个标签": "Previous Tab",
+    "打开搜索对话框": "Open Search",
+    "检索当前目录文件夹/文件名": "Quick Find in Current Folder",
+    "返回上级目录": "Go Up",
+    "刷新当前路径": "Refresh",
+    "添加当前路径到书签": "Add Bookmark",
+    "快速复制选中项（后台）": "Quick Copy Selection (background)",
+    "快速粘贴到当前目录（后台）": "Quick Paste Here (background)",
+    "快速删除选中项": "Quick Delete Selection",
+    "取消后台复制/删除": "Cancel Background Copy/Delete",
+    "复制选中文件名（含后缀）": "Copy File Name (with extension)",
+    "复制文件路径\\文件名": "Copy File Path",
+    "左右分屏对比": "Split View",
+    "插入标签分组": "Insert Tab Group",
+    "编辑路径栏": "Edit Path Bar",
+    "显示/隐藏 AI 助手面板": "Show/Hide AI Assistant",
+    "始终启用，清空按键即可停用": "Always on; clear the key to disable",
+    "清空按键": "Clear Key",
+    "恢复默认按键": "Restore Default Keys",
+    "💡 点击按键框后直接按下新组合；需包含 Ctrl 或 Alt（F1–F24 可单独使用）。取消勾选或清空按键可停用。":
+        "💡 Click a key box and press the new combination; it must include Ctrl or Alt (F1–F24 may be used alone). Uncheck or clear the key to disable.",
+    "快捷键冲突": "Hotkey Conflict",
+    "{}：不支持的按键 {}": "{}: unsupported key {}",
+    "{}：{} 需要包含 Ctrl 或 Alt（F1–F24 可单独使用）": "{}: {} must include Ctrl or Alt (F1–F24 may be used alone)",
+    "{}：{} 是 Explorer 文件操作快捷键": "{}: {} is an Explorer file shortcut",
+    "{}：{} 已用于切换到第 N 个标签": "{}: {} is used for switching to the Nth tab",
+    "{} 同时分配给：{}": "{} is assigned to: {}",
+    "搜索当前文件夹": "Search Current Folder",
+    "AI 助手面板": "AI Assistant",
+    "取消当前后台复制/删除": "Cancel current background copy/delete",
+    "后台复制已开始，可继续操作其他标签页（{} 可取消）": "Background copy started; you can keep using other tabs ({} to cancel)",
+    "后台复制已开始，可继续操作其他标签页": "Background copy started; you can keep using other tabs",
+    "已将当前标签移到右侧。再次按 {} 合并回左侧。": "Moved the current tab to the right. Press {} again to merge it back.",
+    "已将当前标签移到右侧。": "Moved the current tab to the right.",
+    "已复制 {} 项，按 {} 粘贴到当前目录": "Copied {} item(s); press {} to paste into the current folder",
+    "已复制 {} 项": "Copied {} item(s)",
+    "内部剪贴板为空，请先按 {} 复制": "Internal clipboard is empty; press {} to copy first",
+    "内部剪贴板为空": "Internal clipboard is empty",
+    "源文件不存在，请重新按 {} 复制": "Source items no longer exist; press {} to copy again",
+    "源文件不存在": "Source items no longer exist",
+    "检查更新...": "Check for Updates...",
+    "正在查询 GitHub 最新版本…": "Checking GitHub for the latest release…",
+    "检查更新失败": "Update Check Failed",
+    "打开发布页": "Open Releases",
+    "发现新版本": "Update Available",
+    "TabEx v{} 已发布，当前为 v{}": "TabEx v{} is available (current v{})",
+    "查看更新": "View Update",
+    "当前已是最新版本 v{}": "You are on the latest version v{}",
+    "最新发布为 {}，无法读取其版本号": "The latest release is {}, but its version number could not be read",
+    "GitHub 请求过于频繁，请稍后再试": "Too many requests to GitHub; try again later",
+    "GitHub 返回错误 {}": "GitHub returned error {}",
+    "连接 GitHub 超时": "Connection to GitHub timed out",
+    "无法连接 GitHub：{}": "Cannot reach GitHub: {}",
+    "无法读取发布信息：{}": "Cannot read release information: {}",
+    "发布标签无效": "Invalid release tag",
+    "立即检查": "Check Now",
+    "查询 GitHub 上的最新发布版本，只提示不下载": "Query the latest GitHub release; notify only, never download",
+    "自动检查新版本（每天最多一次，只提示不下载）": "Check for new versions automatically (at most daily; notify only, never download)",
+    "后台标签休眠（分钟，0=关闭）:": "Hibernate background tabs (minutes, 0=off):",
+    "后台标签超过该时间未访问时释放文件视图，切回时重新加载（滚动位置和选中项不保留）":
+        "Release the file view of background tabs idle for this long; it reloads when you switch back (scroll position and selection are not kept)",
+    "系统窗口事件不可用时的轮询间隔；事件可用时新窗口即时嵌入，并至少每 10 秒兜底扫描一次":
+        "Polling interval used when window events are unavailable; otherwise new windows are embedded immediately with a fallback scan at least every 10 seconds",
+    "Git 分支: {}": "Git branch: {}",
+    "已休眠，切换到该标签时重新加载": "Hibernated; reloads when you switch to this tab",
+    "，跳过 {} 项": ", {} skipped",
+    "所有项目均已跳过": "All items were skipped",
+    "同名项目": "Items Already Exist",
+    "目标目录中已存在 {} 个同名项目：{}": "{} item(s) with the same name already exist in: {}",
+    "处理方式": "Action",
+    "保留两者（自动重命名）": "Keep both (auto rename)",
+    "跳过": "Skip",
+    "全部保留两者": "Keep Both for All",
+    "全部跳过": "Skip All",
     "全部成功": "Completed",
     "部分失败": "Partially Failed",
     "{}：成功 {} 项，失败 {} 项": "{}: {} succeeded, {} failed",
@@ -294,21 +370,6 @@ _LANG_EN = {
     "启用标题栏启动区（可拖拽应用、快捷方式或脚本并点击启动）": "Enable title bar launcher (drag apps/shortcuts/scripts to launch)",
     "拖拽应用、快捷方式或脚本到标题栏 Git 左侧区域，后续可一键启动": "Drag apps/shortcuts/scripts to the title bar for one-click launch",
     "快捷键设置": "Hotkey Settings",
-    "Ctrl+T - 新建标签页": "Ctrl+T - New Tab",
-    "Ctrl+W - 关闭当前标签页": "Ctrl+W - Close Tab",
-    "Ctrl+Shift+T - 恢复关闭的标签页": "Ctrl+Shift+T - Reopen Tab",
-    "Ctrl+Tab / Ctrl+Shift+Tab - 切换标签页": "Ctrl+Tab / Ctrl+Shift+Tab - Switch Tab",
-    "Ctrl+F - 打开搜索对话框": "Ctrl+F - Open Search",
-    "Ctrl+G - 检索当前目录文件夹/文件名": "Ctrl+G - Quick Find in Current Dir",
-    "Alt+Left/Right - 前进/后退": "Alt+Left/Right - Back/Forward",
-    "Alt+Up - 返回上级目录": "Alt+Up - Go Up",
-    "F5 - 刷新当前路径": "F5 - Refresh",
-    "Ctrl+D - 添加当前路径到书签": "Ctrl+D - Add Bookmark",
-    "F4 - 插入分组书签": "F4 - Insert Group Bookmark",
-    "F4 - 插入标签分组": "F4 - Insert Tab Group",
-    "Alt+Z - 复制选中文件名（含后缀）": "Alt+Z - Copy File Name (with ext)",
-    "Alt+X - 复制文件路径\\文件名": "Alt+X - Copy File Path",
-    "💡 提示：取消勾选可禁用对应的快捷键": "💡 Tip: Uncheck to disable a shortcut",
     "常规": "General",
     "手势与快捷键": "Gestures & Hotkeys",
     "工具集成": "Tools",
@@ -431,14 +492,8 @@ _LANG_EN = {
     "未跟踪(待Add)": "Untracked (Pending Add)",
     "，元数据降级 {} 条": ", {} items degraded",
     # ── Main window toolbar / menus ───────────────────────────────────────
-    "后退 (Alt+←)": "Back (Alt+←)",
-    "前进 (Alt+→)": "Forward (Alt+→)",
-    "新建标签页 (Ctrl+T)": "New Tab (Ctrl+T)",
-    "恢复关闭的标签页 (Ctrl+Shift+T)": "Reopen Tab (Ctrl+Shift+T)",
-    "搜索当前文件夹 (Ctrl+F)": "Search Current Folder (Ctrl+F)",
     "书签管理": "Bookmarks",
     "设置": "Settings",
-    "AI 助手面板 (Ctrl+Shift+A)": "AI Assistant (Ctrl+Shift+A)",
     "打开 TortoiseGit 日志": "Open TortoiseGit Log",
     "打开 TortoiseGit 提交窗口": "Open TortoiseGit Commit",
     "在当前标签页路径打开 Git Bash": "Open Git Bash here",
@@ -446,8 +501,6 @@ _LANG_EN = {
     "在当前标签页路径打开 PowerShell": "Open PowerShell here",
     "打开计算器": "Open Calculator",
     # ── Split view (F3) ───────────────────────────────────────────────────
-    "分屏对比 (F3)": "Split View (F3)",
-    "插入分组 (F4)": "Insert Group (F4)",
     "插入分组": "Insert Group",
     "在左侧插入分组": "Insert Group on Left",
     "在右侧插入分组": "Insert Group on Right",
@@ -487,7 +540,6 @@ _LANG_EN = {
     "分屏对比": "Split View",
     "分屏失败": "Split Failed",
     "已将右侧标签合并回左侧。": "Merged the right-side tab back to the left.",
-    "已将当前标签移到右侧。再次按 F3 合并回左侧。": "Moved the current tab to the right. Press F3 again to merge it back.",
     "无法创建用于左侧的新标签页。": "Failed to create a new tab for the left side.",
     # ── Title bar launcher ────────────────────────────────────────────────
     "拖入应用或快捷方式": "Drop app or shortcut",
@@ -937,6 +989,158 @@ def _compute_dir_snapshot(path, ignore_check=None):
 STATUS_SELECTION_METADATA_LIMIT = 20  # 多选超过阈值时跳过逐项大小统计
 SHORTCUT_POLL_ACTIVE_MS = 60  # 主窗口激活时快捷键轮询频率（需足够快以捕捉"同时按住"的短促组合键）
 SHORTCUT_POLL_INACTIVE_MS = 500  # 主窗口非激活时快捷键轮询频率
+UPDATE_RELEASE_API = "https://api.github.com/repos/caojinyuan/TabEx/releases/latest"
+UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/caojinyuan/TabEx/{tag}/TabEx.py"
+UPDATE_RELEASES_PAGE = "https://github.com/caojinyuan/TabEx/releases"
+UPDATE_CHECK_INTERVAL_S = 24 * 60 * 60
+UPDATE_CHECK_DELAY_MS = 30 * 1000
+
+# 可自定义快捷键：(命令, 启用开关键, 默认按键, 说明)；启用开关为 None 的命令始终启用
+HOTKEY_COMMANDS = (
+    ('new_tab', 'new_tab', 'Ctrl+T', '新建标签页'),
+    ('close_tab', 'close_tab', 'Ctrl+W', '关闭当前标签页'),
+    ('reopen_tab', 'reopen_tab', 'Ctrl+Shift+T', '恢复关闭的标签页'),
+    ('next_tab', 'switch_tab', 'Ctrl+Tab', '下一个标签'),
+    ('prev_tab', 'switch_tab', 'Ctrl+Shift+Tab', '上一个标签'),
+    ('search', 'search', 'Ctrl+F', '打开搜索对话框'),
+    ('quick_find_current_dir', 'quick_find_current_dir', 'Ctrl+G', '检索当前目录文件夹/文件名'),
+    ('go_back', 'navigate', 'Alt+Left', '后退'),
+    ('go_forward', 'navigate', 'Alt+Right', '前进'),
+    ('go_up', 'go_up', 'Alt+Up', '返回上级目录'),
+    ('refresh', 'refresh', 'F5', '刷新当前路径'),
+    ('add_bookmark', 'add_bookmark', 'Ctrl+D', '添加当前路径到书签'),
+    ('quick_copy', 'quick_copy', 'Alt+C', '快速复制选中项（后台）'),
+    ('quick_paste', 'quick_paste', 'Alt+V', '快速粘贴到当前目录（后台）'),
+    ('quick_delete', 'quick_delete', 'Alt+Del', '快速删除选中项'),
+    ('cancel_file_op', 'cancel_file_op', 'Alt+Q', '取消后台复制/删除'),
+    ('copy_filename', 'copy_filename', 'Alt+Z', '复制选中文件名（含后缀）'),
+    ('copy_filepath', 'copy_filepath', 'Alt+X', '复制文件路径\\文件名'),
+    ('split_view', 'split_view', 'F3', '左右分屏对比'),
+    ('insert_group_bookmark', 'insert_group_bookmark', 'F4', '插入标签分组'),
+    ('focus_path_bar', None, 'Ctrl+L', '编辑路径栏'),
+    ('toggle_ai_panel', None, 'Ctrl+Shift+A', '显示/隐藏 AI 助手面板'),
+)
+_HOTKEY_ENABLE_KEYS = {command: enable_key for command, enable_key, _default, _label in HOTKEY_COMMANDS}
+_HOTKEY_KEY_CODES = {
+    **{chr(code): code for code in range(0x41, 0x5B)},
+    **{str(digit): 0x30 + digit for digit in range(10)},
+    **{f'F{number}': 0x6F + number for number in range(1, 25)},
+    'Tab': 0x09, 'Backspace': 0x08, 'Enter': 0x0D, 'Esc': 0x1B, 'Space': 0x20,
+    'PgUp': 0x21, 'PgDown': 0x22, 'End': 0x23, 'Home': 0x24,
+    'Left': 0x25, 'Up': 0x26, 'Right': 0x27, 'Down': 0x28, 'Ins': 0x2D, 'Del': 0x2E,
+    ';': 0xBA, '=': 0xBB, ',': 0xBC, '-': 0xBD, '.': 0xBE, '/': 0xBF, '`': 0xC0,
+    '[': 0xDB, '\\': 0xDC, ']': 0xDD, "'": 0xDE,
+}
+_HOTKEY_KEY_NAMES = {code: name for name, code in _HOTKEY_KEY_CODES.items()}
+# Qt 的 PortableText 名称与手写配置的常见别名；Backtab 即 Shift+Tab
+_HOTKEY_KEY_LOOKUP = {
+    **{name.lower(): name for name in _HOTKEY_KEY_CODES},
+    'delete': 'Del', 'insert': 'Ins', 'return': 'Enter', 'escape': 'Esc',
+    'pageup': 'PgUp', 'pagedown': 'PgDown', 'backtab': 'Tab',
+}
+# 钩子不拦截按键，绑定这些组合会与 Explorer 的文件操作同时生效
+_EXPLORER_RESERVED_HOTKEYS = frozenset(('Ctrl+C', 'Ctrl+X', 'Ctrl+V', 'Ctrl+A', 'Ctrl+Z', 'Ctrl+Y',
+                                        'Ctrl+Shift+N', 'F2', 'Alt+Enter', 'Alt+F4'))
+
+
+def _parse_hotkey(text):
+    """'Ctrl+Shift+T' -> (ctrl, shift, alt, vk)；不支持的写法返回 None。"""
+    parts = [part.strip() for part in str(text or '').split('+')]
+    name = _HOTKEY_KEY_LOOKUP.get(parts[-1].lower())
+    modifiers = {part.lower() for part in parts[:-1]}
+    if name is None or len(modifiers) != len(parts) - 1 or not modifiers <= {'ctrl', 'shift', 'alt'}:
+        return None
+    shift = 'shift' in modifiers or parts[-1].lower() == 'backtab'
+    return ('ctrl' in modifiers, shift, 'alt' in modifiers, _HOTKEY_KEY_CODES[name])
+
+
+def _format_hotkey(ctrl, shift, alt, vk):
+    modifiers = [name for flag, name in ((ctrl, 'Ctrl'), (alt, 'Alt'), (shift, 'Shift')) if flag]
+    return '+'.join(modifiers + [_HOTKEY_KEY_NAMES[vk]])
+
+
+def _hotkey_bindings(config):
+    """合并用户设置与默认值，返回 {命令: 按键文本}；空字符串表示未绑定。"""
+    stored = config.get('hotkey_bindings') if isinstance(config, dict) else None
+    stored = stored if isinstance(stored, dict) else {}
+    bindings = {}
+    for command, _enable_key, default, _label in HOTKEY_COMMANDS:
+        value = stored.get(command, default)
+        bindings[command] = value if isinstance(value, str) else default
+    return bindings
+
+
+def _hotkey_table(config):
+    """{(ctrl, shift, alt, vk): 命令}；无法解析的绑定被忽略。"""
+    table = {}
+    for command, text in _hotkey_bindings(config).items():
+        parsed = _parse_hotkey(text)
+        if parsed is not None:
+            table.setdefault(parsed, command)
+    return table
+
+
+def _hotkey_text(config, command):
+    parsed = _parse_hotkey(_hotkey_bindings(config).get(command, ''))
+    return _format_hotkey(*parsed) if parsed else ''
+
+
+def _hotkey_hint(config, label, command):
+    key = _hotkey_text(config, command)
+    return f"{label} ({key})" if key else label
+
+
+def _hotkey_reserved_combos(config):
+    """不交给 Shell 快捷键翻译的 (ctrl, alt, vk)，与旧版按 Ctrl/Alt+键码判断的方式一致。"""
+    combos = {(ctrl, alt, vk) for ctrl, _shift, alt, vk in _hotkey_table(config)}
+    hotkeys = config.get('hotkeys', {}) if isinstance(config, dict) else {}
+    if hotkeys.get('switch_tab_number', True):
+        combos.update((True, False, vk) for vk in range(0x31, 0x3A))
+    return frozenset(combos)
+
+
+def _validate_hotkey_bindings(bindings, number_switch_enabled=True):
+    """返回错误说明列表：无法识别、缺少修饰键、与 Explorer 或 Ctrl+数字冲突、重复分配。"""
+    labels = {command: tr(label) for command, _enable_key, _default, label in HOTKEY_COMMANDS}
+    errors, owners = [], {}
+    for command, text in bindings.items():
+        if not text:
+            continue
+        parsed = _parse_hotkey(text)
+        if parsed is None:
+            errors.append(tr("{}：不支持的按键 {}").format(labels[command], text))
+            continue
+        ctrl, shift, alt, vk = parsed
+        key = _format_hotkey(*parsed)
+        if not (ctrl or alt or 0x70 <= vk <= 0x87):
+            errors.append(tr("{}：{} 需要包含 Ctrl 或 Alt（F1–F24 可单独使用）").format(labels[command], key))
+        elif key in _EXPLORER_RESERVED_HOTKEYS:
+            errors.append(tr("{}：{} 是 Explorer 文件操作快捷键").format(labels[command], key))
+        elif number_switch_enabled and ctrl and not shift and not alt and 0x31 <= vk <= 0x39:
+            errors.append(tr("{}：{} 已用于切换到第 N 个标签").format(labels[command], key))
+        owners.setdefault(key, []).append(labels[command])
+    for key, names in owners.items():
+        if len(names) > 1:
+            errors.append(tr("{} 同时分配给：{}").format(key, ' / '.join(names)))
+    return errors
+
+
+# 标题栏按钮提示中显示的快捷键：按钮属性名 -> (说明, 命令)
+_TOOLBAR_HOTKEY_TOOLTIPS = {
+    'back_button': ('后退', 'go_back'),
+    'forward_button': ('前进', 'go_forward'),
+    'add_tab_button': ('新建标签页', 'new_tab'),
+    'reopen_tab_button': ('恢复关闭的标签页', 'reopen_tab'),
+    'search_button': ('搜索当前文件夹', 'search'),
+    'insert_group_btn': ('插入分组', 'insert_group_bookmark'),
+    'split_view_btn': ('分屏对比', 'split_view'),
+    'ai_chat_btn': ('AI 助手面板', 'toggle_ai_panel'),
+}
+
+
+def _toolbar_hotkey_tooltip(owner, name):
+    label, command = _TOOLBAR_HOTKEY_TOOLTIPS[name]
+    return _hotkey_hint(getattr(owner, 'config', {}), tr(label), command)
 # ── 主线程 COM 轮询抗高负载保护 ───────────────────────────────────────────────
 # LocationURL 是同步跨进程 COM 调用，无超时。CPU 饱和时其延迟会飙升，阻塞 UI 线程，
 # 且卡顿时 Qt 定时器事件堆积、线程一空就爆发式触发，形成无法恢复的“死亡螺旋”。
@@ -1093,6 +1297,7 @@ class SearchCache:
     
     def get_key(self, search_path, keyword, search_filename, search_content, file_types, force_metadata_degrade=False, match_case=False, match_whole_word=False, use_everything=False):
         """生成缓存键"""
+        import hashlib
         key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}|{force_metadata_degrade}|{match_case}|{match_whole_word}|{use_everything}"
         return hashlib.md5(key_str.encode()).hexdigest()
     
@@ -2879,7 +3084,6 @@ import socket
 import threading
 import queue
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QListWidget, QLabel, QToolBar, QAction, QMenu, QInputDialog, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QFileSystemModel, QSplitter, QProgressBar, QCompleter, QFrame, QToolButton, QFileIconProvider)  # 添加QFrame
-from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import Qt, QDir, QUrl, pyqtSignal, pyqtSlot, Q_ARG, QObject, QSize, QFileSystemWatcher, QTimer, QThread, QMutex, QMimeData, QFileInfo, QEvent, QPoint, QThreadPool, QRunnable
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QCursor, QDrag
 import ctypes
@@ -3736,6 +3940,78 @@ def _retain_thread_until_finished(worker):
         release()
 
 
+def _version_tuple(text):
+    """'3.75' / 'v3.75' -> (3, 75)；无法识别返回 None。"""
+    import re
+    match = re.fullmatch(r'v?(\d+(?:\.\d+)*)', str(text or '').strip())
+    return tuple(int(part) for part in match.group(1).split('.')) if match else None
+
+
+def _fetch_latest_release(timeout=10):
+    """查询 GitHub 最新发布，并读取该发布源码开头的 APP_VERSION（发布标签与软件版本号不同）。"""
+    import json
+    import re
+    import urllib.request
+    headers = {'User-Agent': f'TabEx/{APP_VERSION}', 'Accept': 'application/vnd.github+json'}
+    request = urllib.request.Request(UPDATE_RELEASE_API, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        release = json.loads(response.read(1024 * 1024).decode('utf-8'))
+    tag = str(release.get('tag_name') or '')
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', tag):
+        raise ValueError(tr("发布标签无效"))
+    page = str(release.get('html_url') or '')
+    if not page.startswith(UPDATE_RELEASES_PAGE + '/'):
+        page = UPDATE_RELEASES_PAGE
+    version = ''
+    try:
+        source = urllib.request.Request(UPDATE_SOURCE_URL.format(tag=tag),
+                                        headers={'User-Agent': headers['User-Agent'], 'Range': 'bytes=0-4095'})
+        with urllib.request.urlopen(source, timeout=timeout) as response:
+            head = response.read(4096).decode('utf-8', 'replace')
+        match = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', head, re.M)
+        if match and _version_tuple(match.group(1)):
+            version = match.group(1)
+    except Exception as error:
+        debug_print(f"[Update] cannot read version of {tag}: {error}")
+    return {'tag': tag, 'version': version, 'url': page}
+
+
+def _update_error_text(error):
+    import socket
+    import urllib.error
+    if isinstance(error, urllib.error.HTTPError):
+        if error.code in (403, 429):
+            return tr("GitHub 请求过于频繁，请稍后再试")
+        return tr("GitHub 返回错误 {}").format(error.code)
+    if isinstance(error, (socket.timeout, TimeoutError)):
+        return tr("连接 GitHub 超时")
+    if isinstance(error, urllib.error.URLError):
+        return tr("无法连接 GitHub：{}").format(error.reason)
+    return tr("无法读取发布信息：{}").format(error)
+
+
+def _open_release_page(url):
+    from PyQt5.QtGui import QDesktopServices
+    target = url if str(url).startswith(UPDATE_RELEASES_PAGE + '/') else UPDATE_RELEASES_PAGE
+    QDesktopServices.openUrl(QUrl(target))
+
+
+class UpdateCheckWorker(QThread):
+    completed = pyqtSignal(object)  # dict：成功含 tag/version/url，失败含 error；均含 manual
+
+    def __init__(self, manual):
+        super().__init__()
+        self.manual = bool(manual)
+
+    def run(self):
+        try:
+            result = _fetch_latest_release()
+        except Exception as error:
+            result = {'error': _update_error_text(error)}
+        result['manual'] = self.manual
+        self.completed.emit(result)
+
+
 class DiagnosticExportWorker(QThread):
     def __init__(self, diagnostics, destination, debug_path):
         super().__init__()
@@ -3760,6 +4036,7 @@ class GitStatusWorker(QThread):
         self.dir_path = dir_path
         self.repo_root = repo_root
         self.git_exe = git_exe
+        self.branch = ''
 
     def run(self):
         try:
@@ -3781,6 +4058,7 @@ class GitStatusWorker(QThread):
                 if line.startswith('## '):
                     branch_info = line[3:]
                     branch = branch_info.split('...')[0].split()[0] if branch_info else ''
+                    self.branch = branch
                     continue
                 if len(line) < 2:
                     continue
@@ -3893,6 +4171,8 @@ class FileBatchOpWorker(QThread):
         self._last_progress_at = 0.0
         self.failed_paths = []
         self.rename_plan = {}
+        self.conflict_actions = {}  # 源路径 -> 'skip' | 'rename'；未列出的冲突项按 'rename' 处理
+        self.skipped_count = 0
 
     def request_cancel(self):
         self._cancel_requested = True
@@ -4227,7 +4507,13 @@ class FileBatchOpWorker(QThread):
                         self._raise_if_cancelled()
                         src_norm = os.path.normpath(src)
                         name = os.path.basename(src_norm) or os.path.basename(os.path.dirname(src_norm)) or 'item'
-                        dst_path = self._make_unique_path(os.path.join(self.dst_dir, name))
+                        target = os.path.join(self.dst_dir, name)
+                        if self.conflict_actions.get(src) == 'skip' and os.path.lexists(target):
+                            self.skipped_count += 1
+                            self.done_units += 1
+                            self._emit_progress(name)
+                            continue
+                        dst_path = self._make_unique_path(target)
                         if os.path.isdir(src_norm):
                             if self._is_reparse_path(src_norm):
                                 raise ValueError(tr("暂不支持复制目录链接: ") + src_norm)
@@ -4401,9 +4687,11 @@ class FileTaskPanel(QDialog):
                      for record in self.records)
         return running, failed
 
-    def start_task(self, op_type, paths, destination=None, max_workers=0, tab=None, rename_plan=None):
+    def start_task(self, op_type, paths, destination=None, max_workers=0, tab=None, rename_plan=None,
+                   conflict_actions=None):
         worker = FileBatchOpWorker(op_type, paths, destination, self, max_workers=max_workers)
         worker.rename_plan = dict(rename_plan or {})
+        worker.conflict_actions = dict(conflict_actions or {})
         operation_name = {'copy': '复制', 'delete': '回收站', 'permanent_delete': '永久删除', 'rename': '重命名'}
         location = destination or (paths[0] if paths else '')
         row = QTreeWidgetItem([tr(operation_name.get(op_type, op_type)), location, tr("运行中"), ''])
@@ -4411,7 +4699,7 @@ class FileTaskPanel(QDialog):
         record = {'worker': worker, 'row': row, 'op': op_type, 'paths': list(paths),
                   'destination': destination, 'max_workers': max_workers, 'errors': [],
               'failed': [], 'done': False, 'completed': False, 'cancelled': False,
-              'rename_plan': worker.rename_plan}
+              'rename_plan': worker.rename_plan, 'conflict_actions': worker.conflict_actions}
         row.setData(0, Qt.UserRole, len(self.records))
         self.records.append(record)
         self.table.addTopLevelItem(row)
@@ -4449,6 +4737,8 @@ class FileTaskPanel(QDialog):
         else:
             state, icon = tr('全部成功'), QStyle.SP_DialogApplyButton
         summary = tr("{}：成功 {} 项，失败 {} 项").format(state, ok_count, fail_count)
+        if getattr(worker, 'skipped_count', 0):
+            summary += tr("，跳过 {} 项").format(worker.skipped_count)
         record['summary'] = summary
         record['row'].setText(2, summary)
         record['row'].setIcon(2, self.style().standardIcon(icon))
@@ -4531,7 +4821,7 @@ class FileTaskPanel(QDialog):
                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         self.start_task(record['op'], record['failed'], record['destination'], record['max_workers'],
-                rename_plan=record['rename_plan'])
+                rename_plan=record['rename_plan'], conflict_actions=record.get('conflict_actions'))
 
     def show_errors(self):
         record = self.selected_record()
@@ -4550,6 +4840,69 @@ class FileTaskPanel(QDialog):
                 self.records.remove(record)
         self._update_controls()
         self.tasks_changed.emit()
+
+
+def _find_copy_conflicts(paths, dst_dir):
+    """返回目标目录已有同名项的来源路径；复制到来源所在目录时按系统习惯自动重命名，不算冲突。"""
+    dst_key = os.path.normcase(os.path.normpath(dst_dir))
+    conflicts = []
+    for source in paths:
+        normalized = os.path.normpath(source)
+        if os.path.normcase(os.path.dirname(normalized)) == dst_key:
+            continue
+        name = os.path.basename(normalized)
+        if name and os.path.lexists(os.path.join(dst_dir, name)):
+            conflicts.append(source)
+    return conflicts
+
+
+class CopyConflictDialog(QDialog):
+    """后台粘贴前逐项选择同名冲突的处理方式。"""
+
+    def __init__(self, conflicts, dst_dir, parent=None):
+        super().__init__(parent)
+        from PyQt5.QtWidgets import QComboBox, QDialogButtonBox
+        self.setWindowTitle(tr("同名项目"))
+        self.resize(640, 360)
+        layout = QVBoxLayout(self)
+        label = QLabel(tr("目标目录中已存在 {} 个同名项目：{}").format(len(conflicts), dst_dir), self)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.table = QTreeWidget(self)
+        self.table.setHeaderLabels([tr("名称"), tr("处理方式")])
+        self.table.setRootIsDecorated(False)
+        self.table.header().setStretchLastSection(False)
+        self.table.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self._combos = {}
+        for source in conflicts:
+            item = QTreeWidgetItem([os.path.basename(os.path.normpath(source)), ''])
+            item.setToolTip(0, source)
+            self.table.addTopLevelItem(item)
+            combo = QComboBox(self.table)
+            combo.addItem(tr("保留两者（自动重命名）"), 'rename')
+            combo.addItem(tr("跳过"), 'skip')
+            self.table.setItemWidget(item, 1, combo)
+            self._combos[source] = combo
+        layout.addWidget(self.table)
+        row = QHBoxLayout()
+        for text, value in ((tr("全部保留两者"), 'rename'), (tr("全部跳过"), 'skip')):
+            button = QPushButton(text, self)
+            button.clicked.connect(lambda _checked=False, choice=value: self.set_all(choice))
+            row.addWidget(button)
+        row.addStretch(1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        row.addWidget(buttons)
+        layout.addLayout(row)
+
+    def set_all(self, value):
+        for combo in self._combos.values():
+            combo.setCurrentIndex(combo.findData(value))
+
+    def actions(self):
+        return {source: combo.currentData() for source, combo in self._combos.items()}
 
 
 def _plan_batch_rename(paths, find_text, replacement):
@@ -6058,24 +6411,8 @@ class _IEBKeyboardFilter(QAbstractNativeEventFilter):
     """Application-level native event filter that forwards keyboard messages
     to IExplorerBrowser child windows so that Delete, Ctrl+C/V/X, F2, etc. work."""
 
-    # TabEx 自有快捷键的 VK 码（Ctrl 组合）
-    _TABEX_CTRL_VKS = frozenset([
-        0x54,  # T (Ctrl+T new tab, Ctrl+Shift+T reopen)
-        0x57,  # W (Ctrl+W close tab)
-        0x46,  # F (Ctrl+F search)
-        0x47,  # G (Ctrl+G quick find)
-        0x44,  # D (Ctrl+D bookmark)
-        0x4C,  # L (Ctrl+L focus path bar)
-        0x09,  # Tab (Ctrl+Tab switch)
-    ])
-    # TabEx 自有快捷键的 VK 码（Alt 组合）
-    _TABEX_ALT_VKS = frozenset([
-        0x5A,  # Z (Alt+Z copy filename)
-        0x58,  # X (Alt+X copy path)
-        0x25,  # Left (Alt+Left back)
-        0x27,  # Right (Alt+Right forward)
-        0x26,  # Up (Alt+Up go up)
-    ])
+    # TabEx 自有快捷键 (ctrl, alt, vk)；随设置更新
+    _tabex_hotkeys = _hotkey_reserved_combos({})
 
     def __init__(self):
         super().__init__()
@@ -6089,6 +6426,9 @@ class _IEBKeyboardFilter(QAbstractNativeEventFilter):
 
     def set_main_window(self, mw):
         self._main_window = mw
+
+    def set_tabex_hotkeys(self, combos):
+        self._tabex_hotkeys = frozenset(combos)
 
     def register_ieb_hwnd(self, hwnd, widget=None):
         """注册 IExplorerBrowserWidget 的 winId，用于快速判断子窗口归属"""
@@ -6181,16 +6521,8 @@ class _IEBKeyboardFilter(QAbstractNativeEventFilter):
                 vk = msg.wParam & 0xFF
                 ctrl = (ctypes.windll.user32.GetKeyState(0x11) & 0x8000) != 0
                 alt  = (ctypes.windll.user32.GetKeyState(0x12) & 0x8000) != 0
-                if ctrl and not alt and vk in self._TABEX_CTRL_VKS:
-                    return False, 0  # 留给 TabEx _check_shortcuts
-                if alt and not ctrl and vk in self._TABEX_ALT_VKS:
-                    return False, 0
-                if not ctrl and not alt and vk == 0x74:  # F5
-                    return False, 0
-                if not ctrl and not alt and vk == 0x72:  # F3 分屏
-                    return False, 0
-                if not ctrl and not alt and vk == 0x73:  # F4 插入分组书签
-                    return False, 0
+                if (ctrl, alt, vk) in self._tabex_hotkeys:
+                    return False, 0  # 留给 TabEx 快捷键
 
             # 通过 IShellView::TranslateAccelerator 转发键盘消息
             # 这是 Shell 控件处理 Ctrl+C/V/X, Delete, F2 等的正确 COM 方式
@@ -6352,6 +6684,7 @@ class IExplorerBrowserWidget(QWidget):
         if not self._ensure_browser():
             self._pending_path = path
             return
+        self._pending_path = None
         # 慢盘（网络/UNC/OneDrive/映射远程盘）：把阻塞的 PIDL 解析放到后台线程，避免冻结
         # UI 事件循环——一个慢标签不再拖垮其它标签/窗口。本地快盘保持同步（无线程开销）。
         if _path_is_slow_for_shell(path):
@@ -6680,6 +7013,16 @@ class IExplorerBrowserWidget(QWidget):
         self._nav_sink = None
         self._init_ok  = False
 
+    def hibernate(self, path):
+        """销毁 Shell 视图以释放资源；下次显示时在 showEvent 中按 path 重建。"""
+        if not self._init_ok or not path:
+            return False
+        self.cleanup()
+        self._pending_path = path
+        self._overlay_refresh_done = False
+        self._overlay_visible_refreshed = False
+        return True
+
     def closeEvent(self, event):
         self.cleanup()
         super().closeEvent(event)
@@ -6772,9 +7115,15 @@ class FileExplorerTab(QWidget):
     def set_refresh_active(self, active: bool):
         """设置当前标签的刷新活跃态：仅当前可见标签执行高频刷新。"""
         self._refresh_active = bool(active)
+        self._last_active_at = time.monotonic()
         current_path = getattr(self, 'current_path', '')
 
         if self._refresh_active:
+            if getattr(self, '_hibernated', False):
+                self._hibernated = False
+                mw = getattr(self, 'main_window', None)
+                if mw is not None and hasattr(mw, '_schedule_tab_labels'):
+                    mw._schedule_tab_labels()
             if current_path and not current_path.startswith(('shell:', '::')):
                 is_slow = self._is_slow_path(current_path)
                 # OneDrive/网络路径：跳过os.scandir操作，避免阻塞UI线程和COM消息泵
@@ -6808,6 +7157,26 @@ class FileExplorerTab(QWidget):
 
     def is_auto_refresh_frozen(self):
         return bool(getattr(self, '_manual_refresh_frozen', False))
+
+    def hibernate_shell_view(self):
+        """释放长时间未使用的后台标签的 Shell 视图，切回时按当前路径重建。"""
+        explorer = getattr(self, 'explorer', None)
+        path = getattr(self, 'current_path', '')
+        if not path or not isinstance(explorer, IExplorerBrowserWidget) or not explorer._init_ok:
+            return False
+        if getattr(self, '_refresh_active', False) or self.isVisible() or getattr(self, '_nav_in_progress', False):
+            return False
+        try:
+            worker = getattr(self, '_file_op_worker', None)
+            if worker is not None and worker.isRunning():
+                return False
+        except RuntimeError:
+            pass  # worker 已被 deleteLater 销毁
+        if not explorer.hibernate(path):
+            return False
+        self._hibernated = True
+        debug_print(f"[Hibernate] Released shell view of idle tab: {path}")
+        return True
 
     def set_auto_refresh_frozen(self, frozen):
         self._manual_refresh_frozen = bool(frozen)
@@ -7434,6 +7803,7 @@ class FileExplorerTab(QWidget):
             except Exception as _ieb_err:
                 debug_print(f"[WindowsShellExplorer] IExplorerBrowserWidget failed: {_ieb_err}")
         if not _ieb_ok:
+            from PyQt5.QAxContainer import QAxWidget
             self.explorer = QAxWidget(self)
             if not self.explorer.setControl("Shell.Explorer"):
                 raise RuntimeError("Shell.Explorer control initialization failed")
@@ -7481,7 +7851,8 @@ class FileExplorerTab(QWidget):
             "QPushButton:pressed { background: #e5e5e5; }"
             "QPushButton:disabled { color: #9a9a9a; background: #f4f4f4; }"
         )
-        self.cancel_file_op_btn.setToolTip(tr("取消当前后台复制/删除（等效 Alt+Q）"))
+        self.cancel_file_op_btn.setToolTip(_hotkey_hint(getattr(getattr(self, 'main_window', None), 'config', {}),
+                                                        tr("取消当前后台复制/删除"), 'cancel_file_op'))
         self.cancel_file_op_btn.clicked.connect(self.cancel_current_file_batch_op)
         self.cancel_file_op_btn.hide()
         status_row = QHBoxLayout()
@@ -8140,6 +8511,12 @@ class FileExplorerTab(QWidget):
         self._git_status_cache = {'path': dir_path, 'result': summary, 'ts_ms': now_ms}
         if getattr(self, '_git_status_pending_path', None) == dir_path:
             self._git_status_pending_path = None
+        branch = getattr(self.sender(), 'branch', '') if summary else ''
+        if (dir_path, branch) != getattr(self, '_git_branch_info', ('', '')):
+            self._git_branch_info = (dir_path, branch)
+            mw = getattr(self, 'main_window', None)
+            if mw is not None and hasattr(mw, '_schedule_tab_labels'):
+                mw._schedule_tab_labels()
         # 刷新状态栏（仅当当前路径匹配时）
         if getattr(self, 'current_path', None) == dir_path:
             self.update_explorer_status()
@@ -10490,7 +10867,7 @@ class FileExplorerTab(QWidget):
         if result == QMessageBox.Yes:
             self._run_file_batch_op('delete', selected_paths)
 
-    def _run_file_batch_op(self, op_type, selected_paths, dst_dir=None):
+    def _run_file_batch_op(self, op_type, selected_paths, dst_dir=None, conflict_actions=None):
         if getattr(self, '_file_op_worker', None) and self._file_op_worker.isRunning():
             show_toast(self, tr("提示"), tr("已有后台文件操作进行中，请稍后"), level="warning")
             return
@@ -10508,7 +10885,7 @@ class FileExplorerTab(QWidget):
             configured_workers = 0
 
         panel = self.main_window.get_file_task_panel()
-        panel.start_task(op_type, paths, dst_dir, configured_workers, tab=self)
+        panel.start_task(op_type, paths, dst_dir, configured_workers, tab=self, conflict_actions=conflict_actions)
         if hasattr(self, 'cancel_file_op_btn') and self.cancel_file_op_btn:
             self.cancel_file_op_btn.setText(tr("取消"))
             self.cancel_file_op_btn.setEnabled(True)
@@ -10517,7 +10894,10 @@ class FileExplorerTab(QWidget):
             else:
                 self.cancel_file_op_btn.hide()
         if op_type == 'copy':
-            show_toast(self, tr("提示"), tr("后台复制已开始，可继续操作其他标签页（Alt+Q 可取消）"), level="info", duration=2600)
+            key = _hotkey_text(getattr(getattr(self, 'main_window', None), 'config', {}), 'cancel_file_op')
+            message = (tr("后台复制已开始，可继续操作其他标签页（{} 可取消）").format(key) if key
+                       else tr("后台复制已开始，可继续操作其他标签页"))
+            show_toast(self, tr("提示"), message, level="info", duration=2600)
         elif op_type in ('delete', 'permanent_delete'):
             show_toast(self, tr("提示"), tr("删除任务已开始，可在文件任务面板查看进度"), level="info", duration=2600)
 
@@ -13821,6 +14201,111 @@ class ResizableSplitter(QSplitter):
         return _ResizableSplitterHandle(self.orientation(), self)
 
 
+def _tab_git_branch(pane):
+    """标签当前路径对应的 Git 分支；导航后尚未重新查询时返回空。"""
+    branch_path, branch = getattr(pane, '_git_branch_info', ('', ''))
+    return branch if branch and branch_path == getattr(pane, 'current_path', None) else ''
+
+
+class _KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ('vkCode', ctypes.wintypes.DWORD),
+        ('scanCode', ctypes.wintypes.DWORD),
+        ('flags', ctypes.wintypes.DWORD),
+        ('time', ctypes.wintypes.DWORD),
+        ('dwExtraInfo', ctypes.c_size_t),
+    ]
+
+
+class _ShortcutKeyHook(QObject):
+    """WH_KEYBOARD_LL 快捷键监听：钩子运行在独立线程，UI 线程繁忙时不会触发系统超时摘除钩子。
+
+    只上报本进程窗口在前台时的首次按下（忽略自动重复），不拦截按键。"""
+    keyPressed = pyqtSignal(int, bool, bool, bool)  # vk, ctrl, shift, alt
+
+    _MODIFIER_VKS = frozenset((0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5))
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thread = None
+        self._thread_id = 0
+        self._installed = False
+        self._ready = threading.Event()
+
+    def start(self):
+        if os.name != 'nt':
+            return False
+        self._ready.clear()
+        self._thread = threading.Thread(target=self._run, name='ShortcutKeyHook', daemon=True)
+        self._thread.start()
+        self._ready.wait(2.0)
+        return self._installed
+
+    def stop(self):
+        thread, self._thread = self._thread, None
+        if thread is None:
+            return
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
+        thread.join(1.0)
+
+    def _run(self):
+        wt = ctypes.wintypes
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        hook_proc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+        user32.SetWindowsHookExW.argtypes = (ctypes.c_int, hook_proc_type, wt.HINSTANCE, wt.DWORD)
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.CallNextHookEx.argtypes = (ctypes.c_void_p, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        user32.UnhookWindowsHookEx.argtypes = (ctypes.c_void_p,)
+        user32.GetForegroundWindow.restype = wt.HWND
+        user32.GetWindowThreadProcessId.argtypes = (wt.HWND, ctypes.POINTER(wt.DWORD))
+        user32.GetAsyncKeyState.restype = ctypes.c_short
+        user32.GetMessageW.argtypes = (ctypes.POINTER(wt.MSG), wt.HWND, ctypes.c_uint, ctypes.c_uint)
+        user32.PeekMessageW.argtypes = (ctypes.POINTER(wt.MSG), wt.HWND, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
+        kernel32.GetModuleHandleW.restype = wt.HMODULE
+        pid = os.getpid()
+        modifiers = self._MODIFIER_VKS
+
+        def is_down(vk):
+            return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+        def hook_proc(n_code, w_param, l_param):
+            try:
+                if n_code == 0 and w_param in (0x0100, 0x0104):  # WM_KEYDOWN / WM_SYSKEYDOWN
+                    vk = int(ctypes.cast(l_param, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents.vkCode)
+                    # 钩子先于异步键状态更新：此时已按下说明是自动重复
+                    if vk not in modifiers and not is_down(vk):
+                        hwnd = user32.GetForegroundWindow()
+                        owner = wt.DWORD(0)
+                        if hwnd:
+                            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                        if owner.value == pid:
+                            self.keyPressed.emit(vk, is_down(0x11), is_down(0x10), is_down(0x12))
+            except Exception:
+                pass
+            return user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+        callback = hook_proc_type(hook_proc)
+        msg = wt.MSG()
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)  # 创建消息队列，保证 WM_QUIT 可投递
+        self._thread_id = kernel32.GetCurrentThreadId()
+        handle = user32.SetWindowsHookExW(13, callback, kernel32.GetModuleHandleW(None), 0)
+        self._installed = bool(handle)
+        self._ready.set()
+        if not handle:
+            debug_print(f"[ShortcutHook] SetWindowsHookExW(WH_KEYBOARD_LL) failed err={ctypes.get_last_error()}")
+            return
+        try:
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            user32.UnhookWindowsHookEx(handle)
+            self._thread_id = 0
+
+
 class MainWindow(QMainWindow):
     def _is_control_panel_path_for_monitor(self, path):
         """判断路径是否为控制面板或其子目录（供Explorer Monitor用）"""
@@ -15097,6 +15582,30 @@ class MainWindow(QMainWindow):
         if tab:
             tab._restore_guard_until = time.monotonic() + 2.0
 
+    def _hibernate_idle_tabs(self):
+        """后台标签超过设定时间未访问时释放其 Shell 视图。"""
+        try:
+            minutes = int(self.config.get("tab_hibernate_minutes", 30) or 0)
+        except (TypeError, ValueError):
+            minutes = 30
+        if minutes <= 0:
+            return 0
+        cutoff = time.monotonic() - minutes * 60
+        released = 0
+        for _tabs, stack in self._all_groups():
+            current = stack.currentWidget()
+            for index in range(stack.count()):
+                tab = stack.widget(index)
+                if tab is None or tab is current or not hasattr(tab, 'hibernate_shell_view'):
+                    continue
+                last_active = getattr(tab, '_last_active_at', None)
+                if last_active is not None and last_active <= cutoff and tab.hibernate_shell_view():
+                    released += 1
+        if released:
+            debug_print(f"[Hibernate] Released {released} idle tab(s) after {minutes} min")
+            self._schedule_tab_labels()
+        return released
+
     def _schedule_tab_labels(self):
         if not hasattr(self, '_tab_labels_timer'):
             self._tab_labels_timer = QTimer(self)
@@ -15110,7 +15619,8 @@ class MainWindow(QMainWindow):
         entries = [(tabs, index, stack.widget(index)) for tabs, stack in self._all_groups()
                    for index in range(min(tabs.count(), stack.count()))]
         state = [(_app_language, id(tabs), id(pane), getattr(pane, 'current_path', ''),
-                  bool(getattr(pane, 'is_pinned', False))) for tabs, _index, pane in entries]
+                  bool(getattr(pane, 'is_pinned', False)), _tab_git_branch(pane),
+                  bool(getattr(pane, '_hibernated', False))) for tabs, _index, pane in entries]
         if state == getattr(self, '_tab_label_state', None):
             return
         self._tab_label_state = state
@@ -15122,7 +15632,14 @@ class MainWindow(QMainWindow):
             tabs.setTabText(index, label)
             tabs.setTabIcon(index, _pinned_tab_icon() if pinned else QIcon())
             path = str(getattr(pane, 'current_path', '') or '')
-            tabs.setTabToolTip(index, (tr('已固定') + '\n' if pinned else '') + path)
+            tip = [tr('已固定')] if pinned else []
+            tip.append(path)
+            branch = _tab_git_branch(pane)
+            if branch:
+                tip.append(tr('Git 分支: {}').format(branch))
+            if getattr(pane, '_hibernated', False):
+                tip.append(tr('已休眠，切换到该标签时重新加载'))
+            tabs.setTabToolTip(index, '\n'.join(tip))
 
     def show_tab_list(self):
         dialog = TabListDialog(self)
@@ -15597,7 +16114,9 @@ class MainWindow(QMainWindow):
         self._active_pane = content
         # 持久化分屏状态，确保重启/崩溃后可恢复
         self._schedule_session_snapshot()
-        show_toast(self, tr("分屏对比"), tr("已将当前标签移到右侧。再次按 F3 合并回左侧。"), level="info", duration=2000)
+        key = _hotkey_text(self.config, 'split_view')
+        show_toast(self, tr("分屏对比"), tr("已将当前标签移到右侧。再次按 {} 合并回左侧。").format(key) if key
+                   else tr("已将当前标签移到右侧。"), level="info", duration=2000)
 
     def _merge_split_back(self):
         """把右侧标签组中的标签全部移回左侧标签组并关闭分屏（静默，供关闭流程复用）。"""
@@ -16160,7 +16679,7 @@ class MainWindow(QMainWindow):
         # 标签栏导航按钮（从标签栏移到这里）
         # 后退按钮
         self.back_button = QPushButton("◀")
-        self.back_button.setToolTip(tr("后退 (Alt+←)"))
+        self.back_button.setToolTip(_toolbar_hotkey_tooltip(self, 'back_button'))
         self.back_button.setFixedSize(btn_size, btn_size)
         self.back_button.setStyleSheet(f"""
             QPushButton {{
@@ -16189,7 +16708,7 @@ class MainWindow(QMainWindow):
         
         # 前进按钮
         self.forward_button = QPushButton("▶")
-        self.forward_button.setToolTip(tr("前进 (Alt+→)"))
+        self.forward_button.setToolTip(_toolbar_hotkey_tooltip(self, 'forward_button'))
         self.forward_button.setFixedSize(btn_size, btn_size)
         self.forward_button.setStyleSheet(f"""
             QPushButton {{
@@ -16218,7 +16737,7 @@ class MainWindow(QMainWindow):
         
         # 新建标签页按钮
         self.add_tab_button = QPushButton("+")
-        self.add_tab_button.setToolTip(tr("新建标签页 (Ctrl+T)"))
+        self.add_tab_button.setToolTip(_toolbar_hotkey_tooltip(self, 'add_tab_button'))
         self.add_tab_button.setFixedSize(btn_size, btn_size)
         self.add_tab_button.setStyleSheet(f"""
             QPushButton {{
@@ -16243,7 +16762,7 @@ class MainWindow(QMainWindow):
         
         # 恢复标签页按钮
         self.reopen_tab_button = QPushButton("↺")
-        self.reopen_tab_button.setToolTip(tr("恢复关闭的标签页 (Ctrl+Shift+T)"))
+        self.reopen_tab_button.setToolTip(_toolbar_hotkey_tooltip(self, 'reopen_tab_button'))
         self.reopen_tab_button.setFixedSize(btn_size, btn_size)
         self.reopen_tab_button.setStyleSheet(f"""
             QPushButton {{
@@ -16280,7 +16799,7 @@ class MainWindow(QMainWindow):
         
         # 搜索按钮
         self.search_button = QPushButton("⌕")
-        self.search_button.setToolTip(tr("搜索当前文件夹 (Ctrl+F)"))
+        self.search_button.setToolTip(_toolbar_hotkey_tooltip(self, 'search_button'))
         self.search_button.setFixedSize(btn_size, btn_size)
         search_icon_size = int(13 * getattr(self, 'dpi_scale', 1.0))
         self.search_button.setStyleSheet(f"""
@@ -16327,7 +16846,7 @@ class MainWindow(QMainWindow):
 
         # 插入分组按钮
         self.insert_group_btn = QPushButton("☰")
-        self.insert_group_btn.setToolTip(tr("插入分组 (F4)"))
+        self.insert_group_btn.setToolTip(_toolbar_hotkey_tooltip(self, 'insert_group_btn'))
         self.insert_group_btn.setFixedSize(btn_size, btn_size)
         self.insert_group_btn.setStyleSheet(f"""
             QPushButton {{
@@ -16351,7 +16870,7 @@ class MainWindow(QMainWindow):
         
         # 分屏对比按钮（切换右侧第二个独立浏览面板）
         self.split_view_btn = QPushButton("◫")
-        self.split_view_btn.setToolTip(tr("分屏对比 (F3)"))
+        self.split_view_btn.setToolTip(_toolbar_hotkey_tooltip(self, 'split_view_btn'))
         self.split_view_btn.setFixedSize(btn_size, btn_size)
         self.split_view_btn.setCheckable(True)
         self.split_view_btn.setStyleSheet(f"""
@@ -16429,7 +16948,7 @@ class MainWindow(QMainWindow):
 
         # AI 助手面板切换按钮
         self.ai_chat_btn = QPushButton("🤖")
-        self.ai_chat_btn.setToolTip(tr("AI 助手面板 (Ctrl+Shift+A)"))
+        self.ai_chat_btn.setToolTip(_toolbar_hotkey_tooltip(self, 'ai_chat_btn'))
         self.ai_chat_btn.setFixedSize(bookmark_btn_width, titlebar_height)
         self.ai_chat_btn.setCheckable(True)
         self.ai_chat_btn.setStyleSheet(f"""
@@ -16765,13 +17284,17 @@ class MainWindow(QMainWindow):
 
         self._quick_clipboard_paths = list(paths)
         self._quick_clipboard_mode = 'copy'
-        show_toast(self, tr("复制"), tr("已复制 {} 项，按 Alt+V 粘贴到当前目录").format(len(paths)), level="info")
+        key = _hotkey_text(self.config, 'quick_paste')
+        show_toast(self, tr("复制"), tr("已复制 {} 项，按 {} 粘贴到当前目录").format(len(paths), key) if key
+                   else tr("已复制 {} 项").format(len(paths)), level="info")
 
     def quick_paste_to_current_directory(self):
         """Alt+V：将 TabEx 内部剪贴板的内容后台复制到当前目录。"""
         paths = list(getattr(self, '_quick_clipboard_paths', []) or [])
         if not paths:
-            show_toast(self, tr("提示"), tr("内部剪贴板为空，请先按 Alt+C"), level="warning")
+            key = _hotkey_text(self.config, 'quick_copy')
+            show_toast(self, tr("提示"), tr("内部剪贴板为空，请先按 {} 复制").format(key) if key
+                       else tr("内部剪贴板为空"), level="warning")
             return
 
         current_tab = self.get_active_pane()
@@ -16786,10 +17309,28 @@ class MainWindow(QMainWindow):
 
         alive_paths = [p for p in paths if p and os.path.exists(p)]
         if not alive_paths:
-            show_toast(self, tr("提示"), tr("源文件不存在，请重新 Alt+C"), level="warning")
+            key = _hotkey_text(self.config, 'quick_copy')
+            show_toast(self, tr("提示"), tr("源文件不存在，请重新按 {} 复制").format(key) if key
+                       else tr("源文件不存在"), level="warning")
             return
 
-        current_tab._run_file_batch_op('copy', alive_paths, dst_dir)
+        conflict_actions = {}
+        # 慢盘上逐项探测会阻塞界面，沿用自动重命名
+        if not current_tab._is_slow_path(dst_dir):
+            conflicts = _find_copy_conflicts(alive_paths, dst_dir)
+            if conflicts:
+                dialog = CopyConflictDialog(conflicts, dst_dir, self)
+                accepted = dialog.exec_() == QDialog.Accepted
+                conflict_actions = dialog.actions()
+                dialog.deleteLater()
+                self._guard_shortcuts_after_modal()
+                if not accepted:
+                    return
+                if all(conflict_actions.get(p) == 'skip' for p in alive_paths):
+                    show_toast(self, tr("提示"), tr("所有项目均已跳过"), level="info")
+                    return
+
+        current_tab._run_file_batch_op('copy', alive_paths, dst_dir, conflict_actions=conflict_actions)
 
     def quick_delete_selected_items(self):
         """Alt+Delete：将选中项移入回收站。"""
@@ -16904,338 +17445,158 @@ class MainWindow(QMainWindow):
         # 现在使用定时器轮询方式处理快捷键
         return super().eventFilter(obj, event)
     
-    def _check_shortcuts(self):
-        """定时检查快捷键状态（用于检测被QAxWidget拦截的快捷键）"""
+    def _start_shortcut_listener(self):
+        hook = _ShortcutKeyHook(self)
+        hook.keyPressed.connect(self._on_shortcut_key)
+        if hook.start():
+            self._shortcut_key_hook = hook
+            debug_print("[ShortcutHook] WH_KEYBOARD_LL installed, polling disabled")
+            return
+        hook.deleteLater()
+        debug_print("[ShortcutHook] Keyboard hook unavailable, falling back to polling")
+        self._shortcut_timer.start(SHORTCUT_POLL_ACTIVE_MS)
+
+    def _stop_shortcut_listener(self):
+        hook, self._shortcut_key_hook = getattr(self, '_shortcut_key_hook', None), None
+        if hook is not None:
+            hook.stop()
+
+    def _shortcut_gate(self, wait_for_release):
+        """返回 (是否屏蔽快捷键, 本进程是否在前台)。"""
+        from PyQt5.QtWidgets import QApplication, QLineEdit, QTextEdit, QPlainTextEdit
+        if isinstance(QApplication.focusWidget(), (QLineEdit, QTextEdit, QPlainTextEdit)):
+            return True, False
+        # 以前台窗口的进程归属判断：嵌入 Shell 视图持有焦点时 activeWindow() 可能为 None
+        user32 = ctypes.windll.user32
+        foreground_hwnd = user32.GetForegroundWindow()
+        fg_pid = ctypes.c_ulong(0)
+        if foreground_hwnd:
+            user32.GetWindowThreadProcessId(foreground_hwnd, ctypes.byref(fg_pid))
+        if fg_pid.value != os.getpid():
+            return True, False
+        # 本进程其他 Qt 顶层窗口（如非模态搜索框）持有焦点时不响应
+        active_win = QApplication.activeWindow()
+        if active_win is not None and active_win is not self:
+            return True, False
+        if getattr(self, '_shortcut_wait_for_modifier_release', False):
+            if wait_for_release and any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in (0x11, 0x10, 0x12)):
+                return True, True
+            self._shortcut_wait_for_modifier_release = False
+        if time.monotonic() < getattr(self, '_shortcut_modal_guard_until', 0):
+            return True, True
+        return False, True
+
+    def _on_shortcut_key(self, vk, ctrl, shift, alt):
         try:
-            # 当焦点在文本输入控件时，避免全局快捷键轮询干扰输入
-            from PyQt5.QtWidgets import QApplication, QLineEdit, QTextEdit, QPlainTextEdit
-            fw = QApplication.focusWidget()
-            if isinstance(fw, (QLineEdit, QTextEdit, QPlainTextEdit)):
-                self._last_keys_state.clear()
-                if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
-                    self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
-                return
-
-            # 窗口激活检查：以 Windows API 进程归属为唯一可靠依据。
-            # 原因：QApplication.activeWindow() 和 isActiveWindow() 在嵌入的
-            # Shell.Explorer ActiveX 控件持有 Win32 焦点时会返回 None/False，
-            # 导致误判为"窗口不活跃"→ 降频至 500ms → 快捷键漏检或延迟。
-            import ctypes
-            foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
-            fg_same_process = False
-            if foreground_hwnd:
-                fg_pid = ctypes.c_ulong(0)
-                ctypes.windll.user32.GetWindowThreadProcessId(foreground_hwnd, ctypes.byref(fg_pid))
-                fg_same_process = (fg_pid.value == os.getpid())
-
-            if not fg_same_process:
-                # 前台窗口属于其他进程 → 降频并消耗所有非修饰键的粘性位，
-                # 防止切换回来时因积累的 GetAsyncKeyState bit0 产生幽灵触发。
-                self._last_keys_state.clear()
-                if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
-                    self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
-                for _vk in (0x5A, 0x58, 0x43, 0x56, 0x2E, 0x4C, 0x54, 0x41, 0x57, 0x46, 0x47, 0x44, 0x51, 0x09, 0x25, 0x27, 0x26, 0x74):
-                    ctypes.windll.user32.GetAsyncKeyState(_vk)
-                return
-
-            # 前台属于本进程。若是本进程的其他 Qt 顶层窗口（如非模态搜索对话框）
-            # 持有焦点，也应暂停快捷键响应，避免后台误触。
-            active_win = QApplication.activeWindow()
-            if active_win is not None and active_win is not self:
-                self._last_keys_state.clear()
-                if self._shortcut_timer.interval() != SHORTCUT_POLL_INACTIVE_MS:
-                    self._shortcut_timer.setInterval(SHORTCUT_POLL_INACTIVE_MS)
-                return
-
-            # 本进程主窗口或 Shell.Explorer 子窗口处于前台 → 启用高频轮询
-            if self._shortcut_timer.interval() != SHORTCUT_POLL_ACTIVE_MS:
-                self._shortcut_timer.setInterval(SHORTCUT_POLL_ACTIVE_MS)
-            
-            # Windows虚拟键码
-            VK_CONTROL = 0x11
-            VK_SHIFT = 0x10
-            VK_MENU = 0x12  # Alt键
-            VK_F5 = 0x74
-            
-            # 获取键盘状态
-            # 组合键必须“同时物理按住”才触发：只信任 GetAsyncKeyState 的高位
-            # (0x8000，表示当前正被按住)，不再使用粘滞位 (0x0001，表示自上次查询
-            # 以来按过一次)。粘滞位会导致“先按松某键后再按修饰键”被误判为组合键。
-            # require_down 参数保留以兼容调用点，但行为统一为“必须当前按住”。
-            _GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
-
-            def is_key_pressed(vk_code, require_down=False):
-                state = _GetAsyncKeyState(vk_code)
-                return (state & 0x8000) != 0
-
-            modifiers_down = (
-                is_key_pressed(VK_CONTROL, require_down=True)
-                or is_key_pressed(VK_SHIFT, require_down=True)
-                or is_key_pressed(VK_MENU, require_down=True)
-            )
-
-            if getattr(self, '_shortcut_wait_for_modifier_release', False):
-                if modifiers_down:
-                    return
-                self._shortcut_wait_for_modifier_release = False
-
-            if time.monotonic() < getattr(self, '_shortcut_modal_guard_until', 0):
-                # 守卫期间每轮都消耗一次非修饰键粘性位，防止守卫窗口内新产生的按键残留。
-                for _vk in (0x5A, 0x58, 0x43, 0x56, 0x2E, 0x4C, 0x54, 0x41, 0x57, 0x46, 0x47,
-                            0x44, 0x51, 0x09, 0x25, 0x27, 0x26, 0x28, 0x74):
-                    _GetAsyncKeyState(_vk)
-                return
-            
-            hotkeys = self.config.get("hotkeys", {})
-
-            # Alt+C - 复制选中项到 TabEx 内部剪贴板（后台粘贴用）
-            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x43) and hotkeys.get("quick_copy", True):
-                key_combo = "Alt+C"
-                if not self._last_keys_state.get(key_combo, False):
-                    debug_print("[Shortcut Poll] Detected Alt+C")
-                    self.quick_copy_selected_items_for_background_paste()
-                    self._last_keys_state[key_combo] = True
-                return
-            else:
-                self._last_keys_state["Alt+C"] = False
-
-            # Alt+V - 将内部剪贴板内容粘贴到当前目录（后台执行）
-            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x56) and hotkeys.get("quick_paste", True):
-                key_combo = "Alt+V"
-                if not self._last_keys_state.get(key_combo, False):
-                    debug_print("[Shortcut Poll] Detected Alt+V")
-                    self.quick_paste_to_current_directory()
-                    self._last_keys_state[key_combo] = True
-                return
-            else:
-                self._last_keys_state["Alt+V"] = False
-
-            # Alt+Delete - 快速删除选中项（非阻塞确认）
-            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x2E) and hotkeys.get("quick_delete", True):
-                key_combo = "Alt+Delete"
-                if not self._last_keys_state.get(key_combo, False):
-                    debug_print("[Shortcut Poll] Detected Alt+Delete")
-                    self.quick_delete_selected_items()
-                    self._last_keys_state[key_combo] = True
-                return
-            else:
-                self._last_keys_state["Alt+Delete"] = False
-
-            # Alt+Q - 取消后台复制/删除
-            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x51) and hotkeys.get("cancel_file_op", True):
-                key_combo = "Alt+Q"
-                if not self._last_keys_state.get(key_combo, False):
-                    debug_print("[Shortcut Poll] Detected Alt+Q")
-                    self.quick_cancel_background_file_operation()
-                    self._last_keys_state[key_combo] = True
-                return
-            else:
-                self._last_keys_state["Alt+Q"] = False
-            
-            # Alt+Z - 拷贝文件名
-            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x5A) and hotkeys.get("copy_filename", True):
-                key_combo = "Alt+Z"
-                if not self._last_keys_state.get(key_combo, False):
-                    debug_print("[Shortcut Poll] Detected Alt+Z")
-                    self.copy_selected_filename(mode="filename")
-                    self._last_keys_state[key_combo] = True
-                return
-            else:
-                self._last_keys_state["Alt+Z"] = False
-            
-            # Alt+X - 拷贝路径+文件名
-            if is_key_pressed(VK_MENU, require_down=True) and is_key_pressed(0x58) and hotkeys.get("copy_filepath", True):
-                key_combo = "Alt+X"
-                if not self._last_keys_state.get(key_combo, False):
-                    debug_print("[Shortcut Poll] Detected Alt+X")
-                    self.copy_selected_filename(mode="path")
-                    self._last_keys_state[key_combo] = True
-                return
-            else:
-                self._last_keys_state["Alt+X"] = False
-            
-            # 检查Ctrl组合键
-            if is_key_pressed(VK_CONTROL, require_down=True):
-                # Ctrl+L (0x4C) - 聚焦并全选路径栏，便于直接输入地址
-                if is_key_pressed(0x4C):
-                    key_combo = "Ctrl+L"
-                    if not self._last_keys_state.get(key_combo, False):
-                        debug_print("[Shortcut Poll] Detected Ctrl+L")
-                        current_tab = self.get_active_pane()
-                        if current_tab and hasattr(current_tab, 'path_bar') and current_tab.path_bar:
-                            current_tab.path_bar.enter_edit_mode()
-                        self._last_keys_state[key_combo] = True
-                    return
-                else:
-                    self._last_keys_state["Ctrl+L"] = False
-
-                # Ctrl+Shift+T (0x54) - 恢复关闭的标签页（必须在Ctrl+T之前检测）
-                if is_key_pressed(VK_SHIFT, require_down=True) and is_key_pressed(0x54) and hotkeys.get("reopen_tab", True):
-                    key_combo = "Ctrl+Shift+T"
-                    if not self._last_keys_state.get(key_combo, False):
-                        debug_print("[Shortcut Poll] Detected Ctrl+Shift+T")
-                        self.reopen_closed_tab()
-                        self._last_keys_state[key_combo] = True
-                    return
-                else:
-                    self._last_keys_state["Ctrl+Shift+T"] = False
-
-                    # Ctrl+Shift+A (0x41) - 切换 AI 聊天面板
-                    if is_key_pressed(VK_SHIFT, require_down=True) and is_key_pressed(0x41):
-                        key_combo = "Ctrl+Shift+A"
-                        if not self._last_keys_state.get(key_combo, False):
-                            debug_print("[Shortcut Poll] Detected Ctrl+Shift+A")
-                            self.toggle_chat_panel()
-                            self._last_keys_state[key_combo] = True
-                        return
-                    else:
-                        self._last_keys_state["Ctrl+Shift+A"] = False
-                
-                # Ctrl+T (0x54) - 新建标签页（不包含Shift）
-                if is_key_pressed(0x54) and not is_key_pressed(VK_SHIFT, require_down=True) and hotkeys.get("new_tab", True):
-                    key_combo = "Ctrl+T"
-                    if not self._last_keys_state.get(key_combo, False):
-                        debug_print("[Shortcut Poll] Detected Ctrl+T")
-                        self.add_new_tab()
-                        self._last_keys_state[key_combo] = True
-                    return
-                else:
-                    self._last_keys_state["Ctrl+T"] = False
-                
-                # Ctrl+W (0x57)
-                if is_key_pressed(0x57) and hotkeys.get("close_tab", True):
-                    key_combo = "Ctrl+W"
-                    if not self._last_keys_state.get(key_combo, False):
-                        debug_print("[Shortcut Poll] Detected Ctrl+W")
-                        self.close_current_tab()
-                        self._last_keys_state[key_combo] = True
-                    return
-                else:
-                    self._last_keys_state["Ctrl+W"] = False
-                
-                # Ctrl+F (0x46)
-                if is_key_pressed(0x46) and hotkeys.get("search", True):
-                    key_combo = "Ctrl+F"
-                    if not self._last_keys_state.get(key_combo, False):
-                        debug_print("[Shortcut Poll] Detected Ctrl+F")
-                        self.show_search_dialog()
-                        self._last_keys_state[key_combo] = True
-                    return
-                else:
-                    self._last_keys_state["Ctrl+F"] = False
-
-                # Ctrl+G (0x47) - 快速检索当前目录中的文件/文件夹名
-                if is_key_pressed(0x47) and hotkeys.get("quick_find_current_dir", True):
-                    key_combo = "Ctrl+G"
-                    if not self._last_keys_state.get(key_combo, False):
-                        debug_print("[Shortcut Poll] Detected Ctrl+G")
-                        self.quick_find_in_current_directory()
-                        self._last_keys_state[key_combo] = True
-                    return
-                else:
-                    self._last_keys_state["Ctrl+G"] = False
-                
-                # Ctrl+D (0x44)
-                if is_key_pressed(0x44) and hotkeys.get("add_bookmark", True):
-                    key_combo = "Ctrl+D"
-                    if not self._last_keys_state.get(key_combo, False):
-                        debug_print("[Shortcut Poll] Detected Ctrl+D")
-                        self.add_current_tab_bookmark()
-                        self._last_keys_state[key_combo] = True
-                    return
-                else:
-                    self._last_keys_state["Ctrl+D"] = False
-                
-                # Ctrl+Tab (0x09)
-                if is_key_pressed(0x09) and hotkeys.get("switch_tab", True):
-                    if is_key_pressed(VK_SHIFT, require_down=True):
-                        # Ctrl+Shift+Tab
-                        key_combo = "Ctrl+Shift+Tab"
-                        if not self._last_keys_state.get(key_combo, False):
-                            debug_print("[Shortcut Poll] Detected Ctrl+Shift+Tab")
-                            self.tab_widget.setCurrentIndex(
-                                (self.tab_widget.currentIndex() - 1) % self.tab_widget.count())
-                            self._last_keys_state[key_combo] = True
-                        return
-                    else:
-                        # Ctrl+Tab
-                        key_combo = "Ctrl+Tab"
-                        if not self._last_keys_state.get(key_combo, False):
-                            debug_print("[Shortcut Poll] Detected Ctrl+Tab")
-                            self.tab_widget.setCurrentIndex(
-                                (self.tab_widget.currentIndex() + 1) % self.tab_widget.count())
-                            self._last_keys_state[key_combo] = True
-                        return
-                else:
-                    self._last_keys_state["Ctrl+Tab"] = False
-                    self._last_keys_state["Ctrl+Shift+Tab"] = False
-            
-            # 检查Alt组合键
-            if is_key_pressed(VK_MENU, require_down=True):
-                # Alt+Left (0x25)
-                if is_key_pressed(0x25) and hotkeys.get("navigate", True):
-                    key_combo = "Alt+Left"
-                    if not self._last_keys_state.get(key_combo, False):
-                        self.go_back_current_tab()
-                        self._last_keys_state[key_combo] = True
-                    return
-                else:
-                    self._last_keys_state["Alt+Left"] = False
-                
-                # Alt+Right (0x27)
-                if is_key_pressed(0x27) and hotkeys.get("navigate", True):
-                    key_combo = "Alt+Right"
-                    if not self._last_keys_state.get(key_combo, False):
-                        self.go_forward_current_tab()
-                        self._last_keys_state[key_combo] = True
-                    return
-                else:
-                    self._last_keys_state["Alt+Right"] = False
-                
-                # Alt+Up (0x26)
-                if is_key_pressed(0x26) and hotkeys.get("go_up", True):
-                    key_combo = "Alt+Up"
-                    if not self._last_keys_state.get(key_combo, False):
-                        self.go_up_current_tab()
-                        self._last_keys_state[key_combo] = True
-                    return
-                else:
-                    self._last_keys_state["Alt+Up"] = False
-            
-            # 检查F5
-            if is_key_pressed(VK_F5) and hotkeys.get("refresh", True):
-                key_combo = "F5"
-                if not self._last_keys_state.get(key_combo, False):
-                    self.refresh_current_tab()
-                    self._last_keys_state[key_combo] = True
-                return
-            else:
-                self._last_keys_state["F5"] = False
-
-            # F3 - 左右分屏对比
-            if is_key_pressed(0x72) and hotkeys.get("split_view", True):
-                key_combo = "F3"
-                if not self._last_keys_state.get(key_combo, False):
-                    self.toggle_split_view()
-                    self._last_keys_state[key_combo] = True
-                return
-            else:
-                self._last_keys_state["F3"] = False
-
-            # F4 - 默认分组切换
-            if is_key_pressed(0x73) and hotkeys.get("insert_group_bookmark", True):
-                key_combo = "F4"
-                if not self._last_keys_state.get(key_combo, False):
-                    self.insert_tab_group_marker()
-                    self._last_keys_state[key_combo] = True
-                return
-            else:
-                self._last_keys_state["F4"] = False
-
+            # 钩子只上报新的按下事件，不存在轮询的残留按键问题，无需等待修饰键松开
+            blocked, _foreground = self._shortcut_gate(wait_for_release=False)
+            if not blocked:
+                self._run_shortcut(vk, ctrl, shift, alt)
         except Exception as e:
-            # 如果轮询出错，不影响程序运行
+            debug_print(f"[ShortcutHook] dispatch error: {e}")
+
+    def _check_shortcuts(self):
+        """轮询兜底：仅在键盘钩子安装失败时运行。"""
+        try:
+            blocked, foreground = self._shortcut_gate(wait_for_release=True)
+            interval = SHORTCUT_POLL_ACTIVE_MS if foreground else SHORTCUT_POLL_INACTIVE_MS
+            if self._shortcut_timer.interval() != interval:
+                self._shortcut_timer.setInterval(interval)
+            if blocked:
+                self._last_keys_state.clear()
+                return
+            get_state = ctypes.windll.user32.GetAsyncKeyState
+            ctrl, shift, alt = (bool(get_state(vk) & 0x8000) for vk in (0x11, 0x10, 0x12))
+            pressed = []
+            for vk in getattr(self, '_shortcut_poll_vks', ()):
+                down = bool(get_state(vk) & 0x8000)
+                if down and not self._last_keys_state.get(vk, False):
+                    pressed.append(vk)
+                self._last_keys_state[vk] = down
+            for vk in pressed:
+                if self._run_shortcut(vk, ctrl, shift, alt):
+                    return
+        except Exception:
             pass
-    
+
+    def _cycle_main_tab(self, step):
+        count = self.tab_widget.count()
+        if count:
+            self.tab_widget.setCurrentIndex((self.tab_widget.currentIndex() + step) % count)
+
+    def _select_tab_by_number(self, number):
+        """Ctrl+1..8 切到活动标签组第 N 个标签，Ctrl+9 切到最后一个。"""
+        tabs = self.get_active_group_tabwidget()
+        count = tabs.count()
+        index = count - 1 if number == 9 else number - 1
+        if 0 <= index < count:
+            tabs.setCurrentIndex(index)
+
+    def _focus_active_path_bar(self):
+        current_tab = self.get_active_pane()
+        if current_tab and getattr(current_tab, 'path_bar', None):
+            current_tab.path_bar.enter_edit_mode()
+
+    def _run_shortcut(self, vk, ctrl, shift, alt):
+        """执行按键组合绑定的命令，返回是否命中已启用的快捷键。"""
+        command = _hotkey_table(self.config).get((ctrl, shift, alt, vk))
+        # Ctrl+Shift+数字 是 Explorer 的视图切换，保留给系统
+        if command is None and ctrl and not shift and not alt and 0x31 <= vk <= 0x39:
+            command = 'switch_tab_number'
+        if command is None:
+            return False
+        enable_key = _HOTKEY_ENABLE_KEYS.get(command, command)
+        if enable_key is not None and not self.config.get("hotkeys", {}).get(enable_key, True):
+            return False
+        handlers = {
+            'new_tab': lambda: self.add_new_tab(),
+            'close_tab': self.close_current_tab,
+            'reopen_tab': self.reopen_closed_tab,
+            'next_tab': lambda: self._cycle_main_tab(1),
+            'prev_tab': lambda: self._cycle_main_tab(-1),
+            'switch_tab_number': lambda: self._select_tab_by_number(vk - 0x30),
+            'search': self.show_search_dialog,
+            'quick_find_current_dir': self.quick_find_in_current_directory,
+            'go_back': self.go_back_current_tab,
+            'go_forward': self.go_forward_current_tab,
+            'go_up': self.go_up_current_tab,
+            'refresh': self.refresh_current_tab,
+            'add_bookmark': self.add_current_tab_bookmark,
+            'quick_copy': self.quick_copy_selected_items_for_background_paste,
+            'quick_paste': self.quick_paste_to_current_directory,
+            'quick_delete': self.quick_delete_selected_items,
+            'cancel_file_op': self.quick_cancel_background_file_operation,
+            'copy_filename': lambda: self.copy_selected_filename(mode="filename"),
+            'copy_filepath': lambda: self.copy_selected_filename(mode="path"),
+            'split_view': self.toggle_split_view,
+            'insert_group_bookmark': self.insert_tab_group_marker,
+            'focus_path_bar': self._focus_active_path_bar,
+            'toggle_ai_panel': self.toggle_chat_panel,
+        }
+        debug_print(f"[Shortcut] vk=0x{vk:02X} ctrl={ctrl} shift={shift} alt={alt} -> {command}")
+        handlers[command]()
+        return True
+
+    def _apply_hotkey_bindings(self):
+        """按当前配置更新轮询兜底的键位、Shell 键盘过滤器和界面上的按键提示。"""
+        table = _hotkey_table(self.config)
+        poll_vks = {vk for _ctrl, _shift, _alt, vk in table}
+        if self.config.get("hotkeys", {}).get("switch_tab_number", True):
+            poll_vks.update(range(0x31, 0x3A))
+        self._shortcut_poll_vks = tuple(sorted(poll_vks))
+        _ieb_keyboard_filter.set_tabex_hotkeys(_hotkey_reserved_combos(self.config))
+        for name in _TOOLBAR_HOTKEY_TOOLTIPS:
+            button = getattr(self, name, None)
+            if button is not None:
+                text = _toolbar_hotkey_tooltip(self, name)
+                button.setToolTip(text)
+                button.setAccessibleName(text)
+        for _tabs, stack in self._all_groups():
+            for index in range(stack.count()):
+                button = getattr(stack.widget(index), 'cancel_file_op_btn', None)
+                if button is not None:
+                    button.setToolTip(_hotkey_hint(self.config, tr("取消当前后台复制/删除"), 'cancel_file_op'))
+
     def preview_batch_rename(self):
         tab = self.get_active_pane()
         if tab is None:
@@ -17392,6 +17753,7 @@ class MainWindow(QMainWindow):
         danger.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxWarning))
         menu.addSection(tr('诊断'))
         self.export_diagnostics_action = menu.addAction(tr('导出崩溃诊断包...'), self.export_diagnostics)
+        menu.addAction(tr('检查更新...'), lambda: self.check_for_updates(manual=True))
 
     def _update_task_indicator(self):
         from PyQt5.QtWidgets import QStyle
@@ -17555,6 +17917,7 @@ class MainWindow(QMainWindow):
             self.settings_dialog = None
             self.config["hotkeys"]["reopen_tab"] = dlg.hotkey_reopen_tab.isChecked()
             self.config["hotkeys"]["switch_tab"] = dlg.hotkey_switch_tab.isChecked()
+            self.config["hotkeys"]["switch_tab_number"] = dlg.hotkey_switch_tab_number.isChecked()
             self.config["hotkeys"]["search"] = dlg.hotkey_search.isChecked()
             self.config["hotkeys"]["navigate"] = dlg.hotkey_navigate.isChecked()
             self.config["hotkeys"]["go_up"] = dlg.hotkey_go_up.isChecked()
@@ -17569,6 +17932,7 @@ class MainWindow(QMainWindow):
             self.config["hotkeys"]["quick_find_current_dir"] = dlg.hotkey_quick_find_current_dir.isChecked()
             self.config["hotkeys"]["split_view"] = dlg.hotkey_split_view.isChecked()
             self.config["hotkeys"]["insert_group_bookmark"] = dlg.hotkey_insert_group_bookmark.isChecked()
+            self._apply_hotkey_bindings()
             
             self.save_config()
 
@@ -17598,14 +17962,54 @@ class MainWindow(QMainWindow):
         dlg = BookmarkDialog(self.bookmark_manager, self)
         dlg.exec_()
     
-    def check_for_updates(self):
-        """打开 GitHub Releases 页面检查更新"""
-        import webbrowser
+    def check_for_updates(self, manual=True):
+        """后台查询 GitHub 最新发布；只提示，不下载。"""
+        if getattr(self, '_update_worker', None) is not None:
+            return
+        worker = UpdateCheckWorker(manual)
+        worker.completed.connect(self._on_update_check_finished)
+        self._update_worker = worker
+        worker.start()
+        _retain_thread_until_finished(worker)
+        if manual:
+            show_toast(self, tr("检查更新"), tr("正在查询 GitHub 最新版本…"), level="info", duration=2500)
+
+    def _maybe_auto_check_updates(self):
+        if not self.config.get("auto_check_updates", True):
+            return
         try:
-            webbrowser.open("https://github.com/caojinyuan/TabEx/releases")
-            show_toast(self, tr("检查更新"), tr("已在浏览器中打开更新页面"), level="info")
-        except Exception as e:
-            show_toast(self, tr("错误"), tr("无法打开浏览器: {}").format(e), level="error")
+            last_check = float(self.config.get("last_update_check", 0) or 0)
+        except (TypeError, ValueError):
+            last_check = 0.0
+        if time.time() - last_check >= UPDATE_CHECK_INTERVAL_S:
+            self.check_for_updates(manual=False)
+
+    def _on_update_check_finished(self, result):
+        self._update_worker = None
+        manual = bool(result.get('manual'))
+        if result.get('error'):
+            debug_print(f"[Update] check failed: {result['error']}")
+            if manual:
+                show_toast(self, tr("检查更新失败"), result['error'], level="warning",
+                           action_text=tr("打开发布页"), action=lambda: _open_release_page(UPDATE_RELEASES_PAGE))
+            return
+        self.config["last_update_check"] = int(time.time())
+        version = result.get('version', '')
+        url = result.get('url', UPDATE_RELEASES_PAGE)
+        remote, local = _version_tuple(version), _version_tuple(APP_VERSION)
+        if remote and local and remote > local:
+            # 自动检查对同一版本只提醒一次
+            if manual or self.config.get("update_notified_version") != version:
+                self.config["update_notified_version"] = version
+                show_toast(self, tr("发现新版本"), tr("TabEx v{} 已发布，当前为 v{}").format(version, APP_VERSION),
+                           level="info", duration=15000, action_text=tr("查看更新"),
+                           action=lambda: _open_release_page(url))
+        elif manual and remote:
+            show_toast(self, tr("检查更新"), tr("当前已是最新版本 v{}").format(APP_VERSION), level="success")
+        elif manual:
+            show_toast(self, tr("检查更新"), tr("最新发布为 {}，无法读取其版本号").format(result.get('tag', '')),
+                       level="info", action_text=tr("查看更新"), action=lambda: _open_release_page(url))
+        self.save_config()
     
     def show_search_dialog(self):
         """显示搜索对话框（非模态）"""
@@ -17970,11 +18374,13 @@ class MainWindow(QMainWindow):
         from PyQt5.QtCore import QTimer
         QApplication.instance().installEventFilter(self)
         
-        # 启动快捷键轮询定时器（用于检测被QAxWidget拦截的快捷键）
+        # 快捷键：优先键盘钩子（事件驱动）；安装失败时退回定时轮询
         self._last_keys_state = {}
+        self._shortcut_key_hook = None
         self._shortcut_timer = QTimer(self)
         self._shortcut_timer.timeout.connect(self._check_shortcuts)
-        self._shortcut_timer.start(SHORTCUT_POLL_ACTIVE_MS)
+        self._apply_hotkey_bindings()
+        self._start_shortcut_listener()
 
         # 运行期间持续保存标签会话，异常退出后仍可恢复最近窗口列表。
         self._session_snapshot_debounce_timer = QTimer(self)
@@ -17987,6 +18393,13 @@ class MainWindow(QMainWindow):
         self._housekeeping_timer = QTimer(self)
         self._housekeeping_timer.timeout.connect(self._run_housekeeping)
         self._housekeeping_timer.start(self._get_housekeeping_interval_ms())
+        self._tab_hibernate_timer = QTimer(self)
+        self._tab_hibernate_timer.timeout.connect(self._hibernate_idle_tabs)
+        self._tab_hibernate_timer.start(60 * 1000)
+        self._update_check_timer = QTimer(self)
+        self._update_check_timer.timeout.connect(self._maybe_auto_check_updates)
+        self._update_check_timer.start(60 * 60 * 1000)
+        QTimer.singleShot(UPDATE_CHECK_DELAY_MS, self._maybe_auto_check_updates)
 
         # 状态栏右侧 CPU/内存占用显示（默认关闭，可在设置中开启）
         self._resource_usage_timer = QTimer(self)
@@ -18039,12 +18452,18 @@ class MainWindow(QMainWindow):
             "title_shortcuts": [],  # 标题栏快捷方式（.lnk/.exe/.bat/.cmd/.ps1 路径）
             "enable_mouse_gestures": True,  # 默认启用鼠标手势（右键画线导航）
             "show_tab_group_markers": True,  # 默认显示标签分组颜色
+            "tab_hibernate_minutes": 30,  # 后台标签闲置多久后释放 Shell 视图：0=关闭
+            "hotkey_bindings": {},  # 自定义按键 {命令: "Ctrl+T"}；未列出的命令使用默认按键
+            "auto_check_updates": True,  # 每天最多查询一次 GitHub 最新发布，只提示不下载
+            "last_update_check": 0,
+            "update_notified_version": "",
             # 快捷键配置
             "hotkeys": {
                 "new_tab": True,           # Ctrl+T
                 "close_tab": True,         # Ctrl+W
                 "reopen_tab": True,        # Ctrl+Shift+T
                 "switch_tab": True,        # Ctrl+Tab / Ctrl+Shift+Tab
+                "switch_tab_number": True, # Ctrl+1..9
                 "search": True,            # Ctrl+F
                 "quick_find_current_dir": True,  # Ctrl+G
                 "navigate": True,          # Alt+Left/Right
@@ -18147,18 +18566,21 @@ class MainWindow(QMainWindow):
         tmp_path = config_path + ".tmp"
         try:
             new_content = json.dumps(self.config, ensure_ascii=False, indent=2)
-            # 若文件已存在且内容相同，则跳过写盘
-            if os.path.isfile(config_path):
+            last_written = getattr(self, '_last_config_written', None)
+            if last_written is None and os.path.isfile(config_path):
+                # 仅首次落盘读取磁盘内容做比较，之后与内存中的上次写入内容比较
                 try:
                     with open(config_path, "r", encoding="utf-8") as f:
-                        existing_content = f.read()
-                    if existing_content == new_content:
-                        return
+                        last_written = f.read()
                 except Exception:
-                    pass
+                    last_written = None
+            if last_written == new_content:
+                self._last_config_written = new_content
+                return
             with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(new_content)
             os.replace(tmp_path, config_path)
+            self._last_config_written = new_content
         except Exception as e:
             print(f"Failed to save config: {e}")
             try:
@@ -19275,8 +19697,9 @@ class MainWindow(QMainWindow):
         debug_print("[Explorer Monitor] Stopped")
     
     def _explorer_monitor_loop(self):
-        """Explorer窗口监听循环（优化版 - 降低CPU占用）"""
+        """Explorer窗口监听循环：优先响应窗口显示事件，钩子不可用时按间隔轮询。"""
         pythoncom_initialized = False
+        show_hook = None
         try:
             try:
                 import pythoncom
@@ -19300,18 +19723,28 @@ class MainWindow(QMainWindow):
             
             win32gui.EnumWindows(enum_windows_callback, None)
             debug_print(f"[Explorer Monitor] Found {len(self.known_explorer_windows)} existing Explorer windows")
-            debug_print(f"[Explorer Monitor] Monitor interval: {self.monitor_interval}s (optimized for low CPU usage)")
+            show_hook = self._create_explorer_show_hook()
+            # 事件驱动时仍保留低频全量扫描兜底
+            fallback_interval = max(10.0, float(self.monitor_interval)) if show_hook else self.monitor_interval
+            debug_print(f"[Explorer Monitor] Mode: {'event-driven' if show_hook else 'polling'}, "
+                        f"scan interval: {fallback_interval}s")
             
-            # 定期检查新的Explorer窗口（优化：使用更长的间隔）
             while self.explorer_monitoring:
-                time.sleep(self.monitor_interval)  # 默认2秒检查一次（降低CPU占用）
+                if show_hook:
+                    triggered = self._wait_explorer_show_event(show_hook, fallback_interval)
+                    if not self.explorer_monitoring:
+                        break
+                    if triggered:
+                        # 给新窗口一点时间设置标题和位置
+                        time.sleep(0.1)
+                        show_hook['pending'].clear()
+                else:
+                    time.sleep(self.monitor_interval)
+                    # 防抖：如果距离上次检查太近，跳过
+                    if time.time() - self.last_check_time < self.monitor_interval * 0.8:
+                        continue
                 
-                current_time = time.time()
-                # 防抖：如果距离上次检查太近，跳过
-                if current_time - self.last_check_time < self.monitor_interval * 0.8:
-                    continue
-                
-                self.last_check_time = current_time
+                self.last_check_time = time.time()
                 current_explorer_windows = set()
                 
                 def check_windows_callback(hwnd, _):
@@ -19370,31 +19803,34 @@ class MainWindow(QMainWindow):
                             pass
                         
                         debug_print(f"[Explorer Monitor] New Explorer window detected: {hwnd} - {title}")
-                        
-                        # 尝试获取Explorer窗口的当前路径
-                        path = self._get_explorer_path(hwnd)
-                        
-                        if path:
-                            debug_print(f"[Explorer Monitor] ✓ Path: {path}")
-                            
-                            # 控制面板及其子目录直接在原窗口打开，不拦截
-                            if self._is_control_panel_path_for_monitor(path):
-                                debug_print(f"[Explorer Monitor] Control Panel detected, keeping original window")
-                                # 不关闭原窗口，让控制面板在原生Explorer中打开
-                                continue
-                            
-                            # 非控制面板路径，发送信号并关闭原窗口
-                            self.open_path_signal.emit(path)
-                            # 优化：减少等待时间（从500ms到200ms）
-                            time.sleep(0.2)
-                            # 关闭原Explorer窗口
-                            try:
-                                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-                                debug_print(f"[Explorer Monitor] ✓ Closed original Explorer (hwnd={hwnd})")
-                            except Exception as e:
-                                debug_print(f"[Explorer Monitor] ✗ Failed to close: {e}")
-                        else:
-                            debug_print(f"[Explorer Monitor] ✗ Could not get path from {hwnd}")
+                        # 先隐藏外部窗口，避免在读取路径和嵌入期间闪现；不接管时恢复显示
+                        hidden = self._set_external_explorer_visible(hwnd, False)
+                        handed_off = False
+                        try:
+                            path = self._get_explorer_path(hwnd)
+
+                            if path:
+                                debug_print(f"[Explorer Monitor] ✓ Path: {path}")
+
+                                # 控制面板及其子目录直接在原窗口打开，不拦截
+                                if self._is_control_panel_path_for_monitor(path):
+                                    debug_print(f"[Explorer Monitor] Control Panel detected, keeping original window")
+                                    continue
+
+                                # 非控制面板路径，发送信号并关闭原窗口
+                                self.open_path_signal.emit(path)
+                                handed_off = True
+                                time.sleep(0.2)
+                                try:
+                                    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                                    debug_print(f"[Explorer Monitor] ✓ Closed original Explorer (hwnd={hwnd})")
+                                except Exception as e:
+                                    debug_print(f"[Explorer Monitor] ✗ Failed to close: {e}")
+                            else:
+                                debug_print(f"[Explorer Monitor] ✗ Could not get path from {hwnd}")
+                        finally:
+                            if hidden and not handed_off:
+                                self._set_external_explorer_visible(hwnd, True)
                     
                     except Exception as e:
                         debug_print(f"[Explorer Monitor] Error processing window {hwnd}: {e}")
@@ -19407,6 +19843,8 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
         finally:
+            if show_hook:
+                show_hook['user32'].UnhookWinEvent(show_hook['handle'])
             self.explorer_monitoring = False
             self.known_explorer_windows.clear()
             self.monitor_thread = None
@@ -19416,6 +19854,63 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
     
+    def _create_explorer_show_hook(self):
+        """在监听线程上订阅 EVENT_OBJECT_SHOW，开启 Explorer 顶层窗口时置位 pending。"""
+        try:
+            wt = ctypes.wintypes
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            proc_type = ctypes.WINFUNCTYPE(None, wt.HANDLE, wt.DWORD, wt.HWND, wt.LONG, wt.LONG, wt.DWORD, wt.DWORD)
+            user32.SetWinEventHook.argtypes = (wt.DWORD, wt.DWORD, wt.HMODULE, proc_type, wt.DWORD, wt.DWORD, wt.DWORD)
+            user32.SetWinEventHook.restype = wt.HANDLE
+            user32.UnhookWinEvent.argtypes = (wt.HANDLE,)
+            user32.GetClassNameW.argtypes = (wt.HWND, wt.LPWSTR, ctypes.c_int)
+            user32.MsgWaitForMultipleObjects.argtypes = (wt.DWORD, ctypes.c_void_p, wt.BOOL, wt.DWORD, wt.DWORD)
+            user32.PeekMessageW.argtypes = (ctypes.POINTER(wt.MSG), wt.HWND, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
+            pending = threading.Event()
+            class_buffer = ctypes.create_unicode_buffer(32)
+
+            def on_show(_hook, _event, hwnd, id_object, id_child, _thread, _time):
+                if id_object == 0 and id_child == 0 and hwnd:
+                    if user32.GetClassNameW(hwnd, class_buffer, 32) and class_buffer.value in ("CabinetWClass", "ExploreWClass"):
+                        pending.set()
+
+            callback = proc_type(on_show)
+            # EVENT_OBJECT_SHOW；WINEVENT_OUTOFCONTEXT(0) | WINEVENT_SKIPOWNPROCESS(2)
+            handle = user32.SetWinEventHook(0x8002, 0x8002, None, callback, 0, 0, 0x0002)
+            if not handle:
+                debug_print(f"[Explorer Monitor] SetWinEventHook failed err={ctypes.get_last_error()}")
+                return None
+            return {'user32': user32, 'handle': handle, 'callback': callback, 'pending': pending}
+        except Exception as e:
+            debug_print(f"[Explorer Monitor] Show hook unavailable: {e}")
+            return None
+
+    def _wait_explorer_show_event(self, show_hook, timeout_s):
+        """泵消息等待窗口显示事件；返回 True 表示有新 Explorer 窗口。"""
+        user32 = show_hook['user32']
+        pending = show_hook['pending']
+        msg = ctypes.wintypes.MSG()
+        deadline = time.monotonic() + timeout_s
+        while self.explorer_monitoring and not pending.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            # QS_ALLINPUT；分片等待以便及时响应停止请求
+            user32.MsgWaitForMultipleObjects(0, None, False, int(min(remaining, 0.25) * 1000), 0x04FF)
+            while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        return pending.is_set()
+
+    @staticmethod
+    def _set_external_explorer_visible(hwnd, visible):
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW if visible else win32con.SW_HIDE)
+            return True
+        except Exception as e:
+            debug_print(f"[Explorer Monitor] ShowWindow({visible}) failed for {hwnd}: {e}")
+            return False
+
     def _get_explorer_path(self, hwnd):
         """通过COM接口获取Explorer窗口的当前路径"""
         try:
@@ -19621,11 +20116,18 @@ class MainWindow(QMainWindow):
                 print(f"Error waiting for monitor thread: {e}")
         self.monitor_thread = None
 
+        try:
+            self._stop_shortcut_listener()
+        except Exception as e:
+            print(f"Error stopping shortcut hook: {e}")
+
         for timer_name in (
             '_shortcut_timer',
             '_session_snapshot_debounce_timer',
             '_session_snapshot_timer',
             '_housekeeping_timer',
+            '_tab_hibernate_timer',
+            '_update_check_timer',
             '_resource_usage_timer',
             '_config_save_timer',
         ):
@@ -20114,11 +20616,21 @@ class SettingsDialog(QDialog):
         self.interval_spinbox.setRange(0.5, 10.0)
         self.interval_spinbox.setSingleStep(0.5)
         self.interval_spinbox.setValue(config.get("explorer_monitor_interval", 2.0))
-        self.interval_spinbox.setToolTip(tr("检查新Explorer窗口的时间间隔，更长的间隔降低CPU占用"))
+        self.interval_spinbox.setToolTip(tr("系统窗口事件不可用时的轮询间隔；事件可用时新窗口即时嵌入，并至少每 10 秒兜底扫描一次"))
         interval_layout.addWidget(self.interval_spinbox)
         interval_layout.addWidget(QLabel(tr("（推荐: 2.0秒）")))
         interval_layout.addStretch(1)
         monitor_layout.addLayout(interval_layout)
+        hibernate_layout = QHBoxLayout()
+        hibernate_layout.addWidget(QLabel(tr("后台标签休眠（分钟，0=关闭）:")))
+        from PyQt5.QtWidgets import QSpinBox
+        self.tab_hibernate_spin = QSpinBox()
+        self.tab_hibernate_spin.setRange(0, 1440)
+        self.tab_hibernate_spin.setValue(int(config.get("tab_hibernate_minutes", 30) or 0))
+        self.tab_hibernate_spin.setToolTip(tr("后台标签超过该时间未访问时释放文件视图，切回时重新加载（滚动位置和选中项不保留）"))
+        hibernate_layout.addWidget(self.tab_hibernate_spin)
+        hibernate_layout.addStretch(1)
+        monitor_layout.addLayout(hibernate_layout)
         monitor_group.setLayout(monitor_layout)
         compact_groupbox(monitor_group)
         for i in range(monitor_layout.count()):
@@ -20305,72 +20817,8 @@ class SettingsDialog(QDialog):
         tools_page_layout.addWidget(shortcuts_group)
 
         # 快捷键设置组
-        hotkey_group = QGroupBox(tr("快捷键设置"))
-        hotkey_layout = QVBoxLayout()
-        hotkeys = config.get("hotkeys", {})
-        self.hotkey_new_tab = QCheckBox(tr("Ctrl+T - 新建标签页"))
-        self.hotkey_new_tab.setChecked(hotkeys.get("new_tab", True))
-        hotkey_layout.addWidget(self.hotkey_new_tab)
-        self.hotkey_close_tab = QCheckBox(tr("Ctrl+W - 关闭当前标签页"))
-        self.hotkey_close_tab.setChecked(hotkeys.get("close_tab", True))
-        hotkey_layout.addWidget(self.hotkey_close_tab)
-        self.hotkey_reopen_tab = QCheckBox(tr("Ctrl+Shift+T - 恢复关闭的标签页"))
-        self.hotkey_reopen_tab.setChecked(hotkeys.get("reopen_tab", True))
-        hotkey_layout.addWidget(self.hotkey_reopen_tab)
-        self.hotkey_switch_tab = QCheckBox(tr("Ctrl+Tab / Ctrl+Shift+Tab - 切换标签页"))
-        self.hotkey_switch_tab.setChecked(hotkeys.get("switch_tab", True))
-        hotkey_layout.addWidget(self.hotkey_switch_tab)
-        self.hotkey_search = QCheckBox(tr("Ctrl+F - 打开搜索对话框"))
-        self.hotkey_search.setChecked(hotkeys.get("search", True))
-        hotkey_layout.addWidget(self.hotkey_search)
-        self.hotkey_quick_find_current_dir = QCheckBox(tr("Ctrl+G - 检索当前目录文件夹/文件名"))
-        self.hotkey_quick_find_current_dir.setChecked(hotkeys.get("quick_find_current_dir", True))
-        hotkey_layout.addWidget(self.hotkey_quick_find_current_dir)
-        self.hotkey_navigate = QCheckBox(tr("Alt+Left/Right - 前进/后退"))
-        self.hotkey_navigate.setChecked(hotkeys.get("navigate", True))
-        hotkey_layout.addWidget(self.hotkey_navigate)
-        self.hotkey_go_up = QCheckBox(tr("Alt+Up - 返回上级目录"))
-        self.hotkey_go_up.setChecked(hotkeys.get("go_up", True))
-        hotkey_layout.addWidget(self.hotkey_go_up)
-        self.hotkey_refresh = QCheckBox(tr("F5 - 刷新当前路径"))
-        self.hotkey_refresh.setChecked(hotkeys.get("refresh", True))
-        hotkey_layout.addWidget(self.hotkey_refresh)
-        self.hotkey_add_bookmark = QCheckBox(tr("Ctrl+D - 添加当前路径到书签"))
-        self.hotkey_add_bookmark.setChecked(hotkeys.get("add_bookmark", True))
-        hotkey_layout.addWidget(self.hotkey_add_bookmark)
-        self.hotkey_quick_copy = QCheckBox(tr("Alt+C - 快速复制选中项（后台）"))
-        self.hotkey_quick_copy.setChecked(hotkeys.get("quick_copy", True))
-        hotkey_layout.addWidget(self.hotkey_quick_copy)
-        self.hotkey_quick_paste = QCheckBox(tr("Alt+V - 快速粘贴到当前目录（后台）"))
-        self.hotkey_quick_paste.setChecked(hotkeys.get("quick_paste", True))
-        hotkey_layout.addWidget(self.hotkey_quick_paste)
-        self.hotkey_quick_delete = QCheckBox(tr("Alt+Delete - 快速删除选中项"))
-        self.hotkey_quick_delete.setChecked(hotkeys.get("quick_delete", True))
-        hotkey_layout.addWidget(self.hotkey_quick_delete)
-        self.hotkey_cancel_file_op = QCheckBox(tr("Alt+Q - 取消后台复制/删除"))
-        self.hotkey_cancel_file_op.setChecked(hotkeys.get("cancel_file_op", True))
-        hotkey_layout.addWidget(self.hotkey_cancel_file_op)
-        self.hotkey_copy_filename = QCheckBox(tr("Alt+Z - 复制选中文件名（含后缀）"))
-        self.hotkey_copy_filename.setChecked(hotkeys.get("copy_filename", True))
-        hotkey_layout.addWidget(self.hotkey_copy_filename)
-        self.hotkey_copy_filepath = QCheckBox(tr("Alt+X - 复制文件路径\\文件名"))
-        self.hotkey_copy_filepath.setChecked(hotkeys.get("copy_filepath", True))
-        hotkey_layout.addWidget(self.hotkey_copy_filepath)
-        self.hotkey_split_view = QCheckBox(tr("F3 - 左右分屏对比"))
-        self.hotkey_split_view.setChecked(hotkeys.get("split_view", True))
-        hotkey_layout.addWidget(self.hotkey_split_view)
-        self.hotkey_insert_group_bookmark = QCheckBox(tr("F4 - 插入标签分组"))
-        self.hotkey_insert_group_bookmark.setChecked(hotkeys.get("insert_group_bookmark", True))
-        hotkey_layout.addWidget(self.hotkey_insert_group_bookmark)
-        # 提示信息（放在快捷键设置框内）
-        tip_label = QLabel(tr("💡 提示：取消勾选可禁用对应的快捷键"))
-        tip_label.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
-        hotkey_layout.addWidget(tip_label)
-        hotkey_group.setLayout(hotkey_layout)
+        hotkey_group = self._create_hotkey_group(config, compact_widget)
         compact_groupbox(hotkey_group)
-        for i in range(hotkey_layout.count()):
-            w = hotkey_layout.itemAt(i).widget()
-            if w: compact_widget(w)
         # 手势与快捷键页放快捷键设置组
         input_layout.addWidget(hotkey_group)
 
@@ -20556,7 +21004,16 @@ class SettingsDialog(QDialog):
         update_link.setTextFormat(Qt.RichText)
         update_link.setToolTip(tr("点击链接在浏览器中打开 GitHub Releases 页面"))
         update_link.setWordWrap(True)
-        bottom_layout.addWidget(update_link)
+        update_row = QHBoxLayout()
+        update_row.addWidget(update_link, 1)
+        self.check_update_button = QPushButton(tr("立即检查"), self)
+        self.check_update_button.setToolTip(tr("查询 GitHub 上的最新发布版本，只提示不下载"))
+        self.check_update_button.clicked.connect(self._check_updates_now)
+        update_row.addWidget(self.check_update_button)
+        bottom_layout.addLayout(update_row)
+        self.auto_update_cb = QCheckBox(tr("自动检查新版本（每天最多一次，只提示不下载）"), self)
+        self.auto_update_cb.setChecked(bool(config.get("auto_check_updates", True)))
+        bottom_layout.addWidget(self.auto_update_cb)
         
         # 按钮区域
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
@@ -20676,8 +21133,109 @@ class SettingsDialog(QDialog):
             if self.parent():
                 show_toast(self.parent(), tr("资源日志"), tr("无法打开资源日志: {}").format(e), level="error")
     
+    def _create_hotkey_group(self, config, compact_widget):
+        """每个命令一行：启用开关 + 按键录制框 + 清空按钮；共用开关的命令联动勾选。"""
+        from PyQt5.QtWidgets import QGroupBox, QGridLayout, QKeySequenceEdit, QToolButton, QScrollArea, QWidget
+        from PyQt5.QtGui import QKeySequence
+        group = QGroupBox(tr("快捷键设置"))
+        group_layout = QVBoxLayout(group)
+        rows_widget = QWidget()
+        grid = QGridLayout(rows_widget)
+        grid.setContentsMargins(0, 0, 4, 0)
+        grid.setColumnStretch(1, 1)
+        hotkeys = config.get("hotkeys", {})
+        bindings = _hotkey_bindings(config)
+        self.hotkey_edits = {}
+        switches = {}
+
+        def keep_first_chord(edit, sequence):
+            if sequence.count() > 1:
+                edit.setKeySequence(QKeySequence(sequence[0]))
+
+        for row, (command, enable_key, _default, label) in enumerate(HOTKEY_COMMANDS):
+            switch = QCheckBox(tr(label))
+            if enable_key is None:
+                switch.setChecked(True)
+                switch.setEnabled(False)
+                switch.setToolTip(tr("始终启用，清空按键即可停用"))
+            elif enable_key in switches:
+                partner = switches[enable_key]
+                switch.setChecked(partner.isChecked())
+                switch.toggled.connect(partner.setChecked)
+                partner.toggled.connect(switch.setChecked)
+            else:
+                switch.setChecked(hotkeys.get(enable_key, True))
+                switches[enable_key] = switch
+                setattr(self, 'hotkey_' + enable_key, switch)
+            edit = QKeySequenceEdit(QKeySequence(bindings[command], QKeySequence.PortableText), rows_widget)
+            edit.setAccessibleName(tr(label))
+            edit.keySequenceChanged.connect(lambda sequence, target=edit: keep_first_chord(target, sequence))
+            clear = QToolButton(rows_widget)
+            clear.setText('×')
+            clear.setToolTip(tr("清空按键"))
+            clear.setAccessibleName(tr("清空按键"))
+            clear.clicked.connect(edit.clear)
+            for widget in (switch, edit):
+                compact_widget(widget)
+            grid.addWidget(switch, row, 0)
+            grid.addWidget(edit, row, 1)
+            grid.addWidget(clear, row, 2)
+            self.hotkey_edits[command] = edit
+        row = len(HOTKEY_COMMANDS)
+        self.hotkey_switch_tab_number = QCheckBox(tr("切换到第 N 个标签（Ctrl+9 为最后一个）"))
+        self.hotkey_switch_tab_number.setChecked(hotkeys.get("switch_tab_number", True))
+        number_keys = QLabel("Ctrl+1…9")
+        for widget in (self.hotkey_switch_tab_number, number_keys):
+            compact_widget(widget)
+        grid.addWidget(self.hotkey_switch_tab_number, row, 0)
+        grid.addWidget(number_keys, row, 1)
+        # 行数较多，放进滚动区，避免设置窗口在 1080p 屏幕上超高
+        scroll = QScrollArea(group)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(rows_widget)
+        row_height = max(edit.sizeHint().height(), switch.sizeHint().height()) + max(grid.verticalSpacing(), 0)
+        scroll.setFixedHeight(row_height * 9)
+        group_layout.addWidget(scroll)
+        tip_label = QLabel(tr("💡 点击按键框后直接按下新组合；需包含 Ctrl 或 Alt（F1–F24 可单独使用）。取消勾选或清空按键可停用。"))
+        tip_label.setWordWrap(True)
+        tip_label.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
+        group_layout.addWidget(tip_label)
+        reset_button = QPushButton(tr("恢复默认按键"), group)
+        reset_button.clicked.connect(self._reset_hotkey_bindings)
+        group_layout.addWidget(reset_button, 0, Qt.AlignRight)
+        self._hotkey_group = group
+        return group
+
+    def _reset_hotkey_bindings(self):
+        from PyQt5.QtGui import QKeySequence
+        for command, _enable_key, default, _label in HOTKEY_COMMANDS:
+            self.hotkey_edits[command].setKeySequence(QKeySequence(default, QKeySequence.PortableText))
+
+    def _collect_hotkey_bindings(self):
+        """读取按键框，返回 (规范化后的绑定, 错误说明列表)。"""
+        from PyQt5.QtGui import QKeySequence
+        bindings = {}
+        for command, edit in self.hotkey_edits.items():
+            text = edit.keySequence().toString(QKeySequence.PortableText).split(', ')[0]
+            parsed = _parse_hotkey(text)
+            bindings[command] = _format_hotkey(*parsed) if parsed else text
+        return bindings, _validate_hotkey_bindings(bindings, self.hotkey_switch_tab_number.isChecked())
+
+    def _check_updates_now(self):
+        owner = self.parent()
+        if owner is not None and hasattr(owner, 'check_for_updates'):
+            owner.check_for_updates(manual=True)
+
     def accept(self):
         """保存设置"""
+        hotkey_bindings, hotkey_errors = self._collect_hotkey_bindings()
+        if hotkey_errors:
+            from PyQt5.QtWidgets import QMessageBox
+            self.settings_tabs.setCurrentWidget(self._hotkey_group.parentWidget())
+            QMessageBox.warning(self, tr("快捷键冲突"), '\n'.join(hotkey_errors))
+            return
         # 保存所有设置到 parent (MainWindow)
         if self.parent():
             # 处理开机启动设置
@@ -20688,6 +21246,7 @@ class SettingsDialog(QDialog):
             
             self.parent().config["enable_explorer_monitor"] = self.monitor_cb.isChecked()
             self.parent().config["explorer_monitor_interval"] = self.interval_spinbox.value()
+            self.parent().config["tab_hibernate_minutes"] = self.tab_hibernate_spin.value()
             self.parent().config["debug_mode"] = self.debug_mode_cb.isChecked()
             self.parent().config["explorer_monitor_debug"] = self.explorer_monitor_debug_cb.isChecked()
             self.parent().config["resource_snapshot_logging"] = self.resource_snapshot_logging_cb.isChecked()
@@ -20708,6 +21267,7 @@ class SettingsDialog(QDialog):
                 "close_tab": self.hotkey_close_tab.isChecked(),
                 "reopen_tab": self.hotkey_reopen_tab.isChecked(),
                 "switch_tab": self.hotkey_switch_tab.isChecked(),
+                "switch_tab_number": self.hotkey_switch_tab_number.isChecked(),
                 "search": self.hotkey_search.isChecked(),
                 "quick_find_current_dir": self.hotkey_quick_find_current_dir.isChecked(),
                 "navigate": self.hotkey_navigate.isChecked(),
@@ -20721,6 +21281,8 @@ class SettingsDialog(QDialog):
                 "copy_filename": self.hotkey_copy_filename.isChecked(),
                 "copy_filepath": self.hotkey_copy_filepath.isChecked()
             }
+            self.parent().config["hotkey_bindings"] = hotkey_bindings
+            self.parent().config["auto_check_updates"] = self.auto_update_cb.isChecked()
             
             # 保存到文件
             self.parent().save_config()

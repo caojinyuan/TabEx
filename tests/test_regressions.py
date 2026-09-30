@@ -1437,6 +1437,7 @@ class InterfaceTests(unittest.TestCase):
                                   'title_shortcuts': [], 'ai_chat': {'enabled': False, 'panel_visible': False}}
                         patches.enter_context(patch.object(self.module.MainWindow, 'load_config', return_value=config))
                         for method in ('ensure_default_bookmarks', '_delayed_initialization', '_check_shortcuts',
+                                       '_start_shortcut_listener', '_maybe_auto_check_updates',
                                        'save_config', 'save_session_snapshot', 'save_pinned_tabs', '_setup_window_icon',
                                        'add_new_tab'):
                             patches.enter_context(patch.object(self.module.MainWindow, method))
@@ -1472,6 +1473,13 @@ class InterfaceTests(unittest.TestCase):
                             for control in (search.search_input, search.search_btn, search.stop_btn, search.path_input,
                                             search.advanced_button, search.ai_summary_btn):
                                 self.assertTrue(search.rect().contains(control.geometry()))
+                            self.assertIn('Ctrl+F', window.search_button.toolTip())
+                            window.config['hotkey_bindings'] = {'search': 'Ctrl+E'}
+                            window._apply_hotkey_bindings()
+                            self.assertIn('Ctrl+E', window.search_button.toolTip())
+                            self.assertIn('Ctrl+E', window.search_button.accessibleName())
+                            window.config['hotkey_bindings'] = {}
+                            window._apply_hotkey_bindings()
                             for name, widget in (('window', window), ('search', search)):
                                 image = widget.grab()
                                 self.assertFalse(image.isNull())
@@ -1623,7 +1631,8 @@ class InterfaceTests(unittest.TestCase):
         from PyQt5.QtWidgets import QMenu, QToolButton
         callbacks = {name: Mock() for name in (
             'show_file_tasks', 'show_directory_compare', 'preview_batch_rename', 'save_named_workspace',
-            'open_named_workspace', 'delete_named_workspace', 'permanently_delete_selected', 'export_diagnostics')}
+            'open_named_workspace', 'delete_named_workspace', 'permanently_delete_selected', 'export_diagnostics',
+            'check_for_updates')}
         owner = types.SimpleNamespace(style=self.app.style, **callbacks)
         menu = QMenu()
         self.addCleanup(menu.deleteLater)
@@ -1636,6 +1645,8 @@ class InterfaceTests(unittest.TestCase):
         callbacks['open_named_workspace'].assert_called_once()
         owner.export_diagnostics_action.trigger()
         callbacks['export_diagnostics'].assert_called_once()
+        next(action for action in menu.actions() if action.text() == '检查更新...').trigger()
+        callbacks['check_for_updates'].assert_called_once_with(manual=True)
         owner.file_tasks_button = QToolButton()
         self.addCleanup(owner.file_tasks_button.deleteLater)
         owner._file_task_panel = types.SimpleNamespace(task_counts=lambda: (2, 1))
@@ -2070,6 +2081,335 @@ class PerformanceContractTests(unittest.TestCase):
         tab._request_refresh.assert_not_called()
         callback(tab, 'new', (3, 4))
         tab._request_refresh.assert_called_once_with(reason='poll')
+
+
+class OptimizationTests(unittest.TestCase):
+    """性能与交互优化：快捷键钩子、标签休眠、配置写盘、Explorer 监听和粘贴冲突，共 12 个用例。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        import TabEx
+        cls.module = TabEx
+
+    def shortcut_host(self, hotkeys=None, count=5):
+        tabs = Mock()
+        tabs.count.return_value = count
+        host = Mock()
+        host.config = {'hotkeys': hotkeys or {}}
+        host.get_active_group_tabwidget.return_value = tabs
+        host._select_tab_by_number = lambda number: self.module.MainWindow._select_tab_by_number(host, number)
+        return host, tabs
+
+    def run_shortcut(self, host, vk, ctrl=False, shift=False, alt=False):
+        return self.module.MainWindow._run_shortcut(host, vk, ctrl, shift, alt)
+
+    def test_ctrl_number_switches_tab_in_active_group(self):
+        """Ctrl+数字切换活动标签组的标签，Ctrl+9 到最后一个。
+
+        场景：活动组有 5 个标签，依次按 Ctrl+3、Ctrl+9、Ctrl+7。
+        预期：切到索引 2 和 4；超出标签数的 Ctrl+7 不切换。
+        """
+        host, tabs = self.shortcut_host()
+        self.assertTrue(self.run_shortcut(host, 0x33, ctrl=True))
+        self.assertTrue(self.run_shortcut(host, 0x39, ctrl=True))
+        self.run_shortcut(host, 0x37, ctrl=True)
+        self.assertEqual([call.args[0] for call in tabs.setCurrentIndex.call_args_list], [2, 4])
+
+    def test_ctrl_number_respects_explorer_view_keys_and_settings(self):
+        """Ctrl+Shift+数字留给 Explorer 视图切换，关闭设置后 Ctrl+数字不生效。"""
+        host, tabs = self.shortcut_host()
+        self.assertFalse(self.run_shortcut(host, 0x33, ctrl=True, shift=True))
+        disabled, disabled_tabs = self.shortcut_host({'switch_tab_number': False})
+        self.assertFalse(self.run_shortcut(disabled, 0x33, ctrl=True))
+        tabs.setCurrentIndex.assert_not_called()
+        disabled_tabs.setCurrentIndex.assert_not_called()
+
+    def test_shortcut_modifiers_must_match(self):
+        """Alt 组合不被 AltGr(Ctrl+Alt) 触发，F5 带 Ctrl 时交给 Explorer。"""
+        host, _tabs = self.shortcut_host()
+        self.assertTrue(self.run_shortcut(host, 0x56, alt=True))
+        host.quick_paste_to_current_directory.assert_called_once_with()
+        self.assertFalse(self.run_shortcut(host, 0x51, ctrl=True, alt=True))
+        host.quick_cancel_background_file_operation.assert_not_called()
+        self.assertTrue(self.run_shortcut(host, 0x74))
+        self.assertFalse(self.run_shortcut(host, 0x74, ctrl=True))
+        host.refresh_current_tab.assert_called_once_with()
+
+    def test_keyboard_hook_thread_installs_and_stops(self):
+        """键盘钩子在独立线程安装，停止后线程退出。不模拟真实按键。"""
+        hook = self.module._ShortcutKeyHook()
+        self.assertTrue(hook.start())
+        thread = hook._thread
+        hook.stop()
+        self.assertFalse(thread.is_alive())
+
+    def test_config_flush_compares_with_last_written_content(self):
+        """配置未变化时不再读盘或写盘，变化后原子写入。
+
+        场景：首次写入后在外部改动文件，再用相同配置写盘，最后修改配置。
+        预期：相同配置不覆盖外部内容；配置变化后文件更新。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            host = types.SimpleNamespace(config={'a': 1})
+            path = Path(directory) / 'config.json'
+            with patch.object(self.module, 'get_app_data_path', side_effect=lambda *parts: os.path.join(directory, *parts)):
+                flush = self.module.MainWindow._flush_config_to_disk
+                flush(host)
+                self.assertIn('"a": 1', path.read_text(encoding='utf-8'))
+                path.write_text('external', encoding='utf-8')
+                flush(host)
+                self.assertEqual(path.read_text(encoding='utf-8'), 'external')
+                host.config['a'] = 2
+                flush(host)
+                self.assertIn('"a": 2', path.read_text(encoding='utf-8'))
+
+    def test_browser_hibernate_keeps_path_for_rebuild(self):
+        """休眠销毁 Shell 视图并记录待导航路径；未初始化的视图不处理。"""
+        browser = types.SimpleNamespace(_init_ok=True, cleanup=Mock(), _pending_path=None)
+        self.assertTrue(self.module.IExplorerBrowserWidget.hibernate(browser, 'C:\\work'))
+        browser.cleanup.assert_called_once_with()
+        self.assertEqual(browser._pending_path, 'C:\\work')
+        idle = types.SimpleNamespace(_init_ok=False, cleanup=Mock())
+        self.assertFalse(self.module.IExplorerBrowserWidget.hibernate(idle, 'C:\\work'))
+        idle.cleanup.assert_not_called()
+
+    def test_tab_hibernate_skips_busy_tabs(self):
+        """有后台文件任务的标签不休眠，空闲后台标签休眠并标记状态。"""
+        explorer = Mock(spec=self.module.IExplorerBrowserWidget)
+        explorer._init_ok = True
+        explorer.hibernate.return_value = True
+        worker = Mock()
+        worker.isRunning.return_value = True
+        tab = types.SimpleNamespace(explorer=explorer, current_path='C:\\work', _refresh_active=False,
+                                    isVisible=lambda: False, _file_op_worker=worker)
+        hibernate = self.module.FileExplorerTab.hibernate_shell_view
+        self.assertFalse(hibernate(tab))
+        worker.isRunning.return_value = False
+        self.assertTrue(hibernate(tab))
+        self.assertTrue(tab._hibernated)
+        explorer.hibernate.assert_called_once_with('C:\\work')
+
+    def test_only_idle_background_tabs_hibernate(self):
+        """只释放超过闲置时间的非当前标签；设置为 0 时关闭。
+
+        场景：模拟时钟 10000 秒，三个标签分别闲置 31 分钟、5 分钟，以及闲置但为当前标签。
+        """
+        def tab(idle_minutes):
+            return types.SimpleNamespace(_last_active_at=10000 - idle_minutes * 60,
+                                         hibernate_shell_view=Mock(return_value=True))
+        idle, recent, current = tab(31), tab(5), tab(60)
+        stack = Mock()
+        stack.currentWidget.return_value = current
+        stack.count.return_value = 3
+        stack.widget.side_effect = [idle, recent, current].__getitem__
+        host = Mock()
+        host.config = {'tab_hibernate_minutes': 30}
+        host._all_groups.return_value = [(None, stack)]
+        with patch.object(self.module.time, 'monotonic', return_value=10000):
+            self.assertEqual(self.module.MainWindow._hibernate_idle_tabs(host), 1)
+            host.config['tab_hibernate_minutes'] = 0
+            self.assertEqual(self.module.MainWindow._hibernate_idle_tabs(host), 0)
+        idle.hibernate_shell_view.assert_called_once_with()
+        recent.hibernate_shell_view.assert_not_called()
+        current.hibernate_shell_view.assert_not_called()
+        host._schedule_tab_labels.assert_called_once_with()
+
+    def test_tab_tooltip_branch_matches_current_path(self):
+        """标签提示只显示当前路径对应的 Git 分支，导航后旧分支不会残留。"""
+        pane = types.SimpleNamespace(current_path='C:\\repo', _git_branch_info=('C:\\repo', 'main'))
+        self.assertEqual(self.module._tab_git_branch(pane), 'main')
+        pane.current_path = 'C:\\other'
+        self.assertEqual(self.module._tab_git_branch(pane), '')
+
+    def test_paste_conflict_skip_and_keep_both(self):
+        """同名冲突可按项跳过或保留两者，跳过不覆盖且计入跳过数。
+
+        场景：目标目录已有 a.txt 和 b.txt，来源 a 选跳过、b 选保留两者；同目录复制不算冲突。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            source_dir, target_dir = Path(directory) / 'src', Path(directory) / 'dst'
+            source_dir.mkdir()
+            target_dir.mkdir()
+            for name in ('a.txt', 'b.txt'):
+                (source_dir / name).write_text('new', encoding='utf-8')
+                (target_dir / name).write_text('old', encoding='utf-8')
+            sources = [str(source_dir / 'a.txt'), str(source_dir / 'b.txt')]
+            self.assertEqual(self.module._find_copy_conflicts(sources, str(target_dir)), sources)
+            self.assertEqual(self.module._find_copy_conflicts(sources, str(source_dir)), [])
+            worker = self.module.FileBatchOpWorker('copy', sources, str(target_dir))
+            worker.conflict_actions = {sources[0]: 'skip', sources[1]: 'rename'}
+            worker.run()
+            self.assertEqual((worker.ok_count, worker.fail_count, worker.skipped_count), (1, 0, 1))
+            self.assertEqual((target_dir / 'a.txt').read_text(encoding='utf-8'), 'old')
+            self.assertEqual((target_dir / 'b.txt').read_text(encoding='utf-8'), 'old')
+            self.assertEqual((target_dir / 'b - copy.txt').read_text(encoding='utf-8'), 'new')
+
+    def test_conflict_dialog_applies_choice_to_all(self):
+        """冲突对话框默认保留两者，“全部跳过”后所有项改为跳过。"""
+        dialog = self.module.CopyConflictDialog(['C:\\a.txt', 'C:\\b.txt'], 'D:\\dst')
+        self.addCleanup(dialog.deleteLater)
+        self.assertEqual(set(dialog.actions().values()), {'rename'})
+        dialog.set_all('skip')
+        self.assertEqual(dialog.actions(), {'C:\\a.txt': 'skip', 'C:\\b.txt': 'skip'})
+
+    def test_explorer_show_event_wait(self):
+        """窗口显示事件到达时立即唤醒扫描，无事件时按超时返回。不打开真实 Explorer。"""
+        host = types.SimpleNamespace(explorer_monitoring=True)
+        window = self.module.MainWindow
+        hook = window._create_explorer_show_hook(host)
+        self.assertIsNotNone(hook)
+        try:
+            self.assertFalse(window._wait_explorer_show_event(host, hook, 0.05))
+            hook['pending'].set()
+            self.assertTrue(window._wait_explorer_show_event(host, hook, 5))
+        finally:
+            hook['user32'].UnhookWinEvent(hook['handle'])
+
+
+class HotkeyAndUpdateTests(unittest.TestCase):
+    """自定义快捷键与检查更新，共 10 个用例。网络请求全部模拟，不访问 GitHub。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        import TabEx
+        cls.module = TabEx
+
+    def test_hotkey_text_parsing_accepts_qt_names(self):
+        """按键文本兼容 Qt 录制结果与手写配置，统一为规范写法；不支持的写法返回 None。"""
+        module = self.module
+        cases = {'Ctrl+Shift+Backtab': 'Ctrl+Shift+Tab', 'alt+delete': 'Alt+Del', 'Ctrl+Return': 'Ctrl+Enter',
+                 'Shift+Ctrl+t': 'Ctrl+Shift+T', 'F12': 'F12', 'Ctrl+Alt+PageDown': 'Ctrl+Alt+PgDown'}
+        for text, expected in cases.items():
+            self.assertEqual(module._format_hotkey(*module._parse_hotkey(text)), expected, text)
+        for text in ('', 'Ctrl++', 'Meta+T', 'Ctrl+Ctrl+T', 'Ctrl+ä', 'Num+5'):
+            self.assertIsNone(module._parse_hotkey(text), text)
+
+    def test_default_bindings_are_valid(self):
+        """默认快捷键全部可解析且互不冲突，与改造前的按键一致。"""
+        bindings = self.module._hotkey_bindings({})
+        self.assertEqual(self.module._validate_hotkey_bindings(bindings), [])
+        self.assertEqual(bindings['reopen_tab'], 'Ctrl+Shift+T')
+        self.assertEqual(bindings['quick_delete'], 'Alt+Del')
+
+    def test_validation_reports_unsafe_and_duplicate_bindings(self):
+        """缺少修饰键、占用 Explorer 文件快捷键、与 Ctrl+数字冲突或重复分配时报错。"""
+        validate = self.module._validate_hotkey_bindings
+        bindings = self.module._hotkey_bindings({})
+        cases = (('search', 'T'), ('search', 'Ctrl+C'), ('search', 'Ctrl+3'), ('search', 'Ctrl+W'), ('search', 'Ctrl+ä'))
+        for command, text in cases:
+            with self.subTest(text=text):
+                self.assertEqual(len(validate(dict(bindings, **{command: text}))), 1)
+        self.assertEqual(validate(dict(bindings, search='Ctrl+3'), number_switch_enabled=False), [])
+        self.assertEqual(validate(dict(bindings, search='', close_tab='')), [])
+
+    def test_remapped_hotkey_dispatches_new_combination_only(self):
+        """改键后新组合触发原命令，旧组合失效；清空按键即停用。"""
+        host = Mock()
+        host.config = {'hotkeys': {}, 'hotkey_bindings': {'search': 'Ctrl+E', 'refresh': ''}}
+        run = self.module.MainWindow._run_shortcut
+        self.assertTrue(run(host, 0x45, True, False, False))
+        self.assertFalse(run(host, 0x46, True, False, False))
+        self.assertFalse(run(host, 0x74, False, False, False))
+        host.show_search_dialog.assert_called_once_with()
+        host.refresh_current_tab.assert_not_called()
+
+    def test_shell_key_filter_follows_bindings(self):
+        """交给 TabEx 的组合随绑定变化；关闭 Ctrl+数字后数字键交还 Explorer。"""
+        combos = self.module._hotkey_reserved_combos(
+            {'hotkey_bindings': {'search': 'Ctrl+E'}, 'hotkeys': {'switch_tab_number': False}})
+        self.assertIn((True, False, 0x45), combos)
+        self.assertNotIn((True, False, 0x46), combos)
+        self.assertNotIn((True, False, 0x31), combos)
+        self.assertIn((False, False, 0x74), combos)
+
+    def test_settings_dialog_blocks_conflicts_and_restores_defaults(self):
+        """设置窗口录入重复按键时拒绝保存，恢复默认后可保存；不写入实际配置。"""
+        from PyQt5.QtGui import QKeySequence
+        from PyQt5.QtWidgets import QCheckBox
+        dialog = self.module.SettingsDialog({'hotkey_bindings': {'go_back': 'Alt+B'}})
+        self.addCleanup(dialog.deleteLater)
+        self.assertEqual(dialog.hotkey_edits['go_back'].keySequence().toString(QKeySequence.PortableText), 'Alt+B')
+        forward_switch = next(box for box in dialog.findChildren(QCheckBox) if box.text() == self.module.tr('前进'))
+        dialog.hotkey_navigate.setChecked(False)
+        self.assertFalse(forward_switch.isChecked())
+        dialog.hotkey_edits['search'].setKeySequence(QKeySequence('Ctrl+W'))
+        bindings, errors = dialog._collect_hotkey_bindings()
+        self.assertEqual(bindings['search'], 'Ctrl+W')
+        self.assertEqual(len(errors), 1)
+        with patch('PyQt5.QtWidgets.QMessageBox.warning') as warning:
+            dialog.accept()
+        warning.assert_called_once()
+        self.assertNotEqual(dialog.result(), QDialog.Accepted)
+        dialog._reset_hotkey_bindings()
+        bindings, errors = dialog._collect_hotkey_bindings()
+        self.assertEqual(errors, [])
+        self.assertEqual(bindings, self.module._hotkey_bindings({}))
+
+    def fake_urlopen(self, release, head):
+        import io
+        import json
+        def opener(request, timeout=None):
+            url = request.full_url
+            if url == self.module.UPDATE_RELEASE_API:
+                return io.BytesIO(json.dumps(release).encode('utf-8'))
+            self.assertEqual(url, self.module.UPDATE_SOURCE_URL.format(tag=release['tag_name']))
+            return io.BytesIO(head.encode('utf-8'))
+        return opener
+
+    def test_release_version_read_from_tagged_source(self):
+        """发布标签与软件版本号不同，版本号从该标签源码开头读取；仓库外链接被替换。"""
+        release = {'tag_name': 'v1.14.0', 'html_url': 'https://example.com/evil'}
+        head = '# header\nAPP_VERSION = "3.80"\n'
+        with patch('urllib.request.urlopen', side_effect=self.fake_urlopen(release, head)):
+            result = self.module._fetch_latest_release()
+        self.assertEqual(result, {'tag': 'v1.14.0', 'version': '3.80', 'url': self.module.UPDATE_RELEASES_PAGE})
+        with patch('urllib.request.urlopen', side_effect=self.fake_urlopen(dict(release, tag_name='../x'), head)):
+            with self.assertRaises(ValueError):
+                self.module._fetch_latest_release()
+        self.assertGreater(self.module._version_tuple('3.100'), self.module._version_tuple('v3.99'))
+
+    def test_update_errors_are_readable(self):
+        """GitHub 限流和超时转换为可读提示。"""
+        import socket
+        import urllib.error
+        limited = urllib.error.HTTPError(self.module.UPDATE_RELEASE_API, 403, 'rate limited', {}, None)
+        self.assertIn('频繁', self.module._update_error_text(limited))
+        self.assertIn('超时', self.module._update_error_text(socket.timeout()))
+
+    def update_host(self):
+        host = types.SimpleNamespace(config={}, save_config=Mock(), _update_worker=object())
+        return host
+
+    def test_update_notice_once_per_version_for_auto_check(self):
+        """自动检查发现新版本只提醒一次；手动检查总是提示结果。"""
+        finished = self.module.MainWindow._on_update_check_finished
+        host = self.update_host()
+        newer = {'tag': 'v9', 'version': '99.0', 'url': self.module.UPDATE_RELEASES_PAGE}
+        with patch.object(self.module, 'show_toast') as toast:
+            finished(host, dict(newer, manual=False))
+            finished(host, dict(newer, manual=False))
+            self.assertEqual(toast.call_count, 1)
+            self.assertEqual(toast.call_args.kwargs['action_text'], '查看更新')
+            finished(host, dict(newer, manual=True))
+            self.assertEqual(toast.call_count, 2)
+            finished(host, {'tag': 'v1', 'version': '1.0', 'url': '', 'manual': True})
+            self.assertIn('最新版本', toast.call_args.args[2])
+        self.assertIsNone(host._update_worker)
+        self.assertGreater(host.config['last_update_check'], 0)
+        self.assertEqual(host.config['update_notified_version'], '99.0')
+
+    def test_update_errors_silent_for_auto_check(self):
+        """自动检查失败不打扰用户且不记录检查时间；手动检查失败给出警告。"""
+        finished = self.module.MainWindow._on_update_check_finished
+        host = self.update_host()
+        with patch.object(self.module, 'show_toast') as toast:
+            finished(host, {'error': 'offline', 'manual': False})
+            toast.assert_not_called()
+            finished(host, {'error': 'offline', 'manual': True})
+            self.assertEqual(toast.call_args.kwargs['level'], 'warning')
+        self.assertNotIn('last_update_check', host.config)
 
 
 if __name__ == '__main__':
