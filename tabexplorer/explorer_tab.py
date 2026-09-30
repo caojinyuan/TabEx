@@ -3503,11 +3503,16 @@ class FileExplorerTab(QWidget):
         else:
             self._last_watcher_event = {path: current_time}
         # 事件风暴（批量拷贝/解压/删除等）期间：跳过 UI 线程上的同步快照扫描。
-        # 内嵌视图在拷贝过程中会自行刷新，这里仅走延后调度，等待风暴平息后统一补刷。
+        # 内嵌视图在拷贝过程中会自行刷新；兜底轮询会在风暴平息后用快照确认变化。
+        # 不能仅凭目录事件调用 Refresh()：调试日志等内部文件也会产生事件，并形成
+        # “写日志 -> watcher -> Refresh -> 写日志”的循环，周期性清空用户选择。
         if not is_storm and path == self.current_path and getattr(self, '_refresh_active', True):
             self._poll_directory_changes()
             return
         debug_print(f"[FileWatcher] Directory changed: {path} (storm={is_storm})")
+        if is_storm and path == self.current_path and getattr(self, '_refresh_active', True):
+            debug_print("[FileWatcher] Storm refresh deferred to directory snapshot")
+            return
         if getattr(self, '_suppress_auto_refresh', False):
             debug_print(f"[FileWatcher] Auto-refresh suppressed during navigation")
             return

@@ -2216,6 +2216,20 @@ class PerformanceContractTests(unittest.TestCase):
         callback(tab, 'new', (3, 4))
         tab._request_refresh.assert_called_once_with(reason='poll')
 
+    def test_watcher_storm_never_blindly_refreshes_active_view(self):
+        """目录事件风暴不直接刷新活动视图，避免周期性清空多选。"""
+        current_time = time.time() * 1000
+        tab = types.SimpleNamespace(
+            current_path=r'C:\test', _refresh_active=True,
+            _watcher_storm_times=[current_time] * 5,
+            _last_watcher_event={}, _watcher_debounce_ms=3000,
+            refresh_timer=Mock(isActive=Mock(return_value=False)),
+            _is_slow_path=lambda path: False,
+            _poll_directory_changes=Mock(), _request_refresh=Mock())
+        self.module.FileExplorerTab.on_directory_changed(tab, tab.current_path)
+        tab._poll_directory_changes.assert_not_called()
+        tab._request_refresh.assert_not_called()
+
 
 class OptimizationTests(unittest.TestCase):
     """性能与交互优化：快捷键钩子、标签休眠、配置写盘、Explorer 监听和粘贴冲突，共 12 个用例。"""
