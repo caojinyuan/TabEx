@@ -11,6 +11,7 @@ TabExplorer.exe
 
 # Backup files
 *.bak
+*.broken-*
 
 # vscode
 *.code-workspace

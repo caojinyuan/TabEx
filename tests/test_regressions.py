@@ -16,10 +16,12 @@ import ast
 from collections import OrderedDict
 from contextlib import ExitStack
 import hashlib
+import json
 import os
 from pathlib import Path
 import queue
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -2268,7 +2270,7 @@ class OptimizationTests(unittest.TestCase):
 
 
 class HotkeyAndUpdateTests(unittest.TestCase):
-    """自定义快捷键与检查更新，共 10 个用例。网络请求全部模拟，不访问 GitHub。"""
+    """自定义快捷键与检查更新，共 12 个用例。网络请求全部模拟，不访问 GitHub。"""
 
     @classmethod
     def setUpClass(cls):
@@ -2410,6 +2412,710 @@ class HotkeyAndUpdateTests(unittest.TestCase):
             finished(host, {'error': 'offline', 'manual': True})
             self.assertEqual(toast.call_args.kwargs['level'], 'warning')
         self.assertNotIn('last_update_check', host.config)
+
+    def test_auto_update_check_is_opt_in(self):
+        """自动检查默认关闭，v3.76 遗留的旧开关不生效；开启后距上次检查满一天才再次查询。"""
+        check = self.module.MainWindow._maybe_auto_check_updates
+        host = types.SimpleNamespace(config={'auto_check_updates': True}, check_for_updates=Mock())
+        check(host)
+        host.config = {'auto_update_check': True, 'last_update_check': time.time()}
+        check(host)
+        host.check_for_updates.assert_not_called()
+        host.config['last_update_check'] = 0
+        check(host)
+        host.check_for_updates.assert_called_once_with(manual=False)
+
+    def test_config_load_drops_legacy_default_on_key(self):
+        """读取 v3.76 写入的配置时丢弃旧的默认开启值，自动检查保持关闭。只读写临时目录。"""
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, 'config.json').write_text(json.dumps(
+                {'auto_check_updates': True, 'language': self.module._app_language}), encoding='utf-8')
+            with patch.object(self.module, 'get_app_data_path',
+                              side_effect=lambda *parts: os.path.join(directory, *parts)):
+                config = self.module.MainWindow.load_config(types.SimpleNamespace())
+        self.assertNotIn('auto_check_updates', config)
+        self.assertIs(config['auto_update_check'], False)
+
+
+class AiActionSafetyTests(unittest.TestCase):
+    """AI 助手执行动作的目录范围与危险操作确认，共 5 个用例。只在临时目录操作，不运行真实脚本或 Git。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        import TabEx
+        cls.module = TabEx
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.base = self.root / 'work'
+        self.outside = self.root / 'outside'
+        self.base.mkdir()
+        self.outside.mkdir()
+        self.secret = self.outside / 'secret.txt'
+        self.secret.write_text('SECRET', encoding='utf-8')
+        self.scope_error = self.module.tr("超出当前目录范围: {}").format('')
+
+    def host(self, confirm=False):
+        panel = self.module.ChatPanel
+        host = types.SimpleNamespace(main_window=Mock(), _get_action_base_dir=lambda: str(self.base),
+                                     _confirm_danger_action=Mock(return_value=confirm),
+                                     _run_git_command=Mock(return_value=(True, 'ok', '')))
+        for name in ('_resolve_action_path', '_resolve_git_repo_dir', '_apply_actions'):
+            setattr(host, name, types.MethodType(getattr(panel, name), host))
+        return host
+
+    def test_paths_are_limited_to_current_directory(self):
+        """相对路径按当前目录解析；上级目录、目录外绝对路径和同前缀的兄弟目录都被拒绝。"""
+        resolve = self.host()._resolve_action_path
+        self.assertEqual(resolve('sub/a.txt'), (str(self.base / 'sub' / 'a.txt'), None))
+        self.assertEqual(resolve('.'), (str(self.base), None))
+        sibling = self.root / 'work2'
+        sibling.mkdir()
+        for raw in ('..\\outside\\secret.txt', str(self.secret), str(sibling / 'x.txt'), f'"{self.root}"'):
+            with self.subTest(raw=raw):
+                path, error = resolve(raw)
+                self.assertIsNone(path)
+                self.assertIn(self.scope_error, error)
+        self.assertEqual(resolve('  ')[0], None)
+
+    def test_directory_links_cannot_escape_current_directory(self):
+        """当前目录中指向目录外的目录联接（junction）被拒绝；指向目录内部的联接仍可使用。"""
+        import _winapi
+        escape, alias, inner = self.base / 'escape', self.base / 'alias', self.base / 'inner'
+        inner.mkdir()
+        try:
+            _winapi.CreateJunction(str(self.outside), str(escape))
+            _winapi.CreateJunction(str(inner), str(alias))
+        except (AttributeError, OSError) as error:
+            self.skipTest(f'无法创建目录联接: {error}')
+        self.addCleanup(os.rmdir, alias)
+        self.addCleanup(os.rmdir, escape)
+        host = self.host()
+        path, error = host._resolve_action_path('escape\\secret.txt')
+        self.assertIsNone(path)
+        self.assertIn(self.scope_error, error)
+        text, feedable = host._apply_actions('[READ_FILE: escape\\secret.txt]')
+        self.assertNotIn('SECRET', text)
+        self.assertEqual(len(feedable), 1)
+        self.assertEqual(host._resolve_action_path('alias')[1], None)
+
+    def test_out_of_scope_actions_do_not_touch_files(self):
+        """读取、列目录、建目录、写文件和 Git 查询超出当前目录时都只返回错误，不读取内容也不创建文件。"""
+        host = self.host(confirm=True)
+        content = '\n'.join([f'[READ_FILE: {self.secret}]', '[LIST_DIR: ..]', '[MKDIR: ..\\made]',
+                             '[WRITE_FILE: ..\\new.txt|data]', '[GIT_STATUS: ..]'])
+        text, feedable = host._apply_actions(content)
+        self.assertNotIn('SECRET', text)
+        self.assertEqual(text.count(self.scope_error), 5)
+        self.assertEqual(len(feedable), 3)
+        self.assertFalse((self.root / 'made').exists())
+        self.assertFalse((self.root / 'new.txt').exists())
+        host._run_git_command.assert_not_called()
+
+    def test_dangerous_actions_need_confirmation_and_keep_arguments(self):
+        """删除、运行脚本及所有会改动仓库的 Git 指令各确认一次；拒绝时不执行，同意后参数原样传递且不能注入选项。"""
+        victim = self.base / 'victim.txt'
+        victim.write_text('keep', encoding='utf-8')
+        script = self.base / 'run.bat'
+        script.write_text('@echo off', encoding='utf-8')
+        commands = ['[DELETE: victim.txt]', f'[RUN_SCRIPT: {script}]', '[GIT_ADD: .|-A]', '[GIT_COMMIT: .|fix: x]',
+                    '[GIT_SWITCH: .|main]', '[GIT_RESTORE: .|a.txt]', '[GIT_RESET_SOFT: .]',
+                    '[GIT_PULL: .|origin|main]', '[GIT_PUSH: .|origin]']
+        trash = Mock()
+        with patch.dict(sys.modules, {'send2trash': types.SimpleNamespace(send2trash=trash)}), \
+                patch.object(self.module, 'launch_detached') as launch:
+            refused = self.host(confirm=False)
+            text, _ = refused._apply_actions('\n'.join(commands))
+            self.assertEqual(refused._confirm_danger_action.call_count, len(commands))
+            refused._run_git_command.assert_not_called()
+            trash.assert_not_called()
+            launch.assert_not_called()
+            self.assertTrue(victim.exists())
+            self.assertIn(self.module.tr("⏸ 已取消删除: {}").format(str(victim)), text)
+            accepted = self.host(confirm=True)
+            accepted._apply_actions('\n'.join(commands))
+        trash.assert_called_once_with(str(victim))
+        launch.assert_called_once_with([str(script)], cwd=str(self.base))
+        repo = str(self.base)
+        self.assertEqual([call.args for call in accepted._run_git_command.call_args_list], [
+            (repo, ['add', '--', '-A']), (repo, ['commit', '-m', 'fix: x']), (repo, ['switch', 'main']),
+            (repo, ['restore', '--', 'a.txt']), (repo, ['reset', '--soft', 'HEAD~1']),
+            (repo, ['pull', 'origin', 'main']), (repo, ['push', 'origin'])])
+        self.assertEqual(accepted._run_git_command.call_args_list[-1].kwargs, {'timeout_sec': 60})
+
+    def test_file_writes_need_preview_and_refuse_large_overwrite(self):
+        """已有大于 5KB 的文件拒绝整体覆盖；写入和补丁需预览确认；补丁目标不唯一或预览取消时不改文件。"""
+        big = self.base / 'big.txt'
+        big.write_text('x' * 6000, encoding='utf-8')
+        duplicate = self.base / 'dup.txt'
+        duplicate.write_text('a-a', encoding='utf-8')
+        host = self.host()
+        with patch.object(self.module, '_confirm_file_preview', return_value=True) as preview:
+            host._apply_actions('[WRITE_FILE: big.txt|small]\n[WRITE_FILE: note.txt|hello]\n'
+                                '[PATCH_FILE: note.txt|hello|hi]\n[PATCH_FILE: dup.txt|a|b]')
+        self.assertEqual(big.read_text(encoding='utf-8'), 'x' * 6000)
+        self.assertEqual((self.base / 'note.txt').read_text(encoding='utf-8'), 'hi')
+        self.assertEqual(duplicate.read_text(encoding='utf-8'), 'a-a')
+        self.assertEqual(preview.call_count, 2)
+        with patch.object(self.module, '_confirm_file_preview', return_value=False):
+            text, _ = host._apply_actions('[WRITE_FILE: other.txt|data]')
+        self.assertFalse((self.base / 'other.txt').exists())
+        self.assertIn(self.module.tr("已取消写入: "), text)
+
+
+class BookmarkDataTests(unittest.TestCase):
+    """书签与配置文件的读取、保存、导入导出和损坏保护，共 5 个用例。只读写临时目录。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        import TabEx
+        cls.module = TabEx
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.path = self.root / 'bookmarks.json'
+
+    @staticmethod
+    def tree():
+        return {'bookmark_bar': {'id': '1', 'name': 'bar', 'type': 'folder', 'children': [
+            {'id': '2', 'name': 'Docs', 'type': 'url', 'url': 'C:\\Docs'},
+            {'id': '3', 'name': 'Group', 'type': 'folder', 'children': [
+                {'id': '4', 'name': 'Inner', 'type': 'url', 'url': 'C:\\Inner'}]}]}}
+
+    def manager(self):
+        return self.module.BookmarkManager(str(self.path))
+
+    def saved(self):
+        return json.loads(self.path.read_text(encoding='utf-8'))
+
+    def dialog_host(self, manager):
+        return types.SimpleNamespace(bookmark_manager=manager, populate_tree=Mock(), parent=lambda: None)
+
+    def test_debounced_and_immediate_saves_round_trip(self):
+        """连续修改合并为一次延迟写入；写入带 roots 包装且不残留临时文件；有无 roots 包装都能读取。"""
+        manager = self.manager()
+        self.assertEqual((manager.get_tree(), manager.recovered_backup), ({}, ''))
+        manager.bookmark_tree = self.tree()
+        for _ in range(3):
+            manager.save_bookmarks()
+        self.assertFalse(self.path.exists())
+        deadline = time.monotonic() + 5
+        while not self.path.exists() and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertEqual(self.saved(), {'roots': self.tree()})
+        self.assertFalse(manager._pending_save)
+        self.assertEqual(list(self.root.glob('*.tmp')), [])
+        self.assertEqual(self.manager().get_tree(), self.tree())
+        self.path.write_text(json.dumps(self.tree()), encoding='utf-8')
+        self.assertEqual(self.manager().get_tree(), self.tree())
+
+    def test_failed_save_keeps_previous_file(self):
+        """替换文件失败时保留上一次成功保存的内容并清理临时文件。"""
+        manager = self.manager()
+        manager.bookmark_tree = self.tree()
+        manager.save_bookmarks(immediate=True)
+        manager.bookmark_tree = {}
+        with patch.object(self.module.os, 'replace', side_effect=PermissionError('locked')):
+            manager.save_bookmarks(immediate=True)
+        self.assertEqual(self.saved(), {'roots': self.tree()})
+        self.assertEqual(list(self.root.glob('*.tmp')), [])
+
+    def test_unreadable_files_are_kept_instead_of_overwritten(self):
+        """书签或配置文件损坏、顶层不是对象时改名保留；随后保存新内容不会覆盖原数据，启动后提示用户。"""
+        for content in ('{"roots": {', '[1, 2]'):
+            with self.subTest(content=content):
+                self.path.write_text(content, encoding='utf-8')
+                manager = self.manager()
+                self.assertEqual(manager.get_tree(), {})
+                backup = Path(manager.recovered_backup)
+                self.assertTrue(backup.name.startswith('bookmarks.json.broken-'))
+                manager.bookmark_tree = self.tree()
+                manager.save_bookmarks(immediate=True)
+                self.assertEqual(backup.read_text(encoding='utf-8'), content)
+                backup.unlink()
+        config_path = self.root / 'config.json'
+        config_path.write_text('{"pinned_tabs": [', encoding='utf-8')
+        host = types.SimpleNamespace()
+        with patch.object(self.module, 'get_app_data_path',
+                          side_effect=lambda *parts: os.path.join(str(self.root), *parts)):
+            config = self.module.MainWindow.load_config(host)
+        self.assertIn('hotkeys', config)
+        self.assertFalse(config_path.exists())
+        self.assertEqual(Path(host._config_recovered_backup).read_text(encoding='utf-8'), '{"pinned_tabs": [')
+        host.bookmark_manager = types.SimpleNamespace(recovered_backup='')
+        with patch.object(self.module, 'show_toast') as toast:
+            self.module.MainWindow._warn_recovered_data_files(host)
+        toast.assert_called_once()
+        self.assertIn(Path(host._config_recovered_backup).name, toast.call_args.args[2])
+        self.assertEqual(toast.call_args.kwargs['level'], 'warning')
+
+    def test_export_uses_memory_and_reimport_gets_fresh_ids(self):
+        """导出使用内存中尚未落盘的书签；重复导入自己的导出文件时追加内容并重新编号，不产生重复 ID。"""
+        from PyQt5.QtWidgets import QFileDialog
+        manager = self.manager()
+        manager.bookmark_tree = self.tree()
+        exported = self.root / 'export.json'
+        host = self.dialog_host(manager)
+        dialog = self.module.BookmarkManagerDialog
+        with patch.object(self.module, 'show_toast'), \
+                patch.object(QFileDialog, 'getSaveFileName', return_value=(str(exported), '')), \
+                patch.object(QFileDialog, 'getOpenFileName', return_value=(str(exported), '')):
+            dialog.export_bookmarks(host)
+            self.assertEqual(json.loads(exported.read_text(encoding='utf-8')), {'roots': self.tree()})
+            dialog.import_bookmarks(host)
+        bar = manager.get_tree()['bookmark_bar']
+        self.assertEqual([child['name'] for child in bar['children']], ['Docs', 'Group', 'Docs', 'Group'])
+        self.assertEqual(bar['children'][:2], self.tree()['bookmark_bar']['children'])
+
+        def ids(node):
+            yield node['id']
+            for child in node.get('children', []):
+                yield from ids(child)
+
+        all_ids = list(ids(bar))
+        self.assertEqual(len(all_ids), 7)
+        self.assertEqual(len(set(all_ids)), 7)
+        self.assertEqual(self.saved(), {'roots': manager.get_tree()})
+        host.populate_tree.assert_called_once()
+
+    def test_import_rejects_invalid_file_and_creates_missing_bar(self):
+        """缺少书签栏的文件被拒绝且不改动现有书签；当前没有书签栏时导入会自动创建，导入内容不会丢失。"""
+        from PyQt5.QtWidgets import QFileDialog
+        manager = self.manager()
+        host = self.dialog_host(manager)
+        source = self.root / 'import.json'
+        with patch.object(QFileDialog, 'getOpenFileName', return_value=(str(source), '')), \
+                patch.object(self.module, 'show_toast') as toast:
+            source.write_text(json.dumps({'other': {}}), encoding='utf-8')
+            self.module.BookmarkManagerDialog.import_bookmarks(host)
+            self.assertEqual(toast.call_args.kwargs['level'], 'warning')
+            self.assertEqual(manager.get_tree(), {})
+            host.populate_tree.assert_not_called()
+            source.write_text(json.dumps({'roots': self.tree()}), encoding='utf-8')
+            self.module.BookmarkManagerDialog.import_bookmarks(host)
+        bar = manager.get_tree()['bookmark_bar']
+        self.assertEqual([child['name'] for child in bar['children']], ['Docs', 'Group'])
+        self.assertEqual(self.saved(), {'roots': manager.get_tree()})
+
+
+class SessionPersistenceTests(unittest.TestCase):
+    """标签会话的收集、去重写盘与分屏恢复，共 4 个用例。标签用模拟对象，不创建 Explorer 视图。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        import TabEx
+        cls.module = TabEx
+
+    @staticmethod
+    def tab(path, pinned=False, color=''):
+        return types.SimpleNamespace(current_path=path, is_pinned=pinned, bookmark_group_color=color,
+                                     tab_group_separator_after=bool(color), tab_group_separator_color=color,
+                                     tab_group_separator_name='G' if color else '')
+
+    @staticmethod
+    def stack(tabs):
+        return types.SimpleNamespace(count=lambda: len(tabs), widget=lambda index: tabs[index])
+
+    def host(self, left, right=(), pinned=(), split_active=False, split_current=0):
+        window = self.module.MainWindow
+        names = ('_collect_cached_tabs', '_collect_split_session', '_get_pinned_paths_from_config',
+                 '_normalize_path_for_compare', 'save_session_snapshot', '_get_last_active_tab_path',
+                 '_restore_split_session')
+        host = type('SessionHost', (), {name: getattr(window, name) for name in names})()
+        host.config = {'pinned_tabs': list(pinned), 'enable_cache_tabs': True}
+        host.tab_widget = Mock()
+        host.tab_widget.count.return_value = len(left)
+        host.content_stack = self.stack(list(left))
+        host._split_active = split_active
+        host.split_tab_widget = Mock()
+        host.split_tab_widget.count.return_value = len(right)
+        host.split_tab_widget.currentIndex.return_value = split_current
+        host.split_content_stack = self.stack(list(right))
+        host.get_current_tab_widget = lambda: left[0] if left else None
+        host.save_config = Mock()
+        return host
+
+    def test_cached_tabs_skip_pinned_and_keep_group_fields(self):
+        """会话只记录左侧非固定标签：按标记或配置路径（不区分大小写/尾部斜杠）排除固定标签，保留重复标签及分组信息。"""
+        tabs = [self.tab('C:\\Pinned', pinned=True), self.tab('C:\\Work', color='#E57373'), self.tab('c:\\pinned\\'),
+                self.tab('C:\\Work', color='#E57373'), self.tab(''), self.tab('shell:RecycleBinFolder')]
+        cached = self.host(tabs, pinned=[{'path': 'C:\\PINNED'}])._collect_cached_tabs()
+        self.assertEqual([item['path'] for item in cached], ['C:\\Work', 'C:\\Work', 'shell:RecycleBinFolder'])
+        self.assertEqual(cached[0], {
+            'path': 'C:\\Work', 'is_shell': False, 'bookmark_group_color': '#E57373',
+            'tab_group_separator_after': True, 'tab_group_separator_color': '#E57373', 'tab_group_separator_name': 'G'})
+        self.assertTrue(cached[2]['is_shell'])
+
+    def test_split_session_only_when_active_and_index_clamped(self):
+        """右侧分屏仅在开启时记录非固定标签，当前索引越界时收敛到有效范围。"""
+        right = [self.tab('C:\\R1'), self.tab('C:\\R2', pinned=True)]
+        host = self.host([self.tab('C:\\L')], right, split_active=True, split_current=5)
+        state = host._collect_split_session()
+        self.assertTrue(state['active'])
+        self.assertEqual([item['path'] for item in state['tabs']], ['C:\\R1'])
+        self.assertEqual(state['active_index'], 0)
+        host._split_active = False
+        self.assertEqual(host._collect_split_session(), {'active': False, 'tabs': [], 'active_index': 0})
+
+    def test_snapshot_skips_unchanged_writes_except_immediate(self):
+        """会话内容未变化时不重复写盘；关闭/启动时的立即保存始终写入；关闭标签缓存后不记录普通标签。"""
+        host = self.host([self.tab('C:\\A')])
+        host.save_session_snapshot()
+        host.save_config.assert_called_once_with(immediate=False)
+        self.assertEqual(host.config['cached_tabs'][0]['path'], 'C:\\A')
+        self.assertEqual(host.config['last_active_tab_path'], 'C:\\A')
+        host.save_session_snapshot()
+        self.assertEqual(host.save_config.call_count, 1)
+        host.save_session_snapshot(immediate=True)
+        host.save_config.assert_called_with(immediate=True)
+        host.config['enable_cache_tabs'] = False
+        host.save_session_snapshot()
+        self.assertEqual(host.config['cached_tabs'], [])
+        self.assertEqual(host.save_config.call_count, 3)
+
+    def test_split_restore_recreates_tabs_or_collapses(self):
+        """恢复右侧分屏：逐个在右侧后台创建标签并带回分组色、选中上次标签；全部失败时收起分屏；左侧为空或关闭缓存时不恢复。"""
+        host = self.host([self.tab('C:\\L')])
+        host.config['split_session'] = {'active': True, 'active_index': 1, 'tabs': [
+            {'path': 'C:\\R1', 'is_shell': False, 'tab_group_separator_color': '#81C784'},
+            {'path': ''},
+            {'path': 'shell:RecycleBinFolder', 'is_shell': True}]}
+        for name in ('_activate_split_layout', 'add_new_tab', '_apply_tab_grouping_for_pane', '_teardown_split_group'):
+            setattr(host, name, Mock())
+        host.split_tab_widget.count.return_value = 2
+        self.assertTrue(host._restore_split_session())
+        self.assertEqual(host.add_new_tab.call_count, 2)
+        first, second = host.add_new_tab.call_args_list
+        self.assertEqual(first.args, ('C:\\R1',))
+        self.assertIs(first.kwargs['target_tabwidget'], host.split_tab_widget)
+        self.assertFalse(first.kwargs['activate'])
+        self.assertEqual(first.kwargs['bookmark_group_color'], '#81C784')
+        self.assertEqual((second.args, second.kwargs['is_shell']), (('shell:RecycleBinFolder',), True))
+        host.split_tab_widget.setCurrentIndex.assert_called_once_with(1)
+        host._teardown_split_group.assert_not_called()
+        host.add_new_tab.side_effect = RuntimeError('boom')
+        self.assertFalse(host._restore_split_session())
+        host._teardown_split_group.assert_called_once()
+        host.add_new_tab.reset_mock(side_effect=True)
+        host.tab_widget.count.return_value = 0
+        self.assertFalse(host._restore_split_session())
+        host.tab_widget.count.return_value = 1
+        host.config['enable_cache_tabs'] = False
+        self.assertFalse(host._restore_split_session())
+        host.add_new_tab.assert_not_called()
+
+
+class TabGroupTests(unittest.TestCase):
+    """F4 分组、跨组拖动、关闭与恢复标签，共 4 个用例。使用真实 Qt 标签栏和内容栈，标签内容用轻量控件代替 Explorer。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        import TabEx
+        cls.module = TabEx
+
+    def make_tab(self, path, pinned=False, color=''):
+        from PyQt5.QtWidgets import QWidget
+        tab = QWidget()
+        tab.current_path = path
+        tab.is_pinned = pinned
+        tab.bookmark_group_color = color
+        tab.tab_group_separator_after = False
+        tab.tab_group_separator_color = ''
+        tab.tab_group_separator_name = ''
+        tab.update_tab_title = Mock()
+        tab.set_refresh_active = Mock()
+        tab.cleanup = Mock()
+        return tab
+
+    def host(self, left, right=()):
+        from PyQt5.QtWidgets import QStackedWidget, QTabWidget, QWidget
+        window = self.module.MainWindow
+        names = ('_resolve_group', '_content_stack_for', 'get_active_group_tabwidget', 'insert_tab_group_marker',
+                 '_pick_next_tab_group_color', '_group_palette', '_move_ungrouped_tabs_before_existing_ungrouped',
+                 'move_tab_across_groups', '_apply_right_neighbor_grouping_for_moved_tabs', 'close_tab',
+                 'reopen_closed_tab')
+        host = type('TabHost', (), {name: getattr(window, name) for name in names})()
+        for name in ('_apply_tab_grouping_for_pane', 'save_pinned_tabs', '_schedule_session_snapshot',
+                     'update_navigation_buttons', '_teardown_split_group', 'populate_bookmark_bar_menu',
+                     'add_new_tab', 'close', 'show_file_tasks'):
+            setattr(host, name, Mock())
+        host._get_split_pane = lambda: None
+        host.closed_tabs_history = []
+        host.max_closed_tabs_history = self.module.MAX_CLOSED_TABS_HISTORY
+        for prefix, tabs in (('', left), ('split_', right)):
+            tab_widget, stack = QTabWidget(), QStackedWidget()
+            for tab in tabs:
+                tab_widget.addTab(QWidget(), tab.current_path)
+                stack.addWidget(tab)
+            setattr(host, prefix + 'tab_widget', tab_widget)
+            setattr(host, prefix + 'content_stack', stack)
+        return host
+
+    @staticmethod
+    def paths(stack):
+        return [stack.widget(index).current_path for index in range(stack.count())]
+
+    def test_f4_groups_left_run_and_ungroups_current_only(self):
+        """F4 为当前及左侧连续未分组标签建组（遇到已分组或固定标签停止，颜色不与已有分组重复）；
+        再按 F4 只取消当前标签并移到未分组区域；当前为固定标签时不分组。"""
+        tabs = [self.make_tab('P', pinned=True), self.make_tab('A'), self.make_tab('B', color='#E57373'),
+                self.make_tab('C'), self.make_tab('D')]
+        host = self.host(tabs)
+        with patch.object(self.module, 'show_toast'):
+            host.tab_widget.setCurrentIndex(4)
+            self.assertTrue(host.insert_tab_group_marker())
+            color = tabs[4].bookmark_group_color
+            self.assertNotIn(color, ('', '#E57373'))
+            self.assertEqual([tab.bookmark_group_color for tab in tabs], ['', '', '#E57373', color, color])
+            host.tab_widget.setCurrentIndex(3)
+            self.assertTrue(host.insert_tab_group_marker())
+            self.assertEqual(self.paths(host.content_stack), ['P', 'C', 'A', 'B', 'D'])
+            self.assertEqual(host.tab_widget.currentIndex(), 1)
+            self.assertEqual((tabs[3].bookmark_group_color, tabs[4].bookmark_group_color), ('', color))
+            host.tab_widget.setCurrentIndex(0)
+            self.assertFalse(host.insert_tab_group_marker())
+        self.assertEqual(tabs[0].bookmark_group_color, '')
+        self.assertEqual(host.save_pinned_tabs.call_count, 2)
+        self.assertEqual(host._schedule_session_snapshot.call_count, 2)
+
+    def test_cross_group_move_keeps_pinned_first_and_collapses_empty_split(self):
+        """跨组拖动：落点不能插到固定标签之前，按右邻标签调整分组色；右侧拖空后收起分屏；左侧最后一个标签不能拖走。"""
+        left = [self.make_tab('P', pinned=True), self.make_tab('A')]
+        right = [self.make_tab('R1', color='#81C784'), self.make_tab('R2', color='#81C784')]
+        host = self.host(left, right)
+        self.assertTrue(host.move_tab_across_groups(host.split_tab_widget, right[0], host.tab_widget, 0))
+        self.assertEqual(self.paths(host.content_stack), ['P', 'R1', 'A'])
+        self.assertEqual(host.tab_widget.count(), 3)
+        self.assertEqual(right[0].bookmark_group_color, '')
+        right[0].set_refresh_active.assert_called_with(True)
+        host._teardown_split_group.assert_not_called()
+        self.assertTrue(host.move_tab_across_groups(host.split_tab_widget, right[1], host.tab_widget, None))
+        self.assertEqual(self.paths(host.content_stack), ['P', 'R1', 'A', 'R2'])
+        host._teardown_split_group.assert_called_once()
+        single = self.host([self.make_tab('only')], [self.make_tab('R')])
+        with patch.object(self.module, 'show_toast') as toast:
+            self.assertFalse(single.move_tab_across_groups(
+                single.tab_widget, single.content_stack.widget(0), single.split_tab_widget, 0))
+        toast.assert_called_once()
+        self.assertEqual(self.paths(single.content_stack), ['only'])
+
+    def test_close_history_is_capped_and_reopen_restores_latest(self):
+        """关闭标签前释放资源并记录路径、标题和 Shell 类型；历史超过上限丢弃最旧记录；恢复时打开最近关闭的标签。"""
+        tabs = [self.make_tab(f'C:\\t{index}') for index in range(4)] + [self.make_tab('shell:RecycleBinFolder')]
+        host = self.host(tabs)
+        host.max_closed_tabs_history = 3
+        host.close_tab(4)
+        self.assertEqual(host.closed_tabs_history[0],
+                         {'path': 'shell:RecycleBinFolder', 'title': 'shell:RecycleBinFolder', 'is_shell': True})
+        tabs[4].cleanup.assert_called_once_with()
+        tabs[4].set_refresh_active.assert_called_once_with(False)
+        for _ in range(3):
+            host.close_tab(0)
+        self.assertEqual([item['path'] for item in host.closed_tabs_history], ['C:\\t2', 'C:\\t1', 'C:\\t0'])
+        self.assertEqual((host.tab_widget.count(), host.content_stack.count()), (1, 1))
+        host.close.assert_not_called()
+        host.reopen_closed_tab()
+        host.add_new_tab.assert_called_once_with('C:\\t2', is_shell=False, target_tabwidget=host.tab_widget)
+        self.assertEqual(len(host.closed_tabs_history), 2)
+
+    def test_closing_pinned_or_last_tab(self):
+        """关闭固定标签会取消固定并保存；左侧最后一个标签关闭即退出，但有文件任务运行时先显示任务面板。"""
+        pinned, other = self.make_tab('C:\\P', pinned=True), self.make_tab('C:\\O')
+        host = self.host([pinned, other])
+        host.close_tab(0)
+        self.assertFalse(pinned.is_pinned)
+        host.save_pinned_tabs.assert_called_once_with()
+        host._file_task_panel = types.SimpleNamespace(has_running_tasks=lambda: True)
+        host.close_tab(0)
+        host.show_file_tasks.assert_called_once_with()
+        host.close.assert_not_called()
+        host._file_task_panel = None
+        host.close_tab(0)
+        host.close.assert_called_once_with()
+        self.assertEqual(host.closed_tabs_history[0]['path'], 'C:\\O')
+
+
+class PathParsingTests(unittest.TestCase):
+    """地址栏、面包屑、Explorer 位置、慢盘判断和快捷键门控，共 8 个用例。不访问真实网络路径。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        import TabEx
+        cls.module = TabEx
+
+    def test_file_urls_convert_to_local_and_unc_paths(self):
+        """file: 链接支持本地盘、UNC 各种斜杠写法和百分号编码；嵌入视图刷新 UNC 标签时使用的地址也能还原。"""
+        convert = self.module._file_url_to_path
+        cases = {
+            'file:///C:/Program%20Files/App': 'C:\\Program Files\\App',
+            'file://server/share/dir': '\\\\server\\share\\dir',
+            'file://///server/share': '\\\\server\\share',
+            'file:\\\\server\\share\\a b': '\\\\server\\share\\a b',
+            'FILE:///D:/': 'D:\\',
+            'file:': '',
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(convert(url), expected)
+        to_path = self.module.IExplorerBrowserWidget._url_to_path
+        self.assertEqual(to_path('file://///server/share/x'), '\\\\server\\share\\x')
+        self.assertEqual(to_path('shell:RecycleBinFolder'), 'shell:RecycleBinFolder')
+        self.assertEqual(to_path(None), '')
+
+    def test_breadcrumb_segments_and_damaged_unc_repair(self):
+        """面包屑正确拆分本地盘、UNC 共享根和 Shell 路径；历史会话中丢失一个反斜杠的 UNC 路径自动修复。"""
+        split = lambda path: self.module.SimplePathBar._split_path(None, path)
+        self.assertEqual(split('C:/Work/Repo/'), [('C:', 'C:\\'), ('Work', 'C:\\Work'), ('Repo', 'C:\\Work\\Repo')])
+        self.assertEqual(split('\\\\server\\share\\team'),
+                         [('\\\\server\\share', '\\\\server\\share\\'), ('team', '\\\\server\\share\\team')])
+        self.assertEqual(split('shell:Desktop'), [('shell:Desktop', 'shell:Desktop')])
+        self.assertEqual(split(''), [])
+        normalize = lambda path: self.module.FileExplorerTab._normalize_local_path(None, path)
+        cases = {'\\server\\share\\team': '\\\\server\\share\\team', '/server/share': '\\\\server\\share',
+                 '\\\\server\\share': '\\\\server\\share', 'C:/Work/../Repo': 'C:\\Repo', '\\single': '\\single'}
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(normalize(path), expected)
+        for path in ('shell:Desktop', '::{20D04FE0-3AEA-1069-A2D8-08002B30309D}', None):
+            self.assertEqual(normalize(path), path)
+
+    def test_common_folder_names_translate_between_languages(self):
+        """中英文常用目录名互转只返回实际存在的路径；已存在或找不到对应目录时原样返回。"""
+        translate = self.module.translate_common_path
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, 'Documents', 'Work').mkdir(parents=True)
+            self.assertEqual(translate(os.path.join(directory, '文档', 'Work')),
+                             os.path.join(directory, 'Documents', 'Work'))
+            missing = os.path.join(directory, '下载', 'x')
+            self.assertEqual(translate(missing), missing)
+            self.assertEqual(translate(directory), directory)
+        self.assertEqual(translate(''), '')
+
+    def test_slow_path_detection_is_consistent(self):
+        """UNC、OneDrive 和映射网络盘判定为慢盘，本地固定盘不是；模块函数与标签方法结论一致。"""
+        import ctypes
+        checks = (self.module._path_is_slow_for_shell, lambda path: self.module.FileExplorerTab._is_slow_path(None, path))
+        cases = {'\\\\server\\share': True, '//server/share': True, 'C:\\Users\\me\\OneDrive - Corp\\doc': True,
+                 '': False, os.environ.get('SystemRoot', 'C:\\Windows'): False}
+        for path, expected in cases.items():
+            for check in checks:
+                with self.subTest(path=path, check=check):
+                    self.assertIs(check(path), expected)
+        with patch.object(ctypes.windll.kernel32, 'GetDriveTypeW', return_value=4) as drive_type:
+            for check in checks:
+                self.assertTrue(check('Z:\\team'))
+        drive_type.assert_called_with('Z:\\')
+
+    def path_bar_host(self, current):
+        tab = self.module.FileExplorerTab
+        host = types.SimpleNamespace(current_path=current, navigate_to=Mock(), path_bar=Mock(), main_window=None)
+        host._is_slow_path = types.MethodType(tab._is_slow_path, host)
+        return host, types.MethodType(tab.on_path_bar_changed, host)
+
+    def test_path_bar_navigation_does_not_probe_network_paths(self):
+        """地址栏：file: 链接转为本地/UNC 路径；UNC 不做存在性探测直接交给导航；与当前路径相同不重复导航；
+        不存在的本地路径提示并恢复地址栏。"""
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory, 'Work Dir')
+            target.mkdir()
+            host, change = self.path_bar_host(directory)
+            with patch.object(self.module, 'show_toast') as toast, \
+                    patch('os.path.exists', wraps=os.path.exists) as exists:
+                change(target.as_uri())
+                host.navigate_to.assert_called_once_with(str(target))
+                for raw in ('file://server/share/team', '\\\\server\\share\\team'):
+                    host.navigate_to.reset_mock()
+                    change(raw)
+                    host.navigate_to.assert_called_once_with('\\\\server\\share\\team')
+                self.assertFalse([call for call in exists.call_args_list if str(call.args[0]).startswith('\\\\')])
+                host.navigate_to.reset_mock()
+                change(directory.upper() + '\\')
+                host.navigate_to.assert_not_called()
+                toast.assert_not_called()
+                change(os.path.join(directory, 'missing'))
+                host.navigate_to.assert_not_called()
+                self.assertEqual(toast.call_args.kwargs['level'], 'warning')
+                host.path_bar.set_path.assert_called_with(directory)
+
+    def test_path_bar_special_names_and_commands(self):
+        """地址栏：shell: 地址与特殊名称按 Shell 路径打开；shell:OneDrive 解析为真实目录；cmd 在当前目录打开命令行。"""
+        with tempfile.TemporaryDirectory() as directory:
+            host, change = self.path_bar_host(directory)
+            with patch.object(self.module, 'show_toast') as toast, \
+                    patch.object(self.module, 'launch_shell_tool') as launch, \
+                    patch.dict(os.environ, {'OneDrive': directory}):
+                for raw in ('shell:RecycleBinFolder', self.module.tr('回收站')):
+                    change(raw)
+                    host.navigate_to.assert_called_with('shell:RecycleBinFolder', is_shell=True)
+                change('shell:onedrive')
+                host.navigate_to.assert_called_with(directory)
+                change('cmd')
+                launch.assert_called_once_with('cmd', directory)
+                host.path_bar.set_path.assert_called_with(directory)
+                toast.assert_not_called()
+
+    def test_explorer_location_parsing(self):
+        """Explorer 窗口位置：本地与 UNC 的 file: 地址、此电脑等 CLSID、控制面板及名称回退都能转换；未知位置回到主目录。"""
+        convert = self.module._explorer_location_to_path
+        home = self.module.QDir.homePath()
+        cases = [
+            (('file:///C:/Work%20Dir', 'Work Dir'), 'C:\\Work Dir'),
+            (('file://server/share/team', 'team'), '\\\\server\\share\\team'),
+            (('::{20d04fe0-3aea-1069-a2d8-08002b30309d}', None), 'shell:MyComputerFolder'),
+            (('::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}', None), 'shell:NetworkPlacesFolder'),
+            (('::{00000000-0000-0000-0000-000000000000}', None), home),
+            (('file:///C:/Windows/System32', 'Control Panel'), 'shell:ControlPanelFolder'),
+            (('', 'This PC'), 'shell:MyComputerFolder'),
+            (('', 'Recycle Bin'), 'shell:RecycleBinFolder'),
+            (('', 'Device Manager'), 'shell:ControlPanelFolder'),
+            (('', None), home),
+            (('C:\\Plain', None), 'C:\\Plain'),
+        ]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                self.assertEqual(convert(*args), expected)
+        windows = [types.SimpleNamespace(HWND=7, LocationName='other', LocationURL='file:///C:/Other'),
+                   types.SimpleNamespace(HWND=42, LocationName='team', LocationURL='file://server/share/team')]
+        with patch('win32com.client.Dispatch', return_value=types.SimpleNamespace(Windows=lambda: windows)):
+            self.assertEqual(self.module.MainWindow._get_explorer_path(None, 42), '\\\\server\\share\\team')
+
+    def test_shortcut_gate(self):
+        """快捷键仅在本进程前台且无文本输入焦点时放行；其他进程前台、本进程其他顶层窗口、弹窗保护期和未松开的修饰键都会屏蔽。"""
+        import ctypes
+        from PyQt5.QtWidgets import QLineEdit, QWidget
+        host = type('GateHost', (), {'_shortcut_gate': self.module.MainWindow._shortcut_gate})()
+        editor, other = QLineEdit(), QWidget()
+        with patch.object(QApplication, 'focusWidget', return_value=None), \
+                patch.object(QApplication, 'activeWindow', return_value=host), \
+                patch.object(self.module, '_foreground_pid', return_value=os.getpid()):
+            self.assertEqual(host._shortcut_gate(False), (False, True))
+            with patch.object(self.module, '_foreground_pid', return_value=0):
+                self.assertEqual(host._shortcut_gate(False), (True, False))
+            with patch.object(QApplication, 'focusWidget', return_value=editor):
+                self.assertEqual(host._shortcut_gate(False), (True, False))
+            with patch.object(QApplication, 'activeWindow', return_value=other):
+                self.assertEqual(host._shortcut_gate(False), (True, False))
+            host._shortcut_modal_guard_until = time.monotonic() + 60
+            self.assertEqual(host._shortcut_gate(False), (True, True))
+            host._shortcut_modal_guard_until = 0
+            host._shortcut_wait_for_modifier_release = True
+            with patch.object(ctypes.windll.user32, 'GetAsyncKeyState', return_value=0x8000):
+                self.assertEqual(host._shortcut_gate(True), (True, True))
+            self.assertTrue(host._shortcut_wait_for_modifier_release)
+            with patch.object(ctypes.windll.user32, 'GetAsyncKeyState', return_value=0):
+                self.assertEqual(host._shortcut_gate(True), (False, True))
+            self.assertFalse(host._shortcut_wait_for_modifier_release)
 
 
 if __name__ == '__main__':

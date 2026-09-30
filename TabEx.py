@@ -8,7 +8,7 @@ import time
 
 # 应用版本号（单一来源）：窗口标题与打包脚本 2_build_exe.bat 均引用此处。
 # 修改版本时只改这一行；2_build_exe.bat 会自动解析。
-APP_VERSION = "3.76"
+APP_VERSION = "3.77"
 
 
 # TabEx i18n module
@@ -314,6 +314,8 @@ _LANG_EN = {
     "导入的文件不是有效的JSON格式": "File is not valid JSON",
     "导入的文件中没有书签内容": "No bookmark content in file",
     "导入的文件格式不正确，必须包含 'bookmark_bar' 节点": "Invalid format; must contain 'bookmark_bar' node",
+    "数据文件无法读取": "Data File Unreadable",
+    "{} 无法解析，原文件已另存为 {}，本次使用默认内容": "{} could not be parsed; the original was kept as {} and defaults are used",
     # ── QuickFindResultsDialog ────────────────────────────────────────────
     "选择匹配项": "Select Match",
     "名称": "Name",
@@ -344,13 +346,7 @@ _LANG_EN = {
     "启用后将在终端输出调试信息，用于开发和问题排查": "Outputs debug info to terminal for development",
     "启用 Explorer Monitor 调试输出": "Enable Explorer Monitor Debug Output",
     "单独控制 Explorer Monitor 的日志输出（需要先启用调试输出）": "Control Explorer Monitor logging (requires debug output enabled)",
-    "启用资源快照日志": "Enable Resource Snapshot Log",
-    "定时写入 runtime_health.log，用于观察长期运行时的内存和线程趋势": "Periodically write runtime_health.log for long-term monitoring",
-    "资源快照间隔（分钟）:": "Snapshot Interval (min):",
-    "资源快照日志写入周期，建议 5 分钟或更长": "Snapshot write period; 5 min or more recommended",
     "分钟": "min",
-    "打开资源日志": "Open Resource Log",
-    "打开 runtime_health.log；如果日志尚未生成，则打开所在目录": "Open runtime_health.log, or its directory if not yet created",
     "标签页设置": "Tab Settings",
     "关闭时缓存当前标签页，下次启动时恢复": "Cache tabs on close, restore on next launch",
     "关闭软件时保存非固定标签，下次启动时自动恢复（不包括固定标签）": "Save non-pinned tabs on close; restore at next launch",
@@ -414,11 +410,6 @@ _LANG_EN = {
     "已禁用开机自动启动": "Auto-start disabled",
     "设置开机启动失败: {}": "Failed to set auto-start: {}",
     "未找到 TabExplorer.exe，请确保程序已正确安装": "TabExplorer.exe not found. Please ensure it is installed.",
-    # ── Resource log ──────────────────────────────────────────────────────
-    "资源日志": "Resource Log",
-    "日志尚未生成，已打开日志目录": "Log not yet generated; opened log directory",
-    "日志目录不存在": "Log directory does not exist",
-    "无法打开资源日志: {}": "Cannot open resource log: {}",
     # ── Toast messages ────────────────────────────────────────────────────
     "请至少选择一种搜索类型": "Please select at least one search type",
     "请输入搜索路径": "Please enter a search path",
@@ -914,18 +905,16 @@ MAX_CHAT_HISTORY_MESSAGES = 80   # AI 聊天历史最大消息数
 MAX_CHAT_MESSAGE_CHARS = 12000   # 单条 AI 消息最大长度，防止历史长期膨胀
 MAX_CONTEXT_TOTAL_CHARS = 40000  # 发给 API 的全部历史消息总字符上限（约 10K token），超出则丢弃最老消息
 HOUSEKEEPING_INTERVAL_MS = 5 * 60 * 1000  # 低频运行时清理周期（5分钟）
+RESOURCE_SAMPLE_INTERVAL_S = 10 * 60  # 诊断记录中资源趋势的采样间隔
 HOUSEKEEPING_GC_EVERY_N = 3  # 每 N 次清理执行一次 gc.collect()
 SESSION_SNAPSHOT_INTERVAL_MS = 15000  # 崩溃恢复兜底：定期写入当前会话快照
 SESSION_SNAPSHOT_DEBOUNCE_MS = 1200  # 标签/路径变化后的会话快照防抖时间
 SESSION_SNAPSHOT_MIN_INTERVAL_MS = 8000  # 事件驱动快照最小间隔，防止 DirPoll/FileWatcher 高频触发写盘
-MAX_HEALTH_LOG_BYTES = 1024 * 1024  # runtime_health.log 超过此大小即轮转为 .1，避免长期运行无限增长
 APP_INTERNAL_CHANGE_FILENAMES = {
     'config.json',
     'config.json.tmp',
     'bookmarks.json',
     'chat_history.json',
-    'runtime_health.log',
-    'runtime_health.log.1',
     'tabex_debug_latest.log',
 }
 
@@ -3940,6 +3929,14 @@ def _retain_thread_until_finished(worker):
         release()
 
 
+def _thread_name_summary(limit=10):
+    """按去掉末尾编号后的线程名计数，用于在诊断记录中发现线程堆积。"""
+    import re
+    from collections import Counter
+    names = Counter(re.sub(r'[-_ ]?\d+$', '', thread.name) for thread in threading.enumerate())
+    return dict(names.most_common(limit))
+
+
 def _version_tuple(text):
     """'3.75' / 'v3.75' -> (3, 75)；无法识别返回 None。"""
     import re
@@ -5926,6 +5923,43 @@ class ClickableLabel(QLabel):
         drag.exec_(Qt.CopyAction | Qt.MoveAction)
 
 
+def _preserve_unreadable_file(path):
+    """把无法解析的数据文件改名保留，避免随后写入默认内容时覆盖用户数据；返回备份路径。"""
+    backup = f"{path}.broken-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        os.replace(path, backup)
+        return backup
+    except OSError as e:
+        debug_print(f"[Data] 无法保留损坏文件 {path}: {e}")
+        return ''
+
+
+def _bookmark_ids(nodes):
+    ids, stack = set(), list(nodes)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if node.get('id'):
+                ids.add(str(node['id']))
+            stack.extend(node.get('children') or [])
+    return ids
+
+
+def _assign_new_bookmark_ids(nodes, used_ids):
+    """导入的节点重新编号：重复 ID 会让按 ID 查找的删除/分组操作命中错误节点。"""
+    next_id = int(time.time() * 1000000)
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        while str(next_id) in used_ids:
+            next_id += 1
+        node['id'] = str(next_id)
+        used_ids.add(node['id'])
+        stack.extend(node.get('children') or [])
+
+
 class BookmarkManager:
     def __init__(self, config_file="bookmarks.json"):
         if os.path.isabs(config_file):
@@ -5938,19 +5972,24 @@ class BookmarkManager:
         self._pending_save = False
 
     def load_bookmarks(self):
-        # 只加载主书签文件，不做备份和恢复
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                if 'roots' in data:
-                    return data['roots']
-                return data
-            except Exception as e:
-                debug_print(f"Failed to load bookmarks: {e}")
-                return {}
-        else:
+        self.recovered_backup = ''
+        if not os.path.exists(self.config_file):
             debug_print("No bookmark file found, starting with empty bookmarks")
+            return {}
+        try:
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict) and 'roots' in data:
+                data = data['roots']
+            if not isinstance(data, dict):
+                raise ValueError("bookmark root is not an object")
+            return data
+        except ValueError as e:
+            debug_print(f"Failed to load bookmarks: {e}")
+            self.recovered_backup = _preserve_unreadable_file(self.config_file)
+            return {}
+        except OSError as e:
+            debug_print(f"Failed to load bookmarks: {e}")
             return {}
 
     def save_bookmarks(self, immediate=False):
@@ -6219,6 +6258,52 @@ def _patch_tortoise_overlays():
 
 # Cache of directories already preloaded (overlay icons persist in system image list)
 _OVERLAY_PRELOADED_DIRS = set()
+
+
+def _file_url_to_path(url):
+    """file: URL 转 Windows 路径，兼容 file:///C:/x、file://server/share、file:\\\\server\\share 等写法。"""
+    from urllib.parse import unquote
+    stripped = unquote(str(url)[5:].lstrip('/\\')).replace('/', '\\')
+    if not stripped:
+        return ''
+    if len(stripped) >= 2 and stripped[1] == ':':
+        return stripped
+    return '\\\\' + stripped
+
+
+_EXPLORER_CLSID_PATHS = {
+    '{20D04FE0-3AEA-1069-A2D8-08002B30309D}': 'shell:MyComputerFolder',  # 此电脑
+    '{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}': 'shell:NetworkPlacesFolder',  # 网络
+    '{031E4825-7B94-4DC3-B131-E946B44C8DD5}': 'shell:Libraries',  # 库
+}
+
+
+def _explorer_location_to_path(location, location_name=None):
+    """把 Explorer 窗口的 LocationURL / LocationName 转成可嵌入的路径；无法识别时返回主目录。"""
+    if location_name and location_name in (tr('控制面板'), 'Control Panel'):
+        return 'shell:ControlPanelFolder'
+    if location:
+        if location.lower().startswith('file:'):
+            return _file_url_to_path(location) or QDir.homePath()
+        if '::' in location:
+            upper = location.upper()
+            for clsid, shell_path in _EXPLORER_CLSID_PATHS.items():
+                if clsid in upper:
+                    return shell_path
+            debug_print("[Explorer Monitor] Unknown CLSID, using default home path")
+            return QDir.homePath()
+        return location
+    if location_name in (tr('此电脑'), 'This PC', 'My Computer'):
+        return 'shell:MyComputerFolder'
+    if location_name in (tr('网络'), 'Network'):
+        return 'shell:NetworkPlacesFolder'
+    if location_name in (tr('回收站'), 'Recycle Bin'):
+        return 'shell:RecycleBinFolder'
+    if location_name in (tr('用户帐户'), 'User Accounts', tr('程序和功能'), 'Programs and Features',
+                         tr('系统'), 'System', tr('设备管理器'), 'Device Manager',
+                         tr('网络和共享中心'), 'Network and Sharing Center'):
+        return 'shell:ControlPanelFolder'
+    return QDir.homePath()
 
 
 def _path_is_slow_for_shell(path):
@@ -6669,13 +6754,8 @@ class IExplorerBrowserWidget(QWidget):
         if not url:
             return ''
         url = str(url)
-        if url.startswith('file:///'):
-            from urllib.parse import unquote
-            p = unquote(url[8:]).replace('/', os.sep)
-            return p[1:] if p.startswith(os.sep) else p
-        if url.startswith('file://') and not url.startswith('file:///'):
-            from urllib.parse import unquote
-            return '\\\\' + unquote(url[7:]).replace('/', '\\')
+        if url.lower().startswith('file:'):
+            return _file_url_to_path(url)
         return url  # local path or shell: path – pass through
 
     def _navigate(self, path):
@@ -7499,7 +7579,7 @@ class FileExplorerTab(QWidget):
             return
         # 窗口最小化或失去前台焦点时跳过COM轮询：用户无法在内嵌shell视图中导航，
         # 窗口最小化时跳过COM轮询：用户无法在内嵌shell视图中导航，
-        # 持续读取 LocationURL 只会触发后台 shell worker 线程 churn（见 runtime_health.log）。
+        # 持续读取 LocationURL 只会触发后台 shell worker 线程 churn。
         # 注意：不要用 isActiveWindow() 判断——内嵌 IExplorerBrowser/QAx 控件经常抢占焦点，
         # 主窗口虽在前台却报告非激活，会导致路径同步永久休眠、地址栏冻结需手动 resize 才恢复。
         mw = getattr(self, 'main_window', None)
@@ -8529,16 +8609,7 @@ class FileExplorerTab(QWidget):
         # 处理 file: URL（从邮件/浏览器/SharePoint等复制的链接）
         # 支持 file:///C:/path、file://server/share、file:\\server\share、file:\server\share 等格式
         if path.lower().startswith('file:'):
-            from urllib.parse import unquote
-            raw = path[5:]  # 去掉 'file:'
-            # 去掉所有前导斜杠和反斜杠
-            stripped = raw.lstrip('/\\')
-            stripped = unquote(stripped).replace('/', '\\')
-            # 判断是本地路径(有盘符)还是UNC网络路径
-            if len(stripped) >= 2 and stripped[1] == ':':
-                path = stripped  # 本地路径 C:\path
-            else:
-                path = '\\\\' + stripped  # UNC路径 \\server\share
+            path = _file_url_to_path(path)
             debug_print(f"[PathBar] file: URL converted to: {path}")
 
         lower_path = path.lower()
@@ -8666,11 +8737,16 @@ class FileExplorerTab(QWidget):
             debug_print(f"[PathBar] on_path_bar_changed: same as current_path, skip navigate")
             return
 
+        # UNC 路径不做中英文目录互转：互转会同步探测路径是否存在，服务器不可达时长时间卡住界面
+        if path.startswith('\\\\') or path.startswith('//'):
+            self.navigate_to(path)
+            return
+
         # 尝试中英文目录互转
         path2 = translate_common_path(path)
         # 慢盘（网络/UNC/映射盘/OneDrive）：os.path.exists 在挂起路径上会阻塞 UI 线程，
         # 直接交给 navigate_to（其内部对慢盘走后台异步解析，不做同步文件系统探测）。
-        if self._is_slow_path(path2) or path2.startswith('\\\\') or path2.startswith('//'):
+        if self._is_slow_path(path2):
             self.navigate_to(path2)
         elif os.path.exists(path2):
             self.navigate_to(path2)
@@ -13152,9 +13228,11 @@ class ChatPanel(QWidget):
         p = translate_common_path(os.path.normpath(p))
 
         try:
-            base_norm = os.path.normcase(os.path.normpath(base_dir))
-            path_norm = os.path.normcase(os.path.normpath(p))
-            if not (path_norm == base_norm or path_norm.startswith(base_norm + os.sep)):
+            # 解析目录链接/符号链接后再比较，防止经由当前目录内的链接访问目录外文件
+            base_real = os.path.normcase(os.path.realpath(base_dir)).rstrip(os.sep)
+            path_real = os.path.normcase(os.path.realpath(p))
+            if not (path_real == base_real or path_real.rstrip(os.sep) == base_real
+                    or path_real.startswith(base_real + os.sep)):
                 return None, tr("超出当前目录范围: {}").format(p)
         except Exception:
             return None, tr("路径非法: {}").format(p)
@@ -14205,6 +14283,16 @@ def _tab_git_branch(pane):
     """标签当前路径对应的 Git 分支；导航后尚未重新查询时返回空。"""
     branch_path, branch = getattr(pane, '_git_branch_info', ('', ''))
     return branch if branch and branch_path == getattr(pane, 'current_path', None) else ''
+
+
+def _foreground_pid():
+    """前台窗口所属进程 PID；没有前台窗口时返回 0。"""
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    pid = ctypes.c_ulong(0)
+    if hwnd:
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
 
 
 class _KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -17467,19 +17555,15 @@ class MainWindow(QMainWindow):
         if isinstance(QApplication.focusWidget(), (QLineEdit, QTextEdit, QPlainTextEdit)):
             return True, False
         # 以前台窗口的进程归属判断：嵌入 Shell 视图持有焦点时 activeWindow() 可能为 None
-        user32 = ctypes.windll.user32
-        foreground_hwnd = user32.GetForegroundWindow()
-        fg_pid = ctypes.c_ulong(0)
-        if foreground_hwnd:
-            user32.GetWindowThreadProcessId(foreground_hwnd, ctypes.byref(fg_pid))
-        if fg_pid.value != os.getpid():
+        if _foreground_pid() != os.getpid():
             return True, False
         # 本进程其他 Qt 顶层窗口（如非模态搜索框）持有焦点时不响应
         active_win = QApplication.activeWindow()
         if active_win is not None and active_win is not self:
             return True, False
         if getattr(self, '_shortcut_wait_for_modifier_release', False):
-            if wait_for_release and any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in (0x11, 0x10, 0x12)):
+            get_state = ctypes.windll.user32.GetAsyncKeyState
+            if wait_for_release and any(get_state(vk) & 0x8000 for vk in (0x11, 0x10, 0x12)):
                 return True, True
             self._shortcut_wait_for_modifier_release = False
         if time.monotonic() < getattr(self, '_shortcut_modal_guard_until', 0):
@@ -17801,14 +17885,31 @@ class MainWindow(QMainWindow):
                     retained.append({'type': type(worker).__name__, 'running': worker.isRunning()})
                 except RuntimeError:
                     pass
-            groups = [stack.count() for _tabs, stack in self._all_groups()]
+            groups, hibernated = [], 0
+            for _tabs, stack in self._all_groups():
+                groups.append(stack.count())
+                hibernated += sum(bool(getattr(stack.widget(index), '_hibernated', False))
+                                  for index in range(stack.count()))
+            rss_mb = get_process_memory_usage_mb()
             _diagnostics.snapshot({
                 'qt': QT_VERSION_STR, 'pyqt': PYQT_VERSION_STR,
                 'tabs_per_group': groups, 'split': bool(getattr(self, '_split_active', False)),
-                'python_threads': threading.active_count(), 'rss_mb': get_process_memory_usage_mb(),
+                'python_threads': threading.active_count(), 'rss_mb': rss_mb,
                 'retained_threads': retained[:100], 'tasks': tasks, 'task_count': len(records),
                 'search_windows': len(getattr(self, 'search_dialogs', []) or []),
             })
+            now = time.monotonic()
+            if now - getattr(self, '_last_resource_sample', -RESOURCE_SAMPLE_INTERVAL_S) >= RESOURCE_SAMPLE_INTERVAL_S:
+                self._last_resource_sample = now
+                _diagnostics.sample({
+                    'rss_mb': rss_mb, 'python_threads': threading.active_count(),
+                    'thread_names': _thread_name_summary(),
+                    'tabs': sum(groups), 'hibernated_tabs': hibernated,
+                    'running_background_threads': sum(1 for item in retained if item['running']),
+                    'running_tasks': sum(1 for record in records if not record['done']),
+                    'search_windows': len(getattr(self, 'search_dialogs', []) or []),
+                    'toasts': len(_active_toasts),
+                })
         except Exception as error:
             _diagnostics.record('snapshot_failed', type(error).__name__)
 
@@ -17975,7 +18076,7 @@ class MainWindow(QMainWindow):
             show_toast(self, tr("检查更新"), tr("正在查询 GitHub 最新版本…"), level="info", duration=2500)
 
     def _maybe_auto_check_updates(self):
-        if not self.config.get("auto_check_updates", True):
+        if not self.config.get("auto_update_check", False):
             return
         try:
             last_check = float(self.config.get("last_update_check", 0) or 0)
@@ -18392,7 +18493,7 @@ class MainWindow(QMainWindow):
         self._housekeeping_runs = 0
         self._housekeeping_timer = QTimer(self)
         self._housekeeping_timer.timeout.connect(self._run_housekeeping)
-        self._housekeeping_timer.start(self._get_housekeeping_interval_ms())
+        self._housekeeping_timer.start(HOUSEKEEPING_INTERVAL_MS)
         self._tab_hibernate_timer = QTimer(self)
         self._tab_hibernate_timer.timeout.connect(self._hibernate_idle_tabs)
         self._tab_hibernate_timer.start(60 * 1000)
@@ -18436,8 +18537,6 @@ class MainWindow(QMainWindow):
             "enable_explorer_monitor": True,  # 默认启用Explorer监听
             "debug_mode": False,  # 默认关闭调试输出
             "explorer_monitor_debug": False,  # 默认关闭Explorer Monitor调试输出
-            "resource_snapshot_logging": False,  # 默认关闭运行资源快照日志
-            "resource_snapshot_interval_ms": HOUSEKEEPING_INTERVAL_MS,
             "file_op_max_workers": 0,  # 后台文件操作并发数：0=自动
             "show_bottom_statusbar": True,  # 默认显示底部状态栏（状态/CPU信息区域）
             "show_resource_usage_in_statusbar": False,  # 默认关闭状态栏右侧 CPU/内存占用显示
@@ -18454,7 +18553,7 @@ class MainWindow(QMainWindow):
             "show_tab_group_markers": True,  # 默认显示标签分组颜色
             "tab_hibernate_minutes": 30,  # 后台标签闲置多久后释放 Shell 视图：0=关闭
             "hotkey_bindings": {},  # 自定义按键 {命令: "Ctrl+T"}；未列出的命令使用默认按键
-            "auto_check_updates": True,  # 每天最多查询一次 GitHub 最新发布，只提示不下载
+            "auto_update_check": False,  # 默认关闭；开启后每天最多查询一次 GitHub 最新发布，只提示不下载
             "last_update_check": 0,
             "update_notified_version": "",
             # 快捷键配置
@@ -18508,6 +18607,8 @@ class MainWindow(QMainWindow):
             if os.path.exists(config_path):
                 with open(config_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
+                    if not isinstance(config, dict):
+                        raise ValueError("config root is not an object")
                     # 合并默认配置
                     for key, value in default_config.items():
                         if key not in config:
@@ -18536,6 +18637,12 @@ class MainWindow(QMainWindow):
                     else:
                         config["performance"] = default_config["performance"]
 
+                    # v3.76 曾把默认开启的自动检查写入配置，改为默认关闭后丢弃该旧键
+                    config.pop("auto_check_updates", None)
+                    # 资源快照日志已并入崩溃诊断，旧开关不再使用
+                    config.pop("resource_snapshot_logging", None)
+                    config.pop("resource_snapshot_interval_ms", None)
+
                     apply_runtime_performance_config(config.get("performance"))
                     _set_app_language(config.get("language", "zh"))
                     return config
@@ -18545,6 +18652,8 @@ class MainWindow(QMainWindow):
                 return default_config
         except Exception as e:
             print(f"Failed to load config: {e}")
+            if isinstance(e, ValueError):
+                self._config_recovered_backup = _preserve_unreadable_file(get_app_data_path("config.json"))
             apply_runtime_performance_config(default_config.get("performance"))
             return default_config
     
@@ -18709,77 +18818,6 @@ class MainWindow(QMainWindow):
             effective_delay = int(delay_ms)
         self._session_snapshot_debounce_timer.start(max(0, effective_delay))
 
-    def _get_housekeeping_interval_ms(self):
-        try:
-            value = int(self.config.get("resource_snapshot_interval_ms", HOUSEKEEPING_INTERVAL_MS))
-        except Exception:
-            value = HOUSEKEEPING_INTERVAL_MS
-        return max(60 * 1000, min(60 * 60 * 1000, value))
-
-    def _append_resource_snapshot_log(self, reason="periodic"):
-        if not self.config.get("resource_snapshot_logging", False):
-            return
-        try:
-            from datetime import datetime
-
-            rss_mb = get_process_memory_usage_mb()
-            search_dialogs = len(getattr(self, 'search_dialogs', []) or [])
-            tabs = self.tab_widget.count() if hasattr(self, 'tab_widget') else 0
-            chat_worker_running = 0
-            if self.chat_panel is not None:
-                worker = getattr(self.chat_panel, 'worker', None)
-                if worker and worker.isRunning():
-                    chat_worker_running = 1
-
-            thread_count = threading.active_count()
-            # 当线程数异常增多时，记录线程名称以诊断泄漏
-            thread_detail = ""
-            if thread_count > 10:
-                try:
-                    names = [t.name for t in threading.enumerate()]
-                    from collections import Counter
-                    name_counts = Counter(names)
-                    # 只记录出现超过1次的线程名，或全部（若总数<=20）
-                    if thread_count <= 20:
-                        thread_detail = " thread_names=[" + ",".join(names) + "]"
-                    else:
-                        repeated = {k: v for k, v in name_counts.items() if v > 1}
-                        if repeated:
-                            thread_detail = " thread_repeats=" + str(dict(repeated))
-                        else:
-                            thread_detail = " thread_names=[" + ",".join(names[:20]) + "...]"
-                except Exception:
-                    pass
-
-            line = (
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                f" reason={reason}"
-                f" rss_mb={rss_mb if rss_mb is not None else 'n/a'}"
-                f" threads={thread_count}"
-                f" tabs={tabs}"
-                f" search_dialogs={search_dialogs}"
-                f" toasts={len(_active_toasts)}"
-                f" chat_worker={chat_worker_running}"
-                f" shortcuts_tracked={len(getattr(self, '_last_keys_state', {}) or {})}"
-                f"{thread_detail}"
-            )
-            log_path = get_app_data_path('runtime_health.log')
-            try:
-                if os.path.exists(log_path) and os.path.getsize(log_path) > MAX_HEALTH_LOG_BYTES:
-                    backup = log_path + '.1'
-                    try:
-                        if os.path.exists(backup):
-                            os.remove(backup)
-                    except Exception:
-                        pass
-                    os.replace(log_path, backup)
-            except Exception:
-                pass
-            with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(line + "\n")
-        except Exception as e:
-            debug_print(f"[Housekeeping] resource snapshot failed: {e}")
-
     def _prune_search_dialog_refs(self):
         dialogs = getattr(self, 'search_dialogs', None)
         if dialogs is None:
@@ -18845,8 +18883,6 @@ class MainWindow(QMainWindow):
         removed_toasts = self._prune_toast_refs()
         if not self.isActiveWindow():
             self._last_keys_state.clear()
-
-        self._append_resource_snapshot_log(reason="periodic")
 
         gc_collected = None
         dummy_cleaned = 0
@@ -19024,6 +19060,16 @@ class MainWindow(QMainWindow):
             )
         except Exception as e:
             print(f"Error saving session snapshot: {e}")
+
+    def _warn_recovered_data_files(self):
+        """提示启动时无法解析、已改名保留的配置/书签文件。"""
+        backups = (getattr(self, '_config_recovered_backup', ''),
+                   getattr(getattr(self, 'bookmark_manager', None), 'recovered_backup', ''))
+        for backup in filter(None, backups):
+            name = os.path.basename(backup)
+            show_toast(self, tr("数据文件无法读取"),
+                       tr("{} 无法解析，原文件已另存为 {}，本次使用默认内容").format(name.split('.broken-')[0], name),
+                       level="warning")
 
     def ensure_default_bookmarks(self):
         bm = self.bookmark_manager
@@ -19597,6 +19643,7 @@ class MainWindow(QMainWindow):
         except Exception:
             current_path = None
         self._update_window_title(current_path)
+        self._warn_recovered_data_files()
         debug_print("[Performance] Delayed initialization completed")
     
     def start_instance_server(self):
@@ -19941,70 +19988,7 @@ class MainWindow(QMainWindow):
                                 location = window.LocationURL
                                 
                                 debug_print(f"[Explorer Monitor] LocationURL: {location}")
-                                
-                                # 检查是否为控制面板
-                                if location_name and location_name in [tr('控制面板'), 'Control Panel']:
-                                    debug_print(f"[Explorer Monitor] Control Panel detected by LocationName")
-                                    return 'shell:ControlPanelFolder'
-                                
-                                if location:
-                                    # 转换file:///格式的URL为本地路径
-                                    if location.startswith('file:///'):
-                                        from urllib.parse import unquote
-                                        path = unquote(location[8:])  # 移除 'file:///'
-                                        # Windows路径处理
-                                        if path.startswith('/'):
-                                            path = path[1:]
-                                        path = path.replace('/', '\\')
-                                        return path
-                                    elif '::' in location:
-                                        # CLSID 格式的特殊路径（如"此电脑"）
-                                        # 例如：::{20D04FE0-3AEA-1069-A2D8-08002B30309D}
-                                        debug_print(f"[Explorer Monitor] Special shell path detected: {location}")
-                                        
-                                        # 常见的 CLSID 映射
-                                        clsid_map = {
-                                            '{20D04FE0-3AEA-1069-A2D8-08002B30309D}': 'shell:MyComputerFolder',  # 此电脑
-                                            '{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}': 'shell:NetworkPlacesFolder',  # 网络
-                                            '{031E4825-7B94-4DC3-B131-E946B44C8DD5}': 'shell:Libraries',  # 库
-                                        }
-                                        
-                                        for clsid, shell_path in clsid_map.items():
-                                            if clsid in location:
-                                                return shell_path
-                                        
-                                        # 如果是未知的特殊路径，返回默认位置
-                                        debug_print(f"[Explorer Monitor] Unknown CLSID, using default home path")
-                                        return QDir.homePath()
-                                    else:
-                                        # 其他格式的路径
-                                        return location
-                                else:
-                                    debug_print(f"[Explorer Monitor] LocationURL is empty, trying alternative methods...")
-                                    
-                                    # 尝试获取 LocationName
-                                    try:
-                                        location_name = window.LocationName
-                                        debug_print(f"[Explorer Monitor] LocationName: {location_name}")
-                                        
-                                        # 根据位置名称推断路径
-                                        if location_name in [tr('此电脑'), 'This PC', 'My Computer']:
-                                            return 'shell:MyComputerFolder'
-                                        elif location_name in [tr('网络'), 'Network']:
-                                            return 'shell:NetworkPlacesFolder'
-                                        elif location_name in [tr('回收站'), 'Recycle Bin']:
-                                            return 'shell:RecycleBinFolder'
-                                        # 检查是否为控制面板相关项
-                                        elif location_name in [tr('控制面板'), 'Control Panel', tr('用户帐户'), 'User Accounts', 
-                                                              tr('程序和功能'), 'Programs and Features', tr('系统'), 'System',
-                                                              tr('设备管理器'), 'Device Manager', tr('网络和共享中心'), 'Network and Sharing Center']:
-                                            debug_print(f"[Explorer Monitor] Control Panel item detected by LocationName")
-                                            return 'shell:ControlPanelFolder'
-                                    except Exception:
-                                        pass
-                                    
-                                    # 如果都失败了，返回用户主目录
-                                    return QDir.homePath()
+                                return _explorer_location_to_path(location, location_name)
                         except Exception as e:
                             debug_print(f"[Explorer Monitor] Error accessing window properties: {e}")
                             continue
@@ -20063,8 +20047,6 @@ class MainWindow(QMainWindow):
                 print(f"Error cleaning chat panel: {e}")
 
         self._active_pane = None
-
-        self._append_resource_snapshot_log(reason="close")
 
         # 先保存会话快照（此时分屏仍处于激活态，确保 split_session 被正确持久化）；
         # 若先合并分屏再保存，_split_active 会被清为 False 导致分屏状态丢失、重启无法恢复
@@ -20656,26 +20638,6 @@ class SettingsDialog(QDialog):
         self.explorer_monitor_debug_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.explorer_monitor_debug_cb.setToolTip(tr("单独控制 Explorer Monitor 的日志输出（需要先启用调试输出）"))
         debug_layout.addWidget(self.explorer_monitor_debug_cb)
-        self.resource_snapshot_logging_cb = QCheckBox(tr("启用资源快照日志"), self)
-        self.resource_snapshot_logging_cb.setChecked(config.get("resource_snapshot_logging", False))
-        self.resource_snapshot_logging_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
-        self.resource_snapshot_logging_cb.setToolTip(tr("定时写入 runtime_health.log，用于观察长期运行时的内存和线程趋势"))
-        debug_layout.addWidget(self.resource_snapshot_logging_cb)
-
-        resource_interval_layout = QHBoxLayout()
-        resource_interval_layout.addWidget(QLabel(tr("资源快照间隔（分钟）:")))
-        self.resource_snapshot_interval_spin = QSpinBox(self)
-        self.resource_snapshot_interval_spin.setRange(1, 60)
-        self.resource_snapshot_interval_spin.setSingleStep(1)
-        interval_minutes = max(1, int(config.get("resource_snapshot_interval_ms", HOUSEKEEPING_INTERVAL_MS) / 60000))
-        self.resource_snapshot_interval_spin.setValue(interval_minutes)
-        self.resource_snapshot_interval_spin.setToolTip(tr("资源快照日志写入周期，建议 5 分钟或更长"))
-        self.resource_snapshot_interval_spin.setEnabled(self.resource_snapshot_logging_cb.isChecked())
-        self.resource_snapshot_logging_cb.toggled.connect(self.resource_snapshot_interval_spin.setEnabled)
-        resource_interval_layout.addWidget(self.resource_snapshot_interval_spin)
-        resource_interval_layout.addWidget(QLabel(tr("分钟")))
-        resource_interval_layout.addStretch(1)
-        debug_layout.addLayout(resource_interval_layout)
 
         file_op_workers_layout = QHBoxLayout()
         file_op_workers_layout.addWidget(QLabel(tr("文件操作并发数（0=自动）:")))
@@ -20688,14 +20650,6 @@ class SettingsDialog(QDialog):
         file_op_workers_layout.addWidget(self.file_op_workers_spin)
         file_op_workers_layout.addStretch(1)
         debug_layout.addLayout(file_op_workers_layout)
-
-        resource_log_layout = QHBoxLayout()
-        self.open_resource_log_btn = QPushButton(tr("打开资源日志"), self)
-        self.open_resource_log_btn.setToolTip(tr("打开 runtime_health.log；如果日志尚未生成，则打开所在目录"))
-        self.open_resource_log_btn.clicked.connect(self._open_resource_snapshot_log)
-        resource_log_layout.addWidget(self.open_resource_log_btn)
-        resource_log_layout.addStretch(1)
-        debug_layout.addLayout(resource_log_layout)
         debug_group.setLayout(debug_layout)
         compact_groupbox(debug_group)
         for i in range(debug_layout.count()):
@@ -21012,7 +20966,7 @@ class SettingsDialog(QDialog):
         update_row.addWidget(self.check_update_button)
         bottom_layout.addLayout(update_row)
         self.auto_update_cb = QCheckBox(tr("自动检查新版本（每天最多一次，只提示不下载）"), self)
-        self.auto_update_cb.setChecked(bool(config.get("auto_check_updates", True)))
+        self.auto_update_cb.setChecked(bool(config.get("auto_update_check", False)))
         bottom_layout.addWidget(self.auto_update_cb)
         
         # 按钮区域
@@ -21116,23 +21070,6 @@ class SettingsDialog(QDialog):
         
         return None
 
-    def _open_resource_snapshot_log(self):
-        log_path = get_app_data_path('runtime_health.log')
-        log_dir = os.path.dirname(log_path)
-        try:
-            if os.path.exists(log_path):
-                os.startfile(log_path)
-            elif os.path.isdir(log_dir):
-                os.startfile(log_dir)
-                if self.parent():
-                    show_toast(self.parent(), tr("资源日志"), tr("日志尚未生成，已打开日志目录"), level="info")
-            else:
-                if self.parent():
-                    show_toast(self.parent(), tr("资源日志"), tr("日志目录不存在"), level="warning")
-        except Exception as e:
-            if self.parent():
-                show_toast(self.parent(), tr("资源日志"), tr("无法打开资源日志: {}").format(e), level="error")
-    
     def _create_hotkey_group(self, config, compact_widget):
         """每个命令一行：启用开关 + 按键录制框 + 清空按钮；共用开关的命令联动勾选。"""
         from PyQt5.QtWidgets import QGroupBox, QGridLayout, QKeySequenceEdit, QToolButton, QScrollArea, QWidget
@@ -21249,8 +21186,6 @@ class SettingsDialog(QDialog):
             self.parent().config["tab_hibernate_minutes"] = self.tab_hibernate_spin.value()
             self.parent().config["debug_mode"] = self.debug_mode_cb.isChecked()
             self.parent().config["explorer_monitor_debug"] = self.explorer_monitor_debug_cb.isChecked()
-            self.parent().config["resource_snapshot_logging"] = self.resource_snapshot_logging_cb.isChecked()
-            self.parent().config["resource_snapshot_interval_ms"] = self.resource_snapshot_interval_spin.value() * 60 * 1000
             self.parent().config["file_op_max_workers"] = self.file_op_workers_spin.value()
             self.parent().config["show_bottom_statusbar"] = self.bottom_statusbar_cb.isChecked()
             self.parent().config["show_resource_usage_in_statusbar"] = self.resource_usage_cb.isChecked()
@@ -21282,7 +21217,7 @@ class SettingsDialog(QDialog):
                 "copy_filepath": self.hotkey_copy_filepath.isChecked()
             }
             self.parent().config["hotkey_bindings"] = hotkey_bindings
-            self.parent().config["auto_check_updates"] = self.auto_update_cb.isChecked()
+            self.parent().config["auto_update_check"] = self.auto_update_cb.isChecked()
             
             # 保存到文件
             self.parent().save_config()
@@ -21297,8 +21232,6 @@ class SettingsDialog(QDialog):
             # 应用设置
             set_debug_mode(self.parent().config.get("debug_mode", False))
             set_explorer_monitor_debug(self.parent().config.get("explorer_monitor_debug", False))
-            if hasattr(self.parent(), '_housekeeping_timer') and self.parent()._housekeeping_timer:
-                self.parent()._housekeeping_timer.start(self.parent()._get_housekeeping_interval_ms())
             if hasattr(self.parent(), 'apply_bottom_statusbar_config'):
                 self.parent().apply_bottom_statusbar_config()
             if hasattr(self.parent(), 'apply_resource_usage_config'):
@@ -22146,7 +22079,6 @@ class BookmarkManagerDialog(QDialog):
     def export_bookmarks(self):
         """导出书签到JSON文件"""
         from PyQt5.QtWidgets import QFileDialog
-        import shutil
         from datetime import datetime
         
         # 生成默认文件名（包含日期时间）
@@ -22162,9 +22094,9 @@ class BookmarkManagerDialog(QDialog):
         
         if file_path:
             try:
-                # 复制当前的bookmarks.json到目标位置
-                bookmarks_path = get_app_data_path("bookmarks.json")
-                shutil.copy2(bookmarks_path, file_path)
+                # 直接导出内存中的书签：复制磁盘文件会漏掉尚未落盘的延迟保存
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump({"roots": self.bookmark_manager.get_tree()}, f, ensure_ascii=False, indent=2)
                 show_toast(self, tr("导出成功"), tr("书签已成功导出到:\n{}").format(file_path), level="success")
                 print(f"[Bookmark Export] Successfully exported to: {file_path}")
             except Exception as e:
@@ -22209,9 +22141,11 @@ class BookmarkManagerDialog(QDialog):
             imported_children = imported_bar.get('children', [])
             
             if imported_children:
-                current_bar = current_tree.get('bookmark_bar', {})
+                current_bar = current_tree.setdefault('bookmark_bar', {
+                    "id": str(int(time.time() * 1000000)), "name": tr("书签栏"), "type": "folder", "children": []})
                 if 'children' not in current_bar:
                     current_bar['children'] = []
+                _assign_new_bookmark_ids(imported_children, _bookmark_ids(current_tree.values()))
                 
                 # 添加到末尾
                 current_bar['children'].extend(imported_children)

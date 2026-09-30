@@ -84,6 +84,28 @@ class DiagnosticsTests(unittest.TestCase):
             manifest = json.loads(archive.read('manifest.json'))
             self.assertIn('Debug log unavailable', manifest['warnings'])
 
+    def test_resource_samples_rotate_separately_and_are_exported(self):
+        """资源趋势单独轮转，不挤掉异常事件；路径同样脱敏，不可序列化的数据被忽略；导出包含当前及上一份趋势。"""
+        resources = self.diagnostics.session / 'resources.jsonl'
+        resources.write_text('x' * (MAX_LOG_BYTES + 1))
+        self.diagnostics.record('qt_fatal', 'kept-event')
+        self.diagnostics.sample({'rss_mb': 120.5, 'thread_names': r'C:\Users\someone\secret'})
+        self.diagnostics.sample({'bad': object()})
+        lines = resources.read_text(encoding='utf-8').splitlines()
+        self.assertEqual(len(lines), 1)
+        sample = json.loads(lines[0])
+        self.assertEqual(sample['rss_mb'], 120.5)
+        self.assertIn('time', sample)
+        self.assertNotIn('someone', sample['thread_names'])
+        bundle = self.root / 'resources.zip'
+        self.diagnostics.export(bundle)
+        prefix = f'sessions/{self.diagnostics.session.name}/'
+        with zipfile.ZipFile(bundle) as archive:
+            names = archive.namelist()
+            self.assertIn('kept-event', archive.read(prefix + 'events.jsonl').decode('utf-8'))
+        self.assertIn(prefix + 'resources.jsonl', names)
+        self.assertIn(prefix + 'resources.previous.jsonl', names)
+
     def test_retention_prunes_old_inactive_sessions_but_keeps_live_process(self):
         """保留最近五次运行，不删除仍活跃的会话；旧异常退出记录也受容量限制。"""
         for index in range(8):
@@ -346,6 +368,30 @@ class QtDiagnosticsTests(unittest.TestCase):
         self.assertNotIn('private', text)
         self.assertNotIn('SECRET-CONTENT', text)
         self.assertEqual(json.loads(text)['tasks'][0]['failures'], 1)
+
+    def test_resource_trend_is_sampled_at_most_once_per_interval(self):
+        """资源趋势在首次快照时采样，间隔内不重复写入，满 10 分钟后再写；只记录计数，包括休眠标签数量。"""
+        from PyQt5.QtWidgets import QStackedWidget, QWidget
+        host = self.host()
+        stack = QStackedWidget()
+        self.addCleanup(stack.deleteLater)
+        sleeping = QWidget()
+        sleeping._hibernated = True
+        stack.addWidget(QWidget())
+        stack.addWidget(sleeping)
+        host._all_groups = lambda: [(None, stack)]
+        resources = self.diagnostics.session / 'resources.jsonl'
+        host._capture_diagnostic_snapshot()
+        host._capture_diagnostic_snapshot()
+        self.assertEqual(len(resources.read_text(encoding='utf-8').splitlines()), 1)
+        host._last_resource_sample -= self.module.RESOURCE_SAMPLE_INTERVAL_S
+        host._capture_diagnostic_snapshot()
+        lines = [json.loads(line) for line in resources.read_text(encoding='utf-8').splitlines()]
+        self.assertEqual(len(lines), 2)
+        self.assertEqual((lines[-1]['tabs'], lines[-1]['hibernated_tabs']), (2, 1))
+        self.assertEqual(set(lines[-1]), {
+            'rss_mb', 'python_threads', 'thread_names', 'tabs', 'hibernated_tabs',
+            'running_background_threads', 'running_tasks', 'search_windows', 'toasts', 'time'})
 
     def test_startup_falls_back_when_primary_directory_is_read_only(self):
         """首选目录无权限时回退临时目录；两处都失败时不阻止软件启动。"""

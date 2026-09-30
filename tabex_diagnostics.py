@@ -170,6 +170,19 @@ class Diagnostics:
         except (OSError, ValueError):
             pass
 
+    def sample(self, values):
+        """追加一条资源趋势记录（仅计数），与异常事件分开滚动，避免挤掉崩溃记录。"""
+        try:
+            line = redact(json.dumps(dict(values, time=time.strftime('%Y-%m-%dT%H:%M:%S')), ensure_ascii=True))
+            with self.lock:
+                path = self.session / 'resources.jsonl'
+                if path.exists() and path.stat().st_size > MAX_LOG_BYTES:
+                    os.replace(path, self.session / 'resources.previous.jsonl')
+                with path.open('a', encoding='utf-8') as target:
+                    target.write(line + '\n')
+        except (OSError, TypeError, ValueError):
+            pass
+
     def install(self):
         if self.previous_hooks is not None:
             return
@@ -235,6 +248,7 @@ class Diagnostics:
             if session.is_symlink():
                 continue
             for name in ('session.json', 'snapshot.json', 'events.jsonl', 'events.previous.jsonl',
+                         'resources.jsonl', 'resources.previous.jsonl',
                          'fault.log', 'previous-debug-filtered.log'):
                 path = session / name
                 if path.is_file() and not path.is_symlink():
