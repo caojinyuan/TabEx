@@ -1,0 +1,51 @@
+name: Windows Validation
+
+on:
+  push:
+    paths:
+      - 'TabEx.py'
+      - 'tabexplorer/**'
+      - 'tests/**'
+      - 'tools/**'
+      - 'icons/**'
+      - 'requirements*.txt'
+      - '*.bat'
+      - '.github/workflows/windows-validation.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+      - name: Install Locked Dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Regression, Build And Native Validation
+        run: python tools/build_release.py --skip-install
+      - name: Upload Validation Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-validation
+          path: artifacts/
+          if-no-files-found: ignore
+      - name: Upload Validated Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: TabExplorer-Windows-x64
+          path: TabExplorer.exe

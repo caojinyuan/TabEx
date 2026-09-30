@@ -5,6 +5,8 @@ __pycache__/
 
 # build files
 TabExplorer.exe
+artifacts/
+.tabex-build-*/
 
 # Configuration
 *.json

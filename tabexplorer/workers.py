@@ -11,6 +11,56 @@ from .constants import FOLDER_CHECK_TIMEOUT, LARGE_FOLDER_THRESHOLD
 from .debuglog import debug_print
 
 
+class OpenPathWorker(QThread):
+    completed = pyqtSignal(str, str)
+
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.path = path
+
+    def run(self):
+        try:
+            path = self.path
+            if not path.startswith(('shell:', '::')):
+                path = os.path.abspath(path)
+                if os.path.isfile(path):
+                    path = os.path.dirname(path)
+                if not os.path.isdir(path):
+                    raise FileNotFoundError(path)
+            if not self.isInterruptionRequested():
+                self.completed.emit(path, '')
+        except OSError as error:
+            if not self.isInterruptionRequested():
+                self.completed.emit('', str(error))
+
+
+class QuickFindWorker(QThread):
+    completed = pyqtSignal(str, object, str)
+
+    def __init__(self, directory, keyword, limit=200, parent=None):
+        super().__init__(parent)
+        self.directory = directory
+        self.keyword = keyword.casefold()
+        self.limit = limit
+
+    def run(self):
+        matches, error = [], ''
+        try:
+            with os.scandir(self.directory) as entries:
+                for entry in entries:
+                    if self.isInterruptionRequested():
+                        return
+                    if self.keyword in entry.name.casefold():
+                        matches.append(entry.path)
+                        if len(matches) >= self.limit:
+                            break
+            matches.sort(key=lambda path: os.path.basename(path).casefold())
+        except OSError as exception:
+            error = str(exception)
+        if not self.isInterruptionRequested():
+            self.completed.emit(self.directory, matches, error)
+
+
 class DiagnosticExportWorker(QThread):
     def __init__(self, diagnostics, destination, debug_path):
         super().__init__()

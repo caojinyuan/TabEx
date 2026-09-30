@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULE_NAMES = (
     'paths', 'i18n', 'constants', 'debuglog', 'diagnostics', 'system', 'hotkeys', 'title_shortcuts', 'widgets',
     'updates', 'workers', 'search', 'fileops', 'pathbar', 'bookmarks', 'shellview', 'explorer_tab', 'tabbar',
-    'chat', 'settings', 'mainwindow', 'app',
+    'ai_actions', 'chat', 'settings', 'persistence', 'mainwindow', 'app',
 )
 MODULE_FILES = [ROOT / 'tabexplorer' / f'{name}.py' for name in MODULE_NAMES]
 MODULES = [importlib.import_module(f'tabexplorer.{name}') for name in MODULE_NAMES]

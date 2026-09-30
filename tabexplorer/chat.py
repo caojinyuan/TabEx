@@ -10,9 +10,10 @@ from .paths import get_app_base_dir, get_app_data_path, translate_common_path
 from .i18n import tr
 from .constants import MAX_CHAT_HISTORY_MESSAGES, MAX_CHAT_MESSAGE_CHARS, MAX_CONTEXT_TOTAL_CHARS
 from .debuglog import debug_print
-from .system import launch_detached
+from .system import launch_detached, _retain_thread_until_finished
 from .widgets import show_toast
 from .fileops import _atomic_reviewed_write, _confirm_file_preview
+from .ai_actions import _AiActionMethods, AiActionWorker
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,13 +97,18 @@ class ChatWorker(QThread):
                             )
                         return
                     raise
+                finally:
+                    resp.close()
+                if self.isInterruptionRequested():
+                    return
                 self.response_received.emit(''.join(full_content))
             else:
-                resp = requests.post(url, headers=headers, json=payload, timeout=120, verify=False)
-                resp.raise_for_status()
-                data = resp.json()
-                content = data['choices'][0]['message']['content']
-                self.response_received.emit(content)
+                with requests.post(url, headers=headers, json=payload, timeout=120, verify=False) as resp:
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = data['choices'][0]['message']['content']
+                if not self.isInterruptionRequested():
+                    self.response_received.emit(content)
         except Exception as e:
             self.error_occurred.emit(str(e))
 
@@ -115,6 +121,9 @@ class ChatPanel(QWidget):
         self.main_window = main_window
         self.messages = []   # 对话历史（不含 system prompt）
         self.worker = None
+        self._action_worker = None
+        self._closing = False
+        self._request_cancelled = False
         self.history_file = get_app_data_path("chat_history.json")
         self.workflow_file = get_app_data_path("ai_workflows.json")
         self.workflow_templates = self._load_workflow_templates()
@@ -205,7 +214,11 @@ class ChatPanel(QWidget):
             "QPushButton:disabled{background:#BDBDBD;}"
         )
         self.send_btn.clicked.connect(self.send_message)
+        self.cancel_btn = QPushButton(tr("取消"))
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_actions)
         btn_row.addStretch()
+        btn_row.addWidget(self.cancel_btn)
         btn_row.addWidget(self.send_btn)
         layout.addLayout(btn_row)
 
@@ -392,11 +405,24 @@ class ChatPanel(QWidget):
         menu.exec_(self.chat_display.mapToGlobal(pos))
 
     def clear_chat(self):
+        self.cancel_actions()
         self.messages.clear()
         self.chat_display.clear()
         self._delete_history()  # 清空时删除保存文件
 
-    _MAX_AGENTIC_STEPS = 0  # 0 = 无限制；>0 = 硬性轮数上限
+    _MAX_AGENTIC_STEPS = 12
+
+    def cancel_actions(self):
+        self._request_cancelled = True
+        if self.worker is not None:
+            self.worker.requestInterruption()
+        if self._action_worker is not None:
+            self._action_worker.cancel()
+        self.cancel_btn.setEnabled(False)
+        self.status_lbl.setText(tr("取消中"))
+
+    def has_running_actions(self):
+        return self._action_worker is not None and self._action_worker.isRunning()
 
     def _cleanup_worker(self):
         # 用 sender() 避免与 agentic loop 新建的 worker 混淆
@@ -404,6 +430,9 @@ class ChatPanel(QWidget):
         target = finished_worker if finished_worker else self.worker
         if self.worker is target:
             self.worker = None
+            if self._request_cancelled and not self.has_running_actions():
+                self.send_btn.setEnabled(True)
+                self.status_lbl.setText(tr("已取消"))
         if target:
             try:
                 target.deleteLater()
@@ -411,6 +440,8 @@ class ChatPanel(QWidget):
                 pass
 
     def cleanup(self):
+        self._closing = True
+        self.cancel_actions()
         try:
             self.input_box.removeEventFilter(self)
         except Exception:
@@ -440,14 +471,7 @@ class ChatPanel(QWidget):
                 pass
 
             if worker.isRunning():
-                try:
-                    worker.finished.connect(worker.deleteLater)
-                except Exception:
-                    pass
-                try:
-                    worker.setParent(None)
-                except Exception:
-                    pass
+                _retain_thread_until_finished(worker)
             else:
                 try:
                     worker.deleteLater()
@@ -686,6 +710,8 @@ class ChatPanel(QWidget):
 
     # ── 发送消息 ─────────────────────────────────────────────────────────────
     def send_message(self):
+        if not self.send_btn.isEnabled() or self.has_running_actions():
+            return
         text = self.input_box.toPlainText().strip()
         if not text:
             return
@@ -706,13 +732,12 @@ class ChatPanel(QWidget):
         self.append_bubble("user", text)
 
         # 获取当前路径作为上下文
-        current_path = ""
-        try:
-            tab = self.main_window.get_current_tab_widget()
-            if tab and hasattr(tab, 'current_path'):
-                current_path = tab.current_path or ""
-        except Exception:
-            pass
+        self._action_base_dir = None
+        current_path = self._get_action_base_dir()
+        self._action_base_dir = current_path
+        import weakref
+        action_tab = self.main_window.get_current_tab_widget()
+        self._action_tab_ref = weakref.ref(action_tab) if action_tab is not None else lambda: None
 
         # 构建 system prompt
         system_prompt = cfg.get("system_prompt", "").strip()
@@ -760,6 +785,8 @@ class ChatPanel(QWidget):
 
         # 启动工作线程（流式输出，每个 token 实时更新状态栏）
         self._agentic_steps = 0
+        self._request_cancelled = False
+        self.cancel_btn.setEnabled(True)
         self._last_agentic_feed = None  # 重复调用检测用
         self._streaming_chars = 0
         self.send_btn.setEnabled(False)
@@ -844,11 +871,55 @@ class ChatPanel(QWidget):
         self._streaming_buffer = ""
 
     def _on_response(self, content: str):
+        if self._closing or self._request_cancelled:
+            return
         self.status_lbl.setText("")
         self._streaming_chars = 0
         self.messages.append({"role": "assistant", "content": content})
         self._trim_chat_history()
-        display_content, feedable = self._apply_actions(content)
+        worker = AiActionWorker(content, self._get_action_base_dir(), self)
+        self._action_worker = worker
+        worker.ui_requested.connect(self._handle_action_ui)
+        worker.completed.connect(self._on_actions_completed)
+        worker.finished.connect(self._action_thread_finished)
+        worker.start()
+        _retain_thread_until_finished(worker)
+
+    def _handle_action_ui(self, request):
+        try:
+            if self._closing or self._request_cancelled or self.sender() is not self._action_worker:
+                return
+            kind, arguments = request['kind'], request['arguments']
+            if kind == 'confirm':
+                request['result'] = self._confirm_danger_action(*arguments)
+            elif kind == 'preview':
+                request['result'] = _confirm_file_preview(self, *arguments)
+            elif kind == 'open':
+                from PyQt5 import sip
+                tab = getattr(self, '_action_tab_ref', lambda: None)()
+                if tab is not None and not sip.isdeleted(tab):
+                    tab.navigate_to(arguments[0], skip_async_check=True)
+                else:
+                    self.main_window.add_new_tab(*arguments)
+                request['result'] = True
+        finally:
+            request['ready'].set()
+
+    def _on_actions_completed(self, display_content, feedable, cancelled):
+        if self._closing or self.sender() is not self._action_worker:
+            return
+        if cancelled or self._request_cancelled:
+            self._close_streaming_bubble()
+            self.status_lbl.setText(tr("已取消"))
+            self.send_btn.setEnabled(True)
+            return
+        self._finish_response(display_content, feedable)
+
+    def _action_thread_finished(self):
+        if self.sender() is self._action_worker:
+            self._action_worker = None
+
+    def _finish_response(self, display_content, feedable):
 
         if feedable:
             # 中间轮次：不追加气泡，清空缓冲区让流式气泡原地刷新为“等待”状态
@@ -869,6 +940,7 @@ class ChatPanel(QWidget):
             self.append_bubble("assistant", display_content)
             self._last_agentic_feed = None
             self.send_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(False)
     def _start_agentic_step(self, feedable_results: list, force_final: bool = False):
         """将工具调用结果回传给 AI，启动下一轮自动推理。
         force_final=True 时禁止 AI 继续调工具，强制给出结论。
@@ -883,6 +955,12 @@ class ChatPanel(QWidget):
 
         self._agentic_steps = getattr(self, '_agentic_steps', 0) + 1
         step = self._agentic_steps
+        if self._request_cancelled or (self._MAX_AGENTIC_STEPS and step > self._MAX_AGENTIC_STEPS):
+            self._close_streaming_bubble()
+            self.send_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(False)
+            self.status_lbl.setText(tr("已停止自动工具调用"))
+            return
 
         # 工具结果限制单条 8000 字，防止上下文爆炸
         _MAX_FEED = 8000
@@ -950,8 +1028,11 @@ class ChatPanel(QWidget):
         self.worker.start()
 
     def _on_error(self, msg: str):
+        if self._closing or self._request_cancelled:
+            return
         self._close_streaming_bubble()   # 移除未完成的流式气泡
         self.send_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
         self.status_lbl.setText("")
         self.append_bubble("system", tr("❌ 请求失败: {}").format(msg))
 
@@ -1184,41 +1265,20 @@ class ChatPanel(QWidget):
 
     def _get_action_base_dir(self):
         """获取动作执行的基准目录（当前标签目录）。"""
+        captured = getattr(self, '_action_base_dir', None)
+        if captured is not None:
+            return captured
         try:
             tab = self.main_window.get_current_tab_widget()
             p = getattr(tab, 'current_path', '') if tab else ''
-            if p and os.path.isdir(p):
+            if isinstance(p, str) and os.path.isabs(p) and not p.startswith(('shell:', '::')):
                 return os.path.normpath(p)
         except Exception:
             pass
-        return os.path.normpath(get_app_base_dir())
+        return ''
 
     def _resolve_action_path(self, raw_path: str):
-        """解析动作路径，限制在当前目录范围内。"""
-        p = (raw_path or '').strip().strip('"\'')
-        if not p:
-            return None, tr("空路径")
-
-        p = p.replace('/', '\\')
-        base_dir = self._get_action_base_dir()
-
-        # 相对路径按当前目录解析
-        if not os.path.isabs(p):
-            p = os.path.join(base_dir, p)
-
-        p = translate_common_path(os.path.normpath(p))
-
-        try:
-            # 解析目录链接/符号链接后再比较，防止经由当前目录内的链接访问目录外文件
-            base_real = os.path.normcase(os.path.realpath(base_dir)).rstrip(os.sep)
-            path_real = os.path.normcase(os.path.realpath(p))
-            if not (path_real == base_real or path_real.rstrip(os.sep) == base_real
-                    or path_real.startswith(base_real + os.sep)):
-                return None, tr("超出当前目录范围: {}").format(p)
-        except Exception:
-            return None, tr("路径非法: {}").format(p)
-
-        return p, None
+        return _AiActionMethods._resolve_action_path(self, raw_path)
 
     def _confirm_danger_action(self, title: str, text: str) -> bool:
         """危险操作二次确认。"""
@@ -1237,560 +1297,14 @@ class ChatPanel(QWidget):
             return False
 
     def _resolve_git_repo_dir(self, raw_path: str):
-        """解析 Git 操作目录，限制在当前目录范围内。"""
-        path, err = self._resolve_action_path(raw_path)
-        if err:
-            return None, err
-        repo_dir = path if os.path.isdir(path) else os.path.dirname(path)
-        if not repo_dir or not os.path.isdir(repo_dir):
-            return None, tr("❌ 目录不存在: {}").format(path)
-        return repo_dir, None
+        return _AiActionMethods._resolve_git_repo_dir(self, raw_path)
+
+    def _resolve_git_target(self, repo_dir, target):
+        return _AiActionMethods._resolve_git_target(self, repo_dir, target)
 
     def _run_git_command(self, repo_dir: str, git_args: list, timeout_sec: int = 20):
-        """执行 Git 命令并返回 (ok, stdout, stderr)。"""
-        import shutil
-        import subprocess
-        if not shutil.which("git"):
-            return False, "", tr("未检测到 Git，请先安装 Git for Windows")
-        try:
-            proc = subprocess.run(
-                ["git", "-C", repo_dir] + list(git_args),
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=timeout_sec,
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-            )
-            stdout = (proc.stdout or "").strip()
-            stderr = (proc.stderr or "").strip()
-            if proc.returncode != 0:
-                return False, stdout, (stderr or tr("❌ Git 执行失败: {}").format(" ".join(git_args)))
-            return True, stdout, stderr
-        except subprocess.TimeoutExpired:
-            return False, "", tr("❌ Git 执行超时: {}").format(" ".join(git_args))
-        except Exception as e:
-            return False, "", tr("❌ Git 执行失败: {}").format(e)
+        return _AiActionMethods._run_git_command(self, repo_dir, git_args, timeout_sec)
 
     # ── 解析并执行 AI 操作命令 ────────────────────────────────────────────────
     def _apply_actions(self, content: str) -> tuple:
-        """解析 AI 回复中的操作标记并按出现顺序执行。
-        返回 (display_content, feedable)：
-        - display_content: 附带执行注释的显示文本
-        - feedable: READ_FILE/LIST_DIR 结果列表，供 agentic loop 回传给 AI
-        """
-        import re, subprocess
-        notes = []
-
-        # ── 收集所有指令及其在文本中的位置，按顺序执行 ──────────────────────
-        feedable = []  # 可回传给 AI 的工具结果（READ_FILE / LIST_DIR）
-        actions = []  # list of (start_pos, action_type, match_obj)
-
-        patterns = {
-            'OPEN_DIR':   re.compile(r'\[OPEN_DIR:\s*([^\]]+)\]'),
-            'RUN_SCRIPT': re.compile(r'\[RUN_SCRIPT:\s*([^\]]+)\]'),
-            'LIST_DIR':   re.compile(r'\[LIST_DIR:\s*([^\]]+)\]'),
-            'READ_FILE':  re.compile(r'\[READ_FILE:\s*([^\]]+)\]'),
-            'MKDIR':      re.compile(r'\[MKDIR:\s*([^\]]+)\]'),
-            'GIT_STATUS': re.compile(r'\[GIT_STATUS:\s*([^\]]+)\]'),
-            'GIT_DIFF':   re.compile(r'\[GIT_DIFF:\s*([^\]]+)\]'),
-            'GIT_LOG':    re.compile(r'\[GIT_LOG:\s*([^\]]+)\]'),
-            'GIT_BRANCH': re.compile(r'\[GIT_BRANCH:\s*([^\]]+)\]'),
-            # PATCH_FILE / WRITE_FILE 内容可含代码中的 ] (如 arr[i])，
-            # 用 .*? + 行末 lookahead 确保只在真正的指令结束处停止
-            'PATCH_FILE': re.compile(r'\[PATCH_FILE:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
-            'WRITE_FILE': re.compile(r'\[WRITE_FILE:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
-            'DELETE':     re.compile(r'\[DELETE:\s*([^\]]+)\]'),
-            'GIT_ADD':    re.compile(r'\[GIT_ADD:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
-            'GIT_COMMIT': re.compile(r'\[GIT_COMMIT:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
-            'GIT_SWITCH': re.compile(r'\[GIT_SWITCH:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
-            'GIT_RESTORE': re.compile(r'\[GIT_RESTORE:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
-            'GIT_RESET_SOFT': re.compile(r'\[GIT_RESET_SOFT:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
-            'GIT_PULL': re.compile(r'\[GIT_PULL:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
-            'GIT_PUSH': re.compile(r'\[GIT_PUSH:\s*(.*?)\][ \t]*(?=\n|$)', re.DOTALL),
-        }
-        for atype, pat in patterns.items():
-            for m in pat.finditer(content):
-                actions.append((m.start(), atype, m))
-
-        # 按出现位置排序，保证 WRITE_FILE 在 RUN_SCRIPT 之前（若 AI 如此安排）
-        actions.sort(key=lambda x: x[0])
-
-        for _, atype, m in actions:
-
-            # ── OPEN_DIR ────────────────────────────────────────────────────
-            if atype == 'OPEN_DIR':
-                raw = m.group(1).strip().strip('"\'')
-                path = translate_common_path(os.path.normpath(raw))
-                if os.path.isdir(path):
-                    try:
-                        current_tab = self.main_window.get_current_tab_widget()
-                        if current_tab and hasattr(current_tab, 'navigate_to'):
-                            current_path = getattr(current_tab, 'current_path', '')
-                            same_path = False
-                            if hasattr(self.main_window, '_normalize_path_for_compare'):
-                                same_path = (
-                                    self.main_window._normalize_path_for_compare(current_path)
-                                    == self.main_window._normalize_path_for_compare(path)
-                                )
-                            if same_path:
-                                notes.append(tr("ℹ 当前标签已在该目录: {}").format(path))
-                            else:
-                                current_tab.navigate_to(path, skip_async_check=True)
-                                notes.append(tr("✅ 已在当前标签切换到目录: {}").format(path))
-                        else:
-                            self.main_window.add_new_tab(path)
-                            notes.append(tr("✅ 已打开目录: {}").format(path))
-                    except Exception as e:
-                        notes.append(tr("❌ 打开目录失败: {}（{}）").format(path, e))
-                else:
-                    notes.append(tr("⚠️ 目录不存在: {}").format(path))
-
-            # ── RUN_SCRIPT ──────────────────────────────────────────────────
-            elif atype == 'RUN_SCRIPT':
-                raw = m.group(1).strip().strip('"\'')
-                script = os.path.normpath(raw)
-                if os.path.isfile(script):
-                    try:
-                        if not self._confirm_danger_action(
-                            tr("确认运行脚本"),
-                            tr("AI 请求运行脚本：\n{}\n\n是否继续？").format(script)
-                        ):
-                            notes.append(tr("⏸ 已取消运行脚本: {}").format(script))
-                            continue
-                        launch_detached(script if isinstance(script, list) else [script], cwd=os.path.dirname(script))
-                        notes.append(tr("✅ 已启动脚本: {}").format(script))
-                    except Exception as e:
-                        notes.append(tr("❌ 运行脚本失败: {}（{}）").format(script, e))
-                else:
-                    notes.append(tr("⚠️ 脚本不存在: {}").format(script))
-
-            # ── LIST_DIR ────────────────────────────────────────────────────
-            elif atype == 'LIST_DIR':
-                raw = m.group(1)
-                path, err = self._resolve_action_path(raw)
-                if err:
-                    _emsg = tr("❌ 列目录失败: {}").format(err)
-                    notes.append(_emsg); feedable.append(_emsg)
-                    continue
-                if not os.path.isdir(path):
-                    _emsg = tr("❌ 目录不存在: {}").format(path)
-                    if os.path.isfile(path):
-                        _emsg += tr("（这是文件，请用 READ_FILE）")
-                    notes.append(_emsg); feedable.append(_emsg)
-                    continue
-                try:
-                    items = os.listdir(path)
-                    preview = "\n".join(items[:50]) if items else tr("(空目录)")
-                    if len(items) > 50:
-                        preview += f"\n... 其余 {len(items) - 50} 项省略"
-                    notes.append(tr("📁 目录列表: {}\n{}").format(path, preview))
-                    feedable.append(tr("[LIST_DIR 结果] 目录 {}:\n{}").format(path, preview))
-                except Exception as e:
-                    notes.append(tr("❌ 列目录失败: {}（{}）").format(path, e))
-
-            # ── READ_FILE ───────────────────────────────────────────────────
-            elif atype == 'READ_FILE':
-                raw = m.group(1)
-                parts = raw.split('|')
-                raw_path = parts[0].strip()
-                start_offset = 0
-                if len(parts) > 1:
-                    try:
-                        start_offset = int(parts[1].strip())
-                    except ValueError:
-                        pass
-                path, err = self._resolve_action_path(raw_path)
-                if err:
-                    _emsg = tr("❌ 读取失败: {}").format(err)
-                    notes.append(_emsg); feedable.append(_emsg)
-                    continue
-                if not os.path.isfile(path):
-                    _emsg = tr("❌ 文件不存在: {}").format(path)
-                    if os.path.isdir(path):
-                        _emsg += tr("（这是目录，请用 LIST_DIR 列目录，或直接指定具体 .c/.h 文件路径）")
-                    notes.append(_emsg); feedable.append(_emsg)
-                    continue
-                CHUNK = 5000
-                MAX_TOTAL = 50000
-                try:
-                    enc = 'utf-8'
-                    try:
-                        with open(path, 'r', encoding='utf-8') as _probe_f:
-                            _probe_f.read(1)
-                    except UnicodeDecodeError:
-                        enc = 'gbk'
-                    file_size = os.path.getsize(path)
-                    all_text = []
-                    offset = start_offset
-                    with open(path, 'r', encoding=enc, errors='replace') as f:
-                        f.seek(offset)
-                        while True:
-                            chunk = f.read(CHUNK)
-                            if not chunk:
-                                break
-                            all_text.append(chunk)
-                            offset += len(chunk.encode(enc, errors='replace'))
-                            if sum(len(t) for t in all_text) >= MAX_TOTAL:
-                                break
-                    full_text = ''.join(all_text)
-                    total_read = sum(len(t) for t in all_text)
-                    truncated = (start_offset + total_read) < file_size
-                    info = tr("📄 文件内容（{}-{}/{}字节，{}）: {}").format(start_offset, start_offset+total_read, file_size, enc, path)
-                    if truncated:
-                        info += tr("\n⚠️ 文件过大，仅读取前 {} 字符，剩余 {} 字节未读").format(MAX_TOTAL, file_size - start_offset - total_read)
-                    notes.append(f"{info}\n{full_text}")
-                    feedable.append(f"{info}\n{full_text}")
-                except Exception as e:
-                    notes.append(tr("❌ 读取失败: {}（{}）").format(path, e))
-
-            # ── MKDIR ───────────────────────────────────────────────────────
-            elif atype == 'MKDIR':
-                raw = m.group(1)
-                path, err = self._resolve_action_path(raw)
-                if err:
-                    notes.append(tr("❌ 创建目录失败: {}").format(err))
-                    continue
-                try:
-                    os.makedirs(path, exist_ok=True)
-                    notes.append(tr("✅ 已创建目录: {}").format(path))
-                except Exception as e:
-                    notes.append(tr("❌ 创建目录失败: {}（{}）").format(path, e))
-
-            # ── PATCH_FILE ──────────────────────────────────────────────────
-            elif atype == 'PATCH_FILE':
-                raw = m.group(1)
-                parts = raw.split('|', 2)
-                if len(parts) < 3:
-                    notes.append(tr("❌ PATCH_FILE 格式: [PATCH_FILE: 路径|旧文本|新文本]"))
-                    continue
-                raw_path, old_text, new_text = parts
-                path, err = self._resolve_action_path(raw_path.strip())
-                if err:
-                    notes.append(tr("❌ 补丁失败: {}").format(err))
-                    continue
-                if not os.path.isfile(path):
-                    notes.append(tr("❌ 文件不存在: {}").format(path))
-                    continue
-                try:
-                    if os.path.getsize(path) > 5 * 1024 * 1024:
-                        raise ValueError(tr("预览文件上限为 5 MB"))
-                    with open(path, 'rb') as source:
-                        original_bytes = source.read()
-                    enc = 'utf-8-sig' if original_bytes.startswith(b'\xef\xbb\xbf') else 'utf-8'
-                    try:
-                        file_src = original_bytes.decode(enc)
-                    except UnicodeDecodeError:
-                        enc = 'gbk'
-                        file_src = original_bytes.decode(enc)
-                    if not old_text:
-                        raise ValueError(tr("补丁目标文本不能为空"))
-                    count = file_src.count(old_text)
-                    if count == 0:
-                        notes.append(tr("❌ 补丁失败：在 {} 中未找到目标文本").format(path))
-                        continue
-                    if count > 1:
-                        notes.append(tr("补丁目标不唯一，请提供更多上下文"))
-                        continue
-                    patched = file_src.replace(old_text, new_text, 1)
-                    if not _confirm_file_preview(self, tr("确认 AI 补丁"), path, file_src, patched):
-                        notes.append(tr("已取消补丁: ") + path)
-                        continue
-                    checked_path, checked_error = self._resolve_action_path(raw_path.strip())
-                    if checked_error or checked_path != path:
-                        raise ValueError(tr("文件路径已变化"))
-                    _atomic_reviewed_write(path, original_bytes, patched.encode(enc))
-                    notes.append(tr("✅ 补丁成功: {}").format(path))
-                except Exception as e:
-                    notes.append(tr("❌ 补丁失败: {}（{}）").format(path, e))
-
-            # ── WRITE_FILE ──────────────────────────────────────────────────
-            elif atype == 'WRITE_FILE':
-                raw = m.group(1)
-                if '|' not in raw:
-                    notes.append(tr("❌ 写入失败: 格式应为 [WRITE_FILE: 路径|内容]"))
-                    continue
-                raw_path, file_content = raw.split('|', 1)
-                path, err = self._resolve_action_path(raw_path)
-                if err:
-                    notes.append(tr("❌ 写入失败: {}").format(err))
-                    continue
-                try:
-                    file_exists = os.path.exists(path)
-                    # 已有文件且较大时，拒绝全量覆盖，引导用 PATCH_FILE
-                    if file_exists and os.path.getsize(path) > 5000:
-                        notes.append(
-                            f"❌ 已拒绝覆盖：{os.path.basename(path)} 已存在且大于 5KB，" +
-                            tr("全量覆盖会丢失未读内容。") +
-                            tr("请改用 [PATCH_FILE: 路径|旧文本|新文本] 进行局部修改。")
-                        )
-                        continue
-                    original_bytes = None
-                    before = ''
-                    if file_exists:
-                        with open(path, 'rb') as source:
-                            original_bytes = source.read()
-                        before = original_bytes.decode('utf-8-sig')
-                    if not _confirm_file_preview(self, tr("确认 AI 写入"), path, before, file_content):
-                        notes.append(tr("已取消写入: ") + path)
-                        continue
-                    checked_path, checked_error = self._resolve_action_path(raw_path)
-                    if checked_error or checked_path != path:
-                        raise ValueError(tr("文件路径已变化"))
-                    _atomic_reviewed_write(path, original_bytes, file_content.encode('utf-8'))
-                    notes.append(tr("✅ 已写入文件: {}").format(path))
-                except Exception as e:
-                    notes.append(tr("❌ 写入失败: {}（{}）").format(path, e))
-
-            # ── DELETE ──────────────────────────────────────────────────────
-            elif atype == 'DELETE':
-                raw = m.group(1).strip()
-                path, err = self._resolve_action_path(raw)
-                if err:
-                    notes.append(tr("❌ 删除失败: {}").format(err))
-                    continue
-                if not os.path.exists(path):
-                    notes.append(tr("❌ 路径不存在: {}").format(path))
-                    continue
-                is_dir = os.path.isdir(path)
-                type_label = tr("目录（及其所有内容）") if is_dir else tr("文件")
-                if not self._confirm_danger_action(
-                    tr("确认删除"),
-                    tr("AI 请求将{}移入回收站：\n{}\n\n是否继续？").format(type_label, path)
-                ):
-                    notes.append(tr("⏸ 已取消删除: {}").format(path))
-                    continue
-                try:
-                    from send2trash import send2trash
-                    send2trash(path)
-                    notes.append(tr("✅ 已删除{}: {}").format(type_label, path))
-                except Exception as e:
-                    notes.append(tr("❌ 删除失败: {}（{}）").format(path, e))
-
-            # ── GIT_STATUS / GIT_DIFF / GIT_LOG / GIT_BRANCH ───────────────
-            elif atype in ('GIT_STATUS', 'GIT_DIFF', 'GIT_LOG', 'GIT_BRANCH'):
-                raw = m.group(1).strip()
-                repo_dir, err = self._resolve_git_repo_dir(raw)
-                if err:
-                    _emsg = tr("❌ Git 执行失败: {}").format(err)
-                    notes.append(_emsg)
-                    feedable.append(_emsg)
-                    continue
-
-                git_map = {
-                    'GIT_STATUS': (['status', '--short', '--branch'], tr("✅ Git 状态 ({})\n{}")),
-                    'GIT_DIFF': (['diff'], tr("✅ Git Diff ({})\n{}")),
-                    'GIT_LOG': (['log', '--oneline', '-n', '20'], tr("✅ Git Log ({})\n{}")),
-                    'GIT_BRANCH': (['branch', '--all', '--verbose', '--no-abbrev'], tr("✅ Git Branch ({})\n{}")),
-                }
-                args, fmt = git_map[atype]
-                ok, out, err_msg = self._run_git_command(repo_dir, args)
-                if ok:
-                    text = out if out else tr("⚠️ Git 无输出")
-                    if len(text) > 30000:
-                        text = text[:30000] + tr("\n\n【已截断 {} 个字符】").format(len(text) - 30000)
-                    msg = fmt.format(repo_dir, text)
-                    notes.append(msg)
-                    feedable.append(msg)
-                else:
-                    _emsg = tr("❌ Git 执行失败: {}").format(err_msg)
-                    notes.append(_emsg)
-                    feedable.append(_emsg)
-
-            # ── GIT_ADD ─────────────────────────────────────────────────────
-            elif atype == 'GIT_ADD':
-                raw = m.group(1)
-                parts = raw.split('|', 1)
-                if len(parts) < 2:
-                    notes.append(tr("❌ Git 指令格式应为 [GIT_ADD: 路径|目标]"))
-                    continue
-                repo_raw, target = parts[0].strip(), parts[1].strip() or '.'
-                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
-                if err:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err))
-                    continue
-                if not self._confirm_danger_action(
-                    tr("确认 Git 暂存"),
-                    tr("AI 请求暂存变更：\n仓库: {}\n目标: {}\n\n是否继续？").format(repo_dir, target)
-                ):
-                    notes.append(tr("⏸ 已取消 Git 暂存: {}").format(repo_dir))
-                    continue
-                ok, _, err_msg = self._run_git_command(repo_dir, ['add', '--', target])
-                if ok:
-                    notes.append(tr("✅ Git 已暂存 ({}) 目标: {}").format(repo_dir, target))
-                else:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
-
-            # ── GIT_COMMIT ──────────────────────────────────────────────────
-            elif atype == 'GIT_COMMIT':
-                raw = m.group(1)
-                parts = raw.split('|', 1)
-                if len(parts) < 2:
-                    notes.append(tr("❌ Git 指令格式应为 [GIT_COMMIT: 路径|提交信息]"))
-                    continue
-                repo_raw, commit_msg = parts[0].strip(), parts[1].strip()
-                if not commit_msg:
-                    notes.append(tr("❌ Git 指令格式应为 [GIT_COMMIT: 路径|提交信息]"))
-                    continue
-                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
-                if err:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err))
-                    continue
-                if not self._confirm_danger_action(
-                    tr("确认 Git 提交"),
-                    tr("AI 请求提交变更：\n仓库: {}\n提交信息: {}\n\n是否继续？").format(repo_dir, commit_msg)
-                ):
-                    notes.append(tr("⏸ 已取消 Git 提交: {}").format(repo_dir))
-                    continue
-                ok, out, err_msg = self._run_git_command(repo_dir, ['commit', '-m', commit_msg])
-                if ok:
-                    notes.append(tr("✅ Git 提交成功 ({})\n{}").format(repo_dir, out or tr("⚠️ Git 无输出")))
-                else:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
-
-            # ── GIT_SWITCH ──────────────────────────────────────────────────
-            elif atype == 'GIT_SWITCH':
-                raw = m.group(1)
-                parts = raw.split('|', 1)
-                if len(parts) < 2:
-                    notes.append(tr("❌ Git 指令格式应为 [GIT_SWITCH: 路径|分支名]"))
-                    continue
-                repo_raw, branch = parts[0].strip(), parts[1].strip()
-                if not branch:
-                    notes.append(tr("❌ Git 指令格式应为 [GIT_SWITCH: 路径|分支名]"))
-                    continue
-                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
-                if err:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err))
-                    continue
-                if not self._confirm_danger_action(
-                    tr("确认 Git 切换分支"),
-                    tr("AI 请求切换分支：\n仓库: {}\n分支: {}\n\n是否继续？").format(repo_dir, branch)
-                ):
-                    notes.append(tr("⏸ 已取消 Git 切换分支: {}").format(repo_dir))
-                    continue
-                ok, _, err_msg = self._run_git_command(repo_dir, ['switch', branch])
-                if ok:
-                    notes.append(tr("✅ Git 已切换到分支 ({}) -> {}").format(repo_dir, branch))
-                else:
-                    ok2, _, err_msg2 = self._run_git_command(repo_dir, ['checkout', branch])
-                    if ok2:
-                        notes.append(tr("✅ Git 已切换到分支 ({}) -> {}").format(repo_dir, branch))
-                    else:
-                        notes.append(tr("❌ Git 执行失败: {}").format(err_msg2 or err_msg))
-
-            # ── GIT_RESTORE ────────────────────────────────────────────────
-            elif atype == 'GIT_RESTORE':
-                raw = m.group(1)
-                parts = raw.split('|', 1)
-                if len(parts) < 2:
-                    notes.append(tr("❌ Git 指令格式应为 [GIT_RESTORE: 路径|目标]"))
-                    continue
-                repo_raw, target = parts[0].strip(), (parts[1].strip() or '.')
-                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
-                if err:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err))
-                    continue
-                if not self._confirm_danger_action(
-                    tr("确认 Git 还原"),
-                    tr("AI 请求还原工作区改动：\n仓库: {}\n目标: {}\n\n是否继续？").format(repo_dir, target)
-                ):
-                    notes.append(tr("⏸ 已取消 Git 还原: {}").format(repo_dir))
-                    continue
-                ok, _, err_msg = self._run_git_command(repo_dir, ['restore', '--', target])
-                if ok:
-                    notes.append(tr("✅ Git 已还原 ({}) 目标: {}").format(repo_dir, target))
-                else:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
-
-            # ── GIT_RESET_SOFT ─────────────────────────────────────────────
-            elif atype == 'GIT_RESET_SOFT':
-                raw = m.group(1)
-                parts = raw.split('|', 1)
-                repo_raw = parts[0].strip() if parts else ''
-                target = (parts[1].strip() if len(parts) > 1 else '') or 'HEAD~1'
-                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
-                if err:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err))
-                    continue
-                if not self._confirm_danger_action(
-                    tr("确认 Git 软重置"),
-                    tr("AI 请求软重置 HEAD：\n仓库: {}\n目标: {}\n\n是否继续？").format(repo_dir, target)
-                ):
-                    notes.append(tr("⏸ 已取消 Git 软重置: {}").format(repo_dir))
-                    continue
-                ok, _, err_msg = self._run_git_command(repo_dir, ['reset', '--soft', target])
-                if ok:
-                    notes.append(tr("✅ Git 软重置成功 ({}) -> {}").format(repo_dir, target))
-                else:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
-
-            # ── GIT_PULL ───────────────────────────────────────────────────
-            elif atype == 'GIT_PULL':
-                raw = m.group(1)
-                parts = [p.strip() for p in raw.split('|')]
-                if not parts or not parts[0]:
-                    notes.append(tr("❌ Git 执行失败: {}").format(tr("空路径")))
-                    continue
-                repo_raw = parts[0]
-                remote = parts[1] if len(parts) > 1 and parts[1] else ''
-                branch = parts[2] if len(parts) > 2 and parts[2] else ''
-                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
-                if err:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err))
-                    continue
-                if not self._confirm_danger_action(
-                    tr("确认 Git 拉取"),
-                    tr("AI 请求拉取远程更新：\n仓库: {}\n远程: {}\n分支: {}\n\n是否继续？").format(
-                        repo_dir, remote or '(default)', branch or '(default)'
-                    )
-                ):
-                    notes.append(tr("⏸ 已取消 Git 拉取: {}").format(repo_dir))
-                    continue
-                args = ['pull']
-                if remote:
-                    args.append(remote)
-                if branch:
-                    args.append(branch)
-                ok, out, err_msg = self._run_git_command(repo_dir, args, timeout_sec=60)
-                if ok:
-                    notes.append(tr("✅ Git 拉取成功 ({})\n{}").format(repo_dir, out or tr("⚠️ Git 无输出")))
-                else:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
-
-            # ── GIT_PUSH ───────────────────────────────────────────────────
-            elif atype == 'GIT_PUSH':
-                raw = m.group(1)
-                parts = [p.strip() for p in raw.split('|')]
-                if not parts or not parts[0]:
-                    notes.append(tr("❌ Git 执行失败: {}").format(tr("空路径")))
-                    continue
-                repo_raw = parts[0]
-                remote = parts[1] if len(parts) > 1 and parts[1] else ''
-                branch = parts[2] if len(parts) > 2 and parts[2] else ''
-                repo_dir, err = self._resolve_git_repo_dir(repo_raw)
-                if err:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err))
-                    continue
-                if not self._confirm_danger_action(
-                    tr("确认 Git 推送"),
-                    tr("AI 请求推送本地提交：\n仓库: {}\n远程: {}\n分支: {}\n\n是否继续？").format(
-                        repo_dir, remote or '(default)', branch or '(default)'
-                    )
-                ):
-                    notes.append(tr("⏸ 已取消 Git 推送: {}").format(repo_dir))
-                    continue
-                args = ['push']
-                if remote:
-                    args.append(remote)
-                if branch:
-                    args.append(branch)
-                ok, out, err_msg = self._run_git_command(repo_dir, args, timeout_sec=60)
-                if ok:
-                    notes.append(tr("✅ Git 推送成功 ({})\n{}").format(repo_dir, out or tr("⚠️ Git 无输出")))
-                else:
-                    notes.append(tr("❌ Git 执行失败: {}").format(err_msg))
-
-        if notes:
-            content = content + "\n\n" + "\n".join(notes)
-        return content, feedable
+        return _AiActionMethods._apply_actions(self, content)

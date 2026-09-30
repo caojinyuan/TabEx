@@ -25,7 +25,7 @@ class FileBatchOpWorker(QThread):
     completed = pyqtSignal(str, int, int, list)
     progress = pyqtSignal(str, int, int, str)  # op_type, done_count, total_count, current_name
 
-    def __init__(self, op_type, src_paths, dst_dir=None, parent=None, max_workers=0):
+    def __init__(self, op_type, src_paths, dst_dir=None, parent=None, max_workers=0, resume_state=None):
         super().__init__(parent)
         self.op_type = str(op_type or '').lower()
         self.src_paths = [p for p in (src_paths or []) if isinstance(p, str) and p]
@@ -46,6 +46,10 @@ class FileBatchOpWorker(QThread):
         self.rename_plan = {}
         self.conflict_actions = {}  # 源路径 -> 'skip' | 'rename'；未列出的冲突项按 'rename' 处理
         self.skipped_count = 0
+        state = resume_state or {}
+        self.copy_state = {name: dict(state.get(name, {})) for name in ('targets', 'completed')}
+        self.retry_paths = []
+        self._completed_sources = set()
 
     def request_cancel(self):
         self._cancel_requested = True
@@ -71,7 +75,7 @@ class FileBatchOpWorker(QThread):
         if task_count <= 1:
             return 1
         if self.max_workers > 0:
-            return max(1, min(self.max_workers, task_count))
+            return max(1, min(self.max_workers, task_count, 16))
         return min(2, task_count)
 
     @staticmethod
@@ -216,6 +220,20 @@ class FileBatchOpWorker(QThread):
     def _copy_file_task(self, src_file, dst_file):
         self._raise_if_cancelled()
         import tempfile
+        def identity(path):
+            info = os.stat(path)
+            return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+        source_identity = identity(src_file)
+        with self._progress_lock:
+            completed = self.copy_state['completed'].get(src_file)
+        if completed is not None and os.path.lexists(dst_file):
+            target, previous_source, previous_target = completed
+            if target != dst_file or source_identity != previous_source or identity(dst_file) != previous_target:
+                raise FileExistsError(tr("续作目标或来源已变化: ") + dst_file)
+            with self._progress_lock:
+                self.bytes_done += source_identity[2]
+            return
         parent = os.path.dirname(dst_file)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -232,10 +250,14 @@ class FileBatchOpWorker(QThread):
                         self.bytes_done += len(block)
                     self._emit_progress(os.path.basename(src_file))
             self._raise_if_cancelled()
+            if identity(src_file) != source_identity:
+                raise OSError(tr("复制过程中来源已变化: ") + src_file)
             shutil.copystat(src_file, temporary)
             if os.path.lexists(dst_file):
                 raise FileExistsError(dst_file)
             os.rename(temporary, dst_file)
+            with self._progress_lock:
+                self.copy_state['completed'][src_file] = (dst_file, source_identity, identity(dst_file))
         finally:
             if os.path.exists(temporary):
                 os.remove(temporary)
@@ -369,9 +391,11 @@ class FileBatchOpWorker(QThread):
         self._emit_progress("")
 
         try:
+            self._raise_if_cancelled()
             if self.op_type == 'copy':
                 if not self.dst_dir or not os.path.isdir(self.dst_dir):
                     self.failed_paths = list(self.src_paths)
+                    self.retry_paths = list(self.src_paths)
                     self.completed.emit(self.op_type, 0, len(self.src_paths), [tr("复制失败：目标目录无效")])
                     return
 
@@ -381,12 +405,20 @@ class FileBatchOpWorker(QThread):
                         src_norm = os.path.normpath(src)
                         name = os.path.basename(src_norm) or os.path.basename(os.path.dirname(src_norm)) or 'item'
                         target = os.path.join(self.dst_dir, name)
-                        if self.conflict_actions.get(src) == 'skip' and os.path.lexists(target):
+                        previous_target = self.copy_state['targets'].get(src)
+                        if not previous_target and self.conflict_actions.get(src) == 'skip' and os.path.lexists(target):
                             self.skipped_count += 1
+                            self._completed_sources.add(src)
                             self.done_units += 1
                             self._emit_progress(name)
                             continue
-                        dst_path = self._make_unique_path(target)
+                        if previous_target:
+                            dst_path, target_real = previous_target
+                            if os.path.normcase(os.path.realpath(dst_path)) != target_real:
+                                raise ValueError(tr("续作目标路径已变化: ") + dst_path)
+                        else:
+                            dst_path = self._make_unique_path(target)
+                            self.copy_state['targets'][src] = (dst_path, os.path.normcase(os.path.realpath(dst_path)))
                         if os.path.isdir(src_norm):
                             if self._is_reparse_path(src_norm):
                                 raise ValueError(tr("暂不支持复制目录链接: ") + src_norm)
@@ -408,6 +440,7 @@ class FileBatchOpWorker(QThread):
                             self.done_units += 1
                             self._emit_progress(name)
                         self.ok_count += 1
+                        self._completed_sources.add(src)
                     except RuntimeError as e:
                         if str(e) == "FILE_OP_CANCELLED":
                             break
@@ -442,6 +475,7 @@ class FileBatchOpWorker(QThread):
                             self.done_units += 1
                             self._emit_progress(name)
                         self.ok_count += 1
+                        self._completed_sources.add(src)
                     except RuntimeError as e:
                         if str(e) == "FILE_OP_CANCELLED":
                             break
@@ -468,6 +502,7 @@ class FileBatchOpWorker(QThread):
                     try:
                         os.rename(source, self.rename_plan[source])
                         self.ok_count += 1
+                        self._completed_sources.add(source)
                     except OSError as error:
                         self.fail_count += 1
                         self.failed_paths.append(source)
@@ -488,6 +523,9 @@ class FileBatchOpWorker(QThread):
         if self.cancelled and self.done_units < self.total_units:
             errors.append(tr("操作已取消"))
 
+        self.retry_paths = [source for source in self.src_paths if source not in self._completed_sources]
+        if not self.retry_paths:
+            self.copy_state['completed'].clear()
         self.completed.emit(self.op_type, self.ok_count, self.fail_count, errors)
 
 
@@ -499,6 +537,7 @@ class FileTaskPanel(QDialog):
         self.setWindowTitle(tr("文件任务"))
         self.resize(960, 400)
         self.records = []
+        self.max_running_tasks = 2
         layout = QVBoxLayout(self)
         self.table = QTreeWidget(self)
         self.table.setHeaderLabels([tr("操作"), tr("目标 / 来源"), tr("状态"), tr("进度")])
@@ -540,7 +579,8 @@ class FileTaskPanel(QDialog):
         worker = record['worker'] if record else None
         self.cancel_button.setEnabled(bool(worker and not record.get('completed')
                                            and not worker._cancel_requested))
-        self.retry_button.setEnabled(bool(record and record['done'] and record['failed']))
+        self.retry_button.setEnabled(bool(record and record['done'] and record.get('retry_paths', record['failed'])))
+        self.retry_button.setText(tr('继续剩余项') if record and record.get('cancelled') else tr('重试失败项'))
         self.errors_button.setEnabled(bool(record and record['errors']))
         self.open_button.setEnabled(bool(record and (record['destination'] or record['paths'])))
         self.clear_button.setEnabled(any(entry['done'] for entry in self.records))
@@ -561,8 +601,8 @@ class FileTaskPanel(QDialog):
         return running, failed
 
     def start_task(self, op_type, paths, destination=None, max_workers=0, tab=None, rename_plan=None,
-                   conflict_actions=None):
-        worker = FileBatchOpWorker(op_type, paths, destination, self, max_workers=max_workers)
+                   conflict_actions=None, resume_state=None):
+        worker = FileBatchOpWorker(op_type, paths, destination, self, max_workers=max_workers, resume_state=resume_state)
         worker.rename_plan = dict(rename_plan or {})
         worker.conflict_actions = dict(conflict_actions or {})
         operation_name = {'copy': '复制', 'delete': '回收站', 'permanent_delete': '永久删除', 'rename': '重命名'}
@@ -572,7 +612,8 @@ class FileTaskPanel(QDialog):
         record = {'worker': worker, 'row': row, 'op': op_type, 'paths': list(paths),
                   'destination': destination, 'max_workers': max_workers, 'errors': [],
               'failed': [], 'done': False, 'completed': False, 'cancelled': False,
-              'rename_plan': worker.rename_plan, 'conflict_actions': worker.conflict_actions}
+              'rename_plan': worker.rename_plan, 'conflict_actions': worker.conflict_actions,
+              'retry_paths': [], 'resume_state': worker.copy_state, 'started': False}
         row.setData(0, Qt.UserRole, len(self.records))
         self.records.append(record)
         self.table.addTopLevelItem(row)
@@ -585,10 +626,22 @@ class FileTaskPanel(QDialog):
             worker.completed.connect(tab._on_file_batch_op_finished)
             tab._file_op_worker = worker
         self.timer.start()
-        worker.start()
+        row.setText(2, tr("排队中"))
+        self._start_queued_tasks()
         self._update_controls()
         self.tasks_changed.emit()
         return worker
+
+    def _start_queued_tasks(self):
+        active = sum(record.get('started', True) and not record['done'] for record in self.records)
+        for record in self.records:
+            if active >= self.max_running_tasks:
+                break
+            if not record['done'] and not record.get('started', True):
+                record['started'] = True
+                record['row'].setText(2, tr("运行中"))
+                record['worker'].start()
+                active += 1
 
     def task_completed(self, op_type, ok_count, fail_count, errors):
         from PyQt5.QtWidgets import QStyle
@@ -600,6 +653,7 @@ class FileTaskPanel(QDialog):
             return
         record['errors'] = list(errors)
         record['failed'] = list(worker.failed_paths)
+        record['retry_paths'] = list(worker.retry_paths)
         record['completed'] = True
         record['cancelled'] = worker.cancelled
         if worker.cancelled:
@@ -630,6 +684,7 @@ class FileTaskPanel(QDialog):
                 finished_record = record
                 break
         worker.deleteLater()
+        self._start_queued_tasks()
         if not self.has_running_tasks():
             self.timer.stop()
         self._update_controls()
@@ -665,7 +720,7 @@ class FileTaskPanel(QDialog):
     def refresh_progress(self):
         for record in self.records:
             worker = record['worker']
-            if worker is None or record['done']:
+            if worker is None or record['done'] or not record.get('started', True):
                 continue
             if worker.op_type == 'copy':
                 elapsed = max(0.1, time.monotonic() - worker.started_at)
@@ -683,18 +738,25 @@ class FileTaskPanel(QDialog):
         if record and record['worker'] and not record.get('completed'):
             record['worker'].request_cancel()
             record['row'].setText(2, tr("取消中"))
+            if not record.get('started', True):
+                record['started'] = True
+                record['worker'].start()
             self._update_controls()
 
     def retry_selected(self):
         record = self.selected_record()
-        if not record or not record['done'] or not record['failed']:
+        if not record or not record['done']:
+            return
+        remaining = record.get('retry_paths', record['failed'])
+        if not remaining:
             return
         from PyQt5.QtWidgets import QMessageBox
-        if QMessageBox.question(self, tr("重试失败项"), '\n'.join(record['failed']),
+        if QMessageBox.question(self, tr("继续剩余项"), '\n'.join(remaining),
                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
-        self.start_task(record['op'], record['failed'], record['destination'], record['max_workers'],
-                rename_plan=record['rename_plan'], conflict_actions=record.get('conflict_actions'))
+        self.start_task(record['op'], remaining, record['destination'], record['max_workers'],
+                rename_plan=record['rename_plan'], conflict_actions=record.get('conflict_actions'),
+                resume_state=record.get('resume_state'))
 
     def show_errors(self):
         record = self.selected_record()

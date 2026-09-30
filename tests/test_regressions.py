@@ -171,6 +171,98 @@ class FileOperationTests(unittest.TestCase):
                 worker._copy_file_task(str(source), str(target))
             self.assertEqual(target.read_bytes(), b'old')
 
+    def test_directory_retry_reuses_target_and_skips_completed_files(self):
+        """目录部分失败后在原目标续作，不生成整份副本，不重复复制成功文件。"""
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination = Path(directory) / 'source', Path(directory) / 'destination'
+            source.mkdir()
+            destination.mkdir()
+            (source / 'good').write_bytes(b'good')
+            (source / 'retry').write_bytes(b'retry')
+            first = self.worker_class('copy', [str(source)], str(destination), max_workers=1)
+            copy_file = first._copy_file_task
+
+            def fail_one(source_path, target_path):
+                if Path(source_path).name == 'retry':
+                    raise PermissionError('busy')
+                return copy_file(source_path, target_path)
+
+            with patch.object(first, '_copy_file_task', side_effect=fail_one):
+                first.run()
+            self.assertEqual(first.fail_count, 1)
+            original_identity = (destination / 'source' / 'good').stat().st_ino
+            retry = self.worker_class('copy', first.retry_paths, str(destination), max_workers=1,
+                                      resume_state=first.copy_state)
+            retry.run()
+            self.assertEqual(retry.fail_count, 0)
+            self.assertEqual([path.name for path in destination.iterdir()], ['source'])
+            self.assertEqual((destination / 'source' / 'good').stat().st_ino, original_identity)
+            self.assertEqual((destination / 'source' / 'retry').read_bytes(), b'retry')
+
+    def test_cancelled_copy_tracks_remaining_sources_for_resume(self):
+        """取消后继续剩余来源，成功来源不会再次提交。"""
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'
+            target = Path(directory) / 'target'
+            target.mkdir()
+            source.write_bytes(b'data')
+            worker = self.worker_class('copy', [str(source)], str(target))
+            worker.request_cancel()
+            worker.run()
+            self.assertTrue(worker.cancelled)
+            self.assertEqual(worker.retry_paths, [str(source)])
+            retry = self.worker_class('copy', worker.retry_paths, str(target), resume_state=worker.copy_state)
+            retry.run()
+            self.assertEqual(retry.retry_paths, [])
+            self.assertEqual((target / 'source').read_bytes(), b'data')
+
+    def test_resume_refuses_modified_completed_destination(self):
+        """重试期间用户修改过已完成的目标时，保留该修改，不静默覆盖或生成副本。"""
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / 'source', Path(directory) / 'target'
+            source.write_bytes(b'original')
+            first = self.worker_class('copy', [str(source)], directory)
+            first._copy_file_task(str(source), str(target))
+            target.write_bytes(b'user edit')
+            retry = self.worker_class('copy', [str(source)], directory, resume_state=first.copy_state)
+            with self.assertRaises(FileExistsError):
+                retry._copy_file_task(str(source), str(target))
+            self.assertEqual(target.read_bytes(), b'user edit')
+
+    def test_disk_full_preserves_source_and_removes_partial_output(self):
+        """磁盘空间不足时来源不变、目标不存在，失败来源仍可重试。"""
+        import errno
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination = Path(directory) / 'source', Path(directory) / 'destination'
+            source.write_bytes(b'original')
+            destination.mkdir()
+            worker = self.worker_class('copy', [str(source)], str(destination))
+            with patch('tempfile.mkstemp', side_effect=OSError(errno.ENOSPC, 'disk full')):
+                worker.run()
+            self.assertEqual(worker.fail_count, 1)
+            self.assertEqual(worker.retry_paths, [str(source)])
+            self.assertEqual(source.read_bytes(), b'original')
+            self.assertEqual(list(destination.iterdir()), [])
+
+    def test_source_change_during_copy_does_not_publish_partial_file(self):
+        """复制时来源内容变化会报错，不能把混合内容作为成功结果发布。"""
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / 'source', Path(directory) / 'target'
+            source.write_bytes(b'a' * (2 * 1024 * 1024))
+            worker = self.worker_class('copy', [str(source)], directory)
+            changed = []
+
+            def change_source(name):
+                if not changed:
+                    changed.append(True)
+                    source.write_bytes(b'changed')
+
+            worker._emit_progress = change_source
+            with self.assertRaises(OSError):
+                worker._copy_file_task(str(source), str(target))
+            self.assertFalse(target.exists())
+            self.assertEqual(list(Path(directory).glob('.tabex-copy-*')), [])
+
     def test_copy_into_descendant_rejected(self):
         """拒绝把目录复制到自己的子目录，避免递归自复制。
 
@@ -389,6 +481,46 @@ class TaskPanelTests(unittest.TestCase):
             self.assertEqual(panel.task_counts(), (0, 0))
             panel.clear_completed()
             self.assertFalse(panel.clear_button.isEnabled())
+        panel.close()
+
+    def test_global_task_limit_and_queued_cancellation(self):
+        """多个任务只同时执行两个，取消排队项不会进入文件复制。"""
+        panel = app.FileTaskPanel(None)
+        release = threading.Event()
+        entered = threading.Event()
+        started = []
+        guard = threading.Lock()
+
+        def blocked_copy(worker, source, target):
+            with guard:
+                started.append(source)
+                if len(started) == 2:
+                    entered.set()
+            release.wait(3)
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'
+            source.write_bytes(b'data')
+            with patch.object(app.FileBatchOpWorker, '_copy_file_task', blocked_copy):
+                for _index in range(3):
+                    panel.start_task('copy', [str(source)], directory)
+                try:
+                    self.assertTrue(entered.wait(2))
+                    self.assertEqual(len(started), 2)
+                    self.assertFalse(panel.records[-1]['started'])
+                    panel.table.setCurrentItem(panel.records[-1]['row'])
+                    panel.cancel_selected()
+                    deadline = time.monotonic() + 2
+                    while not panel.records[-1]['done'] and time.monotonic() < deadline:
+                        self.app.processEvents()
+                    self.assertTrue(panel.records[-1]['cancelled'])
+                    self.assertEqual(len(started), 2)
+                finally:
+                    release.set()
+                    deadline = time.monotonic() + 3
+                    while panel.has_running_tasks() and time.monotonic() < deadline:
+                        self.app.processEvents()
+                    self.assertFalse(panel.has_running_tasks())
         panel.close()
 
 
@@ -2436,6 +2568,10 @@ class HotkeyAndUpdateTests(unittest.TestCase):
         self.assertIs(config['auto_update_check'], False)
 
 
+
+
+
+
 class AiActionSafetyTests(unittest.TestCase):
     """AI 助手执行动作的目录范围与危险操作确认，共 5 个用例。只在临时目录操作，不运行真实脚本或 Git。"""
 
@@ -2562,6 +2698,126 @@ class AiActionSafetyTests(unittest.TestCase):
             text, _ = host._apply_actions('[WRITE_FILE: other.txt|data]')
         self.assertFalse((self.base / 'other.txt').exists())
         self.assertIn(self.module.tr("已取消写入: "), text)
+
+    def test_scripts_and_git_targets_cannot_escape_scope(self):
+        """同意确认也不能运行目录外脚本或用 Git pathspec 越过授权目录。"""
+        host = self.host(confirm=True)
+        with patch_all('launch_detached') as launch:
+            host._apply_actions(f'[RUN_SCRIPT: {self.secret}]\n'
+                                '[GIT_RESTORE: .|..\\outside\\secret.txt]\n'
+                                '[GIT_ADD: .|:(top)secret.txt]\n'
+                                '[GIT_RESTORE: .|*]')
+        launch.assert_not_called()
+        host._run_git_command.assert_not_called()
+        host._confirm_danger_action.assert_not_called()
+
+    def test_captured_action_directory_survives_tab_switch(self):
+        """回复期间切换标签后，相对路径仍属于发起请求时的目录。"""
+        host = self.host()
+        host._action_base_dir = str(self.base)
+        host.main_window.get_current_tab_widget.return_value = types.SimpleNamespace(current_path=str(self.outside))
+        host._get_action_base_dir = types.MethodType(self.module.ChatPanel._get_action_base_dir, host)
+        self.assertEqual(host._resolve_action_path('note.txt'), (str(self.base / 'note.txt'), None))
+
+    def test_actions_run_off_gui_thread_and_cancellation_releases_confirmation(self):
+        """慢 Git 不占用界面线程；关闭确认等待时取消可以让工作线程退出。"""
+        entered, release = threading.Event(), threading.Event()
+        observed = []
+        worker = self.module.AiActionWorker('[GIT_STATUS: .]', str(self.base))
+
+        def slow_git(*arguments):
+            observed.append(QThread.currentThread() == self.app.thread())
+            entered.set()
+            release.wait(3)
+            return True, 'ok', ''
+
+        worker._run_git_command = slow_git
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            timer_called = []
+            QTimer.singleShot(0, lambda: timer_called.append(True))
+            self.app.processEvents()
+            self.assertEqual(timer_called, [True])
+            self.assertEqual(observed, [False])
+        finally:
+            release.set()
+            self.assertTrue(worker.wait(3000))
+        worker = self.module.AiActionWorker('[GIT_ADD: .|note.txt]', str(self.base))
+        worker.start()
+        worker.cancel()
+        self.assertTrue(worker.wait(3000))
+
+    def test_git_options_are_rejected_before_starting_a_process(self):
+        """分支、提交和远程参数不能被解释为 Git 命令选项。"""
+        host = self.host()
+        with patch('shutil.which', return_value='git'), patch('subprocess.Popen') as process:
+            for arguments in (['reset', '--soft', '--hard'], ['push', '--all'], ['switch', '--detach']):
+                result = self.module.ChatPanel._run_git_command(host, str(self.base), arguments)
+                self.assertFalse(result[0])
+        process.assert_not_called()
+
+    def test_virtual_directory_never_falls_back_to_program_directory(self):
+        """虚拟目录没有文件授权范围，不会隐式改为程序所在目录。"""
+        host = self.host()
+        host.main_window.get_current_tab_widget.return_value = types.SimpleNamespace(current_path='shell:MyComputerFolder')
+        host._get_action_base_dir = types.MethodType(self.module.ChatPanel._get_action_base_dir, host)
+        with patch('os.path.isdir') as isdir:
+            self.assertEqual(host._get_action_base_dir(), '')
+        isdir.assert_not_called()
+        self.assertIsNone(host._resolve_action_path('note.txt')[0])
+
+    def test_whole_repository_operations_reject_parent_repository(self):
+        """当前授权范围是仓库子目录时，整仓库写操作不允许影响父目录。"""
+        host = self.host()
+
+        def process(*arguments, **keywords):
+            keywords['stdout'].write(str(self.root).encode('utf-8'))
+            return types.SimpleNamespace(poll=lambda: 0, wait=lambda: 0, returncode=0)
+
+        with patch('shutil.which', return_value='git'), patch('subprocess.Popen', side_effect=process) as launch:
+            result = self.module.ChatPanel._run_git_command(host, str(self.base), ['commit', '-m', 'test'])
+        self.assertFalse(result[0])
+        self.assertEqual(launch.call_count, 1)
+        self.assertIn('rev-parse', launch.call_args.args[0])
+
+    def test_real_panel_dispatches_confirmation_on_gui_thread(self):
+        """真实聊天面板从后台请求确认，确认槽在 UI 线程运行，取消后不执行 Git。"""
+        owner = types.SimpleNamespace(config={'ai_chat': {}},
+                                      get_current_tab_widget=lambda: types.SimpleNamespace(current_path=str(self.base)))
+        with patch.object(self.module.ChatPanel, '_load_history'), \
+                patch.object(self.module.ChatPanel, '_load_workflow_templates', return_value={}):
+            panel = self.module.ChatPanel(owner)
+        panel._schedule_save_history = Mock()
+        self.addCleanup(panel.close)
+        observed = []
+        panel._confirm_danger_action = lambda *args: observed.append(QThread.currentThread() == self.app.thread()) or False
+        panel._action_base_dir = str(self.base)
+        panel._on_response('[GIT_ADD: .|note.txt]')
+        deadline = time.monotonic() + 3
+        while panel._action_worker is not None and time.monotonic() < deadline:
+            self.app.processEvents()
+        self.assertIsNone(panel._action_worker)
+        self.assertEqual(observed, [True])
+        self.assertTrue(panel.send_btn.isEnabled())
+
+    def test_open_directory_uses_request_tab_instead_of_new_active_tab(self):
+        """等待回复时切换标签，导航操作仍发送给原标签，不改变新活动标签。"""
+        import weakref
+        from PyQt5.QtWidgets import QWidget
+        tab, other = QWidget(), QWidget()
+        tab.navigate_to, other.navigate_to = Mock(), Mock()
+        host = types.SimpleNamespace(_closing=False, _request_cancelled=False, _action_worker=None,
+                                     sender=lambda: None, _action_tab_ref=weakref.ref(tab), main_window=Mock())
+        host.main_window.get_current_tab_widget.return_value = other
+        request = {'kind': 'open', 'arguments': (str(self.base),), 'ready': threading.Event(), 'result': False}
+        self.module.ChatPanel._handle_action_ui(host, request)
+        tab.navigate_to.assert_called_once_with(str(self.base), skip_async_check=True)
+        other.navigate_to.assert_not_called()
+        self.assertTrue(request['ready'].is_set())
+        self.assertTrue(request['result'])
+        tab.close()
+        other.close()
 
 
 class BookmarkDataTests(unittest.TestCase):
@@ -2700,6 +2956,10 @@ class BookmarkDataTests(unittest.TestCase):
         bar = manager.get_tree()['bookmark_bar']
         self.assertEqual([child['name'] for child in bar['children']], ['Docs', 'Group'])
         self.assertEqual(self.saved(), {'roots': manager.get_tree()})
+
+
+
+
 
 
 class SessionPersistenceTests(unittest.TestCase):

@@ -13,7 +13,9 @@ def get_app_base_dir():
 
 
 def get_app_data_path(*parts):
-    return os.path.join(get_app_base_dir(), *parts)
+    override = os.environ.get('TABEX_DATA_DIR')
+    base = os.path.abspath(override) if override else get_app_base_dir()
+    return os.path.join(base, *parts)
 
 
 # 常用中英文目录名对照表

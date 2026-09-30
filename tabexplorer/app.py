@@ -1,62 +1,58 @@
 """程序启动与单实例转发。"""
 
-import socket
-import time
-
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import QApplication
 
 from . import debuglog as _debuglog
 from .debuglog import debug_print, _init_debug_log_file, qt_message_handler, _start_diagnostics
-from .widgets import _build_te_icon
-from .shellview import _ieb_keyboard_filter
-from .mainwindow import MainWindow
+from .paths import get_app_base_dir, get_app_data_path
+from .instance import InstanceCoordinator
 
 
-def try_send_to_existing_instance(path):
-    """尝试将路径发送给已运行的实例"""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client.settimeout(2.0)  # 增加超时时间
-            client.connect(('127.0.0.1', 58923))
-            client.send(path.encode('utf-8'))
-            client.close()
-            debug_print(f"[Client] Successfully sent path to existing instance: {path}")
-            return True
-        except Exception as e:
-            debug_print(f"[Client] Attempt {attempt + 1}/{max_retries} failed: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(0.1)  # 短暂等待后重试
-            continue
-    debug_print("[Client] No existing instance found, starting new instance")
-    return False
+def _configure_standard_streams():
+    import sys
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, 'reconfigure'):
+            try:
+                stream.reconfigure(encoding='utf-8', errors='backslashreplace')
+            except (OSError, ValueError):
+                pass
+
+
+def try_send_to_existing_instance(path, coordinator=None):
+    coordinator = coordinator or InstanceCoordinator(get_app_data_path())
+    return coordinator.send(path or '')
 
 
 def main():
     # 支持命令行参数：打开指定路径
     import sys
     import os
+    import time
+    started_at = time.time()
 
     # TortoiseOverlays IsMemberOf vtable patch is applied at module load time
     # (see early init block near _patch_tortoise_overlays). No registry changes needed.
 
-    path_to_open = None
-    if len(sys.argv) > 1:
-        path = sys.argv[1]
-        # 处理可能的引号
-        path = path.strip('"').strip("'")
-        if os.path.exists(path):
-            # 如果是文件，打开其所在目录
-            if os.path.isfile(path):
-                path = os.path.dirname(path)
-            path_to_open = path
-            
-            # 尝试发送给已运行的实例
-            if try_send_to_existing_instance(path):
-                print(f"Sent path to existing instance: {path}")
-                sys.exit(0)  # 退出程序，不启动新实例
+    validation = len(sys.argv) > 1 and sys.argv[1] == '--self-test'
+    if validation and (not os.environ.get('TABEX_DATA_DIR')
+                       or not os.path.isfile(get_app_data_path('.tabex-validation'))):
+        raise RuntimeError('Self-test requires an isolated validation data directory')
+    path_to_open = sys.argv[1].strip('"\'') if len(sys.argv) > 1 and not validation else ''
+    coordinator = InstanceCoordinator(get_app_data_path())
+    if not coordinator.acquire():
+        if try_send_to_existing_instance(path_to_open, coordinator):
+            sys.exit(0)
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, 'TabExplorer is already starting or not responding. Please retry.',
+                                        'TabExplorer', 0x10)
+        sys.exit(1)
+    import atexit
+    atexit.register(coordinator.close)
+    from .widgets import _build_te_icon
+    from .shellview import _ieb_keyboard_filter
+    from .mainwindow import MainWindow
+    _configure_standard_streams()
     
     # 禁用 Qt 的警告输出（在创建 QApplication 之前设置）
     os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
@@ -106,6 +102,8 @@ def main():
 
     # 创建窗口（图标在 MainWindow.__init__ 内部生成）
     window = MainWindow()
+    window._instance_coordinator = coordinator
+    coordinator.set_receiver(window.open_path_signal.emit)
     window._diagnostic_timer = QTimer(window)
     window._diagnostic_timer.setInterval(10000)
     window._diagnostic_timer.timeout.connect(window._capture_diagnostic_snapshot)
@@ -116,22 +114,27 @@ def main():
     # 如果有路径参数，在新窗口中打开
     # 注意：固定标签页在延迟初始化阶段加载，这里要避免和固定标签重复
     if path_to_open:
-        pinned_norm = {
-            window._normalize_path_for_compare(p)
-            for p in window.config.get("pinned_tabs", []) if p
-        }
+        pinned_norm = {window._normalize_path_for_compare(path) for path in window._get_pinned_paths_from_config()}
         if window._normalize_path_for_compare(path_to_open) in pinned_norm:
             debug_print(f"[App] Skip argv path (already pinned): {path_to_open}")
         else:
-            window.add_new_tab(path_to_open)
+            window.handle_open_path_from_instance(path_to_open)
     
     # 启动时最大化显示
     window.showMaximized()
+    if validation:
+        from .runtime_validation import RuntimeValidation
+        window._runtime_validation = RuntimeValidation(window, started_at)
     
 
     # No HKCU cleanup needed – overlay fix is vtable-only (process-local).
 
     exit_code = app.exec_()
+    coordinator.close()
+    app.removeNativeEventFilter(_ieb_keyboard_filter)
+    from PyQt5.QtCore import QCoreApplication, QEvent
+    window.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
     if _debuglog._diagnostics is not None:
         _debuglog._diagnostics.close()
     sys.exit(exit_code)
