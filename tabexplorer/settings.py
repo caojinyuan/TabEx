@@ -5,6 +5,7 @@ import os
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QCheckBox, QDialog, QLabel, QPushButton, QVBoxLayout
 
+from . import theme as _theme
 from .paths import get_app_base_dir
 from .i18n import _set_app_language, tr
 from .debuglog import set_debug_mode, set_explorer_monitor_debug
@@ -208,7 +209,8 @@ class SettingsDialog(QDialog):
         gesture_help = QLabel(
             tr("← 向左：后退\n→ 向右：前进\n↓ 向下：关闭当前标签页\n↑ 向上：打开新标签页\n↑↓ 上下：刷新\n↓↑ 下上：返回上级目录\n↓→ 下右：恢复关闭的标签页")
         )
-        gesture_help.setStyleSheet(
+        _theme.bind_style(
+            gesture_help,
             "QLabel { color: #555; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }"
         )
         gesture_layout.addWidget(gesture_help)
@@ -345,7 +347,8 @@ class SettingsDialog(QDialog):
 
         # 获取Key提示标签
         self.ai_key_tip_label = QLabel("")
-        self.ai_key_tip_label.setStyleSheet(
+        _theme.bind_style(
+            self.ai_key_tip_label,
             "color:#1565C0; font-size:8.5pt; padding:2px 4px;"
             "background:#E3F2FD; border-radius:3px;"
         )
@@ -386,7 +389,8 @@ class SettingsDialog(QDialog):
         eye_btn = QPushButton("👁")
         eye_btn.setFixedSize(26, 26)
         eye_btn.setCheckable(True)
-        eye_btn.setStyleSheet(
+        _theme.bind_style(
+            eye_btn,
             "QPushButton{border:none;background:transparent;font-size:11pt;}"
             "QPushButton:hover{background:#e5e5e5;border-radius:3px;}"
         )
@@ -460,6 +464,16 @@ class SettingsDialog(QDialog):
         current_lang = config.get("language", "zh")
         self.lang_combo.setCurrentIndex(0 if current_lang == "zh" else 1)
         lang_row.addWidget(self.lang_combo)
+        lang_row.addSpacing(16)
+        lang_row.addWidget(QLabel(tr("主题:")))
+        self.theme_combo = QComboBox(self)
+        self.theme_combo.addItem(tr("跟随系统"), "system")
+        self.theme_combo.addItem(tr("浅色"), "light")
+        self.theme_combo.addItem(tr("深色"), "dark")
+        self.theme_combo.setCurrentIndex(
+            max(0, self.theme_combo.findData(_theme.normalize_mode(config.get("theme", "system")))))
+        self.theme_combo.setToolTip(tr("跟随系统：随 Windows “应用模式”的浅色/深色设置自动切换"))
+        lang_row.addWidget(self.theme_combo)
         lang_row.addStretch(1)
         bottom_layout.addLayout(lang_row)
         
@@ -650,7 +664,10 @@ class SettingsDialog(QDialog):
         group_layout.addWidget(scroll)
         tip_label = QLabel(tr("💡 点击按键框后直接按下新组合；需包含 Ctrl 或 Alt（F1–F24 可单独使用）。取消勾选或清空按键可停用。"))
         tip_label.setWordWrap(True)
-        tip_label.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
+        _theme.bind_style(
+            tip_label,
+            "QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }"
+        )
         group_layout.addWidget(tip_label)
         reset_button = QPushButton(tr("恢复默认按键"), group)
         reset_button.clicked.connect(self._reset_hotkey_bindings)
@@ -731,6 +748,7 @@ class SettingsDialog(QDialog):
             }
             self.parent().config["hotkey_bindings"] = hotkey_bindings
             self.parent().config["auto_update_check"] = self.auto_update_cb.isChecked()
+            self.parent().config["theme"] = self.theme_combo.currentData()
             
             # 保存到文件
             self.parent().save_config()

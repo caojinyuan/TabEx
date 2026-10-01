@@ -6,6 +6,7 @@ import time
 
 from PyQt5.QtCore import pyqtSignal, QMutex, QThread
 
+from . import theme as _theme
 from .i18n import tr
 from .constants import FOLDER_CHECK_TIMEOUT, LARGE_FOLDER_THRESHOLD
 from .debuglog import debug_print
@@ -124,10 +125,10 @@ class GitStatusWorker(QThread):
             if branch:
                 parts.append(tr("分支: {}").format(branch))
             if is_clean:
-                parts.append(tr('<span style="color:#2e7d32;font-weight:bold">✔ 无更改</span>'))
+                parts.append(f'<span style="color:{_theme.fg("#2e7d32")};font-weight:bold">{tr("✔ 无更改")}</span>')
             else:
                 def _color(label, value, color_pos, color_zero='#2e7d32'):
-                    color = color_pos if value > 0 else color_zero
+                    color = _theme.fg(color_pos if value > 0 else color_zero)
                     return f'<span style="color:{color}">{label} {value}</span>'
                 status_parts = [
                     _color(tr("暂存(Add)"), staged, "#d32f2f"),

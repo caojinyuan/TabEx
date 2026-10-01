@@ -7,6 +7,7 @@ from PyQt5.QtCore import pyqtSignal, QEvent, QFileInfo, QMimeData, QSize, Qt, QT
 from PyQt5.QtGui import QDrag, QIcon
 from PyQt5.QtWidgets import QApplication, QFileIconProvider, QHBoxLayout, QLabel, QMenu, QToolButton, QWidget
 
+from . import theme as _theme
 from .i18n import tr
 from .system import is_supported_title_shortcut_path
 
@@ -34,7 +35,7 @@ class TitleShortcutBar(QWidget):
         self._layout.setSpacing(8)
 
         self._hint_label = QLabel(tr("拖入应用或快捷方式"))
-        self._hint_label.setStyleSheet("QLabel { color: #666; font-size: 9pt; padding: 0 4px; }")
+        _theme.bind_style(self._hint_label, "QLabel { color: #666; font-size: 9pt; padding: 0 4px; }")
         self._hint_label.setAcceptDrops(True)
         self._hint_label.installEventFilter(self)
         self._layout.addWidget(self._hint_label)
@@ -273,7 +274,7 @@ class TitleShortcutBar(QWidget):
 
         # 提示文字固定在最左侧
             self._hint_label = QLabel(tr("+ 拖入应用或快捷方式"))
-        self._hint_label.setStyleSheet("QLabel { color: #888; font-size: 9pt; padding: 0 4px; }")
+        _theme.bind_style(self._hint_label, "QLabel { color: #888; font-size: 9pt; padding: 0 4px; }")
         self._hint_label.setAcceptDrops(True)
         self._hint_label.installEventFilter(self)
         self._layout.addWidget(self._hint_label)
@@ -301,7 +302,8 @@ class TitleShortcutBar(QWidget):
                 btn.setText("…")
                 # Defer icon loading well after startup to avoid SHGetFileInfo blocking
                 QTimer.singleShot(1500, lambda b=btn, p=path: self._load_icon_deferred(b, p))
-            btn.setStyleSheet(
+            _theme.bind_style(
+                btn,
                 "QToolButton { background: transparent; border: none; border-radius: 4px; padding: 0px; margin: 0px; }"
                 "QToolButton:hover { background: #e0e0e0; }"
                 "QToolButton:pressed { background: #d0d0d0; }"
@@ -334,7 +336,7 @@ class TitleShortcutBar(QWidget):
         if not path:
             return
         menu = QMenu(self)
-        menu.setStyleSheet(
+        menu.setStyleSheet(_theme.qss(
             """
             QMenu {
                 background-color: #ffffff;
@@ -358,7 +360,7 @@ class TitleShortcutBar(QWidget):
                 color: #ffffff;
             }
             """
-        )
+        ))
         remove_action = menu.addAction(tr("移除该快捷方式"))
         action = menu.exec_(btn.mapToGlobal(pos))
         if action == remove_action:

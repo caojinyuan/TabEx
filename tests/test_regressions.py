@@ -3385,5 +3385,353 @@ class PathParsingTests(unittest.TestCase):
             self.assertFalse(host._shortcut_wait_for_modifier_release)
 
 
+class ThemeTests(unittest.TestCase):
+    """深浅色主题：样式换色、图标重新着色、标题栏、跟随系统切换与 Shell 视图重建，共 6 个用例。
+
+    不调用未公开的 Win32 深色接口（已替换），每个用例结束恢复浅色。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        cls.module = app
+
+    def setUp(self):
+        native = patch_all('_set_native_app_mode')
+        native.start()
+        self.addCleanup(native.stop)
+        self.addCleanup(self.module.set_dark, False)
+
+    @staticmethod
+    def lightness(color_text):
+        from PyQt5.QtGui import QColor
+        return QColor(color_text).lightnessF()
+
+    def icon_lightness(self, icon):
+        image = icon.pixmap(24, 24).toImage()
+        values = [image.pixelColor(x_pos, y_pos) for y_pos in range(image.height()) for x_pos in range(image.width())]
+        opaque = [color.lightnessF() for color in values if color.alpha() > 128]
+        self.assertTrue(opaque)
+        return sum(opaque) / len(opaque)
+
+    def test_stylesheets_convert_by_role_and_restore_light(self):
+        """背景转深、文字转浅、边框变暗；强调色按钮、白色按钮文字和选区色不变；切回浅色恢复原样式与原控件风格。
+
+        场景：控件用 bind_style 设置浅色样式表后切换深色，再切回浅色。
+        """
+        import re
+        from PyQt5.QtWidgets import QWidget
+        css = ("QWidget { background: #ffffff; color: #202020; border: 1px solid #d0d0d0;"
+               " selection-background-color: #0078d4; } QPushButton { background: #1976D2; color: white; }")
+        widget = QWidget()
+        self.addCleanup(widget.deleteLater)
+        original_style = self.app.style().objectName()
+        self.module.bind_style(widget, css)
+        self.assertEqual(widget.styleSheet(), css)
+        self.assertTrue(self.module.set_dark(True))
+        self.assertFalse(self.module.set_dark(True))
+        dark = widget.styleSheet()
+        values = dict(re.findall(r'(?<=[{;])\s*(background|color|border): ([^;]+);', dark.split('}')[0]))
+        self.assertLess(self.lightness(values['background']), 0.25)
+        self.assertGreater(self.lightness(values['color']), 0.75)
+        self.assertLess(self.lightness(values['border'].split()[-1]), 0.5)
+        self.assertIn('selection-background-color: #0078d4', dark)
+        self.assertIn('QPushButton { background: #1976D2; color: white; }', dark)
+        self.assertEqual(self.app.style().objectName(), 'fusion')
+        self.assertTrue(self.module.set_dark(False))
+        self.assertEqual(widget.styleSheet(), css)
+        self.assertEqual(self.app.style().objectName(), original_style)
+
+    def test_tool_icons_retint_except_on_always_light_buttons(self):
+        """深色主题下工具栏线条图标改为浅色；通知等始终白底的按钮（tone='dark'）保持深色图标；切回浅色复原。"""
+        from PyQt5.QtWidgets import QToolButton, QStyle
+        toolbar, toast = QToolButton(), QToolButton()
+        for button in (toolbar, toast):
+            self.addCleanup(button.deleteLater)
+        self.module._set_tool_icon(toolbar, 'go-previous', QStyle.SP_ArrowBack, 24)
+        self.module._set_tool_icon(toast, 'window-close', QStyle.SP_TitleBarCloseButton, 24, tone='dark')
+        self.assertLess(self.icon_lightness(toolbar.icon()), 0.3)
+        self.module.set_dark(True)
+        self.assertGreater(self.icon_lightness(toolbar.icon()), 0.6)
+        self.assertLess(self.icon_lightness(toast.icon()), 0.3)
+        self.module.set_dark(False)
+        self.assertLess(self.icon_lightness(toolbar.icon()), 0.3)
+
+    def test_title_bar_follows_theme_for_framed_windows_only(self):
+        """有系统标题栏的窗口随主题设置深色标题栏，无边框窗口不处理；已是目标状态时不重复调用。"""
+        from PyQt5.QtWidgets import QDialog, QWidget
+        dialog, frameless = QDialog(), QWidget(None, Qt.FramelessWindowHint)
+        for widget in (dialog, frameless):
+            widget.winId()
+            self.addCleanup(widget.deleteLater)
+        with patch_all('_set_dwm_dark', return_value=True) as dwm:
+            self.module.apply_window_frame(dialog)
+            dwm.assert_not_called()
+            self.module.set_dark(True)
+            dwm.reset_mock()
+            self.module.apply_window_frame(dialog)
+            self.module.apply_window_frame(frameless)
+            self.module.apply_window_frame(dialog)
+            dwm.assert_called_once_with(int(dialog.winId()), True)
+            self.module.set_dark(False)
+            dwm.reset_mock()
+            self.module.apply_window_frame(dialog)
+            dwm.assert_called_once_with(int(dialog.winId()), False)
+
+    def test_theme_switch_rebuilds_views_and_follows_windows_setting(self):
+        """跟随系统时按 Windows 设置切换：重建 Shell 视图、重绘聊天、丢弃带旧配色的 Git 摘要；无变化时不重复处理。
+
+        浅色/深色为固定模式，不响应系统设置变化；跟随系统时系统设置变化消息去抖后再检查。
+        """
+        from PyQt5.QtCore import QObject
+        main = self.module.MainWindow
+        names = ('apply_theme_config', '_rebuild_shell_views_for_theme', '_schedule_system_theme_check')
+        host = type('ThemeHost', (QObject,), {name: getattr(main, name) for name in names})()
+        self.addCleanup(host.deleteLater)
+        pane = Mock(_git_status_cache={'path': 'C:\\work'})
+        stack = Mock()
+        stack.count.return_value = 1
+        stack.widget.return_value = pane
+        host.config = {'theme': 'system'}
+        host._all_groups = lambda: [(None, stack)]
+        host.get_current_tab_widget = host.get_active_pane = lambda: pane
+        host.chat_panel = Mock()
+        for name in ('_apply_window_palettes', 'apply_tab_group_markers_config', '_update_resource_usage_display'):
+            setattr(host, name, Mock())
+        with patch_all('system_prefers_dark', return_value=True), \
+                patch_all('_shell_file_operation_window_open', return_value=False):
+            self.assertTrue(host.apply_theme_config())
+            self.assertTrue(self.module.is_dark())
+            self.assertFalse(host.apply_theme_config())
+        pane.rebuild_shell_view.assert_called_once_with()
+        host.chat_panel.apply_theme.assert_called_once_with()
+        host.apply_tab_group_markers_config.assert_called_once_with()
+        self.assertIsNone(pane._git_status_cache)
+        host._schedule_system_theme_check()
+        self.assertTrue(host._system_theme_timer.isActive())
+        host._system_theme_timer.stop()
+        host.config['theme'] = 'light'
+        del host._system_theme_timer
+        host._schedule_system_theme_check()
+        self.assertFalse(hasattr(host, '_system_theme_timer'))
+        with patch_all('_shell_file_operation_window_open', return_value=False):
+            self.assertTrue(host.apply_theme_config())
+        self.assertFalse(self.module.is_dark())
+
+    def test_shell_view_rebuilt_only_when_colors_are_stale(self):
+        """原生视图按创建时的深浅色记录判断是否需要重建；需要时销毁并在原路径重新导航，不写历史。"""
+        explorer = Mock(spec=self.module.IExplorerBrowserWidget)
+        explorer._init_ok = True
+        explorer._created_dark = False
+        explorer.hibernate.return_value = True
+        tab = types.SimpleNamespace(explorer=explorer, current_path='C:\\work', isVisible=lambda: True,
+                                    navigate_to=Mock(), _hide_loading_indicator=Mock(), _nav_in_progress=True)
+        rebuild = self.module.FileExplorerTab.rebuild_shell_view
+        self.assertFalse(rebuild(tab))
+        explorer.hibernate.assert_not_called()
+        with patch_all('_dark', True):
+            self.assertTrue(rebuild(tab))
+        explorer.hibernate.assert_called_once_with('C:\\work')
+        tab.navigate_to.assert_called_once_with('C:\\work', is_shell=False, add_to_history=False)
+        self.assertFalse(tab._nav_in_progress)
+
+    def test_theme_setting_defaults_to_system(self):
+        """配置缺省或取值无效时为跟随系统；设置窗口显示已保存的主题。"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.json'
+            for stored, expected in (({'theme': 'neon'}, 'system'), ({'theme': 'dark'}, 'dark'), ({}, 'system')):
+                path.write_text(json.dumps(stored), encoding='utf-8')
+                self.assertEqual(self.module.ConfigStore(path).load()['theme'], expected)
+        dialog = self.module.SettingsDialog({'theme': 'light'})
+        self.addCleanup(dialog.deleteLater)
+        self.assertEqual(dialog.theme_combo.currentData(), 'light')
+        self.assertEqual([dialog.theme_combo.itemData(i) for i in range(dialog.theme_combo.count())],
+                         ['system', 'light', 'dark'])
+
+
+class NetworkBannerTests(unittest.TestCase):
+    """网络位置不可用提示条：原因说明、重试、重新连接、超时与过期失败，共 6 个用例。不访问真实网络。"""
+
+    UNC = '\\\\srv\\share\\team'
+    BAD_NETPATH = -2147024843  # HRESULT_FROM_WIN32(ERROR_BAD_NETPATH)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        cls.module = app
+
+    def banner_host(self):
+        from PyQt5.QtWidgets import QWidget
+        tab = self.module.FileExplorerTab
+        host = QWidget()
+        self.addCleanup(host.deleteLater)
+        layout = QVBoxLayout(host)
+        host.net_banner = self.module.NetworkErrorBanner(host)
+        host.explorer = QWidget(host)
+        host.explorer._has_view = False
+        host._explorer_placeholder = QWidget(host)
+        host._explorer_placeholder.hide()
+        for widget in (host.net_banner, host.explorer, host._explorer_placeholder):
+            layout.addWidget(widget)
+        host._is_cleaning_up = False
+        host._nav_in_progress = True
+        host.navigate_to = Mock()
+        host._hide_loading_indicator = Mock()
+        for name in ('_on_navigation_failed', '_handle_navigation_failure', '_show_network_error',
+                     '_set_explorer_placeholder', '_dismiss_network_banner', '_on_navigation_succeeded',
+                     '_retry_failed_location', '_reconnect_failed_location', '_on_reconnect_finished',
+                     '_async_nav_safety_timeout'):
+            setattr(host, name, types.MethodType(getattr(tab, name), host))
+        host.net_banner.retryRequested.connect(host._retry_failed_location)
+        host.net_banner.reconnectRequested.connect(host._reconnect_failed_location)
+        host.resize(800, 400)
+        host.show()
+        return host
+
+    def settle(self):
+        for _attempt in range(3):
+            self.app.processEvents()
+
+    def test_failure_reasons_and_network_roots(self):
+        """HRESULT 还原为 Win32 错误码；断网、凭据、映射盘未连接、超时给出对应建议；UNC 与映射盘识别为网络位置。"""
+        import ctypes
+        m = self.module
+        self.assertEqual(m.win32_error(self.BAD_NETPATH), 53)
+        self.assertEqual(m.win32_error(0x80004005), 0x80004005)
+        reason, hint = m.describe_failure(53)
+        self.assertTrue(reason)
+        self.assertEqual(hint, m.tr('请检查网络或 VPN 连接，以及服务器是否在线。'))
+        self.assertEqual(m.describe_failure(1326)[1], m.tr('可点击“重新连接”输入凭据。'))
+        self.assertEqual(m.describe_failure(m.ERROR_CONNECTION_UNAVAIL)[1],
+                         m.tr('映射的网络驱动器未连接，可点击“重新连接”恢复。'))
+        self.assertEqual(m.describe_failure(m.NAV_TIMEOUT)[0], m.tr('连接超时：网络位置长时间无响应。'))
+        self.assertEqual(m.describe_failure(0x12345678, network=False),
+                         (m.tr('错误代码 {}').format('0x12345678'), ''))
+        roots = {self.UNC: '\\\\srv\\share', '//srv/share': '\\\\srv\\share', 'z:\\x': 'Z:', '\\\\srv': '',
+                 'shell:Desktop': '', '': ''}
+        for path, expected in roots.items():
+            with self.subTest(path=path):
+                self.assertEqual(m.network_root(path), expected)
+        self.assertTrue(m.is_network_path(self.UNC))
+        with patch.object(ctypes.windll.kernel32, 'GetDriveTypeW', return_value=4):
+            self.assertTrue(m.is_network_path('Z:\\team'))
+        with patch.object(ctypes.windll.kernel32, 'GetDriveTypeW', return_value=1), \
+                patch_all('remembered_remote_name', side_effect=lambda drive: '\\\\srv\\share' if drive == 'Y:' else ''):
+            self.assertTrue(m.is_network_path('Y:\\team'))
+            self.assertFalse(m.is_network_path('Q:\\team'))
+
+    def test_failed_navigation_shows_banner_and_retry_recovers(self):
+        """解析失败显示提示条（含原因、重新连接按钮）并用空白占位代替未加载的视图；重试进入忙碌状态并重新导航，
+        导航成功后提示条和占位都消失。"""
+        host = self.banner_host()
+        banner = host.net_banner
+        host._on_navigation_failed(self.UNC, self.BAD_NETPATH)
+        self.assertFalse(banner.isVisible())
+        self.settle()
+        self.assertTrue(banner.isVisible())
+        self.assertIn(self.UNC, banner.title_label.toolTip())
+        self.assertIn(self.module.tr('请检查网络或 VPN 连接，以及服务器是否在线。'), banner.detail_label.text())
+        self.assertTrue(banner.reconnect_button.isVisible())
+        self.assertFalse(host._nav_in_progress)
+        self.assertTrue(host.explorer.isHidden())
+        self.assertFalse(host._explorer_placeholder.isHidden())
+        banner.retry_button.click()
+        host.navigate_to.assert_called_once_with(self.UNC)
+        self.assertTrue(banner.is_busy())
+        host._on_navigation_succeeded()
+        self.settle()
+        self.assertFalse(banner.isVisible())
+        self.assertFalse(host.explorer.isHidden())
+        self.assertTrue(host._explorer_placeholder.isHidden())
+
+    def test_superseded_and_local_shell_failures_are_ignored(self):
+        """失败通知处理前已有导航成功则忽略；Shell 报告的本地路径导航失败沿用系统行为，不显示提示条。"""
+        host = self.banner_host()
+        host._on_navigation_failed(self.UNC, 0)
+        host._on_navigation_succeeded()
+        self.settle()
+        self.assertFalse(host.net_banner.isVisible())
+        with tempfile.TemporaryDirectory() as directory:
+            host._on_navigation_failed(directory, 0)
+            self.settle()
+        self.assertFalse(host.net_banner.isVisible())
+        self.assertTrue(host._explorer_placeholder.isHidden())
+
+    def test_timeout_and_reconnect_results(self):
+        """导航超时提示连接超时；重新连接在后台线程执行并传入主窗口句柄：成功后重新打开，取消时恢复原提示，
+        期间已离开该位置则不再跳回。"""
+        host = self.banner_host()
+        banner = host.net_banner
+        host._nav_in_progress_path = self.UNC
+        host._async_nav_safety_timeout(self.UNC)
+        self.assertTrue(banner.isVisible())
+        self.assertIn(self.module.tr('连接超时：网络位置长时间无响应。'), banner.detail_label.text())
+        created = []
+
+        class FakeWorker:
+            def __init__(self, path, hwnd, parent):
+                created.append((path, hwnd, parent))
+                self.completed = Mock()
+                self.start = Mock()
+
+        with patch_all('ReconnectWorker', FakeWorker), patch_all('_retain_thread_until_finished'):
+            banner.reconnect_button.click()
+        self.assertEqual(created, [(self.UNC, int(host.winId()), host)])
+        self.assertTrue(banner.is_busy())
+        host._on_reconnect_finished(self.UNC, 0)
+        host.navigate_to.assert_called_once_with(self.UNC)
+        host._on_reconnect_finished(self.UNC, self.module.ERROR_CANCELLED)
+        self.assertIn(self.module.tr('已取消连接。'), banner.detail_label.text())
+        self.assertTrue(banner.retry_button.isEnabled())
+        host.navigate_to.reset_mock()
+        host._on_reconnect_finished('\\\\other\\share', 0)
+        host.navigate_to.assert_not_called()
+
+    def test_resolver_failure_reports_reason_and_stale_results_are_dropped(self):
+        """后台解析失败时同时报告结束与原因；过期解析结果不再落地；解析期间不刷新旧视图；同步导航作废在途解析。"""
+        widget = self.module.IExplorerBrowserWidget
+        host = types.SimpleNamespace(_nav_generation=2, _resolving_generation=2, _browser=None,
+                                     navigationFinished=Mock(), navigationFailed=Mock())
+        widget._on_pidl_resolved(host, self.UNC, None, self.BAD_NETPATH, 2)
+        host.navigationFinished.emit.assert_called_once_with(self.UNC, False)
+        host.navigationFailed.emit.assert_called_once_with(self.UNC, self.BAD_NETPATH)
+        self.assertIsNone(host._resolving_generation)
+        host.navigationFailed.reset_mock()
+        widget._on_pidl_resolved(host, '\\\\srv\\old', None, self.BAD_NETPATH, 1)
+        host.navigationFailed.emit.assert_not_called()
+        refresh = types.SimpleNamespace(_nav_generation=3, _resolving_generation=3, _location_url='file:///C:/x',
+                                        _navigate_url=Mock())
+        widget._do_refresh(refresh)
+        refresh._navigate_url.assert_not_called()
+        refresh._resolving_generation = None
+        widget._do_refresh(refresh)
+        refresh._navigate_url.assert_called_once_with('file:///C:/x')
+        sync = types.SimpleNamespace(_nav_generation=5, _browser=Mock(), navigationFailed=Mock())
+        with tempfile.TemporaryDirectory() as directory, patch_all('_TORTOISE_OVERLAY_PATCHED', False):
+            missing = os.path.join(directory, 'missing')
+            widget._navigate_sync(sync, missing)
+        self.assertEqual(sync._nav_generation, 6)
+        path, hr = sync.navigationFailed.emit.call_args.args
+        self.assertEqual(path, missing)
+        self.assertIn(self.module.win32_error(hr), (2, 3))
+
+    def test_network_bookmarks_open_without_ui_thread_probe(self):
+        """网络书签直接打开新标签，由标签内提示条报告结果，不在界面线程探测网络路径是否存在。"""
+        real_exists = os.path.exists
+
+        def guarded(path):
+            if str(path).startswith('\\\\'):
+                raise AssertionError('UI thread probed a network path')
+            return real_exists(path)
+
+        host = types.SimpleNamespace(get_active_group_tabwidget=lambda: None, add_new_tab=Mock())
+        with patch('os.path.exists', side_effect=guarded):
+            self.module.MainWindow.open_bookmark_url(host, 'file://///srv/share/team', group_color='#E57373',
+                                                     bookmark_node_id='7')
+            self.module.MainWindow.open_bookmark_url(host, '\\\\srv\\share\\docs')
+        self.assertEqual([call.args[0] for call in host.add_new_tab.call_args_list],
+                         ['\\\\srv\\share\\team', '\\\\srv\\share\\docs'])
+        self.assertEqual(host.add_new_tab.call_args_list[0].kwargs['bookmark_group_color'], '#E57373')
+
+
 if __name__ == '__main__':
     unittest.main()

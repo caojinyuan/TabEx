@@ -6,6 +6,7 @@ import os
 from PyQt5.QtCore import pyqtSignal, Qt, QThread
 from PyQt5.QtWidgets import QHBoxLayout, QLabel, QMenu, QPushButton, QVBoxLayout, QWidget
 
+from . import theme as _theme
 from .paths import get_app_base_dir, get_app_data_path, translate_common_path
 from .i18n import tr
 from .constants import MAX_CHAT_HISTORY_MESSAGES, MAX_CHAT_MESSAGE_CHARS, MAX_CONTEXT_TOTAL_CHARS
@@ -145,7 +146,7 @@ class ChatPanel(QWidget):
 
         # 标题栏
         header = QWidget()
-        header.setStyleSheet("background: #E3F2FD; border-radius: 4px;")
+        _theme.bind_style(header, "background: #E3F2FD; border-radius: 4px;")
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(8, 4, 8, 4)
         title_lbl = QLabel(tr("🤖 AI 助手"))
@@ -154,7 +155,8 @@ class ChatPanel(QWidget):
         header_layout.addStretch()
         clear_btn = QPushButton(tr("清空"))
         clear_btn.setFixedHeight(22)
-        clear_btn.setStyleSheet(
+        _theme.bind_style(
+            clear_btn,
             "QPushButton{background:#fff;border:1px solid #90CAF9;border-radius:3px;font-size:9pt;padding:0 6px;}"
             "QPushButton:hover{background:#BBDEFB;}"
         )
@@ -164,7 +166,8 @@ class ChatPanel(QWidget):
 
         # 当前目录提示条
         self.context_label = QLabel(tr("当前目录: —"))
-        self.context_label.setStyleSheet(
+        _theme.bind_style(
+            self.context_label,
             "color:#555; font-size:8.5pt; padding:2px 6px;"
             "background:#f0f4f8; border-radius:3px;"
         )
@@ -177,7 +180,8 @@ class ChatPanel(QWidget):
         self.chat_display.setTextInteractionFlags(
             Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard | Qt.TextBrowserInteraction
         )
-        self.chat_display.setStyleSheet(
+        _theme.bind_style(
+            self.chat_display,
             "QTextBrowser{background:#fafafa;border:1px solid #e0e0e0;"
             "border-radius:4px;font-family:'Microsoft YaHei UI','Segoe UI',Arial;"
             "font-size:9.5pt;}"
@@ -193,7 +197,8 @@ class ChatPanel(QWidget):
         self.input_box.setReadOnly(False)
         self.input_box.setFocusPolicy(Qt.StrongFocus)
         self.input_box.setAttribute(Qt.WA_InputMethodEnabled, True)
-        self.input_box.setStyleSheet(
+        _theme.bind_style(
+            self.input_box,
             "QPlainTextEdit{border:1px solid #d0d0d0;border-radius:4px;padding:4px;"
             "font-family:'Microsoft YaHei UI','Segoe UI',Arial;font-size:9.5pt;}"
             "QPlainTextEdit:focus{border:1px solid #42A5F5;}"
@@ -207,7 +212,8 @@ class ChatPanel(QWidget):
         btn_row = QHBoxLayout()
         self.send_btn = QPushButton(tr("发 送"))
         self.send_btn.setFixedHeight(28)
-        self.send_btn.setStyleSheet(
+        _theme.bind_style(
+            self.send_btn,
             "QPushButton{background:#1976D2;color:white;border:none;border-radius:4px;"
             "font-size:9.5pt;font-weight:bold;padding:0 16px;}"
             "QPushButton:hover{background:#1565C0;}"
@@ -246,7 +252,7 @@ class ChatPanel(QWidget):
 
         # 状态提示
         self.status_lbl = QLabel("")
-        self.status_lbl.setStyleSheet("color:#888;font-size:8.5pt;")
+        _theme.bind_style(self.status_lbl, "color:#888;font-size:8.5pt;")
         layout.addWidget(self.status_lbl)
 
     # ── 鼠标点击：确保焦点转移到输入框 ──────────────────────────────────────
@@ -521,7 +527,7 @@ class ChatPanel(QWidget):
                 if part.startswith('`') and part.endswith('`') and len(part) > 1:
                     inner = part[1:-1]
                     result.append(
-                        f'<code style="background:#f0f0f0;padding:1px 4px;'
+                        f'<code style="background:{_theme.bg("#f0f0f0")};padding:1px 4px;'
                         f'border-radius:3px;font-family:Consolas,monospace;font-size:12px">'
                         f'{inner}</code>'
                     )
@@ -534,6 +540,7 @@ class ChatPanel(QWidget):
 
         lines = text.split('\n')
         out = []
+        rule = _theme.line('#ccc')
         i = 0
         while i < len(lines):
             line = lines[i]
@@ -561,7 +568,7 @@ class ChatPanel(QWidget):
 
             # --- Horizontal rule ---
             if _re.match(r'^[-*_]{3,}\s*$', line):
-                out.append('<hr style="border:0;border-top:1px solid #ccc;margin:8px 0">')
+                out.append(f'<hr style="border:0;border-top:1px solid {rule};margin:8px 0">')
                 i += 1
                 continue
 
@@ -571,7 +578,7 @@ class ChatPanel(QWidget):
                 level = len(m.group(1))
                 sizes = {1: '18px', 2: '16px', 3: '14px', 4: '13px'}
                 size = sizes.get(level, '13px')
-                border = 'border-bottom:1px solid #ccc;padding-bottom:3px;' if level <= 2 else ''
+                border = f'border-bottom:1px solid {rule};padding-bottom:3px;' if level <= 2 else ''
                 content = inline_fmt(_html.escape(m.group(2)))
                 out.append(
                     f'<div style="font-size:{size};font-weight:bold;'
@@ -604,8 +611,8 @@ class ChatPanel(QWidget):
                             tbl.append('<tr>')
                             for cell in cells:
                                 tbl.append(
-                                    f'<th style="padding:4px 8px;border:1px solid #ccc;'
-                                    f'background:#e8e8e8;text-align:left">'
+                                    f'<th style="padding:4px 8px;border:1px solid {rule};'
+                                    f'background:{_theme.bg("#e8e8e8")};text-align:left">'
                                     f'{inline_fmt(_html.escape(cell))}</th>'
                                 )
                             tbl.append('</tr></thead>')
@@ -615,7 +622,7 @@ class ChatPanel(QWidget):
                             tbl.append('<tr>')
                             for cell in cells:
                                 tbl.append(
-                                    f'<td style="padding:4px 8px;border:1px solid #ccc">'
+                                    f'<td style="padding:4px 8px;border:1px solid {rule}">'
                                     f'{inline_fmt(_html.escape(cell))}</td>'
                                 )
                             tbl.append('</tr>')
@@ -664,6 +671,7 @@ class ChatPanel(QWidget):
             color, prefix, bg = "#2E7D32", "🤖 AI", "#F1F8E9"
         else:
             color, prefix, bg = "#888", tr("ℹ 系统"), "#F5F5F5"
+        color, bg = _theme.fg(color), _theme.bg(bg)
 
         if role == "assistant":
             body = self._md_to_html(content)
@@ -682,6 +690,11 @@ class ChatPanel(QWidget):
         self.chat_display.verticalScrollBar().setValue(
             self.chat_display.verticalScrollBar().maximum()
         )
+
+    def apply_theme(self):
+        """按新主题重绘已有气泡；流式回复进行中时保持原样，避免打断正在更新的气泡。"""
+        if self.worker is None and not getattr(self, '_streaming_bubble_open', False):
+            self._rebuild_chat_display()
 
     # 气泡过多时 QTextDocument 不会自动截断——超过此块数则重建显示
     _MAX_CHAT_DISPLAY_BLOCKS = 400

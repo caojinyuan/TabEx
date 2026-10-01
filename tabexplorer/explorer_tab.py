@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QMenu, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
+from . import theme as _theme
 from .paths import get_app_base_dir, translate_common_path
 from .i18n import tr
 from .constants import (
@@ -28,6 +29,10 @@ from .widgets import GestureOverlay, show_toast
 from .workers import FolderSizeChecker, GitStatusWorker
 from .search import _search_cache
 from .pathbar import SimplePathBar
+from .netstatus import (
+    ERROR_CANCELLED, ERROR_CONNECTION_UNAVAIL, is_network_path, NAV_TIMEOUT, NetworkErrorBanner, RECONNECTED_CODES,
+    ReconnectWorker, win32_error,
+)
 from .shellview import _COMTYPES_AVAILABLE, _file_url_to_path, IExplorerBrowserWidget
 
 if HAS_PYWIN:
@@ -851,7 +856,7 @@ class FileExplorerTab(QWidget):
     def setup_ui(self):
         from PyQt5.QtWidgets import QLabel
         # 设置FileExplorerTab背景为白色
-        self.setStyleSheet("background: white;")
+        _theme.bind_style(self, "background: white;")
         self.setAutoFillBackground(True)
         
         layout = QVBoxLayout(self)
@@ -862,6 +867,12 @@ class FileExplorerTab(QWidget):
         self.path_bar.pathChanged.connect(self.on_path_bar_changed)
         self.path_bar.activated.connect(self._activate_path_bar)
         layout.addWidget(self.path_bar)
+
+        # 位置不可用提示条（平时隐藏）：导航失败或超时时说明原因，提供重试与重新连接
+        self.net_banner = NetworkErrorBanner(self)
+        self.net_banner.retryRequested.connect(self._retry_failed_location)
+        self.net_banner.reconnectRequested.connect(self._reconnect_failed_location)
+        layout.addWidget(self.net_banner)
         
         # 加载指示器（初始隐藏）
         # 注意：改为悬浮覆盖层，不加入垂直布局，避免显示/隐藏时顶部区域高度跳动
@@ -898,12 +909,17 @@ class FileExplorerTab(QWidget):
         except Exception:
             pass
         layout.addWidget(self.explorer)
+        # 新建的 Shell 视图导航失败时只有一片空白（深色主题下是强烈白块），改显示空占位
+        self._explorer_placeholder = QWidget(self)
+        self._explorer_placeholder.hide()
+        layout.addWidget(self._explorer_placeholder)
 
         # 状态栏（参考系统 Explorer 样式：细高、浅底色、顶部分割线）
         self.status_bar = QLabel(tr("就绪"))
         self.status_bar.setFixedHeight(20)
         self.status_bar.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.status_bar.setStyleSheet(
+        _theme.bind_style(
+            self.status_bar,
             "QLabel { padding: 2px 8px; background: white; border-top: 1px solid #e0e0e0; font-size: 12px; color: #444; }"
         )
         # 支持在状态栏上按住拖动整个软件窗口
@@ -917,7 +933,8 @@ class FileExplorerTab(QWidget):
         self.resource_label = QLabel("")
         self.resource_label.setFixedHeight(20)
         self.resource_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.resource_label.setStyleSheet(
+        _theme.bind_style(
+            self.resource_label,
             "QLabel { padding: 2px 10px; background: white; border-top: 1px solid #e0e0e0; font-size: 12px; }"
         )
         self.resource_label.mouseDoubleClickEvent = self._status_bar_mouse_double_click
@@ -925,7 +942,8 @@ class FileExplorerTab(QWidget):
         self.cancel_file_op_btn = QPushButton(tr("取消"), self)
         self.cancel_file_op_btn.setFixedHeight(20)
         self.cancel_file_op_btn.setFixedWidth(52)
-        self.cancel_file_op_btn.setStyleSheet(
+        _theme.bind_style(
+            self.cancel_file_op_btn,
             "QPushButton { background: #f8f8f8; border: 1px solid #dddddd; border-top: 1px solid #e0e0e0;"
             " color: #444; font-size: 11px; padding: 0 6px; }"
             "QPushButton:hover { background: #efefef; }"
@@ -1007,6 +1025,7 @@ class FileExplorerTab(QWidget):
         try:
             self.explorer.navigationStarted.connect(self._on_async_nav_started)
             self.explorer.navigationFinished.connect(self._on_async_nav_finished)
+            self.explorer.navigationFailed.connect(self._on_navigation_failed)
         except (AttributeError, TypeError):
             pass  # Shell.Explorer 回退控件无此信号，忽略
 
@@ -1056,19 +1075,95 @@ class FileExplorerTab(QWidget):
         )
 
     def _on_async_nav_finished(self, path, ok):
-        """慢盘异步导航结束（仅解析失败/无法访问时触发）：解锁并隐藏 loading。"""
+        """慢盘异步导航结束（仅解析失败/无法访问时触发）：解锁并隐藏 loading；失败原因由提示条展示。"""
         self._nav_in_progress = False
         self._hide_loading_indicator()
-        if not ok:
-            show_toast(self, tr("路径错误"), tr("无法访问: {}").format(path), level="warning")
 
     def _async_nav_safety_timeout(self, path):
-        """导航中锁定的兜底超时：仍在等待同一目标时强制解锁，避免永久卡在加载态。"""
+        """导航中锁定的兜底超时：仍在等待同一目标时强制解锁，并提示连接超时。
+
+        后台解析若之后成功，导航完成会自动关闭提示条。"""
+        if self._is_cleaning_up:
+            return
         if (getattr(self, '_nav_in_progress', False) and
                 getattr(self, '_nav_in_progress_path', None) == path):
             debug_print(f"[AsyncNav] Safety timeout, clearing nav lock: {path}")
             self._nav_in_progress = False
             self._hide_loading_indicator()
+            self._show_network_error(path, NAV_TIMEOUT)
+
+    def _on_navigation_failed(self, path, hr):
+        """导航失败：hr 非 0 为路径解析失败；hr 为 0 是 Shell 内部导航失败，仅对网络位置提示。"""
+        # 可能在 Shell 的 COM 回调内触发，延后改布局；其间若有导航成功则忽略本次失败
+        seq = getattr(self, '_nav_success_seq', 0)
+        QTimer.singleShot(0, lambda: self._handle_navigation_failure(path, hr, seq))
+
+    def _handle_navigation_failure(self, path, hr, seq):
+        if self._is_cleaning_up or getattr(self, '_nav_success_seq', 0) != seq:
+            return
+        if not hr and not is_network_path(path):
+            return
+        self._nav_in_progress = False
+        self._hide_loading_indicator()
+        self._show_network_error(path, win32_error(hr) if hr else 0)
+
+    def _on_navigation_succeeded(self):
+        self._nav_success_seq = getattr(self, '_nav_success_seq', 0) + 1
+        banner = getattr(self, 'net_banner', None)
+        placeholder = getattr(self, '_explorer_placeholder', None)
+        if (banner is not None and banner.isVisible()) or (placeholder is not None and not placeholder.isHidden()):
+            QTimer.singleShot(0, self._dismiss_network_banner)
+
+    def _show_network_error(self, path, code):
+        banner = getattr(self, 'net_banner', None)
+        if banner is None:
+            return
+        debug_print(f"[NetBanner] Location unavailable: {path} (code={code})")
+        banner.show_failure(path, code, network=is_network_path(path))
+        if not getattr(getattr(self, 'explorer', None), '_has_view', True):
+            self._set_explorer_placeholder(True)
+
+    def _set_explorer_placeholder(self, active):
+        placeholder = getattr(self, '_explorer_placeholder', None)
+        if placeholder is None or placeholder.isHidden() != active:
+            return
+        placeholder.setVisible(active)
+        self.explorer.setVisible(not active)
+
+    def _dismiss_network_banner(self):
+        banner = getattr(self, 'net_banner', None)
+        if banner is not None and banner.isVisible():
+            banner.hide()
+        self._set_explorer_placeholder(False)
+
+    def _retry_failed_location(self, path):
+        self.net_banner.set_busy(tr("正在重试…"))
+        self.navigate_to(path)
+
+    def _reconnect_failed_location(self, path):
+        if getattr(self, '_reconnect_worker', None) is not None:
+            return
+        self.net_banner.set_busy(tr("正在连接网络位置…"))
+        window = self.window()
+        worker = ReconnectWorker(path, int(window.winId()) if window is not None else 0, self)
+        worker.completed.connect(self._on_reconnect_finished)
+        self._reconnect_worker = worker
+        worker.start()
+        _retain_thread_until_finished(worker)
+
+    def _on_reconnect_finished(self, path, code):
+        self._reconnect_worker = None
+        banner = getattr(self, 'net_banner', None)
+        # 期间已导航到别处或关闭了提示条：不再把用户带回该位置
+        if self._is_cleaning_up or banner is None or not banner.isVisible() or banner.path != path:
+            return
+        if code in RECONNECTED_CODES:
+            banner.set_busy(tr("已连接，正在打开…"))
+            self.navigate_to(path)
+        elif code == ERROR_CANCELLED:
+            banner.show_failure(path, banner.code, network=True, note=tr("已取消连接。"))
+        else:
+            self._show_network_error(path, code)
 
     def _clear_async_nav_lock(self):
         """导航真正完成（NavigateComplete2）时解除导航中锁定并隐藏 loading。"""
@@ -1252,6 +1347,7 @@ class FileExplorerTab(QWidget):
                     self.path_bar.set_path(local_path)
                 # 导航真正完成：解除慢盘异步导航的“导航中”锁定并隐藏 loading
                 self._clear_async_nav_lock()
+                self._on_navigation_succeeded()
                 self._force_details_view_for_local_path(local_path)
                 # 延迟安装/更新 IExplorerBrowser 双击钩子（SysListView32 在首次导航后才创建）
                 QTimer.singleShot(200, self._install_listview_dblclick_hook)
@@ -1749,7 +1845,8 @@ class FileExplorerTab(QWidget):
         # 直接交给 navigate_to（其内部对慢盘走后台异步解析，不做同步文件系统探测）。
         if self._is_slow_path(path2):
             self.navigate_to(path2)
-        elif os.path.exists(path2):
+        elif os.path.exists(path2) or is_network_path(path2):
+            # 已记住但未连接的映射盘也交给 navigate_to，由其显示重新连接提示
             self.navigate_to(path2)
         else:
             show_toast(self, tr("路径错误"), tr("路径不存在: {}").format(path2), level="warning")
@@ -3168,6 +3265,26 @@ class FileExplorerTab(QWidget):
             self._perform_navigation(path, add_to_history)
         else:
             debug_print(f"[navigate_to] Path does not exist: {path}")
+            if is_network_path(path):
+                # 盘符仍记录为网络驱动器但当前未连接
+                self._show_network_error(path, ERROR_CONNECTION_UNAVAIL)
+
+    def rebuild_shell_view(self):
+        """切换深浅色后重建 Shell 视图（原生视图只在新建时完整应用配色）。不可见的标签延迟到下次显示。"""
+        explorer = getattr(self, 'explorer', None)
+        path = getattr(self, 'current_path', '')
+        if not isinstance(explorer, IExplorerBrowserWidget) or not explorer._init_ok or not path:
+            return False
+        if getattr(explorer, '_created_dark', None) == _theme.is_dark():
+            return False
+        if not explorer.hibernate(path):
+            return False
+        if self.isVisible():
+            # 销毁视图会作废在途的后台解析，需解除导航中锁定才能重新导航到同一路径
+            self._nav_in_progress = False
+            self._hide_loading_indicator()
+            self.navigate_to(path, is_shell=str(path).startswith('shell:'), add_to_history=False)
+        return True
 
     def _is_slow_path(self, path):
         """检测OneDrive/网络/映射网络驱动器路径——这类路径上os.scandir()可能阻塞UI线程"""
@@ -3383,7 +3500,7 @@ class FileExplorerTab(QWidget):
         if not hasattr(self, 'loading_bar'):
             return
         try:
-            top = self.path_bar.height() if hasattr(self, 'path_bar') else 30
+            top = self.explorer.y() if hasattr(self, 'explorer') else 30
             self.loading_bar.setGeometry(0, top, self.width(), 20)
         except Exception:
             pass
@@ -3396,6 +3513,9 @@ class FileExplorerTab(QWidget):
 
     def _do_show_loading_indicator(self):
         if hasattr(self, 'loading_bar'):
+            banner = getattr(self, 'net_banner', None)
+            if banner is not None and banner.isVisible():
+                return  # 提示条已显示重试/连接进度
             self._position_loading_bar()
             self.loading_bar.show()
             self.loading_bar.raise_()

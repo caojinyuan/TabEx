@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
 from . import debuglog as _debuglog
 from . import i18n as _i18n
 from . import search as _search
+from . import theme as _theme
 from .paths import get_app_data_path
 from .i18n import _set_app_language, tr
 from .constants import (
@@ -52,7 +53,10 @@ from .fileops import (
     _plan_batch_rename,
 )
 from .bookmarks import BookmarkDialog, BookmarkManager, BookmarkManagerDialog, _preserve_unreadable_file
-from .shellview import _explorer_location_to_path, _ieb_keyboard_filter
+from .shellview import (
+    _explorer_location_to_path, _ieb_keyboard_filter, _path_is_slow_for_shell, _shell_file_operation_window_open,
+)
+from .netstatus import is_network_path
 from .explorer_tab import FileExplorerTab
 from .tabbar import CustomMenuBar, CustomTabBar, DragDropTabWidget, _tab_display_labels, TabListDialog
 from .chat import ChatPanel
@@ -68,6 +72,11 @@ def _tab_git_branch(pane):
     """标签当前路径对应的 Git 分支；导航后尚未重新查询时返回空。"""
     branch_path, branch = getattr(pane, '_git_branch_info', ('', ''))
     return branch if branch and branch_path == getattr(pane, 'current_path', None) else ''
+
+
+def _tab_target_available(path):
+    """网络/慢速位置不在 UI 线程探测（断线时会卡住界面），直接打开，由标签内提示条报告结果。"""
+    return _path_is_slow_for_shell(path) or is_network_path(path) or os.path.exists(path)
 
 
 class MainWindow(QMainWindow):
@@ -655,9 +664,10 @@ class MainWindow(QMainWindow):
         from PyQt5.QtGui import QColor
         show_markers = bool(getattr(self, 'config', {}).get('show_tab_group_markers', True))
         if color_hex and show_markers:
-            tab_widget.tabBar().setTabTextColor(index, QColor(color_hex).darker(125))
+            group_color = QColor(color_hex)
+            tab_widget.tabBar().setTabTextColor(index, group_color if _theme.is_dark() else group_color.darker(125))
         else:
-            tab_widget.tabBar().setTabTextColor(index, QColor("#505050"))
+            tab_widget.tabBar().setTabTextColor(index, QColor(_theme.fg("#505050")))
         tab_widget.setTabIcon(index, _pinned_tab_icon() if getattr(tab_ref, 'is_pinned', False) else QIcon())
         try:
             tab_widget.tabBar().update()
@@ -2304,7 +2314,7 @@ class MainWindow(QMainWindow):
         titlebar_height = int(32 * getattr(self, 'dpi_scale', 1.0))
         titlebar = QWidget()
         titlebar.setFixedHeight(titlebar_height)
-        titlebar.setStyleSheet("background-color: #f3f3f3;")
+        _theme.bind_style(titlebar, "background-color: #f3f3f3;")
         titlebar_layout = QHBoxLayout(titlebar)
         titlebar_layout.setContentsMargins(10, 0, 0, 0)
         titlebar_layout.setSpacing(0)
@@ -2350,7 +2360,7 @@ class MainWindow(QMainWindow):
         self.shortcut_git_separator = QFrame()
         self.shortcut_git_separator.setFrameShape(QFrame.VLine)
         self.shortcut_git_separator.setFrameShadow(QFrame.Plain)
-        self.shortcut_git_separator.setStyleSheet("background-color: #d0d0d0; max-width: 1px;")
+        _theme.bind_style(self.shortcut_git_separator, "background-color: #d0d0d0; max-width: 1px;")
         self.shortcut_git_separator.setFixedWidth(1)
         self.shortcut_git_separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
         titlebar_layout.addWidget(self.shortcut_git_separator)
@@ -2404,7 +2414,7 @@ class MainWindow(QMainWindow):
         self.git_tools_separator = QFrame()
         self.git_tools_separator.setFrameShape(QFrame.VLine)
         self.git_tools_separator.setFrameShadow(QFrame.Plain)
-        self.git_tools_separator.setStyleSheet("background-color: #d0d0d0; max-width: 1px;")
+        _theme.bind_style(self.git_tools_separator, "background-color: #d0d0d0; max-width: 1px;")
         self.git_tools_separator.setFixedWidth(1)
         self.git_tools_separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
         titlebar_layout.addWidget(self.git_tools_separator)
@@ -2435,7 +2445,7 @@ class MainWindow(QMainWindow):
         separator = QFrame()
         separator.setFrameShape(QFrame.VLine)
         separator.setFrameShadow(QFrame.Plain)
-        separator.setStyleSheet("background-color: #d0d0d0; max-width: 1px;")
+        _theme.bind_style(separator, "background-color: #d0d0d0; max-width: 1px;")
         separator.setFixedWidth(1)
         separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
         titlebar_layout.addWidget(separator)
@@ -2775,9 +2785,9 @@ class MainWindow(QMainWindow):
             button.setText('')
             button.setFixedSize(btn_size, btn_size)
             _set_tool_icon(button, theme, fallback, max(16, int(18 * self.dpi_scale)))
-            button.setStyleSheet(toolbar_style)
+            _theme.bind_style(button, toolbar_style)
         for button in (self.workspace_tools_button, self.file_tasks_button, self.tab_list_button):
-            button.setStyleSheet(toolbar_style)
+            _theme.bind_style(button, toolbar_style)
             button.setAccessibleName(button.toolTip())
         self.bookmark_button = bookmark_btn
         self.settings_button = settings_btn
@@ -2840,6 +2850,9 @@ class MainWindow(QMainWindow):
                 
                 msg = cast(int(message), POINTER(wintypes.MSG)).contents
 
+                # WM_SETTINGCHANGE：可能是 Windows 深浅色切换，去抖后重新读取
+                if msg.message == 0x001A:
+                    self._schedule_system_theme_check()
                 # WM_SYSCOMMAND：从最小化恢复时设置 restore guard（抑制 IEB 虚假导航）
                 if msg.message == 0x0112:  # WM_SYSCOMMAND
                     command = msg.wParam & 0xFFF0
@@ -2918,6 +2931,57 @@ class MainWindow(QMainWindow):
                         pass
         except Exception as e:
             debug_print(f"[Reactivate] failed: {e}")
+
+    def _apply_window_palettes(self):
+        """主窗口与主容器的窗口底色（填充边框与内容之间的缝隙）随主题变化。"""
+        from PyQt5.QtGui import QColor, QPalette
+        for widget in (self, getattr(self, '_main_container', None)):
+            if widget is not None:
+                palette = widget.palette()
+                palette.setColor(QPalette.Window, QColor(_theme.bg('#ffffff')))
+                widget.setPalette(palette)
+
+    def _schedule_system_theme_check(self):
+        if _theme.normalize_mode(self.config.get("theme")) != 'system':
+            return
+        timer = getattr(self, '_system_theme_timer', None)
+        if timer is None:
+            timer = self._system_theme_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self.apply_theme_config)
+        timer.start(400)
+
+    def apply_theme_config(self):
+        """按配置（跟随系统/浅色/深色）应用主题；与当前一致时不做任何事。"""
+        if not _theme.set_dark(_theme.resolve_dark(self.config.get("theme", "system"))):
+            return False
+        self._apply_window_palettes()
+        self.apply_tab_group_markers_config()
+        chat_panel = getattr(self, 'chat_panel', None)
+        if chat_panel is not None:
+            chat_panel.apply_theme()
+        for _tabs, stack in self._all_groups():
+            for index in range(stack.count()):
+                pane = stack.widget(index)
+                if hasattr(pane, '_git_status_cache'):
+                    pane._git_status_cache = None  # 缓存的 Git 摘要带旧配色
+        for pane in (self.get_current_tab_widget(), self.get_active_pane()):
+            if pane is not None and hasattr(pane, 'update_explorer_status'):
+                pane.update_explorer_status()
+        self._update_resource_usage_display()
+        self._rebuild_shell_views_for_theme()
+        return True
+
+    def _rebuild_shell_views_for_theme(self):
+        """重建配色与当前主题不符的资源管理器视图；有 Shell 文件操作进度窗口时稍后再试，避免打断复制。"""
+        if _shell_file_operation_window_open():
+            QTimer.singleShot(2000, self._rebuild_shell_views_for_theme)
+            return
+        for _tabs, stack in self._all_groups():
+            for index in range(stack.count()):
+                pane = stack.widget(index)
+                if hasattr(pane, 'rebuild_shell_view'):
+                    pane.rebuild_shell_view()
 
     def _manual_statusbar_reflow_refresh(self):
         """底部状态栏双击触发：模拟一次 resize 级别的 UI 重排，并重新武装当前标签刷新。
@@ -3667,6 +3731,7 @@ class MainWindow(QMainWindow):
         dlg = self.settings_dialog
         result = dlg.exec_()
         if result:
+            self.apply_theme_config()
             # 获取新配置
             old_monitor = self.config.get("enable_explorer_monitor", True)
             old_interval = self.config.get("explorer_monitor_interval", 2.0)
@@ -4064,7 +4129,7 @@ class MainWindow(QMainWindow):
                 else:
                     path = entry
                     is_shell = str(path).startswith('shell:')
-                if os.path.exists(path) or path.startswith('shell:'):
+                if path.startswith('shell:') or _tab_target_available(path):
                     try:
                         # 懒加载：固定标签也延迟首次导航，避免启动瞬间多个 Shell 视图同时创建
                         tab = FileExplorerTab(self, path, is_shell=is_shell, defer_nav=True)
@@ -4117,6 +4182,8 @@ class MainWindow(QMainWindow):
         # 初始化全局调试开关
         set_debug_mode(self.config.get("debug_mode", False))
         set_explorer_monitor_debug(self.config.get("explorer_monitor_debug", False))
+        # 须在创建任何 Shell 视图之前应用：原生视图只在新建时完整采用深色
+        _theme.set_dark(_theme.resolve_dark(self.config.get("theme", "system")))
         
         # 初始化书签管理器
         self.bookmark_manager = BookmarkManager()
@@ -4391,15 +4458,15 @@ class MainWindow(QMainWindow):
 
         def _color(pct):
             if pct >= RESOURCE_CRIT_PERCENT:
-                return "#d32f2f"  # 红：危急
+                return _theme.fg("#d32f2f")  # 红：危急
             if pct >= RESOURCE_WARN_PERCENT:
-                return "#e67700"  # 橙：偏高
-            return "#666"          # 常态
+                return _theme.fg("#e67700")  # 橙：偏高
+            return _theme.fg("#666")          # 常态
 
         cpu = get_system_cpu_percent()
         mem = get_system_memory_status()
         cpu_html = (f"<span style='color:{_color(cpu)}'>CPU {cpu:.0f}%</span>"
-                    if cpu is not None else "<span style='color:#666'>CPU --</span>")
+                    if cpu is not None else f"<span style='color:{_theme.fg('#666')}'>CPU --</span>")
         if mem is not None:
             used_mb, total_mb, pct = mem
             mem_html = (f"<span style='color:{_color(pct)}'>{tr('内存')} "
@@ -4557,27 +4624,21 @@ class MainWindow(QMainWindow):
 
         # 填充窗口背景，避免边框与内容之间出现半透明缝隙
         self.setAutoFillBackground(True)
-        from PyQt5.QtGui import QPalette, QColor
-        pal = self.palette()
-        pal.setColor(QPalette.Window, QColor(255, 255, 255))
-        self.setPalette(pal)
         # 再次用样式表确保非客户区也以白色填充
-        self.setStyleSheet("QMainWindow { background: white; }")
+        _theme.bind_style(self, "QMainWindow { background: white; }")
         
         
         # 创建主容器，无边距，纯白填充
         main_container = QWidget()
         main_container.setAutoFillBackground(True)
-        pal_container = main_container.palette()
-        pal_container.setColor(QPalette.Window, QColor(255, 255, 255))
-        main_container.setPalette(pal_container)
-        main_container.setStyleSheet("QWidget { background: white; margin: 0px; padding: 0px; border: none; }")
+        _theme.bind_style(main_container, "QWidget { background: white; margin: 0px; padding: 0px; border: none; }")
         container_layout = QVBoxLayout(main_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(0)
         
         # 保存主容器引用，用于应用阴影效果
         self._main_container = main_container
+        self._apply_window_palettes()
         
         # 创建内容布局
         main_layout = QVBoxLayout()
@@ -4611,7 +4672,7 @@ class MainWindow(QMainWindow):
         tab_font_size = int(12 * self.dpi_scale)
         tab_margin = int(2 * self.dpi_scale)
         
-        tabbar.setStyleSheet(f"""
+        tab_css = f"""
             QTabBar::tab {{
                 background: #f5f5f5;
                 border: 1px solid #d0d0d0;
@@ -4651,7 +4712,8 @@ class MainWindow(QMainWindow):
                 border-color: #a0a5ad;
                 color: #505050;
             }}
-        """)
+        """
+        _theme.bind_style(tabbar, tab_css)
         # 设置标签文本省略模式 - 左边省略，保留右侧文件/文件夹名称
         tabbar.setElideMode(Qt.ElideLeft)
 
@@ -4659,7 +4721,7 @@ class MainWindow(QMainWindow):
         tab_bar_container = QWidget()
         tab_bar_height = int(32 * getattr(self, 'dpi_scale', 1.0))
         tab_bar_container.setFixedHeight(tab_bar_height)  # 固定高度，只显示标签栏
-        tab_bar_container.setStyleSheet("background-color: #f3f3f3;")
+        _theme.bind_style(tab_bar_container, "background-color: #f3f3f3;")
         tab_bar_layout = QHBoxLayout(tab_bar_container)
         tab_bar_layout.setContentsMargins(0, 0, 0, 0)
         tab_bar_layout.setSpacing(0)
@@ -4678,7 +4740,7 @@ class MainWindow(QMainWindow):
         split_tabbar.owner_tabwidget = self.split_tab_widget
         self.split_tab_widget.setTabBar(split_tabbar)
         split_tabbar.setAcceptDrops(True)
-        split_tabbar.setStyleSheet(tabbar.styleSheet())
+        _theme.bind_style(split_tabbar, tab_css)
         split_tabbar.setElideMode(Qt.ElideLeft)
         # 右侧分屏标签栏也支持右键菜单（固定/取消固定/书签等），与左侧一致
         split_tabbar.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -4703,7 +4765,7 @@ class MainWindow(QMainWindow):
         self.menu_bar.setFixedHeight(menu_bar_height)  # 设置菜单栏高度
         # 设置菜单栏的大小策略，允许它被压缩
         self.menu_bar.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-        self.menu_bar.setStyleSheet("""
+        _theme.bind_style(self.menu_bar, """
             QMenuBar {
                 background-color: #f3f3f3;
                 border-top: 1px solid #d0d0d0;
@@ -4768,7 +4830,7 @@ class MainWindow(QMainWindow):
         # 右侧标签页内容区域（使用 StackedWidget 独立显示，不依赖 tab_widget）
         from PyQt5.QtWidgets import QStackedWidget
         self.content_stack = QStackedWidget()
-        self.content_stack.setStyleSheet("background: white;")
+        _theme.bind_style(self.content_stack, "background: white;")
         self.content_stack.setAutoFillBackground(True)
         # 允许右侧内容在窗口缩小时被压缩，避免阻止左侧目录树向左拖动
         self.content_stack.setMinimumWidth(0)
@@ -4779,7 +4841,7 @@ class MainWindow(QMainWindow):
 
         # 右侧分屏内容栈（默认不加入分割器，F3 时插入到索引 1）
         self.split_content_stack = QStackedWidget()
-        self.split_content_stack.setStyleSheet("background: white;")
+        _theme.bind_style(self.split_content_stack, "background: white;")
         self.split_content_stack.setAutoFillBackground(True)
         self.split_content_stack.setMinimumWidth(0)
         self.split_content_stack.setVisible(False)
@@ -5530,7 +5592,7 @@ class MainWindow(QMainWindow):
             if local_path.startswith('shell:'):
                 self.add_new_tab(local_path, is_shell=True, target_tabwidget=target_tw,
                                  bookmark_group_color=group_color, bookmark_source_node_id=bookmark_node_id)
-            elif os.path.exists(local_path):
+            elif _tab_target_available(local_path):
                 self.add_new_tab(local_path, target_tabwidget=target_tw,
                                  bookmark_group_color=group_color, bookmark_source_node_id=bookmark_node_id)
             else:
@@ -5547,7 +5609,7 @@ class MainWindow(QMainWindow):
             else:
                 self.add_new_tab(url, is_shell=True, target_tabwidget=target_tw,
                                  bookmark_group_color=group_color, bookmark_source_node_id=bookmark_node_id)
-        elif os.path.isabs(url) and os.path.exists(url):
+        elif os.path.isabs(url) and _tab_target_available(url):
             self.add_new_tab(url, target_tabwidget=target_tw,
                              bookmark_group_color=group_color, bookmark_source_node_id=bookmark_node_id)
         else:
@@ -5756,6 +5818,9 @@ class MainWindow(QMainWindow):
         from PyQt5.QtCore import QEvent
         from PyQt5.QtWidgets import QMenu
         from PyQt5.QtGui import QMouseEvent
+
+        if event.type() == QEvent.Show and isinstance(obj, QWidget) and obj.isWindow():
+            _theme.apply_window_frame(obj)
 
         # 处理主菜单栏的右键点击
         if obj == self.menu_bar:

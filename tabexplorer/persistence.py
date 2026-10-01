@@ -9,6 +9,7 @@ from .i18n import _set_app_language
 from .debuglog import debug_print
 from .search import apply_runtime_performance_config
 from .bookmarks import _preserve_unreadable_file
+from .theme import normalize_mode
 
 class ConfigStore:
     def __init__(self, path):
@@ -75,6 +76,7 @@ class ConfigStore:
                 "insert_group_bookmark": True  # F4 - 插入标签分组（保留旧键名兼容已有配置）
             },
             "language": "zh",              # 界面语言：zh / en
+            "theme": "system",             # 主题：system（跟随 Windows）/ light / dark
         }
         default_config["ai_chat"] = {
             "enabled": False,
@@ -139,6 +141,7 @@ class ConfigStore:
                     # 资源快照日志已并入崩溃诊断，旧开关不再使用
                     config.pop("resource_snapshot_logging", None)
                     config.pop("resource_snapshot_interval_ms", None)
+                    config["theme"] = normalize_mode(config.get("theme"))
 
                     apply_runtime_performance_config(config.get("performance"))
                     _set_app_language(config.get("language", "zh"))

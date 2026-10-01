@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
 )
 
 from . import debuglog as _debuglog
+from . import theme as _theme
 from .i18n import tr
 from .debuglog import debug_print
 from .system import detect_notepad_plus_plus, format_file_size, launch_detached, launch_detached_async
@@ -599,7 +600,7 @@ class SearchDialog(QDialog):
         path_layout.addWidget(QLabel(tr("搜索路径:")))
         self.path_input = QLineEdit(search_path)
         self.path_input.setClearButtonEnabled(True)
-        self.path_input.setStyleSheet("QLineEdit { color: #0066cc; font-weight: bold; padding: 5px; }")
+        _theme.bind_style(self.path_input, "QLineEdit { color: #0066cc; font-weight: bold; padding: 5px; }")
         self.path_input.setPlaceholderText(tr("输入要搜索的文件夹路径..."))
         path_layout.addWidget(self.path_input)
         layout.addLayout(path_layout)
@@ -705,7 +706,7 @@ class SearchDialog(QDialog):
         self.result_list.setShowGrid(False)
         self.result_list.setAlternatingRowColors(True)  # 启用交替行颜色
         # 设置表头样式
-        self.result_list.setStyleSheet("""
+        _theme.bind_style(self.result_list, """
             QHeaderView::section {
                 background-color: #E0E0E0;
                 padding: 4px;

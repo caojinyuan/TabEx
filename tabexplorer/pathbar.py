@@ -7,6 +7,7 @@ from PyQt5.QtGui import QDrag
 from PyQt5.QtWidgets import QApplication, QLineEdit, QMenu, QWidget
 
 from . import debuglog as _debuglog
+from . import theme as _theme
 from .i18n import tr
 from .debuglog import debug_print
 
@@ -59,7 +60,7 @@ class SimplePathBar(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)    # hover 高亮需要
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet(self._S_BAR)
+        _theme.bind_style(self, self._S_BAR)
 
         from PyQt5.QtGui import QFont
         self._font = QFont("Segoe UI", 11)
@@ -72,7 +73,7 @@ class SimplePathBar(QWidget):
         self.setFont(self._font)
         # 编辑框：常驻子控件，编辑模式下覆盖显示，不参与常态绘制
         self._edit = QLineEdit(self)
-        self._edit.setStyleSheet(self._S_EDIT)
+        _theme.bind_style(self._edit, self._S_EDIT)
         self._edit.setFrame(False)
         self._edit.returnPressed.connect(self._commit_edit)
         self._edit.installEventFilter(self)
@@ -118,7 +119,7 @@ class SimplePathBar(QWidget):
             return
         self._pane_active, self._split_indicator = state
         border = '#2f6fdb' if active else '#a0a5ad'
-        self._edit.setStyleSheet(self._S_EDIT + (f'QLineEdit {{ border: 2px solid {border}; }}' if split else ''))
+        _theme.bind_style(self._edit, self._S_EDIT + (f'QLineEdit {{ border: 2px solid {border}; }}' if split else ''))
         self.update()
 
     def enter_edit_mode(self):
@@ -170,10 +171,10 @@ class SimplePathBar(QWidget):
         from PyQt5.QtGui import QPainter, QColor, QFont
         from PyQt5.QtCore import QRectF
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor('#ffffff'))
+        painter.fillRect(self.rect(), QColor(_theme.bg('#ffffff')))
         if self._split_indicator:
             color = '#2f6fdb' if self._pane_active else '#b7bcc4'
-            painter.fillRect(0, self.height() - 2, self.width(), 2, QColor(color))
+            painter.fillRect(0, self.height() - 2, self.width(), 2, QColor(_theme.line(color)))
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.TextAntialiasing, True)
         painter.setFont(self._font)
@@ -188,9 +189,9 @@ class SimplePathBar(QWidget):
             return
         display_parts = self._choose_display_parts(parts)
         left_collapsed = len(display_parts) < len(parts)
-        col_seg = QColor(self._COL_SEG)
-        col_sep = QColor(self._COL_SEP)
-        col_hover = QColor(self._COL_HOVER)
+        col_seg = QColor(_theme.fg(self._COL_SEG))
+        col_sep = QColor(_theme.fg(self._COL_SEP))
+        col_hover = QColor(_theme.bg(self._COL_HOVER))
         pad = self._PAD
         sep_w = self._SEP_W
         chevron = self._CHEVRON

@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (
     QDialog, QHBoxLayout, QInputDialog, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
 )
 
+from . import theme as _theme
 from .paths import get_app_data_path, translate_common_path
 from .i18n import tr
 from .debuglog import debug_print
@@ -790,7 +791,7 @@ class BookmarkManagerDialog(QDialog):
         
         # 添加拖拽提示
         drag_hint = QLabel(tr("💡 提示：可以拖动书签和文件夹调整顺序和层级，调整后点击【保存】按钮保存更改"))
-        drag_hint.setStyleSheet("QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
+        _theme.bind_style(drag_hint, "QLabel { color: #666; background: #f0f0f0; padding: 8px; border-radius: 4px; font-size: 10pt; }")
         layout.addWidget(drag_hint)
         
         self.populate_tree()

@@ -8,6 +8,7 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtWidgets import QWidget
 
+from . import theme as _theme
 from .i18n import tr
 from .debuglog import dbg_exc, debug_print
 from .system import HAS_PYWIN, _retain_thread_until_finished
@@ -144,9 +145,10 @@ if _COMTYPES_AVAILABLE:
         """IExplorerBrowserEvents sink – receives navigation-complete callbacks."""
         _com_interfaces_ = [_IExplorerBrowserEvents]
 
-        def __init__(self, on_complete):
+        def __init__(self, on_complete, on_failed=None):
             super().__init__()
             self._on_complete = on_complete
+            self._on_failed = on_failed
 
         def OnNavigationPending(self, pidlFolder):
             return 0  # S_OK
@@ -176,6 +178,17 @@ if _COMTYPES_AVAILABLE:
             return 0  # S_OK
 
         def OnNavigationFailed(self, pidlFolder):
+            try:
+                if pidlFolder and self._on_failed:
+                    _fn = ctypes.windll.shell32.SHGetPathFromIDListW
+                    _fn.restype  = ctypes.c_bool
+                    _fn.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+                    buf = ctypes.create_unicode_buffer(32768)
+                    if _fn(pidlFolder, buf) and buf.value:
+                        debug_print(f"[IEB NavSink] navigation failed: {buf.value}")
+                        self._on_failed(buf.value)
+            except Exception:
+                pass
             return 0  # S_OK
 
 
@@ -313,6 +326,31 @@ def _path_is_slow_for_shell(path):
     except Exception:
         pass
     return False
+
+
+def _shell_file_operation_window_open():
+    """本进程是否有 Shell 复制/移动/删除进度窗口；此时重建 Shell 视图可能打断正在进行的文件操作。"""
+    user32 = ctypes.windll.user32
+    pid = os.getpid()
+    found = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+    def _check(hwnd, _lparam):
+        owner = ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid:
+            name = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, name, 64)
+            if name.value == 'OperationStatusWindow':
+                found.append(hwnd)
+                return False
+        return True
+
+    try:
+        user32.EnumWindows(_check, 0)
+    except OSError:
+        return False
+    return bool(found)
 
 
 def _preload_overlay_icons(directory_path):
@@ -651,6 +689,7 @@ class IExplorerBrowserWidget(QWidget):
     # 异步导航（慢盘）状态信号：宿主标签据此显示 loading / 解除导航锁
     navigationStarted  = pyqtSignal(str)        # path — 后台 PIDL 解析已开始
     navigationFinished = pyqtSignal(str, bool)  # path, ok — 解析失败/无法访问时触发
+    navigationFailed   = pyqtSignal(str, int)   # path, HRESULT（0 表示 Shell 报告失败但无错误码）
 
     # IExplorerBrowser option flags  (SDK shobjidl_core.h values)
     _EBO_SHOWFRAMES  = 0x00000002  # 显示左侧导航窗格
@@ -665,9 +704,11 @@ class IExplorerBrowserWidget(QWidget):
         self._location_url = ''
         self._pending_path = None
         self._init_ok      = False
+        self._has_view     = False  # 当前 Shell 视图是否成功显示过某个位置
         # 异步导航（慢盘）：导航代号用于作废过期的后台解析结果；线程引用防 GC
         self._nav_generation = 0
         self._nav_resolver   = None
+        self._resolving_generation = None
         # 后台 overlay 图标预加载：懒创建信号对象 + in-flight 去重标志
         self._overlay_signals = None
         self._overlay_preload_inflight = False
@@ -736,6 +777,8 @@ class IExplorerBrowserWidget(QWidget):
 
     def _navigate_sync(self, path):
         """同步导航（本地快盘）：UI 线程内解析 PIDL 并浏览。"""
+        # 作废在途的慢盘解析，避免其结果稍后把视图拉回旧目标或误报失败
+        self._nav_generation += 1
         try:
             # Pre-load overlay icons BEFORE navigation so DefView has them
             # when it first renders (skip if already cached for this dir)
@@ -762,6 +805,7 @@ class IExplorerBrowserWidget(QWidget):
             else:
                 debug_print(f"[IExplorerBrowser] SHParseDisplayName failed "
                             f"hr=0x{hr & 0xFFFFFFFF:08x} for '{path}'")
+                self.navigationFailed.emit(path, int(hr))
         except Exception as e:
             debug_print(f"[IExplorerBrowser] _navigate error: {e}")
 
@@ -770,6 +814,7 @@ class IExplorerBrowserWidget(QWidget):
         # 递增导航代号：解析期间若再次发起导航，旧线程的结果会被作废，避免错误落地
         self._nav_generation += 1
         gen = self._nav_generation
+        self._resolving_generation = gen
         try:
             self.navigationStarted.emit(path)
         except Exception:
@@ -790,6 +835,7 @@ class IExplorerBrowserWidget(QWidget):
                 except Exception:
                     pass
             return
+        self._resolving_generation = None
         try:
             if pidl_val and self._browser is not None:
                 pidl = ctypes.c_void_p(pidl_val)
@@ -809,16 +855,21 @@ class IExplorerBrowserWidget(QWidget):
                         pass
                 try:
                     self.navigationFinished.emit(path, False)
+                    self.navigationFailed.emit(path, int(hr))
                 except Exception:
                     pass
         except Exception as e:
             debug_print(f"[IExplorerBrowser] async _navigate error: {e}")
             try:
                 self.navigationFinished.emit(path, False)
+                code = getattr(e, 'hresult', None) or hr or -2147467259  # E_FAIL
+                self.navigationFailed.emit(path, int(code))
             except Exception:
                 pass
 
     def _do_refresh(self):
+        if self._resolving_generation == self._nav_generation:
+            return  # 慢盘导航仍在解析：刷新旧视图会作废该导航
         if self._location_url:
             self._navigate_url(self._location_url)
 
@@ -847,12 +898,14 @@ class IExplorerBrowserWidget(QWidget):
             browser.Initialize(hwnd, ctypes.byref(rc), ctypes.byref(fs))
             # EBO_SHOWFRAMES: 显示左侧导航窗格（目录树）
             browser.SetOptions(self._EBO_SHOWFRAMES | self._EBO_NOTRAVELLOG)
-            sink   = _NavEventSink(self._on_nav_complete)
+            sink   = _NavEventSink(self._on_nav_complete, self._on_nav_failed)
             cookie = browser.Advise(sink)  # out-param returned by comtypes
             self._browser  = browser
             self._nav_sink = sink
             self._cookie   = ctypes.c_ulong(cookie)
             self._init_ok  = True
+            self._has_view = False
+            self._created_dark = _theme.is_dark()
             _ieb_keyboard_filter.register_ieb_hwnd(hwnd, widget=self)
             debug_print("[IExplorerBrowser] Initialized successfully")
             return True
@@ -862,6 +915,9 @@ class IExplorerBrowserWidget(QWidget):
 
     def _on_nav_complete(self, path):
         """Called by _NavEventSink when navigation completes."""
+        # 已导航到新位置（含用户在视图内双击进入）：更早发起的慢盘解析作废
+        self._nav_generation += 1
+        self._has_view = True
         norm = os.path.normpath(path)
         url  = 'file:///' + norm.replace('\\', '/')
         self._location_url = url
@@ -870,6 +926,10 @@ class IExplorerBrowserWidget(QWidget):
         # Skip if this navigation was triggered by our own Refresh()
         if not getattr(self, '_overlay_refreshing', False):
             self._notify_overlay_refresh(norm)
+
+    def _on_nav_failed(self, path):
+        """Shell 报告导航失败（如在已断开的共享中打开子文件夹）。"""
+        self.navigationFailed.emit(os.path.normpath(path), 0)
 
     def _notify_overlay_refresh(self, path):
         """Refresh overlay rendering after navigation if needed."""

@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout,
 )
 
+from . import theme as _theme
 from .i18n import tr
 from .debuglog import debug_print
 from .widgets import _set_tool_icon
@@ -559,10 +560,10 @@ class CustomTabBar(QTabBar):
         border = "#4a90d9" if cross else "#b0b0b0"
         title = getattr(self, '_press_title', '') or tr("标签页")
         prefix = "\u21a6 " if cross else ""  # ↦ 表示将转移到另一组
-        prev.setStyleSheet(
+        prev.setStyleSheet(_theme.qss(
             f"QLabel {{ background: #ffffff; border: 1px solid {border};"
             f" border-radius: 4px; padding: 4px 10px; color: #202020; font-size: 12px; }}"
-        )
+        ))
         prev.setText(prefix + title)
         prev.adjustSize()
         prev.move(int(gpos.x()) + 14, int(gpos.y()) + 14)
@@ -744,7 +745,7 @@ class CustomTabBar(QTabBar):
         tab_close_btn_size = max(16, int(16 * scale))
         _set_tool_icon(close_btn, 'window-close', QStyle.SP_TitleBarCloseButton, max(12, int(12 * scale)))
         close_btn.setFixedSize(tab_close_btn_size, tab_close_btn_size)
-        close_btn.setStyleSheet("""
+        _theme.bind_style(close_btn, """
             QToolButton {
                 border: none;
                 background: transparent;

@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
     QToolButton, QVBoxLayout, QWidget,
 )
 
+from . import theme as _theme
 from .paths import get_app_base_dir
 from .i18n import tr
 from .constants import MAX_ACTIVE_TOASTS
@@ -58,14 +59,44 @@ def _pinned_tab_icon():
     return _RED_PIN_ICON
 
 
-def _tool_asset_icon(name):
+def _tool_asset_icon(name, tone=None):
+    """本地 SVG 线条图标；深色主题下改用浅色线条，tone='dark' 用于始终是浅色底的按钮。"""
     from PyQt5.QtGui import QIcon
     from PyQt5.QtSvg import QSvgRenderer
     root = getattr(sys, '_MEIPASS', get_app_base_dir())
     path = os.path.join(root, 'icons', name + '.svg')
+    color = _theme.icon_color() if tone is None else None
+    if color:
+        key = (path, color)
+        if key not in _TOOL_ASSET_CACHE:
+            _TOOL_ASSET_CACHE[key] = _tinted_svg_icon(path, color)
+        return _TOOL_ASSET_CACHE[key]
     if path not in _TOOL_ASSET_CACHE:
         _TOOL_ASSET_CACHE[path] = QIcon(path) if QSvgRenderer(path).isValid() else QIcon()
     return _TOOL_ASSET_CACHE[path]
+
+
+def _tinted_svg_icon(path, color):
+    from PyQt5.QtCore import QByteArray
+    from PyQt5.QtGui import QIcon, QImage, QPainter, QPixmap
+    from PyQt5.QtSvg import QSvgRenderer
+    try:
+        with open(path, 'rb') as handle:
+            data = handle.read().replace(b'currentColor', color.encode('ascii'))
+    except OSError:
+        return QIcon()
+    renderer = QSvgRenderer(QByteArray(data))
+    if not renderer.isValid():
+        return QIcon()
+    icon = QIcon()
+    for size in (16, 20, 24, 28, 32, 40, 48, 64):
+        image = QImage(size, size, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        renderer.render(painter)
+        painter.end()
+        icon.addPixmap(QPixmap.fromImage(image))
+    return icon
 
 
 def _native_tool_executable(tool_name):
@@ -102,7 +133,7 @@ def _native_tool_icon(tool_name):
 def _commit_badged_icon(native):
     from PyQt5.QtGui import QColor, QIcon, QPainter, QPixmap
     icon = QIcon()
-    badge = _tool_asset_icon('check')
+    badge = _tool_asset_icon('check', tone='dark')
     for size in (16, 24, 32, 48, 64):
         pixmap = QPixmap(size, size)
         pixmap.fill(Qt.transparent)
@@ -117,7 +148,7 @@ def _commit_badged_icon(native):
     return icon
 
 
-def _set_tool_icon(button, theme_name, fallback, size=18):
+def _set_tool_icon(button, theme_name, fallback, size=18, tone=None):
     from PyQt5.QtGui import QIcon
     native_tools = {'app-cmd': 'cmd', 'app-powershell': 'powershell', 'app-git-bash': 'git-bash',
                     'app-tortoisegit-log': 'tortoisegit', 'app-tortoisegit-commit': 'tortoisegit'}
@@ -125,12 +156,31 @@ def _set_tool_icon(button, theme_name, fallback, size=18):
     if theme_name == 'app-tortoisegit-commit' and not icon.isNull():
         icon = _commit_badged_icon(icon)
     if icon.isNull() and theme_name in _TOOL_ICON_FILES:
-        icon = _tool_asset_icon(_TOOL_ICON_FILES[theme_name])
+        icon = _tool_asset_icon(_TOOL_ICON_FILES[theme_name], tone)
     if icon.isNull():
         icon = QIcon.fromTheme(theme_name, button.style().standardIcon(fallback))
     button.setIcon(icon)
     button.setIconSize(QSize(size, size))
     button.setAccessibleName(button.toolTip() or button.text())
+    button.setProperty('tabexIconSpec', [theme_name, int(fallback), int(size), tone or ''])
+
+
+def _refresh_themed_icon(widget):
+    spec = widget.property('tabexIconSpec')
+    if not spec:
+        return
+    from PyQt5.QtWidgets import QAbstractButton, QStyle
+    if not isinstance(widget, QAbstractButton):
+        # Python 包装已回收的按钮会以基类 QWidget 返回
+        if not widget.inherits('QAbstractButton'):
+            return
+        from PyQt5 import sip
+        widget = sip.cast(widget, QAbstractButton)
+    theme_name, fallback, size, tone = spec
+    _set_tool_icon(widget, theme_name, QStyle.StandardPixmap(fallback), size, tone or None)
+
+
+_theme.add_widget_hook(_refresh_themed_icon)
 
 
 def _position_toasts():
@@ -191,7 +241,7 @@ class ToastMessage(QWidget):
         self.close_button = QToolButton(self)
         self.close_button.setToolTip(tr('关闭'))
         self.close_button.setFixedSize(24, 24)
-        _set_tool_icon(self.close_button, 'window-close', QStyle.SP_TitleBarCloseButton, 14)
+        _set_tool_icon(self.close_button, 'window-close', QStyle.SP_TitleBarCloseButton, 14, tone='dark')
         self.close_button.clicked.connect(self.close)
         title_layout.addWidget(self.close_button)
         
@@ -211,7 +261,7 @@ class ToastMessage(QWidget):
             self.action_button.setText(action_text)
             self.action_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
             self.action_button.setToolTip(action_text)
-            _set_tool_icon(self.action_button, 'document-open', QStyle.SP_DirOpenIcon, 16)
+            _set_tool_icon(self.action_button, 'document-open', QStyle.SP_DirOpenIcon, 16, tone='dark')
 
             def activate():
                 self.close()
@@ -541,12 +591,12 @@ class _ResizableSplitterHandle(_QSplitterHandle):
     def paintEvent(self, event):
         from PyQt5.QtGui import QPainter, QColor
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#aab2c0") if self._hovered else QColor("#d2d7e0"))
+        p.fillRect(self.rect(), QColor(_theme.bg("#aab2c0" if self._hovered else "#d2d7e0")))
         # 中央竖向抓取条（三段短竖线），提升可识别度
         cx = self.width() // 2
         cy = self.height() // 2
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#6b7686"))
+        p.setBrush(QColor(_theme.fg("#6b7686")))
         if self.orientation() == Qt.Horizontal:
             for dy in (-12, 0, 12):
                 p.drawRect(cx - 1, cy + dy - 6, 2, 12)

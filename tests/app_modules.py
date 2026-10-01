@@ -7,9 +7,9 @@ from unittest.mock import DEFAULT, MagicMock, patch
 ROOT = Path(__file__).resolve().parents[1]
 # 由底层到上层排列：同名对象以最先出现的模块（即定义处）为准
 MODULE_NAMES = (
-    'paths', 'i18n', 'constants', 'debuglog', 'diagnostics', 'system', 'hotkeys', 'title_shortcuts', 'widgets',
-    'updates', 'workers', 'search', 'fileops', 'pathbar', 'bookmarks', 'shellview', 'explorer_tab', 'tabbar',
-    'ai_actions', 'chat', 'settings', 'persistence', 'mainwindow', 'app',
+    'paths', 'i18n', 'constants', 'debuglog', 'theme', 'diagnostics', 'system', 'hotkeys', 'title_shortcuts',
+    'widgets', 'updates', 'workers', 'search', 'fileops', 'pathbar', 'bookmarks', 'shellview', 'netstatus',
+    'explorer_tab', 'tabbar', 'ai_actions', 'chat', 'settings', 'persistence', 'mainwindow', 'app',
 )
 MODULE_FILES = [ROOT / 'tabexplorer' / f'{name}.py' for name in MODULE_NAMES]
 MODULES = [importlib.import_module(f'tabexplorer.{name}') for name in MODULE_NAMES]
