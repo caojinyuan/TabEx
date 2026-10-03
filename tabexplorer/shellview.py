@@ -6,7 +6,7 @@ import os
 from PyQt5.QtCore import (
     pyqtSignal, QAbstractNativeEventFilter, QDir, QObject, QRunnable, Qt, QThread, QThreadPool, QTimer,
 )
-from PyQt5.QtWidgets import QWidget
+from PyQt5.QtWidgets import QSizePolicy, QWidget
 
 from . import theme as _theme
 from .i18n import tr
@@ -714,6 +714,7 @@ class IExplorerBrowserWidget(QWidget):
         self._overlay_preload_inflight = False
         # Force native HWND creation; IExplorerBrowser::Initialize needs a real HWND
         self.setAttribute(Qt.WA_NativeWindow, True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     # ── QAxWidget compatibility ───────────────────────────────────────────────
 
@@ -763,6 +764,9 @@ class IExplorerBrowserWidget(QWidget):
 
     def _navigate(self, path):
         if not _COMTYPES_AVAILABLE:
+            return
+        if not self.isVisible():
+            self._pending_path = path
             return
         if not self._ensure_browser():
             self._pending_path = path
@@ -891,11 +895,13 @@ class IExplorerBrowserWidget(QWidget):
                 _CLSID_ExplorerBrowser,
                 interface=_IExplorerBrowser,
             )
-            w = max(self.width(),  100)
-            h = max(self.height(), 100)
-            rc = ctypes.wintypes.RECT(0, 0, w, h)
+            rc = self._native_client_rect(hwnd)
+            if rc.right <= rc.left or rc.bottom <= rc.top:
+                debug_print(f"[IExplorerBrowser] Empty host client rect: {rc.right}x{rc.bottom}")
+                return False
             fs = _FOLDERSETTINGS(4, 0)  # ViewMode=FVM_DETAILS, fFlags=0
             browser.Initialize(hwnd, ctypes.byref(rc), ctypes.byref(fs))
+            QTimer.singleShot(0, self._sync_browser_rect)
             # EBO_SHOWFRAMES: 显示左侧导航窗格（目录树）
             browser.SetOptions(self._EBO_SHOWFRAMES | self._EBO_NOTRAVELLOG)
             sink   = _NavEventSink(self._on_nav_complete, self._on_nav_failed)
@@ -1037,10 +1043,8 @@ class IExplorerBrowserWidget(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        if not self._init_ok:
-            if self._ensure_browser() and self._pending_path:
-                path, self._pending_path = self._pending_path, None
-                self._navigate(path)
+        if self._pending_path:
+            QTimer.singleShot(0, self._initialize_pending_browser)
         elif self._browser and _TORTOISE_OVERLAY_PATCHED:
             # Tab became visible: ensure overlays are rendered
             # Refresh is needed because IShellView::Refresh on hidden views is a no-op
@@ -1056,12 +1060,87 @@ class IExplorerBrowserWidget(QWidget):
                         self._overlay_visible_refreshed = True
                         QTimer.singleShot(200, self._refresh_shell_view)
 
+    def _initialize_pending_browser(self):
+        if not self.isVisible() or not self._pending_path:
+            return
+        path = self._pending_path
+        if not self._init_ok and not self._ensure_browser():
+            return
+        self._pending_path = None
+        self._navigate(path)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._sync_browser_rect()
+
+    @staticmethod
+    def _native_client_rect(hwnd):
+        user32 = ctypes.windll.user32
+        user32.GetClientRect.argtypes = [
+            ctypes.wintypes.HWND,
+            ctypes.POINTER(ctypes.wintypes.RECT),
+        ]
+        user32.GetClientRect.restype = ctypes.wintypes.BOOL
+        rect = ctypes.wintypes.RECT()
+        if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+            raise ctypes.WinError()
+        return rect
+
+    def _sync_browser_rect(self):
+        """Keep the native Explorer view fitted to this widget's client area."""
         if self._browser:
             try:
-                rc = ctypes.wintypes.RECT(0, 0, self.width(), self.height())
-                self._browser.SetRect(None, rc)
+                hwnd = int(self.winId())
+                rc = self._native_client_rect(hwnd)
+                hr = self._browser.SetRect(None, rc)
+                user32 = ctypes.windll.user32
+                user32.GetWindowRect.argtypes = [
+                    ctypes.wintypes.HWND,
+                    ctypes.POINTER(ctypes.wintypes.RECT),
+                ]
+                user32.GetWindowRect.restype = ctypes.wintypes.BOOL
+                user32.GetClassNameW.argtypes = [
+                    ctypes.wintypes.HWND,
+                    ctypes.wintypes.LPWSTR,
+                    ctypes.c_int,
+                ]
+                user32.GetClassNameW.restype = ctypes.c_int
+                enum_proc_type = ctypes.WINFUNCTYPE(
+                    ctypes.wintypes.BOOL,
+                    ctypes.wintypes.HWND,
+                    ctypes.wintypes.LPARAM,
+                )
+                user32.EnumChildWindows.argtypes = [
+                    ctypes.wintypes.HWND,
+                    enum_proc_type,
+                    ctypes.wintypes.LPARAM,
+                ]
+                user32.EnumChildWindows.restype = ctypes.wintypes.BOOL
+                host_rect = ctypes.wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(host_rect))
+                child_windows = []
+
+                def record_child(child_hwnd, _lparam):
+                    class_name = ctypes.create_unicode_buffer(128)
+                    child_rect = ctypes.wintypes.RECT()
+                    user32.GetClassNameW(child_hwnd, class_name, len(class_name))
+                    if (class_name.value in ('ExplorerBrowserControl', 'DUIViewWndClassName',
+                                             'SHELLDLL_DefView') and
+                            user32.GetWindowRect(child_hwnd, ctypes.byref(child_rect))):
+                        child_windows.append(
+                            f"{class_name.value}@"
+                            f"{child_rect.left - host_rect.left},{child_rect.top - host_rect.top}:"
+                            f"{child_rect.right - child_rect.left}x"
+                            f"{child_rect.bottom - child_rect.top}"
+                        )
+                    return True
+
+                user32.EnumChildWindows(hwnd, enum_proc_type(record_child), 0)
+                debug_print(
+                    f"[IEB Geometry] hwnd=0x{hwnd:X} widget={self.width()}x{self.height()} "
+                    f"client={rc.right - rc.left}x{rc.bottom - rc.top} SetRect={hr!r} "
+                    f"children={child_windows}"
+                )
             except Exception as e:
                 debug_print(f"[IExplorerBrowser] SetRect failed: {e}")
 
