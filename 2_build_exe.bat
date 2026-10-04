@@ -27,6 +27,7 @@ if errorlevel 1 (
 )
 
 echo Existing EXE is kept until all checks pass.
+echo Close all TabEx windows and stop VS Code F5 sessions before building.
 echo Native validation briefly opens an isolated test window.
 "%PY%" tools\build_release.py
 if errorlevel 1 (

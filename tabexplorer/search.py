@@ -606,14 +606,16 @@ class SearchDialog(QDialog):
         layout.addLayout(path_layout)
         
         # 搜索类型选择
-        type_options = QHBoxLayout()
+        type_options = QGridLayout()
+        type_options.setHorizontalSpacing(5)
+        type_options.setVerticalSpacing(5)
         self.search_filename_cb = QCheckBox(tr("搜索文件名"))
         self.search_filename_cb.setChecked(True)
-        type_options.addWidget(self.search_filename_cb)
+        type_options.addWidget(self.search_filename_cb, 0, 0)
         
         self.search_content_cb = QCheckBox(tr("搜索文件内容"))
         self.search_content_cb.setChecked(True)  # 默认也选中
-        type_options.addWidget(self.search_content_cb)
+        type_options.addWidget(self.search_content_cb, 0, 1)
 
         self.advanced_options = QWidget(self)
         advanced_layout = QGridLayout(self.advanced_options)
@@ -635,7 +637,7 @@ class SearchDialog(QDialog):
             self.use_everything_cb.setEnabled(False)
             self.use_everything_cb.setToolTip(tr("未检测到Everything，请从 https://www.voidtools.com/ 下载安装"))
         self.use_everything_cb.stateChanged.connect(self.on_everything_toggled)
-        type_options.addWidget(self.use_everything_cb)
+        type_options.addWidget(self.use_everything_cb, 1, 0, 1, 2)
 
         # 手动轻量模式：强制降级元数据以提升吞吐
         self.force_lightweight_cb = QCheckBox(tr("轻量模式(更快)"))
@@ -643,7 +645,6 @@ class SearchDialog(QDialog):
         self.force_lightweight_cb.setToolTip(tr("勾选后搜索结果将优先显示核心路径信息，可能省略修改时间/大小"))
         advanced_layout.addWidget(self.force_lightweight_cb, 1, 0, 1, 2)
         
-        type_options.addStretch(1)
         self.advanced_button = QToolButton(self)
         self.advanced_button.setText(tr('高级'))
         self.advanced_button.setCheckable(True)
@@ -653,7 +654,8 @@ class SearchDialog(QDialog):
         self.advanced_button.toggled.connect(self._toggle_advanced_options)
         for checkbox in (self.match_case_cb, self.match_whole_word_cb, self.force_lightweight_cb):
             checkbox.toggled.connect(self._update_advanced_count)
-        type_options.addWidget(self.advanced_button)
+        type_options.setColumnStretch(2, 1)
+        type_options.addWidget(self.advanced_button, 1, 2, alignment=Qt.AlignRight)
         layout.addLayout(type_options)
         layout.addWidget(self.advanced_options)
         self.advanced_options.hide()
