@@ -4,6 +4,8 @@ from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -188,6 +190,57 @@ class AsyncWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, TABEX_DATA_DIR=directory):
             self.assertEqual(get_app_data_path('config.json'), os.path.join(directory, 'config.json'))
             self.assertEqual(get_app_base_dir(), base)
+
+
+@unittest.skipUnless(os.name == 'nt', 'Project Python bootstrap requires Windows')
+class ProjectPythonTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[1]
+        self.script = self.root / 'tools' / 'project_python.ps1'
+        self.powershell = str(Path(os.environ['SystemRoot']) / 'System32' /
+                              'WindowsPowerShell' / 'v1.0' / 'powershell.exe')
+
+    def ensure(self, script, environment=None):
+        return subprocess.run(
+            [self.powershell, '-NoProfile', '-ExecutionPolicy', 'Bypass',
+             '-File', str(script), '-Action', 'Ensure'],
+            env=environment, capture_output=True, text=True, timeout=60)
+
+    def test_batch_entrypoints_use_the_shared_project_runtime(self):
+        for filename, action in (('0_install_requirements.bat', 'Install'),
+                                 ('1_run_TabEx.bat', 'Run'), ('2_build_exe.bat', 'Build')):
+            with self.subTest(filename=filename):
+                content = (self.root / filename).read_text(encoding='utf-8')
+                self.assertIn('tools\\project_python.ps1" -Action ' + action, content)
+                self.assertNotIn('.venv', content)
+                self.assertNotIn('set "PY=python"', content)
+
+    def test_project_python_ignores_system_python_and_poisoned_environment(self):
+        python = self.root / '.python' / 'python-3.13.13' / 'tools' / 'python.exe'
+        if not python.is_file():
+            self.skipTest('Project runtime has not been bootstrapped')
+        environment = dict(os.environ, PATH=os.environ['SystemRoot'], PYTHONHOME='Z:\\missing-python',
+                           PYTHONPATH='Z:\\missing-packages', PYTHONUSERBASE='Z:\\missing-user',
+                           PIP_TARGET='Z:\\missing-target', PIP_REQUIRE_VIRTUALENV='true')
+        result = self.ensure(self.script, environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(python), result.stdout)
+        self.assertIn('Version: 3.13.13', result.stdout)
+
+    def test_corrupt_cached_package_is_rejected_without_system_fallback(self):
+        with tempfile.TemporaryDirectory(prefix='TabEx setup ') as directory:
+            root = Path(directory)
+            tools = root / 'tools'
+            tools.mkdir()
+            script = tools / self.script.name
+            shutil.copy2(self.script, script)
+            cache = root / '.python' / 'cache'
+            cache.mkdir(parents=True)
+            (cache / 'python-3.13.13.zip').write_bytes(b'not a trusted Python package')
+            result = self.ensure(script)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Cached Python package is invalid', result.stdout)
+            self.assertFalse((root / '.python' / 'python-3.13.13').exists())
 
 
 class BuildPipelineTests(unittest.TestCase):

@@ -1,11 +1,12 @@
 @echo off
+setlocal
 cd /d "%~dp0"
-REM Prefer the project virtual environment (all dependencies installed); fall back to the system Python.
-if exist ".venv\Scripts\pythonw.exe" (
-    start "" ".venv\Scripts\pythonw.exe" -OO TabEx.py
-) else (
-    start "" pythonw.exe -OO TabEx.py
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\project_python.ps1" -Action Run
+if errorlevel 1 (
+    pause
+    exit /b 1
 )
+exit /b 0
 
 
 

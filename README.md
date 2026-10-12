@@ -66,10 +66,12 @@
   - `chat_history.json`：AI 聊天历史
   - 配置或书签文件无法解析时，原文件保留为 `config.json.broken-日期-时间` 或 `bookmarks.json.broken-日期-时间`，可手动修复后改回原名
 
-**从源码运行**（需要 Python 3.9+）：
-1. 双击 `0_install_requirements.bat`：首次运行会在项目目录创建虚拟环境 `.venv` 并安装依赖，不影响系统 Python
-2. 双击 `1_run_TabEx.bat` 启动程序（优先使用 `.venv`，没有时回退到系统 Python）
+**从源码运行**（Windows x64，无需预装 Python）：
+1. 双击 `0_install_requirements.bat`：首次运行会下载固定版本 Python 3.13.13 x64，校验 SHA-512 后解压到项目 `.python/python-3.13.13/`，并安装依赖，不影响系统 Python，无需管理员权限
+2. 双击 `1_run_TabEx.bat` 启动程序（仅使用项目本地 Python，不回退到系统 Python 或旧 `.venv`）
 3. 若使用 AI 功能，确保 `requests` 已安装并在 `config.json` 或设置界面中填写 AI 服务配置
+
+运行、安装和构建统一由 [tools/project_python.ps1](tools/project_python.ps1) 管理解释器。它使用官方 Python NuGet 完整运行时（包含 pip，不是嵌入式精简包），依赖安装在本地运行时内，并隔离系统 Python 的环境变量、用户包和 pip 配置。首次需要访问 `api.nuget.org` 和 Python 包索引；下载的 Python 包缓存于 `.python/cache/`，再次使用无需重复下载。`.python/` 已被 Git 忽略，每个开发者从同一固定版本初始化。旧 `.venv` 不会被自动删除，可自行清理。
 
 **开机自启动**：
 将 `TabExplorer.exe` 或 `1_run_TabEx.bat` 的快捷方式放到 `shell:startup` 目录
@@ -360,19 +362,19 @@ python -m coverage html --data-file="$env:TEMP\tabex-coverage" -d "$env:TEMP\tab
 .\2_build_exe.bat
 ```
 
-无需提前删除旧输出。脚本安装 [requirements-build.txt](requirements-build.txt) 中的锁定依赖，执行回归测试，在临时目录打包，并启动使用隔离数据的 EXE 进行原生冒烟验证。全部通过才替换原 EXE；程序占用目标文件导致替换失败时旧版本仍保留。替换前请退出旧程序。
+无需预装 Python，也无需提前删除旧输出。脚本自动准备项目本地 Python 3.13.13，再安装 [requirements-build.txt](requirements-build.txt) 中的构建依赖，执行回归测试，在临时目录打包，并启动使用隔离数据的 EXE 进行原生冒烟验证。全部通过才替换原 EXE；程序占用目标文件导致替换失败时旧版本仍保留。替换前请退出旧程序。
 
 独立输出验证版，不替换现有程序：
 ```powershell
-.\.venv\Scripts\python.exe tools\build_release.py --skip-install --output artifacts\TabExplorer-validated.exe
+.\.python\python-3.13.13\tools\python.exe -s -X utf8 tools\build_release.py --skip-install --output artifacts\TabExplorer-validated.exe
 ```
 `--skip-install` 仅适用于已安装锁定构建依赖的环境。Windows CI 采用同一流水线，上传验证报告、截图及通过验证的 EXE；不能将工作流文件存在等同于远程 CI 已通过。
 
 ### 原生与性能验收
 ```powershell
-.\.venv\Scripts\python.exe tools\validate_runtime.py --seconds 10 --tabs 10
-.\.venv\Scripts\python.exe tools\validate_runtime.py --seconds 3600 --tabs 30 --report artifacts\soak.json
-.\.venv\Scripts\python.exe tools\validate_runtime.py --exe artifacts\TabExplorer-validated.exe --seconds 10 --tabs 10 --report artifacts\packaged.json
+.\.python\python-3.13.13\tools\python.exe -s -X utf8 tools\validate_runtime.py --seconds 10 --tabs 10
+.\.python\python-3.13.13\tools\python.exe -s -X utf8 tools\validate_runtime.py --seconds 3600 --tabs 30 --report artifacts\soak.json
+.\.python\python-3.13.13\tools\python.exe -s -X utf8 tools\validate_runtime.py --exe artifacts\TabExplorer-validated.exe --seconds 10 --tabs 10 --report artifacts\packaged.json
 ```
 
 验证器使用临时 `TABEX_DATA_DIR` 和 `LOCALAPPDATA`，不加载个人配置、书签、聊天记录，也不开启外部 Explorer 监听。数据目录与资源目录独立，默认用户运行的数据位置不变。测试会短暂显示真实原生窗口，不要手工操作该窗口。报告包括首个视图就绪耗时、Qt 心跳 P95/P99/最大延迟、内存、句柄、线程和标签计数，以及单实例、导航和正常退出结果。截图是人工检查材料，不等于自动视觉正确性判定。
@@ -403,9 +405,10 @@ python -m coverage html --data-file="$env:TEMP\tabex-coverage" -d "$env:TEMP\tab
 - `tools/build_release.py`、`requirements-build.txt` - 可验证、失败保留旧版本的构建流程
 - `tests/` - 回归测试；`tests/app_modules.py` 汇总各模块供测试读取，`patch_all()` 在所有导入了同一名称的模块中同时替换
 - `requirements.txt` - Python 运行依赖列表
-- `0_install_requirements.bat` - 创建项目虚拟环境 `.venv` 并安装依赖
+- `tools/project_python.ps1` - 下载、校验并管理固定版本的项目本地 Python，统一安装、运行与构建入口
+- `0_install_requirements.bat` - 安装项目本地 Python 及运行依赖（无需系统 Python）
 - `1_run_TabEx.bat` - 源码运行脚本
-- `2_build_exe.bat` - PyInstaller 打包脚本（同样优先使用 `.venv`）
+- `2_build_exe.bat` - PyInstaller 打包脚本（仅使用项目本地 Python）
 - [icons/generate_icon.py](icons/generate_icon.py) - 应用图标生成脚本（需要 Pillow：`pip install pillow`）；在项目根目录运行 `python icons/generate_icon.py`
 - [icons/TabExplorer.ico](icons/TabExplorer.ico) - 应用图标，生成脚本输出到此位置，打包时直接使用
 
