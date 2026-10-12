@@ -212,11 +212,11 @@ class ProjectPythonTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 content = (self.root / filename).read_text(encoding='utf-8')
                 self.assertIn('tools\\project_python.ps1" -Action ' + action, content)
-                self.assertNotIn('.venv', content)
+                self.assertNotIn('.venv\\Scripts', content)
                 self.assertNotIn('set "PY=python"', content)
 
     def test_project_python_ignores_system_python_and_poisoned_environment(self):
-        python = self.root / '.python' / 'python-3.13.13' / 'tools' / 'python.exe'
+        python = self.root / '.venv' / 'python-3.13.13' / 'python.exe'
         if not python.is_file():
             self.skipTest('Project runtime has not been bootstrapped')
         environment = dict(os.environ, PATH=os.environ['SystemRoot'], PYTHONHOME='Z:\\missing-python',
@@ -226,6 +226,9 @@ class ProjectPythonTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(str(python), result.stdout)
         self.assertIn('Version: 3.13.13', result.stdout)
+        self.assertFalse((python.parent / 'tools').exists())
+        self.assertTrue((python.parent / 'pythonw.exe').is_file())
+        self.assertTrue((python.parent / 'Lib').is_dir())
 
     def test_corrupt_cached_package_is_rejected_without_system_fallback(self):
         with tempfile.TemporaryDirectory(prefix='TabEx setup ') as directory:
@@ -234,13 +237,34 @@ class ProjectPythonTests(unittest.TestCase):
             tools.mkdir()
             script = tools / self.script.name
             shutil.copy2(self.script, script)
-            cache = root / '.python' / 'cache'
+            cache = root / '.venv' / 'cache'
             cache.mkdir(parents=True)
             (cache / 'python-3.13.13.zip').write_bytes(b'not a trusted Python package')
             result = self.ensure(script)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('Cached Python package is invalid', result.stdout)
-            self.assertFalse((root / '.python' / 'python-3.13.13').exists())
+            self.assertFalse((root / '.venv' / 'python-3.13.13').exists())
+
+    def test_legacy_virtual_environment_is_preserved_outside_runtime_root(self):
+        with tempfile.TemporaryDirectory(prefix='TabEx legacy setup ') as directory:
+            root = Path(directory)
+            tools = root / 'tools'
+            tools.mkdir()
+            script = tools / self.script.name
+            shutil.copy2(self.script, script)
+            legacy = root / '.venv'
+            cache = legacy / 'cache'
+            cache.mkdir(parents=True)
+            configuration = 'home = Z:\\old-python\n'
+            (legacy / 'pyvenv.cfg').write_text(configuration, encoding='utf-8')
+            (cache / 'python-3.13.13.zip').write_bytes(b'not a trusted Python package')
+            result = self.ensure(script)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Cached Python package is invalid', result.stdout)
+            backups = list(root.glob('.venv-legacy-*'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual((backups[0] / 'pyvenv.cfg').read_text(encoding='utf-8'), configuration)
+            self.assertFalse((legacy / 'pyvenv.cfg').exists())
 
 
 class BuildPipelineTests(unittest.TestCase):

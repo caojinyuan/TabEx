@@ -16,7 +16,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo Python and dependencies installed into .python. Double-click 1_run_TabEx.bat to start TabExplorer.
+echo Python and dependencies installed into .venv. Double-click 1_run_TabEx.bat to start TabExplorer.
 pause
 exit /b 0
 

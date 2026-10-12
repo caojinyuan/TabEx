@@ -7,9 +7,9 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $version = '3.13.13'
 $packageHash = '2BEACFF5A52B33E0919EA6C06CCCDDDD9E245EF55F69E9ACBDB6FE2CA8B7831B49D4515438DD2B3DAB8D9ED772F10DEA839BEFDC6D0DBF809101D3EB6A111D29'
-$runtimeRoot = Join-Path $root '.python'
+$runtimeRoot = Join-Path $root '.venv'
 $installation = Join-Path $runtimeRoot "python-$version"
-$python = Join-Path $installation 'tools\python.exe'
+$python = Join-Path $installation 'python.exe'
 $lock = $null
 $stage = $null
 
@@ -24,7 +24,16 @@ try {
     $env:PYTHONNOUSERSITE = '1'
     $env:PYTHONUTF8 = '1'
     $env:PIP_CONFIG_FILE = 'NUL'
+    $legacyBackup = $null
+    if (Test-Path (Join-Path $runtimeRoot 'pyvenv.cfg')) {
+        $legacyBackup = Join-Path $root ('.venv-legacy-' + [Guid]::NewGuid().ToString('N'))
+        Move-Item -Path $runtimeRoot -Destination $legacyBackup
+        Write-Host "Previous virtual environment preserved at $legacyBackup"
+    }
     New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null
+    if ($legacyBackup -and (Test-Path (Join-Path $legacyBackup 'cache'))) {
+        Copy-Item -Path (Join-Path $legacyBackup 'cache') -Destination $runtimeRoot -Recurse
+    }
     if ($Action -ne 'Ensure' -or -not (Test-Path $python)) {
         $lock = [IO.File]::Open((Join-Path $runtimeRoot 'setup.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     }
@@ -59,11 +68,12 @@ try {
         if (-not (Test-Path (Join-Path $stage 'tools\python.exe'))) {
             throw 'Python package does not contain the expected runtime.'
         }
-        Move-Item -Path $stage -Destination $installation
+        Move-Item -Path (Join-Path $stage 'tools') -Destination $installation
+        Remove-Item -Path $stage -Recurse -Force
         $stage = $null
     }
 
-    & $python -I -c "import struct, sys; from pathlib import Path; assert sys.version_info[:3] == (3, 13, 13), sys.version; assert struct.calcsize('P') == 8; assert Path(sys.base_prefix).resolve() == Path(sys.argv[1]).resolve(); import pip; print('Project Python:', sys.executable); print('Version:', sys.version.split()[0])" (Join-Path $installation 'tools')
+    & $python -I -c "import struct, sys; from pathlib import Path; assert sys.version_info[:3] == (3, 13, 13), sys.version; assert struct.calcsize('P') == 8; assert Path(sys.base_prefix).resolve() == Path(sys.argv[1]).resolve(); assert Path(sys.prefix).resolve() == Path(sys.argv[1]).resolve(); import pip; print('Project Python:', sys.executable); print('Version:', sys.version.split()[0])" $installation
     if ($LASTEXITCODE -ne 0) {
         throw 'Project Python validation failed. No system Python fallback is allowed.'
     }
@@ -78,7 +88,7 @@ try {
             'Run' {
                 & $python -X utf8 -c 'import PyQt5, comtypes, win32api, requests, send2trash'
                 if ($LASTEXITCODE -ne 0) { throw 'Run 0_install_requirements.bat before starting TabEx.' }
-                Start-Process -FilePath (Join-Path $installation 'tools\pythonw.exe') -WorkingDirectory $root -ArgumentList ('-OO "' + (Join-Path $root 'TabEx.py') + '"')
+                Start-Process -FilePath (Join-Path $installation 'pythonw.exe') -WorkingDirectory $root -ArgumentList ('-OO "' + (Join-Path $root 'TabEx.py') + '"')
             }
             'Build' {
                 Write-Host 'Close all TabEx windows before building. Existing EXE is kept until validation passes.'

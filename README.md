@@ -47,11 +47,11 @@
 
 ## 🆕 最近更新(只保留最新)
 
-### v3.83 (2026-10-04)
-- **资源管理器嵌入修复**：IExplorerBrowser 按宿主 HWND 的原生客户区尺寸布局，修复高 DPI 下视图只显示在左上角的问题；隐藏标签延迟到显示后再初始化，避免使用尚未完成布局的小尺寸。
-- **搜索窗口布局**：英文搜索选项改为两行排列，在不同字体缩放比例下保持紧凑并避免对话框被长标签撑宽。
-- **构建稳定性**：构建依赖不再强制降级 pywin32，避免已有版本被占用时卸载失败。
-- **升级注意**：已有 EXE 需重新打包才能包含 v3.83。
+### v3.84 (2026-10-12)
+- **项目本地 Python**：自动下载固定版本 Python 3.13.13 x64，校验 SHA-512 后将完整运行时安装到 `.venv/python-3.13.13/`，无需预装 Python，也不额外创建虚拟环境。
+- **统一运行环境**：安装、启动和打包均使用 `.venv/python-3.13.13/python.exe`，隔离系统环境与用户包，不回退到系统 Python；运行依赖同步适配新解释器。
+- **旧环境保护**：检测到旧虚拟环境时，先整体备份到 `.venv-legacy-<唯一标识>/`，避免旧 `pyvenv.cfg` 干扰新运行时，不删除原环境。
+- **调试与升级**：VS Code 请选择上述项目解释器；已有 EXE 需重新打包才能包含 v3.84，本次源码更新不会自动替换已发布 EXE。
 
 ---
 
@@ -67,11 +67,11 @@
   - 配置或书签文件无法解析时，原文件保留为 `config.json.broken-日期-时间` 或 `bookmarks.json.broken-日期-时间`，可手动修复后改回原名
 
 **从源码运行**（Windows x64，无需预装 Python）：
-1. 双击 `0_install_requirements.bat`：首次运行会下载固定版本 Python 3.13.13 x64，校验 SHA-512 后解压到项目 `.python/python-3.13.13/`，并安装依赖，不影响系统 Python，无需管理员权限
-2. 双击 `1_run_TabEx.bat` 启动程序（仅使用项目本地 Python，不回退到系统 Python 或旧 `.venv`）
+1. 双击 `0_install_requirements.bat`：首次运行会下载固定版本 Python 3.13.13 x64，校验 SHA-512 后将完整运行时放到项目 `.venv/python-3.13.13/`，并安装依赖，不影响系统 Python，无需管理员权限
+2. 双击 `1_run_TabEx.bat` 启动程序（仅使用项目本地 Python，不回退到系统 Python 或旧 `.venv/Scripts`）
 3. 若使用 AI 功能，确保 `requests` 已安装并在 `config.json` 或设置界面中填写 AI 服务配置
 
-运行、安装和构建统一由 [tools/project_python.ps1](tools/project_python.ps1) 管理解释器。它使用官方 Python NuGet 完整运行时（包含 pip，不是嵌入式精简包），依赖安装在本地运行时内，并隔离系统 Python 的环境变量、用户包和 pip 配置。首次需要访问 `api.nuget.org` 和 Python 包索引；下载的 Python 包缓存于 `.python/cache/`，再次使用无需重复下载。`.python/` 已被 Git 忽略，每个开发者从同一固定版本初始化。旧 `.venv` 不会被自动删除，可自行清理。
+运行、安装和构建统一由 [tools/project_python.ps1](tools/project_python.ps1) 管理解释器。它使用官方 Python NuGet 完整运行时（包含 pip，不是嵌入式精简包），依赖安装在本地运行时内，并隔离系统 Python 的环境变量、用户包和 pip 配置。首次需要访问 `api.nuget.org` 和 Python 包索引；下载的 Python 包缓存于 `.venv/cache/`，再次使用无需重复下载。`.venv/` 已被 Git 忽略，每个开发者从同一固定版本初始化。这里只用 `.venv` 收纳完整 Python，不创建额外虚拟环境，也无需激活。VS Code 调试请选择 `.venv/python-3.13.13/python.exe`。若检测到旧 `.venv/pyvenv.cfg`，脚本会先将旧环境整体备份到 `.venv-legacy-<唯一标识>/`，避免旧配置干扰新解释器；备份不会删除，且已被 Git 忽略。旧 `.python` 不会被删除，也不会被使用。
 
 **开机自启动**：
 将 `TabExplorer.exe` 或 `1_run_TabEx.bat` 的快捷方式放到 `shell:startup` 目录
@@ -366,15 +366,15 @@ python -m coverage html --data-file="$env:TEMP\tabex-coverage" -d "$env:TEMP\tab
 
 独立输出验证版，不替换现有程序：
 ```powershell
-.\.python\python-3.13.13\tools\python.exe -s -X utf8 tools\build_release.py --skip-install --output artifacts\TabExplorer-validated.exe
+.\.venv\python-3.13.13\python.exe -s -X utf8 tools\build_release.py --skip-install --output artifacts\TabExplorer-validated.exe
 ```
 `--skip-install` 仅适用于已安装锁定构建依赖的环境。Windows CI 采用同一流水线，上传验证报告、截图及通过验证的 EXE；不能将工作流文件存在等同于远程 CI 已通过。
 
 ### 原生与性能验收
 ```powershell
-.\.python\python-3.13.13\tools\python.exe -s -X utf8 tools\validate_runtime.py --seconds 10 --tabs 10
-.\.python\python-3.13.13\tools\python.exe -s -X utf8 tools\validate_runtime.py --seconds 3600 --tabs 30 --report artifacts\soak.json
-.\.python\python-3.13.13\tools\python.exe -s -X utf8 tools\validate_runtime.py --exe artifacts\TabExplorer-validated.exe --seconds 10 --tabs 10 --report artifacts\packaged.json
+.\.venv\python-3.13.13\python.exe -s -X utf8 tools\validate_runtime.py --seconds 10 --tabs 10
+.\.venv\python-3.13.13\python.exe -s -X utf8 tools\validate_runtime.py --seconds 3600 --tabs 30 --report artifacts\soak.json
+.\.venv\python-3.13.13\python.exe -s -X utf8 tools\validate_runtime.py --exe artifacts\TabExplorer-validated.exe --seconds 10 --tabs 10 --report artifacts\packaged.json
 ```
 
 验证器使用临时 `TABEX_DATA_DIR` 和 `LOCALAPPDATA`，不加载个人配置、书签、聊天记录，也不开启外部 Explorer 监听。数据目录与资源目录独立，默认用户运行的数据位置不变。测试会短暂显示真实原生窗口，不要手工操作该窗口。报告包括首个视图就绪耗时、Qt 心跳 P95/P99/最大延迟、内存、句柄、线程和标签计数，以及单实例、导航和正常退出结果。截图是人工检查材料，不等于自动视觉正确性判定。

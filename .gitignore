@@ -154,6 +154,7 @@ celerybeat.pid
 .env
 .envrc
 .venv
+.venv-legacy-*/
 env/
 venv/
 ENV/
