@@ -405,11 +405,79 @@ class SettingsDialog(QDialog):
         # 模型名称
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel(tr("模型名称:")))
-        self.ai_model_edit = QLineEdit()
-        self.ai_model_edit.setPlaceholderText(tr("例: llama-3.3-70b-versatile"))
-        self.ai_model_edit.setText(config.get("ai_chat", {}).get("model", ""))
-        model_row.addWidget(self.ai_model_edit, 1)
+        self.ai_model_combo = _CB2()
+        self.ai_model_combo.setEditable(True)
+        self.ai_model_combo.setInsertPolicy(_CB2.NoInsert)
+        self.ai_model_combo.setPlaceholderText(tr("先获取模型列表，或手动输入模型/Agent 名称"))
+        self.ai_model_combo.setCurrentText(config.get("ai_chat", {}).get("model", ""))
+        self.ai_model_combo.setToolTip(tr("从 API 获取可用模型后选择；也可以手动输入模型或 Agent 名称"))
+        model_row.addWidget(self.ai_model_combo, 1)
+        self.ai_fetch_models_btn = QPushButton(tr("获取模型"))
+        self.ai_fetch_models_btn.setToolTip(tr("使用上方 API 地址和密钥读取可用模型/Agent 列表"))
+        model_row.addWidget(self.ai_fetch_models_btn)
         ai_layout.addLayout(model_row)
+        self.ai_model_status = QLabel("")
+        self.ai_model_status.setWordWrap(True)
+        _theme.bind_style(self.ai_model_status, "color:#666; font-size:8.5pt; padding:0 4px;")
+        ai_layout.addWidget(self.ai_model_status)
+
+        def _fetch_ai_models():
+            api_url = self.ai_api_url_edit.text().strip().rstrip("/")
+            if not api_url:
+                self.ai_model_status.setText(tr("请先填写 API 地址。"))
+                return
+            self.ai_fetch_models_btn.setEnabled(False)
+            self.ai_fetch_models_btn.setText(tr("获取中…"))
+            self.ai_model_status.setText("")
+            from PyQt5.QtWidgets import QApplication
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                import requests
+                headers = {}
+                api_key = self.ai_api_key_edit.text().strip()
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                response = requests.get(
+                    api_url + "/models", headers=headers, timeout=8, verify=False
+                )
+                response.raise_for_status()
+                payload = response.json()
+                entries = payload.get("data", []) if isinstance(payload, dict) else payload
+                model_names = []
+                if isinstance(entries, list):
+                    for entry in entries:
+                        if isinstance(entry, str):
+                            name = entry
+                        elif isinstance(entry, dict):
+                            name = entry.get("id") or entry.get("name")
+                        else:
+                            name = None
+                        if name and str(name) not in model_names:
+                            model_names.append(str(name))
+                if not model_names:
+                    self.ai_model_status.setText(
+                        tr("接口未返回可用模型/Agent。请在服务端创建或授权 Agent 后重试。")
+                    )
+                    return
+                current_model = self.ai_model_combo.currentText().strip()
+                self.ai_model_combo.clear()
+                self.ai_model_combo.addItems(model_names)
+                if current_model in model_names:
+                    self.ai_model_combo.setCurrentText(current_model)
+                else:
+                    self.ai_model_combo.setCurrentIndex(-1)
+                    self.ai_model_combo.setEditText("")
+                self.ai_model_status.setText(
+                    tr("已获取 {} 个可用模型/Agent。请选择一个。").format(len(model_names))
+                )
+            except Exception as error:
+                self.ai_model_status.setText(tr("获取模型失败: {}").format(error))
+            finally:
+                QApplication.restoreOverrideCursor()
+                self.ai_fetch_models_btn.setEnabled(True)
+                self.ai_fetch_models_btn.setText(tr("获取模型"))
+
+        self.ai_fetch_models_btn.clicked.connect(_fetch_ai_models)
         # 系统提示词
         from PyQt5.QtWidgets import QPlainTextEdit as _PE
         sp_label = QLabel(tr("系统提示词（留空使用默认）:"))
@@ -778,7 +846,7 @@ class SettingsDialog(QDialog):
                 "enabled": ai_enabled,
                 "api_url": self.ai_api_url_edit.text().strip(),
                 "api_key": self.ai_api_key_edit.text().strip(),
-                "model": self.ai_model_edit.text().strip() or "gpt-3.5-turbo",
+                "model": self.ai_model_combo.currentText().strip() or "gpt-3.5-turbo",
                 "system_prompt": self.ai_system_prompt_edit.toPlainText().strip(),
                 "panel_width": self.ai_panel_width_spin.value(),
             }
