@@ -44,6 +44,7 @@ class ConfigStore:
             "split_session": {"active": False, "tabs": [], "active_index": 0},  # 右侧分屏组会话（用于重启/崩溃恢复分屏）
             "enable_tortoisegit_buttons": False,  # 默认关闭TortoiseGit按钮
             "preferred_terminal_tool": "cmd",  # 默认终端类型
+            "everything_path": "",  # 指定 es.exe 路径（留空自动检测）
             "enable_title_shortcuts": True,  # 默认启用标题栏快捷方式区域
             "title_shortcuts": [],  # 标题栏快捷方式（.lnk/.exe/.bat/.cmd/.ps1 路径）
             "enable_mouse_gestures": True,  # 默认启用鼠标手势（右键画线导航）

@@ -2,6 +2,7 @@
 
 import os
 import queue
+import stat
 import threading
 import time
 from collections import OrderedDict
@@ -457,9 +458,30 @@ class SearchResultsTableModel(QAbstractTableModel):
 
 
 # Everything 搜索引擎集成
-def detect_everything():
-    """检测系统中是否安装了Everything"""
+def resolve_everything_cli(custom_path):
+    """将用户指定的路径（es.exe、Everything.exe 或其所在目录）解析为 es.exe 路径。"""
+    if not custom_path or not isinstance(custom_path, str):
+        return None
+    custom_path = os.path.expandvars(custom_path.strip().strip('"'))
+    if not custom_path:
+        return None
+    if os.path.isdir(custom_path):
+        candidate = os.path.join(custom_path, 'es.exe')
+        return candidate if os.path.isfile(candidate) else None
+    if not os.path.isfile(custom_path):
+        return None
+    if os.path.basename(custom_path).lower() == 'es.exe':
+        return custom_path
+    candidate = os.path.join(os.path.dirname(custom_path), 'es.exe')
+    return candidate if os.path.isfile(candidate) else None
+
+
+def detect_everything(custom_path=None):
+    """检测系统中是否安装了Everything；优先使用设置中指定的路径。"""
     import shutil
+    resolved = resolve_everything_cli(custom_path)
+    if resolved:
+        return resolved
     # 检查Everything命令行工具es.exe是否在PATH中
     es_path = shutil.which('es.exe')
     if es_path:
@@ -538,7 +560,9 @@ class SearchDialog(QDialog):
         self.search_history = search_history or []  # 搜索历史列表
         
         # 检测Everything
-        self.everything_path = detect_everything()
+        parent_config = getattr(parent, 'config', None)
+        custom_everything_path = parent_config.get('everything_path', '') if isinstance(parent_config, dict) else ''
+        self.everything_path = detect_everything(custom_everything_path)
         self.notepad_plus_plus_path = detect_notepad_plus_plus()
         debug_print(f"[Search] Everything detected: {self.everything_path}")
         
@@ -606,59 +630,47 @@ class SearchDialog(QDialog):
         layout.addLayout(path_layout)
         
         # 搜索类型选择
-        type_options = QGridLayout()
-        type_options.setHorizontalSpacing(5)
-        type_options.setVerticalSpacing(5)
+        type_options = QHBoxLayout()
+        type_options.setSpacing(10)
         self.search_filename_cb = QCheckBox(tr("搜索文件名"))
         self.search_filename_cb.setChecked(True)
-        type_options.addWidget(self.search_filename_cb, 0, 0)
+        type_options.addWidget(self.search_filename_cb)
         
         self.search_content_cb = QCheckBox(tr("搜索文件内容"))
         self.search_content_cb.setChecked(True)  # 默认也选中
-        type_options.addWidget(self.search_content_cb, 0, 1)
+        type_options.addWidget(self.search_content_cb)
 
-        self.advanced_options = QWidget(self)
-        advanced_layout = QGridLayout(self.advanced_options)
-        advanced_layout.setContentsMargins(0, 0, 0, 0)
         self.match_case_cb = QCheckBox(tr("区分大小写"))
         self.match_case_cb.setToolTip(tr("区分大小写匹配文件名和文件内容"))
-        advanced_layout.addWidget(self.match_case_cb, 0, 0)
+        type_options.addWidget(self.match_case_cb)
 
         self.match_whole_word_cb = QCheckBox(tr("全词匹配"))
         self.match_whole_word_cb.setToolTip(tr("仅匹配完整单词，避免命中更长字符串的一部分"))
-        advanced_layout.addWidget(self.match_whole_word_cb, 0, 1)
+        type_options.addWidget(self.match_whole_word_cb)
         
         # Everything搜索选项
         self.use_everything_cb = QCheckBox(tr("使用 Everything (极速)"))
         if self.everything_path:
             self.use_everything_cb.setChecked(True)  # 如果有Everything，默认启用
-            self.use_everything_cb.setToolTip(tr("使用Everything搜索引擎\n路径: {}\n只搜索文件名，速度极快").format(self.everything_path))
+            self.use_everything_cb.setToolTip(tr("使用Everything搜索引擎\n路径: {}\n只搜索文件名，速度极快；启用后无法搜索文件内容").format(self.everything_path))
         else:
             self.use_everything_cb.setEnabled(False)
             self.use_everything_cb.setToolTip(tr("未检测到Everything，请从 https://www.voidtools.com/ 下载安装"))
         self.use_everything_cb.stateChanged.connect(self.on_everything_toggled)
-        type_options.addWidget(self.use_everything_cb, 1, 0, 1, 2)
+        self.on_everything_toggled(self.use_everything_cb.isChecked())
+        type_options.addWidget(self.use_everything_cb)
 
         # 手动轻量模式：强制降级元数据以提升吞吐
         self.force_lightweight_cb = QCheckBox(tr("轻量模式(更快)"))
         self.force_lightweight_cb.setChecked(False)
         self.force_lightweight_cb.setToolTip(tr("勾选后搜索结果将优先显示核心路径信息，可能省略修改时间/大小"))
-        advanced_layout.addWidget(self.force_lightweight_cb, 1, 0, 1, 2)
-        
-        self.advanced_button = QToolButton(self)
-        self.advanced_button.setText(tr('高级'))
-        self.advanced_button.setCheckable(True)
-        self.advanced_button.setArrowType(Qt.DownArrow)
-        self.advanced_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.advanced_button.setFixedWidth(self.advanced_button.fontMetrics().horizontalAdvance(tr('高级 ({})').format(3)) + 38)
-        self.advanced_button.toggled.connect(self._toggle_advanced_options)
-        for checkbox in (self.match_case_cb, self.match_whole_word_cb, self.force_lightweight_cb):
-            checkbox.toggled.connect(self._update_advanced_count)
-        type_options.setColumnStretch(2, 1)
-        type_options.addWidget(self.advanced_button, 1, 2, alignment=Qt.AlignRight)
+        type_options.addWidget(self.force_lightweight_cb)
+        type_options.addStretch(1)
+        # 窄窗口下允许复选框文字被压缩，而不是撑宽整个对话框
+        for checkbox in (self.search_filename_cb, self.search_content_cb, self.match_case_cb,
+                         self.match_whole_word_cb, self.use_everything_cb, self.force_lightweight_cb):
+            checkbox.setMinimumWidth(24)
         layout.addLayout(type_options)
-        layout.addWidget(self.advanced_options)
-        self.advanced_options.hide()
         
         # 文件类型过滤
         file_type_layout = QHBoxLayout()
@@ -723,16 +735,6 @@ class SearchDialog(QDialog):
         self.ui_update_timer = QTimer(self)
         self.ui_update_timer.timeout.connect(self.update_ui_from_queue)
         self.ui_update_timer.start(80)  # 搜索时动态提速，空闲时降频
-
-    def _toggle_advanced_options(self, expanded):
-        self.advanced_options.setVisible(expanded)
-        self.advanced_button.setArrowType(Qt.UpArrow if expanded else Qt.DownArrow)
-
-    def _update_advanced_count(self, *args):
-        count = sum(checkbox.isChecked() for checkbox in (
-            self.match_case_cb, self.match_whole_word_cb, self.force_lightweight_cb))
-        self.advanced_button.setText(tr('高级 ({})').format(count) if count else tr('高级'))
-        self.advanced_button.setToolTip(self.advanced_button.text())
 
     def _drain_result_queue(self):
         if not self.result_queue:
@@ -1047,25 +1049,25 @@ class SearchDialog(QDialog):
             # 构建Everything命令
             cmd = [self.everything_path, '-max-results', str(self.max_results)]
             
-            # 如果指定了搜索路径，添加路径过滤
+            # 用 es.exe 的 -path 选项限定目录；内嵌引号的 path:"..." 经 Python 转义后 es.exe 无法解析，会返回空结果
             if search_path:
-                # Everything使用path:语法指定路径
-                search_pattern = f'path:"{search_path}" {keyword}'
-            else:
-                search_pattern = keyword
+                cmd += ['-path', search_path]
             
-            # 添加文件类型过滤
+            if keyword:
+                cmd.append(keyword)
+            
+            # 添加文件类型过滤（为空则不限制）
             if file_types:
                 extensions = []
                 for ft in file_types.split(','):
                     ft = ft.strip()
                     if ft.startswith('*.'):
                         ft = ft[2:]  # 移除 *.
-                    extensions.append(ft.lstrip('.'))
+                    ft = ft.lstrip('.')
+                    if ft:
+                        extensions.append(ft)
                 if extensions:
-                    search_pattern += ' ext:' + ';'.join(extensions)
-            
-            cmd.append(search_pattern)
+                    cmd.append('ext:' + ';'.join(extensions))
             
             # 执行Everything搜索
             if _debuglog._DEBUG_MODE:
@@ -1192,22 +1194,33 @@ class SearchDialog(QDialog):
                             metadata_degrade_count += 1
                             mtime = "-"
                             size_str = "-"
+                            is_dir = os.path.isdir(file_path)
                         else:
                             try:
                                 stat_info = os.stat(file_path)
+                                is_dir = stat.S_ISDIR(stat_info.st_mode)
                                 mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
-                                size_bytes = stat_info.st_size
                                 sort_date_ts = stat_info.st_mtime
-                                sort_size_bytes = size_bytes
-                                size_str = format_file_size(size_bytes)
+                                if is_dir:
+                                    size_str = "-"
+                                else:
+                                    sort_size_bytes = stat_info.st_size
+                                    size_str = format_file_size(stat_info.st_size)
                             except Exception:
                                 mtime = "-"
                                 size_str = "-"
+                                is_dir = os.path.isdir(file_path)
+
+                        if is_dir:
+                            display_name = f"📁 {file_path}"
+                            file_type = tr('文件夹')
+                        else:
+                            display_name = f"📄 {path_without_ext}"
 
                         batch_items.append({
                             'path': file_path,
-                            'name': f"📄 {path_without_ext}",
-                            'full_path': f"📄 {file_path}",
+                            'name': display_name,
+                            'full_path': f"{'📁' if is_dir else '📄'} {file_path}",
                             'file_type': file_type,
                             'date': mtime,
                             'size': size_str,
@@ -1378,7 +1391,7 @@ class SearchDialog(QDialog):
                             
                             result_item = {
                                 'path': dir_path,
-                                'name': f"📁 {dirname}",
+                                'name': f"📁 {dir_path}",
                                 'full_path': f"📁 {dir_path}",
                                 'file_type': tr('文件夹'),
                                 'date': mtime,

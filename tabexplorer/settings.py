@@ -270,6 +270,59 @@ class SettingsDialog(QDialog):
                 compact_widget(item.widget())
         tools_page_layout.addWidget(git_group)
 
+        # Everything 搜索引擎设置组
+        everything_group = QGroupBox(tr("Everything 设置"))
+        everything_layout = QVBoxLayout()
+        everything_row = QHBoxLayout()
+        everything_row.addWidget(QLabel(tr("es.exe 路径:")))
+        from PyQt5.QtWidgets import QLineEdit as _LE
+        self.everything_path_edit = _LE(self)
+        self.everything_path_edit.setText(str(config.get("everything_path", "") or ""))
+        self.everything_path_edit.setPlaceholderText(tr("留空则自动检测（PATH 及常见安装目录）"))
+        self.everything_path_edit.setToolTip(tr("指定 Everything 命令行工具 es.exe 的路径（也可选择其所在目录或 Everything.exe）"))
+        everything_row.addWidget(self.everything_path_edit, 1)
+        everything_browse_btn = QPushButton(tr("浏览…"), self)
+        everything_row.addWidget(everything_browse_btn)
+        everything_layout.addLayout(everything_row)
+        self.everything_status_label = QLabel("")
+        self.everything_status_label.setWordWrap(True)
+        _theme.bind_style(self.everything_status_label, "color:#666; font-size:8.5pt; padding:0 4px;")
+        everything_layout.addWidget(self.everything_status_label)
+
+        def _update_everything_status():
+            from .search import detect_everything, resolve_everything_cli
+            text = self.everything_path_edit.text().strip()
+            if text and not resolve_everything_cli(text):
+                if os.path.basename(text.strip('"')).lower() == 'everything.exe' or os.path.isdir(text.strip('"')):
+                    self.everything_status_label.setText(
+                        tr("该位置没有 es.exe。Everything.exe 本身不能用于命令行搜索，请从 voidtools.com 下载 ES 命令行工具，将 es.exe 放在同一目录或直接选择它。")
+                    )
+                else:
+                    self.everything_status_label.setText(tr("未在该路径找到 es.exe，将回退到自动检测。"))
+                return
+            found = detect_everything(text)
+            self.everything_status_label.setText(
+                tr("当前使用: {}").format(found) if found else tr("未检测到 Everything（es.exe）。")
+            )
+
+        def _browse_everything():
+            from PyQt5.QtWidgets import QFileDialog
+            start = self.everything_path_edit.text().strip()
+            path, _ = QFileDialog.getOpenFileName(
+                self, tr("选择 es.exe 或 Everything.exe"),
+                os.path.dirname(start) if start else "",
+                tr("可执行文件 (*.exe);;所有文件 (*)"),
+            )
+            if path:
+                self.everything_path_edit.setText(os.path.normpath(path))
+
+        everything_browse_btn.clicked.connect(_browse_everything)
+        self.everything_path_edit.textChanged.connect(lambda *_: _update_everything_status())
+        _update_everything_status()
+        everything_group.setLayout(everything_layout)
+        compact_groupbox(everything_group)
+        tools_page_layout.addWidget(everything_group)
+
         # 快捷方式设置组（右侧独立分组）
         shortcuts_group = QGroupBox(tr("快捷方式设置"))
         shortcuts_layout = QVBoxLayout()
@@ -792,6 +845,7 @@ class SettingsDialog(QDialog):
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
             self.parent().config["preferred_terminal_tool"] = normalize_terminal_tool_name(self.preferred_terminal_combo.currentData())
+            self.parent().config["everything_path"] = self.everything_path_edit.text().strip().strip('"')
             # 保存路径栏分隔符设置
             self.parent().config["breadcrumb_copy_separator"] = self.path_separator_combo.currentData()
             

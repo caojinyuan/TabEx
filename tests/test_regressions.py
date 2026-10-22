@@ -816,7 +816,7 @@ class FunctionalBoundaryTests(unittest.TestCase):
             results = task.search_with_everything('Needle', task.search_path, '*.c,*.h', True, True)
         self.assertEqual(results, [r'C:\scope\Needle.c', r'C:\scope\Needle.h'])
         self.assertEqual(launch.call_args.args[0],
-                         ['fake-es.exe', '-max-results', '2', 'path:"C:\\scope" Needle ext:c;h'])
+                         ['fake-es.exe', '-max-results', '2', '-path', 'C:\\scope', 'Needle', 'ext:c;h'])
         process.kill.assert_not_called()
 
     def test_everything_cancel_kills_and_reaps_process(self):
@@ -1593,7 +1593,6 @@ class InterfaceTests(unittest.TestCase):
                             window.show()
                             search.resize(680 if scale == 1 else 980, 580)
                             search.show()
-                            search.advanced_button.click()
                             self.app.processEvents()
                             buttons = [button for button in window.titlebar_widget.findChildren(QAbstractButton)
                                        if button.isVisibleTo(window.titlebar_widget)]
@@ -1607,7 +1606,7 @@ class InterfaceTests(unittest.TestCase):
                                 previous_right = position.x() + button.width()
                             self.assertEqual(search.width(), 680 if scale == 1 else 980)
                             for control in (search.search_input, search.search_btn, search.stop_btn, search.path_input,
-                                            search.advanced_button, search.ai_summary_btn):
+                                            search.ai_summary_btn):
                                 self.assertTrue(search.rect().contains(control.geometry()))
                             self.assertIn('Ctrl+F', window.search_button.toolTip())
                             window.config['hotkey_bindings'] = {'search': 'Ctrl+E'}
@@ -1629,28 +1628,29 @@ class InterfaceTests(unittest.TestCase):
             self.app.setFont(original_font)
             self.module._set_app_language(original_language)
 
-    def test_search_advanced_options_keep_filters_and_fit_narrow_window(self):
-        """高级选项折叠不清除条件；窄窗口中搜索、停止和高级按钮互不重叠。"""
+    def test_search_options_share_one_row_and_fit_narrow_window(self):
+        """所有勾选项在同一行显示；窄窗口中搜索、停止按钮互不重叠。"""
         with patch_all('detect_everything', return_value=None):
             dialog = self.module.SearchDialog(str(ROOT))
         try:
             dialog.resize(640, 520)
             dialog.show()
             self.app.processEvents()
-            self.assertTrue(dialog.advanced_options.isHidden())
-            dialog.advanced_button.click()
-            self.assertFalse(dialog.advanced_options.isHidden())
+            checkboxes = (dialog.search_filename_cb, dialog.search_content_cb, dialog.match_case_cb,
+                          dialog.match_whole_word_cb, dialog.use_everything_cb, dialog.force_lightweight_cb)
+            for checkbox in checkboxes:
+                self.assertTrue(checkbox.isVisible())
+                self.assertEqual(checkbox.geometry().center().y(), checkboxes[0].geometry().center().y())
+            for left, right in zip(checkboxes, checkboxes[1:]):
+                self.assertLess(left.geometry().right(), right.geometry().left())
             dialog.match_case_cb.setChecked(True)
             dialog.match_whole_word_cb.setChecked(True)
-            dialog.advanced_button.click()
-            self.assertTrue(dialog.advanced_options.isHidden())
             self.assertTrue(dialog.match_case_cb.isChecked())
             self.assertTrue(dialog.match_whole_word_cb.isChecked())
-            self.assertEqual(dialog.advanced_button.text(), '高级 (2)')
             self.app.processEvents()
             self.assertLess(dialog.search_input.geometry().right(), dialog.search_btn.geometry().left())
             self.assertLess(dialog.search_btn.geometry().right(), dialog.stop_btn.geometry().left())
-            for button in (dialog.search_btn, dialog.stop_btn, dialog.ai_summary_btn, dialog.advanced_button):
+            for button in (dialog.search_btn, dialog.stop_btn, dialog.ai_summary_btn):
                 self.assertTrue(dialog.rect().contains(button.geometry()))
             self.assertFalse(dialog.search_btn.icon().isNull())
             self.assertFalse(dialog.stop_btn.icon().isNull())
@@ -1725,14 +1725,14 @@ class InterfaceTests(unittest.TestCase):
                             search = module.SearchDialog(str(screenshot_dir))
                         search.resize(int(700 * scale), int(520 * scale))
                         search.show()
-                        search.advanced_button.click()
                         search.match_case_cb.setChecked(True)
                         self.app.processEvents()
                         label = search.layout().itemAt(0).layout().itemAt(0).widget()
                         self.assertGreaterEqual(label.width(), label.fontMetrics().horizontalAdvance(label.text()))
-                        self.assertTrue(search.rect().contains(search.advanced_button.geometry()))
-                        self.assertGreater(search.advanced_button.width(),
-                                           search.advanced_button.fontMetrics().horizontalAdvance(search.advanced_button.text()))
+                        for checkbox in (search.search_filename_cb, search.search_content_cb, search.match_case_cb,
+                                         search.match_whole_word_cb, search.use_everything_cb,
+                                         search.force_lightweight_cb):
+                            self.assertTrue(search.rect().contains(checkbox.geometry()), checkbox.text())
                         self.assertTrue(search.grab().save(str(screenshot_dir / f'search-{language}.png')))
                         panel = module.FileTaskPanel(None)
                         panel.resize(int(960 * scale), int(400 * scale))

@@ -939,6 +939,8 @@ class IExplorerBrowserWidget(QWidget):
             self._created_dark = _theme.is_dark()
             self._created_gray = _theme.is_gray()
             QTimer.singleShot(0, self.update_gray_tint)
+            for delay in (300, 1200):
+                QTimer.singleShot(delay, self._sync_tree_colors)
             _ieb_keyboard_filter.register_ieb_hwnd(hwnd, widget=self)
             debug_print("[IExplorerBrowser] Initialized successfully")
             return True
@@ -955,6 +957,8 @@ class IExplorerBrowserWidget(QWidget):
         url  = 'file:///' + norm.replace('\\', '/')
         self._location_url = url
         self.NavigateComplete2.emit(None, url)
+        for delay in (150, 800, 2500):
+            QTimer.singleShot(delay, self._sync_tree_colors)
         # Force shell to re-evaluate icon overlays for this directory
         # Skip if this navigation was triggered by our own Refresh()
         if not getattr(self, '_overlay_refreshing', False):
@@ -1065,6 +1069,56 @@ class IExplorerBrowserWidget(QWidget):
                 _RELEASE(release_addr)(iface_ptr)
         except Exception as e:
             debug_print(f"[TortoiseGit] _refresh_shell_view error: {e}")
+
+    # ── 左侧目录树配色校正 ────────────────────────────────────────────────────
+
+    _TREE_DARK_BG = 0x191919
+    _TREE_DARK_TEXT = 0xFFFFFF
+
+    def _sync_tree_colors(self):
+        """新建的 Shell 视图偶尔不会给左侧目录树（SysTreeView32）应用深色，导致深色/灰色主题下目录树仍是白底；
+        发现与当前主题不符时手动补上配色。"""
+        if not self._init_ok or not self._browser:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            wt = ctypes.wintypes
+            enum_proc_type = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+            user32.EnumChildWindows.argtypes = [wt.HWND, enum_proc_type, wt.LPARAM]
+            user32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+            user32.SendMessageW.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
+            user32.SendMessageW.restype = ctypes.c_long
+            user32.InvalidateRect.argtypes = [wt.HWND, ctypes.c_void_p, wt.BOOL]
+            trees = []
+
+            def collect(child_hwnd, _lparam):
+                class_name = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(child_hwnd, class_name, len(class_name))
+                if class_name.value == 'SysTreeView32':
+                    trees.append(child_hwnd)
+                return True
+
+            user32.EnumChildWindows(int(self.winId()), enum_proc_type(collect), 0)
+            dark = _theme.is_dark()
+            uxtheme = ctypes.windll.uxtheme
+            uxtheme.SetWindowTheme.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR]
+            TVM_SETBKCOLOR, TVM_SETTEXTCOLOR, TVM_GETBKCOLOR = 0x111D, 0x111E, 0x111F
+            for tree in trees:
+                bg = user32.SendMessageW(tree, TVM_GETBKCOLOR, 0, 0) & 0xFFFFFF
+                if dark and bg != self._TREE_DARK_BG:
+                    uxtheme.SetWindowTheme(tree, 'DarkMode_Explorer', None)
+                    user32.SendMessageW(tree, TVM_SETBKCOLOR, 0, self._TREE_DARK_BG)
+                    user32.SendMessageW(tree, TVM_SETTEXTCOLOR, 0, self._TREE_DARK_TEXT)
+                elif not dark and bg == self._TREE_DARK_BG:
+                    uxtheme.SetWindowTheme(tree, 'Explorer', None)
+                    user32.SendMessageW(tree, TVM_SETBKCOLOR, 0, 0xFFFFFF)
+                    user32.SendMessageW(tree, TVM_SETTEXTCOLOR, 0, 0x000000)
+                else:
+                    continue
+                user32.InvalidateRect(tree, None, True)
+                debug_print(f"[IExplorerBrowser] Corrected navigation tree colors (dark={dark})")
+        except Exception:
+            dbg_exc("IExplorerBrowser._sync_tree_colors")
 
     # ── 灰色主题：在原生视图上叠加半透明白色 ────────────────────────────────
 

@@ -3747,6 +3747,7 @@ class MainWindow(QMainWindow):
             self.config["enable_cache_tabs"] = dlg.cache_tabs_cb.isChecked()
             self.config["enable_tortoisegit_buttons"] = dlg.tortoisegit_buttons_cb.isChecked()
             self.config["preferred_terminal_tool"] = normalize_terminal_tool_name(dlg.preferred_terminal_combo.currentData())
+            self.config["everything_path"] = dlg.everything_path_edit.text().strip().strip('"')
             self.config["enable_title_shortcuts"] = dlg.title_shortcuts_cb.isChecked()
             self.config["enable_mouse_gestures"] = dlg.mouse_gestures_cb.isChecked()
             self.config["file_op_max_workers"] = dlg.file_op_workers_spin.value()
