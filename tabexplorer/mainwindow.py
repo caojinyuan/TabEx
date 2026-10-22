@@ -2953,7 +2953,8 @@ class MainWindow(QMainWindow):
 
     def apply_theme_config(self):
         """按配置（跟随系统/浅色/深色）应用主题；与当前一致时不做任何事。"""
-        if not _theme.set_dark(_theme.resolve_dark(self.config.get("theme", "system"))):
+        if not _theme.set_dark(_theme.resolve_dark(self.config.get("theme", "system")),
+                               _theme.resolve_gray(self.config.get("theme", "system"))):
             return False
         self._apply_window_palettes()
         self.apply_tab_group_markers_config()
@@ -4183,7 +4184,8 @@ class MainWindow(QMainWindow):
         set_debug_mode(self.config.get("debug_mode", False))
         set_explorer_monitor_debug(self.config.get("explorer_monitor_debug", False))
         # 须在创建任何 Shell 视图之前应用：原生视图只在新建时完整采用深色
-        _theme.set_dark(_theme.resolve_dark(self.config.get("theme", "system")))
+        _theme.set_dark(_theme.resolve_dark(self.config.get("theme", "system")),
+                        _theme.resolve_gray(self.config.get("theme", "system")))
         
         # 初始化书签管理器
         self.bookmark_manager = BookmarkManager()

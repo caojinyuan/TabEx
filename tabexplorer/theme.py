@@ -16,12 +16,13 @@ from PyQt5.QtWidgets import QApplication, QToolTip
 from .debuglog import debug_print
 
 
-THEME_MODES = ('system', 'light', 'dark')
+THEME_MODES = ('system', 'light', 'dark', 'gray')
 _STYLE_PROPERTY = 'tabexThemeCss'
 _FRAME_PROPERTY = 'tabexDarkFrame'
 _ICON_COLOR_DARK = '#d4d4d4'
 
 _dark = False
+_gray = False  # 灰色是较浅的深色变体，_dark 同为 True
 _original_style = None
 _original_palette = None
 _widget_hooks = []
@@ -44,11 +45,19 @@ def system_prefers_dark():
 
 def resolve_dark(mode):
     mode = normalize_mode(mode)
-    return mode == 'dark' or (mode == 'system' and system_prefers_dark())
+    return mode in ('dark', 'gray') or (mode == 'system' and system_prefers_dark())
+
+
+def resolve_gray(mode):
+    return normalize_mode(mode) == 'gray'
 
 
 def is_dark():
     return _dark
+
+
+def is_gray():
+    return _dark and _gray
 
 
 def icon_color():
@@ -57,7 +66,7 @@ def icon_color():
 
 
 @lru_cache(maxsize=1024)
-def _to_dark(role, value):
+def _to_dark(role, value, variant_gray=False):
     color = QColor(value)
     if not color.isValid():
         return value
@@ -72,12 +81,18 @@ def _to_dark(role, value):
         # 深色或强调色背景（L<0.55）保持不变，浅色背景按亮度反转到深色区间
         if light < 0.55:
             return value
-        light = min(0.45, 0.118 + (1.0 - light) * 1.05)
+        if variant_gray:
+            light = min(0.5, 0.25 + (1.0 - light) * 0.95)
+        else:
+            light = min(0.45, 0.118 + (1.0 - light) * 1.05)
         sat = 0.0 if gray else sat * 0.45
     else:
         if light < 0.55 or (not gray and light < 0.75):
             return value
-        light = min(0.5, max(0.24, 0.118 + (1.0 - light) * 1.25))
+        if variant_gray:
+            light = min(0.58, max(0.38, 0.25 + (1.0 - light) * 1.25))
+        else:
+            light = min(0.5, max(0.24, 0.118 + (1.0 - light) * 1.25))
         sat = 0.0 if gray else sat * 0.5
     result = QColor.fromHslF(max(hue, 0.0), sat, light, alpha)
     if result.alpha() == 255:
@@ -87,17 +102,17 @@ def _to_dark(role, value):
 
 def fg(value):
     """文字/线条前景色。"""
-    return _to_dark('fg', value) if _dark else value
+    return _to_dark('fg', value, _gray) if _dark else value
 
 
 def bg(value):
     """背景填充色。"""
-    return _to_dark('bg', value) if _dark else value
+    return _to_dark('bg', value, _gray) if _dark else value
 
 
 def line(value):
     """边框/分隔线颜色。"""
-    return _to_dark('line', value) if _dark else value
+    return _to_dark('line', value, _gray) if _dark else value
 
 
 _DECLARATION = re.compile(r'([A-Za-z-]+)(\s*:\s*)([^;{}]*)')
@@ -124,7 +139,7 @@ def qss(css):
         role = _role_for(match.group(1))
         if role is None:
             return match.group(0)
-        value = _COLOR.sub(lambda color: _to_dark(role, color.group(0)), match.group(3))
+        value = _COLOR.sub(lambda color: _to_dark(role, color.group(0), _gray), match.group(3))
         return match.group(1) + match.group(2) + value
 
     return _DECLARATION.sub(convert, css)
@@ -205,7 +220,7 @@ def apply_window_frame(widget, force=False):
         pass
 
 
-def _dark_palette():
+def _dark_palette(gray=False):
     palette = QPalette()
     colors = {
         QPalette.Window: '#202020', QPalette.WindowText: '#e8e8e8', QPalette.Base: '#1b1b1b',
@@ -216,29 +231,42 @@ def _dark_palette():
         QPalette.Shadow: '#000000', QPalette.Highlight: '#2f6fdb', QPalette.HighlightedText: '#ffffff',
         QPalette.Link: '#6ea8ff', QPalette.LinkVisited: '#b39ddb',
     }
+    disabled = ((QPalette.WindowText, '#6e6e6e'), (QPalette.Text, '#6e6e6e'),
+                (QPalette.ButtonText, '#6e6e6e'), (QPalette.Highlight, '#3a3a3a'),
+                (QPalette.HighlightedText, '#9a9a9a'))
+    if gray:
+        colors.update({
+            QPalette.Window: '#404040', QPalette.Base: '#383838', QPalette.AlternateBase: '#444444',
+            QPalette.ToolTipBase: '#4a4a4a', QPalette.PlaceholderText: '#9a9a9a', QPalette.Button: '#4c4c4c',
+            QPalette.Light: '#606060', QPalette.Midlight: '#555555', QPalette.Mid: '#484848',
+            QPalette.Dark: '#2e2e2e',
+        })
+        disabled = ((QPalette.WindowText, '#8a8a8a'), (QPalette.Text, '#8a8a8a'),
+                    (QPalette.ButtonText, '#8a8a8a'), (QPalette.Highlight, '#555555'),
+                    (QPalette.HighlightedText, '#bbbbbb'))
     for role, value in colors.items():
         palette.setColor(role, QColor(value))
-    for role, value in ((QPalette.WindowText, '#6e6e6e'), (QPalette.Text, '#6e6e6e'),
-                        (QPalette.ButtonText, '#6e6e6e'), (QPalette.Highlight, '#3a3a3a'),
-                        (QPalette.HighlightedText, '#9a9a9a')):
+    for role, value in disabled:
         palette.setColor(QPalette.Disabled, role, QColor(value))
     return palette
 
 
-def set_dark(dark):
-    """切换深浅色；返回是否发生变化。已存在的 Shell 视图需由调用方重建。"""
-    global _dark, _original_style, _original_palette
+def set_dark(dark, gray=False):
+    """切换深浅色（gray=True 为较浅的灰色深色变体）；返回是否发生变化。已存在的 Shell 视图需由调用方重建。"""
+    global _dark, _gray, _original_style, _original_palette
     dark = bool(dark)
-    if dark == _dark:
+    gray = dark and bool(gray)
+    if dark == _dark and gray == _gray:
         return False
     app = QApplication.instance()
     if _original_style is None:
         _original_style = app.style().objectName() or 'windowsvista'
         _original_palette = QPalette(app.palette())
     _dark = dark
+    _gray = gray
     _set_native_app_mode(dark)
     app.setStyle('Fusion' if dark else _original_style)
-    palette = _dark_palette() if dark else QPalette(_original_palette)
+    palette = _dark_palette(gray) if dark else QPalette(_original_palette)
     app.setPalette(palette)
     QToolTip.setPalette(palette)
     restyle_widgets()

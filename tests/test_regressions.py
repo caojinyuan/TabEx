@@ -1385,6 +1385,7 @@ class InterfaceTests(unittest.TestCase):
                 self.assertEqual(tabs.tabIcon(0).cacheKey(), self.module._pinned_tab_icon().cacheKey())
                 self.assertEqual([pane.bookmark_group_color for pane in before[2:4]], ['#64B5F6', '#64B5F6'])
 
+    @unittest.skipIf(os.environ.get('QT_QPA_PLATFORM') == 'offscreen', 'offscreen 平台不渲染文字/emoji，截图中没有图钉')
     def test_long_pinned_tab_keeps_original_red_marker_visible(self):
         """长名称左侧省略时保留独立红图钉；固定和取消固定不会改变红钉外观。"""
         from PyQt5.QtWidgets import QStyle, QStyleOptionTab
@@ -3441,6 +3442,23 @@ class ThemeTests(unittest.TestCase):
         self.assertEqual(widget.styleSheet(), css)
         self.assertEqual(self.app.style().objectName(), original_style)
 
+    def test_gray_variant_is_lighter_than_dark_and_switches_independently(self):
+        """灰色主题仍属深色，但背景比深色主题更亮；深色与灰色之间切换视为变化，切回浅色复原。"""
+        self.assertTrue(self.module.resolve_dark('gray'))
+        self.assertTrue(self.module.resolve_gray('gray'))
+        self.assertFalse(self.module.resolve_gray('dark'))
+        self.module.set_dark(True)
+        dark_bg = self.lightness(self.module.bg('#ffffff'))
+        self.assertTrue(self.module.set_dark(True, gray=True))
+        self.assertFalse(self.module.set_dark(True, gray=True))
+        self.assertTrue(self.module.is_dark() and self.module.is_gray())
+        gray_bg = self.lightness(self.module.bg('#ffffff'))
+        self.assertGreater(gray_bg, dark_bg + 0.05)
+        self.assertLess(gray_bg, 0.35)
+        self.assertTrue(self.module.set_dark(False))
+        self.assertFalse(self.module.is_gray())
+        self.assertEqual(self.module.bg('#ffffff'), '#ffffff')
+
     def test_tool_icons_retint_except_on_always_light_buttons(self):
         """深色主题下工具栏线条图标改为浅色；通知等始终白底的按钮（tone='dark'）保持深色图标；切回浅色复原。"""
         from PyQt5.QtWidgets import QToolButton, QStyle
@@ -3545,7 +3563,7 @@ class ThemeTests(unittest.TestCase):
         self.addCleanup(dialog.deleteLater)
         self.assertEqual(dialog.theme_combo.currentData(), 'light')
         self.assertEqual([dialog.theme_combo.itemData(i) for i in range(dialog.theme_combo.count())],
-                         ['system', 'light', 'dark'])
+                         ['system', 'light', 'dark', 'gray'])
 
 
 class NetworkBannerTests(unittest.TestCase):

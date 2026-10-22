@@ -76,7 +76,7 @@ class ConfigStore:
                 "insert_group_bookmark": True  # F4 - 插入标签分组（保留旧键名兼容已有配置）
             },
             "language": "zh",              # 界面语言：zh / en
-            "theme": "system",             # 主题：system（跟随 Windows）/ light / dark
+            "theme": "system",             # 主题：system（跟随 Windows）/ light / dark / gray
         }
         default_config["ai_chat"] = {
             "enabled": False,

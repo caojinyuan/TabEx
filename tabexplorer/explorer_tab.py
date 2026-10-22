@@ -3275,7 +3275,8 @@ class FileExplorerTab(QWidget):
         path = getattr(self, 'current_path', '')
         if not isinstance(explorer, IExplorerBrowserWidget) or not explorer._init_ok or not path:
             return False
-        if getattr(explorer, '_created_dark', None) == _theme.is_dark():
+        if (getattr(explorer, '_created_dark', None) == _theme.is_dark()
+                and getattr(explorer, '_created_gray', False) == _theme.is_gray()):
             return False
         if not explorer.hibernate(path):
             return False

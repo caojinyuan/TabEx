@@ -402,6 +402,7 @@ _LANG_EN = {
     "跟随系统": "Follow system",
     "浅色": "Light",
     "深色": "Dark",
+    "灰色": "Gray",
     "跟随系统：随 Windows “应用模式”的浅色/深色设置自动切换":
         "Follow system: switches automatically with the Windows app mode (light/dark)",
     # ── Network location banner ───────────────────────────────────────────

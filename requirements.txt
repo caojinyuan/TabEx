@@ -1,5 +1,5 @@
 PyQt5==5.15.11
-pywin32>=305
+pywin32==312
 comtypes==1.4.8
-requests>=2.28.0
-Send2Trash>=1.8.3
+requests==2.32.5
+Send2Trash==2.1.0
