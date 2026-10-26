@@ -458,30 +458,25 @@ class SearchResultsTableModel(QAbstractTableModel):
 
 
 # Everything 搜索引擎集成
-def resolve_everything_cli(custom_path):
-    """将用户指定的路径（es.exe、Everything.exe 或其所在目录）解析为 es.exe 路径。"""
-    if not custom_path or not isinstance(custom_path, str):
-        return None
-    custom_path = os.path.expandvars(custom_path.strip().strip('"'))
-    if not custom_path:
-        return None
-    if os.path.isdir(custom_path):
-        candidate = os.path.join(custom_path, 'es.exe')
-        return candidate if os.path.isfile(candidate) else None
-    if not os.path.isfile(custom_path):
-        return None
-    if os.path.basename(custom_path).lower() == 'es.exe':
-        return custom_path
-    candidate = os.path.join(os.path.dirname(custom_path), 'es.exe')
-    return candidate if os.path.isfile(candidate) else None
+def get_bundled_es_path():
+    """返回随程序内置的 es.exe 路径（打包后位于 PyInstaller 解压目录，源码运行时位于项目根目录）。"""
+    import sys
+    from .paths import get_app_base_dir
+    roots = [getattr(sys, '_MEIPASS', None), get_app_base_dir()]
+    for root in roots:
+        if root:
+            candidate = os.path.join(root, 'es.exe')
+            if os.path.isfile(candidate):
+                return candidate
+    return None
 
 
-def detect_everything(custom_path=None):
-    """检测系统中是否安装了Everything；优先使用设置中指定的路径。"""
+def detect_everything():
+    """获取 es.exe：优先使用内置版本，其次回退到系统中已有的 es.exe。"""
     import shutil
-    resolved = resolve_everything_cli(custom_path)
-    if resolved:
-        return resolved
+    bundled = get_bundled_es_path()
+    if bundled:
+        return bundled
     # 检查Everything命令行工具es.exe是否在PATH中
     es_path = shutil.which('es.exe')
     if es_path:
@@ -560,9 +555,7 @@ class SearchDialog(QDialog):
         self.search_history = search_history or []  # 搜索历史列表
         
         # 检测Everything
-        parent_config = getattr(parent, 'config', None)
-        custom_everything_path = parent_config.get('everything_path', '') if isinstance(parent_config, dict) else ''
-        self.everything_path = detect_everything(custom_everything_path)
+        self.everything_path = detect_everything()
         self.notepad_plus_plus_path = detect_notepad_plus_plus()
         debug_print(f"[Search] Everything detected: {self.everything_path}")
         

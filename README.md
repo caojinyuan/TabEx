@@ -47,15 +47,11 @@
 
 ## 🆕 最近更新(只保留最新)
 
-### v3.86 (2026-10-22)
-- **Everything 路径可配置**：设置 → 工具集成新增“Everything 设置”，可手动指定 `es.exe`（也可选 `Everything.exe` 或其目录，同目录需有 `es.exe`），留空则自动检测；状态行实时提示当前使用的路径。
-- **修复 Everything 搜不到结果**：改用 `es.exe -path` 传搜索目录，修复 `path:"..."` 被转义后返回空结果的问题；文件类型留空即不限制类型。
-- **Everything 结果区分文件夹**：文件夹显示 📁、完整路径和“文件夹”类型，不再因无扩展名显示“无”。
-- **Everything 与内容搜索互斥**：打开搜索窗口时即按 Everything 状态同步，启用时“搜索文件内容”取消并置灰。
-- **搜索结果**：普通搜索中的文件夹结果也显示完整路径。
-- **搜索选项同一行**：移除“高级”折叠按钮，所有勾选项排在同一行。
-- **修复新嵌入 Explorer 目录树仍为白色**：深色/灰色主题下，新建视图的左侧目录树若未套用深色，自动补上配色。
-- **升级**：已有 EXE 需重新打包才能包含 v3.86，本次源码更新不会自动替换已发布 EXE。
+### v3.87 (2026-10-26)
+- **Everything 内置 es.exe**：`es.exe`（voidtools ES 1.1.0.27，MIT 许可）随工程提供并在打包时嵌入 `TabExplorer.exe`，用户无需再单独下载；仍需安装并运行 Everything 本体。
+- **移除 es.exe 路径设置**：设置 → 工具集成中不再有“Everything 设置”；程序优先使用内置 `es.exe`，找不到时回退到 PATH 和常见安装目录。
+- **打包校验**：根目录缺少 `es.exe` 时打包会直接报错，避免发布缺少搜索组件的 EXE。
+- **升级**：已有 EXE 需重新打包才能包含 v3.87，本次源码更新不会自动替换已发布 EXE。
 
 ---
 
@@ -132,10 +128,8 @@ AI 的 `PATCH_FILE` 和 `WRITE_FILE` 在写入前展示差异；预览后发现�
 - 分组状态会进入会话快照：重启后可恢复分组颜色；同路径重复标签页也按数量和顺序恢复
 
 ### Everything 搜索（推荐）
-1. 下载安装 [Everything](https://www.voidtools.com/)
-2. 下载 [es.exe](https://www.voidtools.com/downloads/) 并放到 Everything 安装目录（`Everything.exe` 本身不能用于命令行搜索）；若不在常见位置，可在设置 → 工具集成 → Everything 设置中指定 `es.exe` 路径
-3. 启动 Everything 并等待索引完成
-4. 在 TabExplorer 中按 `Ctrl+F` 打开搜索，勾选"使用 Everything"即可享受毫秒级搜索；Everything 只搜索文件名，启用后“搜索文件内容”不可用，结果中的文件夹显示为 📁 和“文件夹”类型
+1. 只需安装并启动 [Everything](https://www.voidtools.com/) 并等待索引完成；命令行工具 `es.exe` 已内置在工程根目录并会被打包进 `TabExplorer.exe`，无需单独下载或在设置中指定路径
+2. 在 TabExplorer 中按 `Ctrl+F` 打开搜索，勾选"使用 Everything"即可享受毫秒级搜索；Everything 只搜索文件名，启用后“搜索文件内容”不可用，结果中的文件夹显示为 📁 和“文件夹”类型
 
 ### 自动监听 Explorer 窗口
 - 类似 Clover 的核心功能
@@ -392,6 +386,7 @@ python -m coverage html --data-file="$env:TEMP\tabex-coverage" -d "$env:TEMP\tab
 
 ### 项目文件说明
 - `TabEx.py` - 启动入口，包含版本号 `APP_VERSION`（唯一来源，打包脚本与检查更新都读取这一行）
+- `es.exe` - Everything 命令行工具（voidtools ES，MIT），搜索时直接调用，打包时嵌入 EXE
 - `tabexplorer/` - 功能模块（按依赖从底层到上层）：
   - `paths.py`（数据目录与路径工具）、`i18n.py`（界面翻译）、`constants.py`（全局常量）
   - `debuglog.py`（调试日志与诊断接入）、`diagnostics.py`（崩溃诊断记录）、`system.py`（进程资源与外部程序启动）

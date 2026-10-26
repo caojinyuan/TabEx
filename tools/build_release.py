@@ -26,6 +26,9 @@ def build(root=ROOT, install=True, output=None, run=None, verify=None):
         run(python + ['-m', 'pip', 'install', '-r', str(root / 'requirements-build.txt')], cwd=root, check=True)
     run(python + ['-W', 'ignore::DeprecationWarning', '-m', 'unittest', 'discover', '-s', 'tests'],
         cwd=root, check=True)
+    es_exe = root / 'es.exe'
+    if not es_exe.is_file():
+        raise FileNotFoundError(f'Bundled Everything CLI not found: {es_exe}')
     with tempfile.TemporaryDirectory(prefix='.tabex-build-', dir=root) as temporary:
         stage = Path(temporary)
         command = python + [
@@ -33,6 +36,7 @@ def build(root=ROOT, install=True, output=None, run=None, verify=None):
             '--name', 'TabExplorer', '--distpath', str(stage / 'dist'),
             '--workpath', str(stage / 'work'), '--specpath', str(stage),
             '--add-data', str(root / 'icons') + ';icons',
+            '--add-data', str(es_exe) + ';.',
         ]
         icon = root / 'icons' / 'TabExplorer.ico'
         if icon.exists():
