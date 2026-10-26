@@ -1798,18 +1798,20 @@ class InterfaceTests(unittest.TestCase):
             self.app.setFont(saved_font)
 
     def test_tools_menu_groups_danger_and_preserves_actions(self):
-        """工具菜单区分文件、工作区、危险操作和诊断，保留原操作连接。"""
+        """工具菜单区分文件、工作区、截图、危险操作和诊断，保留原操作连接。"""
         from PyQt5.QtWidgets import QMenu, QToolButton
         callbacks = {name: Mock() for name in (
             'show_file_tasks', 'show_directory_compare', 'preview_batch_rename', 'save_named_workspace',
             'open_named_workspace', 'delete_named_workspace', 'permanently_delete_selected', 'export_diagnostics',
-            'check_for_updates')}
+            'check_for_updates', 'start_screenshot')}
         owner = types.SimpleNamespace(style=self.app.style, **callbacks)
         menu = QMenu()
         self.addCleanup(menu.deleteLater)
         self.module.MainWindow._populate_workspace_tools_menu(owner, menu)
         sections = [action.text() for action in menu.actions() if action.isSeparator()]
-        self.assertEqual(sections, ['文件操作', '危险操作', '诊断'])
+        self.assertEqual(sections, ['文件操作', '截图', '危险操作', '诊断'])
+        owner.screenshot_action.trigger()
+        callbacks['start_screenshot'].assert_called_once_with(250)
         workspaces = next(action.menu() for action in menu.actions() if action.menu())
         self.assertEqual(len(workspaces.actions()), 3)
         workspaces.actions()[1].trigger()
@@ -2528,6 +2530,42 @@ class HotkeyAndUpdateTests(unittest.TestCase):
         bindings, errors = dialog._collect_hotkey_bindings()
         self.assertEqual(errors, [])
         self.assertEqual(bindings, self.module._hotkey_bindings({}))
+
+    def test_screenshot_hotkey_row_is_editable_and_has_its_own_switch(self):
+        """屏幕截图的按键框和启用开关都可操作（不是灰色禁用），并能改键、关闭。"""
+        from PyQt5.QtGui import QKeySequence
+        dialog = self.module.SettingsDialog({})
+        self.addCleanup(dialog.deleteLater)
+        self.assertTrue(dialog.hotkey_edits['screenshot'].isEnabled())
+        self.assertTrue(dialog.hotkey_screenshot.isEnabled())
+        self.assertTrue(dialog.hotkey_screenshot.isChecked())
+        dialog.hotkey_edits['screenshot'].setKeySequence(QKeySequence('Ctrl+Shift+X'))
+        dialog.hotkey_screenshot.setChecked(False)
+        bindings, errors = dialog._collect_hotkey_bindings()
+        self.assertEqual((bindings['screenshot'], errors), ('Ctrl+Shift+X', []))
+        self.assertFalse(dialog.hotkey_screenshot.isChecked())
+
+    def test_screenshot_hotkey_conflict_warns_once_and_survives_window_deletion(self):
+        """全局热键注册失败时延迟提示一次；窗口在提示前被销毁也不会抛异常（PyQt 回调异常会使进程崩溃）。"""
+        from PyQt5.QtTest import QTest
+        from PyQt5.QtWidgets import QWidget
+
+        def make_owner():
+            owner = QWidget()
+            owner.config = {}
+            owner.screenshot = Mock(apply_hotkey=Mock(return_value=False))
+            owner._warn_screenshot_hotkey_unavailable = types.MethodType(
+                self.module.MainWindow._warn_screenshot_hotkey_unavailable, owner)
+            return owner
+
+        survivor, doomed = make_owner(), make_owner()
+        with patch_all('show_toast') as show_toast:
+            self.module.MainWindow._apply_screenshot_hotkey(survivor)
+            self.module.MainWindow._apply_screenshot_hotkey(doomed)
+            doomed.deleteLater()
+            QTest.qWait(1700)
+        self.assertEqual(show_toast.call_count, 1)
+        self.assertIs(show_toast.call_args[0][0], survivor)
 
     def fake_urlopen(self, release, head):
         import io

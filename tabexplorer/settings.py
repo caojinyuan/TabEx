@@ -896,7 +896,8 @@ class SettingsDialog(QDialog):
                 "quick_delete": self.hotkey_quick_delete.isChecked(),
                 "cancel_file_op": self.hotkey_cancel_file_op.isChecked(),
                 "copy_filename": self.hotkey_copy_filename.isChecked(),
-                "copy_filepath": self.hotkey_copy_filepath.isChecked()
+                "copy_filepath": self.hotkey_copy_filepath.isChecked(),
+                "screenshot": self.hotkey_screenshot.isChecked()
             }
             self.parent().config["hotkey_bindings"] = hotkey_bindings
             self.parent().config["auto_update_check"] = self.auto_update_cb.isChecked()

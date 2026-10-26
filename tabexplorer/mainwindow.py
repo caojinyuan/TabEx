@@ -35,6 +35,7 @@ from .system import (
 )
 from .hotkeys import (
     _foreground_pid, _HOTKEY_ENABLE_KEYS, _hotkey_hint, _hotkey_reserved_combos, _hotkey_table, _hotkey_text,
+    _parse_hotkey,
     SHORTCUT_POLL_ACTIVE_MS, SHORTCUT_POLL_INACTIVE_MS, _ShortcutKeyHook, _toolbar_hotkey_tooltip,
     _TOOLBAR_HOTKEY_TOOLTIPS,
 )
@@ -66,6 +67,7 @@ from .tabbar import CustomMenuBar, CustomTabBar, DragDropTabWidget, _tab_display
 from .chat import ChatPanel
 from .settings import SettingsDialog
 from .persistence import ConfigStore, SessionController
+from .screenshot import ScreenshotController
 
 if HAS_PYWIN:
     import win32con
@@ -2726,7 +2728,7 @@ class MainWindow(QMainWindow):
 
         # AI 助手面板切换按钮
         self.ai_chat_btn = QPushButton("🤖")
-        self.ai_chat_btn.setToolTip(_toolbar_hotkey_tooltip(self, 'ai_chat_btn'))
+        self.ai_chat_btn.setToolTip(tr("AI 助手面板"))
         self.ai_chat_btn.setFixedSize(bookmark_btn_width, titlebar_height)
         self.ai_chat_btn.setCheckable(True)
         self.ai_chat_btn.setStyleSheet(f"""
@@ -3409,11 +3411,6 @@ class MainWindow(QMainWindow):
         if 0 <= index < count:
             tabs.setCurrentIndex(index)
 
-    def _focus_active_path_bar(self):
-        current_tab = self.get_active_pane()
-        if current_tab and getattr(current_tab, 'path_bar', None):
-            current_tab.path_bar.enter_edit_mode()
-
     def _run_shortcut(self, vk, ctrl, shift, alt):
         """执行按键组合绑定的命令，返回是否命中已启用的快捷键。"""
         command = _hotkey_table(self.config).get((ctrl, shift, alt, vk))
@@ -3447,12 +3444,39 @@ class MainWindow(QMainWindow):
             'copy_filepath': lambda: self.copy_selected_filename(mode="path"),
             'split_view': self.toggle_split_view,
             'insert_group_bookmark': self.insert_tab_group_marker,
-            'focus_path_bar': self._focus_active_path_bar,
-            'toggle_ai_panel': self.toggle_chat_panel,
+            'screenshot': self.start_screenshot,
         }
         debug_print(f"[Shortcut] vk=0x{vk:02X} ctrl={ctrl} shift={shift} alt={alt} -> {command}")
         handlers[command]()
         return True
+
+    def _apply_screenshot_hotkey(self):
+        """注册全局截图热键并刷新菜单提示；被其他程序占用时仍可在 TabEx 前台使用。"""
+        text = _hotkey_text(self.config, 'screenshot')
+        if not self.config.get("hotkeys", {}).get("screenshot", True):
+            text = ''
+        action = getattr(self, 'screenshot_action', None)
+        if action is not None:
+            action.setText(f"{tr('屏幕截图')} ({text})" if text else tr('屏幕截图'))
+        controller = getattr(self, 'screenshot', None)
+        if controller is None:
+            return
+        parsed = _parse_hotkey(text)
+        self._screenshot_hotkey_text = text
+        if not controller.apply_hotkey(parsed) and parsed is not None and (parsed[0] or parsed[1] or parsed[2]):
+            QTimer.singleShot(1500, self._warn_screenshot_hotkey_unavailable)
+
+    def _warn_screenshot_hotkey_unavailable(self):
+        show_toast(self, tr("提示"), tr("全局截图快捷键 {} 已被其他程序占用，仅在 TabEx 前台可用").format(
+            getattr(self, '_screenshot_hotkey_text', '')), level="warning")
+
+    def start_screenshot(self, delay_ms=0):
+        controller = getattr(self, 'screenshot', None)
+        if controller is not None:
+            controller.start(delay_ms)
+
+    def _screenshot_notify(self, message, level='info'):
+        show_toast(self, tr("提示"), message, level=level, duration=3000)
 
     def _apply_hotkey_bindings(self):
         """按当前配置更新轮询兜底的键位、Shell 键盘过滤器和界面上的按键提示。"""
@@ -3462,6 +3486,7 @@ class MainWindow(QMainWindow):
             poll_vks.update(range(0x31, 0x3A))
         self._shortcut_poll_vks = tuple(sorted(poll_vks))
         _ieb_keyboard_filter.set_tabex_hotkeys(_hotkey_reserved_combos(self.config))
+        self._apply_screenshot_hotkey()
         for name in _TOOLBAR_HOTKEY_TOOLTIPS:
             button = getattr(self, name, None)
             if button is not None:
@@ -3607,6 +3632,8 @@ class MainWindow(QMainWindow):
         workspace.addAction(tr('保存命名工作区...'), self.save_named_workspace)
         workspace.addAction(tr('打开命名工作区...'), self.open_named_workspace)
         workspace.addAction(tr('删除命名工作区...'), self.delete_named_workspace)
+        menu.addSection(tr('截图'))
+        self.screenshot_action = menu.addAction(tr('屏幕截图'), lambda: self.start_screenshot(250))
         menu.addSection(tr('危险操作'))
         danger = menu.addAction(tr('永久删除选中项...'), self.permanently_delete_selected)
         danger.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxWarning))
@@ -3810,6 +3837,7 @@ class MainWindow(QMainWindow):
             self.config["hotkeys"]["quick_find_current_dir"] = dlg.hotkey_quick_find_current_dir.isChecked()
             self.config["hotkeys"]["split_view"] = dlg.hotkey_split_view.isChecked()
             self.config["hotkeys"]["insert_group_bookmark"] = dlg.hotkey_insert_group_bookmark.isChecked()
+            self.config["hotkeys"]["screenshot"] = dlg.hotkey_screenshot.isChecked()
             self._apply_hotkey_bindings()
             
             self.save_config()
@@ -4260,6 +4288,7 @@ class MainWindow(QMainWindow):
         self._shortcut_key_hook = None
         self._shortcut_timer = QTimer(self)
         self._shortcut_timer.timeout.connect(self._check_shortcuts)
+        self.screenshot = ScreenshotController(self._screenshot_notify, self)
         self._apply_hotkey_bindings()
         self._start_shortcut_listener()
 
@@ -5492,6 +5521,10 @@ class MainWindow(QMainWindow):
                 self.chat_panel.cleanup()
             except Exception as e:
                 print(f"Error cleaning chat panel: {e}")
+
+        screenshot = getattr(self, 'screenshot', None)
+        if screenshot is not None:
+            screenshot.shutdown()
 
         self._active_pane = None
 

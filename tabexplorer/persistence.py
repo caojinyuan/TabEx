@@ -74,7 +74,8 @@ class ConfigStore:
                 "copy_filename": True,     # Alt+Z - 复制选中文件名
                 "copy_filepath": True,     # Alt+X - 复制文件路径\文件名
                 "split_view": True,        # F3 - 左右分屏对比
-                "insert_group_bookmark": True  # F4 - 插入标签分组（保留旧键名兼容已有配置）
+                "insert_group_bookmark": True,  # F4 - 插入标签分组（保留旧键名兼容已有配置）
+                "screenshot": True         # Ctrl+Alt+Z - 屏幕截图（全局热键）
             },
             "language": "zh",              # 界面语言：zh / en
             "theme": "system",             # 主题：system（跟随 Windows）/ light / dark / gray

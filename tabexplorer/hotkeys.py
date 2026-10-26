@@ -35,8 +35,7 @@ HOTKEY_COMMANDS = (
     ('copy_filepath', 'copy_filepath', 'Alt+X', '复制文件路径\\文件名'),
     ('split_view', 'split_view', 'F3', '左右分屏对比'),
     ('insert_group_bookmark', 'insert_group_bookmark', 'F4', '插入标签分组'),
-    ('focus_path_bar', None, 'Ctrl+L', '编辑路径栏'),
-    ('toggle_ai_panel', None, 'Ctrl+Shift+A', '显示/隐藏 AI 助手面板'),
+    ('screenshot', 'screenshot', 'Ctrl+Alt+Z', '屏幕截图（全局）'),
 )
 _HOTKEY_ENABLE_KEYS = {command: enable_key for command, enable_key, _default, _label in HOTKEY_COMMANDS}
 _HOTKEY_KEY_CODES = {
@@ -152,7 +151,6 @@ _TOOLBAR_HOTKEY_TOOLTIPS = {
     'search_button': ('搜索当前文件夹', 'search'),
     'insert_group_btn': ('插入分组', 'insert_group_bookmark'),
     'split_view_btn': ('分屏对比', 'split_view'),
-    'ai_chat_btn': ('AI 助手面板', 'toggle_ai_panel'),
 }
 
 
