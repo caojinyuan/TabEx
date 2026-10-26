@@ -649,10 +649,10 @@ class SearchDialog(QDialog):
         type_options.addWidget(self.match_whole_word_cb)
         
         # Everything搜索选项
-        self.use_everything_cb = QCheckBox(tr("使用 Everything (极速)"))
+        self.use_everything_cb = QCheckBox(tr("使用 Everything（不支持搜索文件内容）"))
         if self.everything_path:
             self.use_everything_cb.setChecked(True)  # 如果有Everything，默认启用
-            self.use_everything_cb.setToolTip(tr("使用Everything搜索引擎\n路径: {}\n只搜索文件名，速度极快；启用后无法搜索文件内容").format(self.everything_path))
+            self.use_everything_cb.setToolTip(tr("使用Everything搜索引擎\n路径: {}\n仅支持搜索文件名，不支持搜索文件内容").format(self.everything_path))
         else:
             self.use_everything_cb.setEnabled(False)
             self.use_everything_cb.setToolTip(tr("未检测到Everything，请从 https://www.voidtools.com/ 下载安装"))
