@@ -1162,6 +1162,8 @@ class IExplorerBrowserWidget(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         QTimer.singleShot(0, self.update_gray_tint)
+        QTimer.singleShot(0, self._sync_browser_rect_if_stale)
+        QTimer.singleShot(150, self._sync_browser_rect_if_stale)
         if self._pending_path:
             QTimer.singleShot(0, self._initialize_pending_browser)
         elif self._browser and _TORTOISE_OVERLAY_PATCHED:
@@ -1191,6 +1193,20 @@ class IExplorerBrowserWidget(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._sync_browser_rect()
+        QTimer.singleShot(0, self._sync_browser_rect_if_stale)
+
+    def _sync_browser_rect_if_stale(self):
+        """Qt 的 resizeEvent 可能先于原生 HWND 尺寸更新（如分屏合并后），
+        此时 GetClientRect 仍是旧尺寸；延迟一轮事件循环后按真实客户区重新同步。"""
+        if not self._browser:
+            return
+        try:
+            rc = self._native_client_rect(int(self.winId()))
+            size = (rc.right - rc.left, rc.bottom - rc.top)
+            if size != getattr(self, '_applied_rect_size', None):
+                self._sync_browser_rect()
+        except Exception:
+            pass
 
     @staticmethod
     def _native_client_rect(hwnd):
@@ -1212,6 +1228,7 @@ class IExplorerBrowserWidget(QWidget):
                 hwnd = int(self.winId())
                 rc = self._native_client_rect(hwnd)
                 hr = self._browser.SetRect(None, rc)
+                self._applied_rect_size = (rc.right - rc.left, rc.bottom - rc.top)
                 user32 = ctypes.windll.user32
                 user32.GetWindowRect.argtypes = [
                     ctypes.wintypes.HWND,

@@ -2,6 +2,7 @@
 
 import ctypes.wintypes
 import os
+import subprocess
 
 from PyQt5.QtCore import pyqtSignal, QEvent, QFileInfo, QMimeData, QSize, Qt, QTimer
 from PyQt5.QtGui import QDrag, QIcon
@@ -361,10 +362,26 @@ class TitleShortcutBar(QWidget):
             }
             """
         ))
+        open_dir_action = menu.addAction(tr("打开所在目录"))
         remove_action = menu.addAction(tr("移除该快捷方式"))
         action = menu.exec_(btn.mapToGlobal(pos))
-        if action == remove_action:
+        if action == open_dir_action:
+            self._open_containing_folder(path)
+        elif action == remove_action:
             self._remove_shortcut(path)
+
+    @staticmethod
+    def _open_containing_folder(path):
+        norm = os.path.normpath(path)
+        try:
+            if os.path.exists(norm):
+                subprocess.Popen(["explorer.exe", f"/select,{norm}"])
+            else:
+                parent = os.path.dirname(norm)
+                if parent and os.path.isdir(parent):
+                    os.startfile(parent)
+        except OSError:
+            pass
 
     def _remove_shortcut(self, path):
         if path not in self._paths:
