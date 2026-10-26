@@ -748,7 +748,7 @@ class FunctionalBoundaryTests(unittest.TestCase):
 
     def search_rows(self, directory, keyword, filename=True, content=False, **options):
         """运行普通搜索的实际实现并收集结果；小数据集不会填满结果队列。"""
-        task = self.module._SearchTask(directory, '', options.pop('limit', 100))
+        task = self.module._SearchTask(directory, '', options.pop('limit', 100), options.pop('ripgrep_path', None))
         self.module.SearchDialog.do_search(task, keyword, filename, content, **options)
         rows = []
         while not task.result_queue.empty():
@@ -780,6 +780,42 @@ class FunctionalBoundaryTests(unittest.TestCase):
                 with self.subTest(keyword=keyword):
                     rows = self.search_rows(directory, keyword, False, True, file_types='txt', **options)
                     self.assertEqual({Path(row['path']).name for row in rows}, expected)
+
+    def test_ripgrep_content_search_matches_python_scan(self):
+        """内置 ripgrep 的内容搜索与 Python 扫描结果一致：大小写、整词、扩展名、UTF-8/GBK 中文、二进制扩展名。"""
+        ripgrep = self.module.detect_ripgrep()
+        if not ripgrep:
+            self.skipTest('rg.exe not available')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'sub').mkdir()
+            contents = {'ascii.txt': b'Alpha alphabet', 'sub/nested.txt': b'ALPHA', 'utf8.txt': '测试文字'.encode('utf-8'),
+                        'gbk.txt': '测试文字'.encode('gbk'), 'data.exe': b'Alpha', 'other.log': b'Alpha',
+                        'Alpha.txt': b'unrelated', '-dash.txt': b'a -x b'}
+            for name, content in contents.items():
+                (root / name).write_bytes(content)
+            cases = (
+                ('Alpha', {'match_case': True, 'match_whole_word': True}),
+                ('alpha', {}),
+                ('alpha', {'match_whole_word': True, 'file_types': '*.txt'}),
+                ('测试', {}),
+                ('-x', {}),
+                ('absent', {}),
+            )
+            for keyword, options in cases:
+                with self.subTest(keyword=keyword, options=options):
+                    expected = {row['path'] for row in self.search_rows(directory, keyword, False, True, **options)}
+                    actual = {row['path'] for row in self.search_rows(
+                        directory, keyword, False, True, ripgrep_path=ripgrep, **options)}
+                    self.assertEqual(actual, expected)
+
+    def test_ripgrep_failure_falls_back_to_python_scan(self):
+        """ripgrep 无法启动时自动回退到 Python 扫描，搜索结果不丢失。"""
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / 'hit.txt').write_bytes(b'needle')
+            rows = self.search_rows(directory, 'needle', False, True,
+                                    ripgrep_path=str(Path(directory) / 'missing-rg.exe'))
+            self.assertEqual({Path(row['path']).name for row in rows}, {'hit.txt'})
 
     def test_content_search_skips_known_binary_files(self):
         """二进制扩展名内即使包含关键字，也不会被当作文本内容搜索结果。"""
@@ -1637,7 +1673,7 @@ class InterfaceTests(unittest.TestCase):
             dialog.show()
             self.app.processEvents()
             checkboxes = (dialog.search_filename_cb, dialog.search_content_cb, dialog.match_case_cb,
-                          dialog.match_whole_word_cb, dialog.use_everything_cb, dialog.force_lightweight_cb)
+                          dialog.match_whole_word_cb, dialog.use_everything_cb)
             for checkbox in checkboxes:
                 self.assertTrue(checkbox.isVisible())
                 self.assertEqual(checkbox.geometry().center().y(), checkboxes[0].geometry().center().y())
@@ -1730,8 +1766,7 @@ class InterfaceTests(unittest.TestCase):
                         label = search.layout().itemAt(0).layout().itemAt(0).widget()
                         self.assertGreaterEqual(label.width(), label.fontMetrics().horizontalAdvance(label.text()))
                         for checkbox in (search.search_filename_cb, search.search_content_cb, search.match_case_cb,
-                                         search.match_whole_word_cb, search.use_everything_cb,
-                                         search.force_lightweight_cb):
+                                         search.match_whole_word_cb, search.use_everything_cb):
                             self.assertTrue(search.rect().contains(checkbox.geometry()), checkbox.text())
                         self.assertTrue(search.grab().save(str(screenshot_dir / f'search-{language}.png')))
                         panel = module.FileTaskPanel(None)

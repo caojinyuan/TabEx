@@ -175,10 +175,10 @@ class SearchCache:
         self._lock = threading.RLock()
         self._timestamps = {}
     
-    def get_key(self, search_path, keyword, search_filename, search_content, file_types, force_metadata_degrade=False, match_case=False, match_whole_word=False, use_everything=False):
+    def get_key(self, search_path, keyword, search_filename, search_content, file_types, match_case=False, match_whole_word=False, use_everything=False):
         """生成缓存键"""
         import hashlib
-        key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}|{force_metadata_degrade}|{match_case}|{match_whole_word}|{use_everything}"
+        key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}|{match_case}|{match_whole_word}|{use_everything}"
         return hashlib.md5(key_str.encode()).hexdigest()
     
     def get(self, key):
@@ -234,9 +234,10 @@ class _SearchResultQueue(queue.Queue):
 
 
 class _SearchTask:
-    def __init__(self, search_path, everything_path, max_results):
+    def __init__(self, search_path, everything_path, max_results, ripgrep_path=None):
         self.search_path = search_path
         self.everything_path = everything_path
+        self.ripgrep_path = ripgrep_path
         self.max_results = max_results
         self.cancel_event = threading.Event()
         self.result_queue = _SearchResultQueue(self.cancel_event)
@@ -256,6 +257,9 @@ class _SearchTask:
 
     def search_with_everything(self, *args, **kwargs):
         return SearchDialog.search_with_everything(self, *args, **kwargs)
+
+    def search_with_ripgrep(self, *args, **kwargs):
+        return SearchDialog.search_with_ripgrep(self, *args, **kwargs)
 
     def run(self, *args):
         try:
@@ -458,17 +462,27 @@ class SearchResultsTableModel(QAbstractTableModel):
 
 
 # Everything 搜索引擎集成
-def get_bundled_es_path():
-    """返回随程序内置的 es.exe 路径（打包后位于 PyInstaller 解压目录，源码运行时位于项目根目录）。"""
+def _bundled_tool_path(file_name):
+    """返回随程序内置的工具路径（打包后位于 PyInstaller 解压目录，源码运行时位于项目根目录）。"""
     import sys
     from .paths import get_app_base_dir
     roots = [getattr(sys, '_MEIPASS', None), get_app_base_dir()]
     for root in roots:
         if root:
-            candidate = os.path.join(root, 'es.exe')
+            candidate = os.path.join(root, file_name)
             if os.path.isfile(candidate):
                 return candidate
     return None
+
+
+def get_bundled_es_path():
+    return _bundled_tool_path('es.exe')
+
+
+def detect_ripgrep():
+    """获取 rg.exe：优先使用内置版本，其次回退到 PATH 中已有的 rg.exe。"""
+    import shutil
+    return _bundled_tool_path('rg.exe') or shutil.which('rg.exe')
 
 
 def detect_everything():
@@ -556,6 +570,7 @@ class SearchDialog(QDialog):
         
         # 检测Everything
         self.everything_path = detect_everything()
+        self.ripgrep_path = detect_ripgrep()
         self.notepad_plus_plus_path = detect_notepad_plus_plus()
         debug_print(f"[Search] Everything detected: {self.everything_path}")
         
@@ -653,15 +668,11 @@ class SearchDialog(QDialog):
         self.on_everything_toggled(self.use_everything_cb.isChecked())
         type_options.addWidget(self.use_everything_cb)
 
-        # 手动轻量模式：强制降级元数据以提升吞吐
-        self.force_lightweight_cb = QCheckBox(tr("轻量模式(更快)"))
-        self.force_lightweight_cb.setChecked(False)
-        self.force_lightweight_cb.setToolTip(tr("勾选后搜索结果将优先显示核心路径信息，可能省略修改时间/大小"))
-        type_options.addWidget(self.force_lightweight_cb)
+        # 手动轻量模式已移除；队列高压时仍自动降级元数据
         type_options.addStretch(1)
         # 窄窗口下允许复选框文字被压缩，而不是撑宽整个对话框
         for checkbox in (self.search_filename_cb, self.search_content_cb, self.match_case_cb,
-                         self.match_whole_word_cb, self.use_everything_cb, self.force_lightweight_cb):
+                         self.match_whole_word_cb, self.use_everything_cb):
             checkbox.setMinimumWidth(24)
         layout.addLayout(type_options)
         
@@ -935,7 +946,7 @@ class SearchDialog(QDialog):
         if previous_task:
             previous_task.cancel_event.set()
         self.is_searching = False
-        self._search_task = _SearchTask(search_path, self.everything_path, self.max_results)
+        self._search_task = _SearchTask(search_path, self.everything_path, self.max_results, self.ripgrep_path)
         self.result_queue = self._search_task.result_queue
         
         # 获取文件类型过滤
@@ -943,14 +954,12 @@ class SearchDialog(QDialog):
         
         # 检查缓存
         global _search_cache
-        force_metadata_degrade = self.force_lightweight_cb.isChecked()
         use_everything = self.use_everything_cb.isChecked() if self.everything_path else False
         cache_key = _search_cache.get_key(
             search_path, keyword,
             do_search_filename,
             do_search_content,
             file_types,
-            force_metadata_degrade,
             self.match_case_cb.isChecked(),
             self.match_whole_word_cb.isChecked(),
             use_everything,
@@ -1006,7 +1015,7 @@ class SearchDialog(QDialog):
         match_whole_word = self.match_whole_word_cb.isChecked()
         self.search_thread = threading.Thread(
             target=self._search_task.run,
-            args=(keyword, do_search_filename, do_search_content, file_types, cache_key, use_everything, force_metadata_degrade, match_case, match_whole_word)
+            args=(keyword, do_search_filename, do_search_content, file_types, cache_key, use_everything, match_case, match_whole_word)
         )
         self.search_thread.daemon = True
         self.search_thread.start()
@@ -1116,7 +1125,64 @@ class SearchDialog(QDialog):
             debug_print(f"[Everything] Error: {e}")
             raise
     
-    def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None, use_everything=False, force_metadata_degrade=False, match_case=False, match_whole_word=False):
+    def search_with_ripgrep(self, keyword, search_path, file_extensions=(), match_case=False, match_whole_word=False):
+        """用 ripgrep 找出内容包含关键词的文件，返回规范化路径集合；失败或取消时返回 None（调用方回退到 Python 扫描）。"""
+        import subprocess
+
+        ripgrep_path = getattr(self, 'ripgrep_path', None)
+        if not ripgrep_path or not keyword:
+            return None
+
+        base_cmd = [ripgrep_path, '--no-config', '-l', '--null', '-F', '-uu', '--no-messages',
+                    '-s' if match_case else '-i']
+        if match_whole_word:
+            base_cmd.append('-w')
+        for ext in sorted(file_extensions):
+            base_cmd += ['--iglob', f'*.{ext}']
+        passes = [[]]
+        if not keyword.isascii():
+            # 默认只识别 UTF-8 及带 BOM 的 UTF-16；非 ASCII 关键词再按 GBK 解码扫描一遍，与 Python 路径的编码范围保持一致
+            passes.append(['-E', 'gbk'])
+
+        matches = set()
+        for extra in passes:
+            cmd = base_cmd + extra + ['-e', keyword, '--', search_path]
+            if _debuglog._DEBUG_MODE:
+                debug_print(f"[ripgrep] Executing: {' '.join(cmd)}")
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                )
+            except OSError as error:
+                debug_print(f"[ripgrep] Failed to start: {error}")
+                return None
+            try:
+                while True:
+                    if not self.is_searching:
+                        return None
+                    try:
+                        output, error_output = process.communicate(timeout=0.1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+            # 退出码 1 表示无匹配；2 在部分文件不可读时也会出现，只要没有错误输出就视为成功
+            if process.returncode not in (0, 1) and (process.returncode != 2 or error_output.strip()):
+                debug_print(f"[ripgrep] Error: {error_output.decode('utf-8', errors='replace')}")
+                return None
+            for raw_path in output.split(b'\0'):
+                if raw_path:
+                    matches.add(os.path.normcase(os.path.normpath(raw_path.decode('utf-8', errors='replace'))))
+        debug_print(f"[ripgrep] Found {len(matches)} matching files")
+        return matches
+
+    def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None, use_everything=False, match_case=False, match_whole_word=False):
         import re
 
         metadata_degrade_count = 0
@@ -1148,8 +1214,6 @@ class SearchDialog(QDialog):
             return keyword_bytes_lower in value.lower()
 
         def _should_degrade_metadata():
-            if force_metadata_degrade:
-                return True
             if not SEARCH_METADATA_DEGRADE_ENABLED:
                 return False
             try:
@@ -1338,6 +1402,12 @@ class SearchDialog(QDialog):
         debug_print(tr("[Search] 文件类型过滤: {}").format(file_extensions if file_extensions else '所有类型'))
         
         try:
+            rg_matches = None
+            if search_content and keyword and getattr(self, 'ripgrep_path', None):
+                self.result_queue.put({'type': 'status', 'text': tr('使用 ripgrep 搜索文件内容...')})
+                rg_matches = self.search_with_ripgrep(keyword, self.search_path, file_extensions, match_case, match_whole_word)
+                if rg_matches is None:
+                    debug_print("[Search] ripgrep unavailable, falling back to Python content scan")
             scanned_files = 0
             folder_count = 0
             skipped_binary_files = 0  # 跳过的二进制文件数
@@ -1459,8 +1529,17 @@ class SearchDialog(QDialog):
                         matched = True
                         match_type = "📄"
                     
+                    # 搜索文件内容：ripgrep 已预先给出命中文件集合，这里只按集合判断
+                    if search_content and not matched and rg_matches is not None:
+                        if file_ext in binary_file_extensions:
+                            skipped_binary_files += 1
+                            continue
+                        if os.path.normcase(os.path.normpath(file_path)) in rg_matches:
+                            matched = True
+                            match_type = "📄"
+
                     # 搜索文件内容（智能检测文本文件）
-                    if search_content and not matched:
+                    if search_content and not matched and rg_matches is None:
                         # 1. 首先检查黑名单（明确的二进制文件）
                         if file_ext in binary_file_extensions:
                             skipped_binary_files += 1

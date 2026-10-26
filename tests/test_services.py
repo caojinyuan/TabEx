@@ -277,7 +277,8 @@ class BuildPipelineTests(unittest.TestCase):
                 root = Path(directory)
                 executable = root / 'TabExplorer.exe'
                 executable.write_bytes(b'old working executable')
-                (root / 'es.exe').write_bytes(b'es')
+                for tool in ('es.exe', 'rg.exe'):
+                    (root / tool).write_bytes(b'tool')
 
                 def run(command, **keywords):
                     if 'PyInstaller' in command:
@@ -305,7 +306,8 @@ class BuildPipelineTests(unittest.TestCase):
             root = Path(directory)
             executable = root / 'TabExplorer.exe'
             executable.write_bytes(b'old')
-            (root / 'es.exe').write_bytes(b'es')
+            for tool in ('es.exe', 'rg.exe'):
+                (root / tool).write_bytes(b'tool')
             commands = []
 
             def run(command, **keywords):
