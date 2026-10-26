@@ -463,16 +463,8 @@ class SearchResultsTableModel(QAbstractTableModel):
 
 # Everything 搜索引擎集成
 def _bundled_tool_path(file_name):
-    """返回随程序内置的工具路径（打包后位于 PyInstaller 解压目录，源码运行时位于项目根目录）。"""
-    import sys
-    from .paths import get_app_base_dir
-    roots = [getattr(sys, '_MEIPASS', None), get_app_base_dir()]
-    for root in roots:
-        if root:
-            candidate = os.path.join(root, file_name)
-            if os.path.isfile(candidate):
-                return candidate
-    return None
+    from .paths import get_bundled_path
+    return get_bundled_path(file_name)
 
 
 def get_bundled_es_path():

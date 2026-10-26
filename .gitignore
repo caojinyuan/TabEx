@@ -8,6 +8,11 @@ TabExplorer.exe
 artifacts/
 .tabex-build-*/
 
+# QuickLook 便携版（设置中下载，GPL，不入库）
+QuickLook/
+QuickLook.7z.part
+QuickLook.extracting/
+
 # Configuration
 *.json
 

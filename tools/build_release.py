@@ -26,7 +26,7 @@ def build(root=ROOT, install=True, output=None, run=None, verify=None):
         run(python + ['-m', 'pip', 'install', '-r', str(root / 'requirements-build.txt')], cwd=root, check=True)
     run(python + ['-W', 'ignore::DeprecationWarning', '-m', 'unittest', 'discover', '-s', 'tests'],
         cwd=root, check=True)
-    bundled_tools = [root / name for name in ('es.exe', 'rg.exe')]
+    bundled_tools = [root / name for name in ('es.exe', 'rg.exe', '7zr.exe')]
     for tool in bundled_tools:
         if not tool.is_file():
             raise FileNotFoundError(f'Bundled tool not found: {tool}')

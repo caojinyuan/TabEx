@@ -18,6 +18,17 @@ def get_app_data_path(*parts):
     return os.path.join(base, *parts)
 
 
+def get_bundled_path(file_name):
+    """返回随程序内置的文件路径（打包后位于 PyInstaller 解压目录，源码运行时位于项目根目录）。"""
+    roots = [getattr(sys, '_MEIPASS', None), get_app_base_dir()]
+    for root in roots:
+        if root:
+            candidate = os.path.join(root, file_name)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
 # 常用中英文目录名对照表
 _COMMON_PATH_PAIRS = [
     ("Users", "用户"),

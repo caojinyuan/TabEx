@@ -270,6 +270,33 @@ class SettingsDialog(QDialog):
                 compact_widget(item.widget())
         tools_page_layout.addWidget(git_group)
 
+        # QuickLook 预览设置组
+        quicklook_group = QGroupBox(tr("QuickLook 预览"))
+        quicklook_layout = QVBoxLayout()
+        self.quicklook_cb = QCheckBox(tr("启用 QuickLook 预览（在文件列表选中文件后按空格）"), self)
+        self.quicklook_cb.setChecked(config.get("quicklook_enabled", False))
+        self.quicklook_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
+        self.quicklook_cb.setToolTip(tr("选中文件后按空格弹出预览，再按一次关闭；输入文件名或重命名时的空格不受影响"))
+        quicklook_layout.addWidget(self.quicklook_cb)
+        quicklook_row = QHBoxLayout()
+        self.quicklook_download_btn = QPushButton(self)
+        self.quicklook_download_btn.setToolTip(
+            tr("QuickLook 是 GPL v3 开源软件，不随本程序分发；点击后从官方 GitHub 发布页下载并校验，保存在程序目录的 QuickLook 文件夹。")
+        )
+        quicklook_row.addWidget(self.quicklook_download_btn)
+        self.quicklook_status_label = QLabel("")
+        self.quicklook_status_label.setWordWrap(True)
+        _theme.bind_style(self.quicklook_status_label, "color:#666; font-size:8.5pt; padding:0 4px;")
+        quicklook_row.addWidget(self.quicklook_status_label, 1)
+        quicklook_layout.addLayout(quicklook_row)
+        quicklook_group.setLayout(quicklook_layout)
+        compact_groupbox(quicklook_group)
+        compact_widget(self.quicklook_cb)
+        self._quicklook_worker = None
+        self.quicklook_download_btn.clicked.connect(self._on_quicklook_download_clicked)
+        self._refresh_quicklook_status()
+        tools_page_layout.addWidget(quicklook_group)
+
         # 快捷方式设置组（右侧独立分组）
         shortcuts_group = QGroupBox(tr("快捷方式设置"))
         shortcuts_layout = QVBoxLayout()
@@ -666,6 +693,61 @@ class SettingsDialog(QDialog):
         
         return None
 
+    def _refresh_quicklook_status(self, progress_text=None):
+        from .quicklook import find_quicklook, QUICKLOOK_VERSION
+        downloading = self._quicklook_worker is not None
+        found = find_quicklook()
+        if downloading:
+            self.quicklook_download_btn.setText(tr("取消下载"))
+            self.quicklook_download_btn.setEnabled(True)
+            self.quicklook_status_label.setText(progress_text or tr("正在下载…"))
+        elif found:
+            self.quicklook_download_btn.setText(tr("已下载"))
+            self.quicklook_download_btn.setEnabled(False)
+            self.quicklook_status_label.setText(tr("可用: {}").format(found))
+        else:
+            self.quicklook_download_btn.setText(tr("下载 QuickLook {}（约 60 MB）").format(QUICKLOOK_VERSION))
+            self.quicklook_download_btn.setEnabled(True)
+            self.quicklook_status_label.setText(tr("未下载，启用前请先下载。"))
+
+    def _on_quicklook_download_clicked(self):
+        from .quicklook import QuickLookInstallWorker
+        worker = self._quicklook_worker
+        if worker is not None:
+            worker.requestInterruption()
+            self.quicklook_download_btn.setEnabled(False)
+            self.quicklook_status_label.setText(tr("正在取消…"))
+            return
+        worker = QuickLookInstallWorker(self)
+        worker.progressed.connect(self._on_quicklook_progress)
+        worker.completed.connect(self._on_quicklook_done)
+        self._quicklook_worker = worker
+        self._refresh_quicklook_status()
+        worker.start()
+
+    def _on_quicklook_progress(self, done, total):
+        percent = int(done * 100 / total) if total else 0
+        self._refresh_quicklook_status(tr("正在下载… {}%（{:.1f} / {:.1f} MB）").format(percent, done / 1048576, total / 1048576))
+
+    def _on_quicklook_done(self, ok, error):
+        worker, self._quicklook_worker = self._quicklook_worker, None
+        if worker is not None:
+            worker.wait(2000)
+        self._refresh_quicklook_status()
+        if ok:
+            show_toast(self.parent() or self, tr("成功"), tr("QuickLook 已下载完成"), level="success")
+        elif error:
+            self.quicklook_status_label.setText(tr("下载失败: {}（再次点击可从断点继续）").format(error))
+
+    def done(self, result):
+        # 关闭设置窗口时中断下载，已下载的部分保留，下次从断点继续
+        worker, self._quicklook_worker = getattr(self, '_quicklook_worker', None), None
+        if worker is not None:
+            from .system import _retain_thread_until_finished
+            worker.requestInterruption()
+            _retain_thread_until_finished(worker)
+        super().done(result)
+
     def _create_hotkey_group(self, config, compact_widget):
         """每个命令一行：启用开关 + 按键录制框 + 清空按钮；共用开关的命令联动勾选。"""
         from PyQt5.QtWidgets import QGroupBox, QGridLayout, QKeySequenceEdit, QToolButton, QScrollArea, QWidget
@@ -792,6 +874,7 @@ class SettingsDialog(QDialog):
             self.parent().config["enable_cache_tabs"] = self.cache_tabs_cb.isChecked()
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
             self.parent().config["preferred_terminal_tool"] = normalize_terminal_tool_name(self.preferred_terminal_combo.currentData())
+            self.parent().config["quicklook_enabled"] = self.quicklook_cb.isChecked()
             # 保存路径栏分隔符设置
             self.parent().config["breadcrumb_copy_separator"] = self.path_separator_combo.currentData()
             

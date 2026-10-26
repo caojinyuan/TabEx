@@ -39,6 +39,10 @@ from .hotkeys import (
     _TOOLBAR_HOTKEY_TOOLTIPS,
 )
 from .title_shortcuts import TitleShortcutBar
+from .quicklook import (
+    find_quicklook, foreground_focus_class_name, is_file_view_focus_class, is_typing_key, preview as quicklook_preview,
+    stop_owned_process as stop_quicklook, TYPING_GUARD_SECONDS,
+)
 from .widgets import (
     _active_toasts, _build_te_icon, _pinned_tab_icon, ResizableSplitter, _set_tool_icon, show_toast,
 )
@@ -3334,12 +3338,39 @@ class MainWindow(QMainWindow):
 
     def _on_shortcut_key(self, vk, ctrl, shift, alt):
         try:
+            if is_typing_key(vk, ctrl, alt):
+                self._last_typing_key_at = time.monotonic()
             # 钩子只上报新的按下事件，不存在轮询的残留按键问题，无需等待修饰键松开
             blocked, _foreground = self._shortcut_gate(wait_for_release=False)
-            if not blocked:
-                self._run_shortcut(vk, ctrl, shift, alt)
+            if blocked:
+                return
+            if vk == 0x20 and not (ctrl or shift or alt):
+                self._quicklook_preview_selection()
+                return
+            self._run_shortcut(vk, ctrl, shift, alt)
         except Exception as e:
             debug_print(f"[ShortcutHook] dispatch error: {e}")
+
+    def _quicklook_preview_selection(self):
+        """空格键：用 QuickLook 预览文件列表中选中的第一项；未启用或未下载时不做任何事。"""
+        if not self.config.get("quicklook_enabled", False):
+            return
+        if time.monotonic() - getattr(self, '_last_typing_key_at', 0) < TYPING_GUARD_SECONDS:
+            return
+        focus_class = foreground_focus_class_name()
+        if not is_file_view_focus_class(focus_class):
+            debug_print(f"[QuickLook] skipped, focus class={focus_class!r}")
+            return
+        executable = find_quicklook()
+        if executable is None:
+            show_toast(self, tr("提示"), tr("尚未下载 QuickLook，请在 设置 → 工具集成 中下载"), level="info")
+            return
+        tab = self.get_active_pane()
+        paths = tab._get_selected_paths() if tab is not None and hasattr(tab, '_get_selected_paths') else []
+        path = next((item for item in (paths or []) if item), None)
+        if path:
+            debug_print(f"[QuickLook] preview {path} (focus class={focus_class!r})")
+            quicklook_preview(path, executable)
 
     def _check_shortcuts(self):
         """轮询兜底：仅在键盘钩子安装失败时运行。"""
@@ -3747,6 +3778,7 @@ class MainWindow(QMainWindow):
             self.config["enable_cache_tabs"] = dlg.cache_tabs_cb.isChecked()
             self.config["enable_tortoisegit_buttons"] = dlg.tortoisegit_buttons_cb.isChecked()
             self.config["preferred_terminal_tool"] = normalize_terminal_tool_name(dlg.preferred_terminal_combo.currentData())
+            self.config["quicklook_enabled"] = dlg.quicklook_cb.isChecked()
             self.config["enable_title_shortcuts"] = dlg.title_shortcuts_cb.isChecked()
             self.config["enable_mouse_gestures"] = dlg.mouse_gestures_cb.isChecked()
             self.config["file_op_max_workers"] = dlg.file_op_workers_spin.value()
@@ -5517,6 +5549,7 @@ class MainWindow(QMainWindow):
             self._stop_shortcut_listener()
         except Exception as e:
             print(f"Error stopping shortcut hook: {e}")
+        stop_quicklook()
 
         for timer_name in (
             '_shortcut_timer',
