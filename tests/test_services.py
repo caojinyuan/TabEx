@@ -430,6 +430,48 @@ class QuickLookTests(unittest.TestCase):
         first.terminate.assert_called_once()
         forwarder.terminate.assert_not_called()
 
+    def test_only_visible_quicklook_window_gets_taskbar_button(self):
+        """只处理可见的 QuickLook 顶层窗口；隐藏的消息窗口和其他程序的窗口不受影响。"""
+        cls = 'HwndWrapper[QuickLook.exe;;1d018446-ab1d-44f4-9144-1db0b71f72b0]'
+        self.assertTrue(self.quicklook.is_preview_window(cls, True))
+        self.assertFalse(self.quicklook.is_preview_window(cls, False))
+        self.assertFalse(self.quicklook.is_preview_window('HwndWrapper[Other.exe;;x]', True))
+        self.assertFalse(self.quicklook.is_preview_window('', True))
+        self.assertEqual(len(self.quicklook.show_preview_in_taskbar()), 2)
+
+    def test_taskbar_watcher_waits_for_slow_window_then_stops(self):
+        """窗口迟迟不出现时持续等待至超时；窗口出现后持续监视，关闭后且超时才停止。"""
+        from PyQt5.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        watcher = self.quicklook.QuickLookTaskbarWatcher()
+        self.addCleanup(watcher.deleteLater)
+        results = iter([(0, 0), (1, 1), (1, 0), (0, 0)])
+        with patch.object(self.quicklook, 'show_preview_in_taskbar', side_effect=lambda: next(results)):
+            watcher.watch()
+            self.assertTrue(watcher._timer.isActive())
+            watcher._tick()   # 窗口出现并加上样式
+            watcher._tick()   # 窗口仍在，继续监视
+            self.assertTrue(watcher._timer.isActive())
+            watcher._deadline = 0
+            watcher._tick()   # 窗口已关闭且超过监视时限
+        self.assertFalse(watcher._timer.isActive())
+
+    def test_idle_quicklook_is_stopped_but_recent_one_is_kept(self):
+        """空闲超时才结束本程序启动的 QuickLook；刚用过的保留，结束后可再次启动。"""
+        process = Mock()
+        process.poll.return_value = None
+        process.pid = 4321
+        self.quicklook._owned_process = None
+        with patch('subprocess.Popen', return_value=process):
+            self.assertTrue(self.quicklook.preview(r'C:\a.txt', r'C:\ql\QuickLook.exe'))
+        self.assertEqual(self.quicklook.owned_process_id(), 4321)
+        self.assertFalse(self.quicklook.stop_owned_process_if_idle(timeout_s=3600))
+        process.terminate.assert_not_called()
+        self.assertTrue(self.quicklook.stop_owned_process_if_idle(timeout_s=0))
+        process.terminate.assert_called_once()
+        self.assertIsNone(self.quicklook.owned_process_id())
+        self.assertFalse(self.quicklook.stop_owned_process_if_idle(timeout_s=0))
+
 
 class ConfigStoreTests(unittest.TestCase):
     def test_invalid_field_types_do_not_discard_unrelated_settings(self):

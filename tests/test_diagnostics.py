@@ -390,7 +390,9 @@ class QtDiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertEqual((lines[-1]['tabs'], lines[-1]['hibernated_tabs']), (2, 1))
         self.assertEqual(set(lines[-1]), {
-            'rss_mb', 'python_threads', 'thread_names', 'tabs', 'hibernated_tabs',
+            'rss_mb', 'commit_mb', 'handles', 'gdi_objects', 'user_objects',
+            'quicklook_commit_mb', 'quicklook_handles',
+            'python_threads', 'thread_names', 'tabs', 'hibernated_tabs',
             'running_background_threads', 'running_tasks', 'search_windows', 'toasts', 'time'})
 
     def test_startup_falls_back_when_primary_directory_is_read_only(self):

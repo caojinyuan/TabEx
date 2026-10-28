@@ -28,7 +28,7 @@ from .constants import (
 )
 from .debuglog import _DEBUG_LOG_PATH, debug_print, set_debug_mode, set_explorer_monitor_debug
 from .system import (
-    get_process_memory_usage_mb, get_system_cpu_percent, get_system_memory_status, HAS_PYWIN,
+    get_process_memory_usage_mb, get_process_resources, get_system_cpu_percent, get_system_memory_status, HAS_PYWIN,
     is_supported_title_shortcut_path, launch_detached, launch_shell_tool, normalize_external_launch_dir,
     normalize_terminal_tool_name, _retain_thread_until_finished, _retained_background_threads,
     _thread_name_summary,
@@ -41,8 +41,10 @@ from .hotkeys import (
 )
 from .title_shortcuts import TitleShortcutBar
 from .quicklook import (
-    find_quicklook, foreground_focus_class_name, is_file_view_focus_class, is_typing_key, preview as quicklook_preview,
-    stop_owned_process as stop_quicklook, TYPING_GUARD_SECONDS,
+    find_quicklook, foreground_focus_class_name, is_file_view_focus_class, is_typing_key, owned_process_id as quicklook_pid,
+    preview as quicklook_preview, QuickLookTaskbarWatcher,
+    stop_owned_process as stop_quicklook, stop_owned_process_if_idle as stop_quicklook_if_idle,
+    TYPING_GUARD_SECONDS,
 )
 from .widgets import (
     _active_toasts, _build_te_icon, _pinned_tab_icon, ResizableSplitter, _set_tool_icon, show_toast,
@@ -3372,7 +3374,11 @@ class MainWindow(QMainWindow):
         path = next((item for item in (paths or []) if item), None)
         if path:
             debug_print(f"[QuickLook] preview {path} (focus class={focus_class!r})")
-            quicklook_preview(path, executable)
+            if quicklook_preview(path, executable):
+                watcher = getattr(self, '_quicklook_taskbar_watcher', None)
+                if watcher is None:
+                    watcher = self._quicklook_taskbar_watcher = QuickLookTaskbarWatcher(self)
+                watcher.watch()
 
     def _check_shortcuts(self):
         """轮询兜底：仅在键盘钩子安装失败时运行。"""
@@ -3693,10 +3699,13 @@ class MainWindow(QMainWindow):
                 hibernated += sum(bool(getattr(stack.widget(index), '_hibernated', False))
                                   for index in range(stack.count()))
             rss_mb = get_process_memory_usage_mb()
+            resources = get_process_resources() or {}
+            quicklook_process = quicklook_pid()
+            quicklook = get_process_resources(quicklook_process) if quicklook_process else None
             _debuglog._diagnostics.snapshot({
                 'qt': QT_VERSION_STR, 'pyqt': PYQT_VERSION_STR,
                 'tabs_per_group': groups, 'split': bool(getattr(self, '_split_active', False)),
-                'python_threads': threading.active_count(), 'rss_mb': rss_mb,
+                'python_threads': threading.active_count(), 'rss_mb': rss_mb, **resources,
                 'retained_threads': retained[:100], 'tasks': tasks, 'task_count': len(records),
                 'search_windows': len(getattr(self, 'search_dialogs', []) or []),
             })
@@ -3704,7 +3713,10 @@ class MainWindow(QMainWindow):
             if now - getattr(self, '_last_resource_sample', -RESOURCE_SAMPLE_INTERVAL_S) >= RESOURCE_SAMPLE_INTERVAL_S:
                 self._last_resource_sample = now
                 _debuglog._diagnostics.sample({
-                    'rss_mb': rss_mb, 'python_threads': threading.active_count(),
+                    'rss_mb': rss_mb, **resources,
+                    'quicklook_commit_mb': quicklook['commit_mb'] if quicklook else None,
+                    'quicklook_handles': quicklook['handles'] if quicklook else None,
+                    'python_threads': threading.active_count(),
                     'thread_names': _thread_name_summary(),
                     'tabs': sum(groups), 'hibernated_tabs': hibernated,
                     'running_background_threads': sum(1 for item in retained if item['running']),
@@ -4461,6 +4473,7 @@ class MainWindow(QMainWindow):
         self._housekeeping_runs += 1
         removed_dialogs = self._prune_search_dialog_refs()
         removed_toasts = self._prune_toast_refs()
+        stop_quicklook_if_idle()
         if not self.isActiveWindow():
             self._last_keys_state.clear()
 

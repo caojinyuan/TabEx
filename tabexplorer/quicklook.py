@@ -11,7 +11,7 @@ import subprocess
 import time
 import urllib.request
 
-from PyQt5.QtCore import pyqtSignal, QThread
+from PyQt5.QtCore import pyqtSignal, QObject, QThread, QTimer
 
 from .debuglog import debug_print
 from .i18n import tr
@@ -30,6 +30,9 @@ _NON_FILE_VIEW_CLASS_PARTS = ('edit', 'combobox', 'systreeview', 'qt', 'scintill
 TYPING_GUARD_SECONDS = 0.8
 
 _owned_process = None
+_last_preview_at = None
+# 本程序启动的 QuickLook 常驻后台且内存随预览累积，空闲超过该时长后结束，下次预览时自动重新启动
+QUICKLOOK_IDLE_TIMEOUT_S = 20 * 60
 
 
 class QuickLookCancelled(Exception):
@@ -103,7 +106,7 @@ def foreground_focus_class_name():
 
 def preview(path, executable=None):
     """让 QuickLook 预览（或再次调用时关闭预览）指定路径；QuickLook 未运行时会先启动。"""
-    global _owned_process
+    global _owned_process, _last_preview_at
     executable = executable or find_quicklook()
     if not executable or not path:
         return False
@@ -112,10 +115,132 @@ def preview(path, executable=None):
     except OSError as error:
         debug_print(f"[QuickLook] launch failed: {error}")
         return False
+    _last_preview_at = time.monotonic()
     # 第一个实例会常驻托盘；之后再启动的进程只是把路径转交给它并立即退出
     if _owned_process is None or _owned_process.poll() is not None:
         _owned_process = process
     return True
+
+
+_WS_EX_APPWINDOW = 0x00040000
+_GWL_EXSTYLE = -20
+# SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+_SWP_REFRESH_FRAME = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020
+_PREVIEW_CLASS_PREFIX = 'HwndWrapper[QuickLook.exe'
+
+
+def is_preview_window(class_name, visible):
+    """可见的 QuickLook WPF 顶层窗口即预览窗口（其余同类窗口都是隐藏的消息窗口）。"""
+    return bool(visible) and str(class_name or '').startswith(_PREVIEW_CLASS_PREFIX)
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [('a', ctypes.c_ulong), ('b', ctypes.c_ushort), ('c', ctypes.c_ushort), ('d', ctypes.c_ubyte * 8)]
+
+
+def _guid(text):
+    value = _GUID()
+    ctypes.windll.ole32.CLSIDFromString(text, ctypes.byref(value))
+    return value
+
+
+def _add_taskbar_tab(hwnd):
+    """用 ITaskbarList::AddTab 让任务栏立即为 hwnd 建按钮；失败返回 False。
+
+    任务栏只在窗口显示的瞬间判断是否建按钮，窗口已显示后再改样式不会被重新评估。"""
+    ole32 = ctypes.windll.ole32
+    taskbar = ctypes.c_void_p()
+    if ole32.CoCreateInstance(ctypes.byref(_guid('{56FDF344-FD6D-11d0-958A-006097C9A090}')), None, 1,
+                              ctypes.byref(_guid('{56FDF342-FD6D-11d0-958A-006097C9A090}')),
+                              ctypes.byref(taskbar)) != 0 or not taskbar.value:
+        return False
+    # ITaskbarList 虚函数表：QueryInterface(0) AddRef(1) Release(2) HrInit(3) AddTab(4)
+    methods = ctypes.cast(ctypes.cast(taskbar, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+    this = ctypes.c_void_p
+    try:
+        if ctypes.WINFUNCTYPE(ctypes.c_long, this)(methods[3])(taskbar) != 0:
+            return False
+        return ctypes.WINFUNCTYPE(ctypes.c_long, this, ctypes.wintypes.HWND)(methods[4])(taskbar, hwnd) == 0
+    finally:
+        ctypes.WINFUNCTYPE(ctypes.c_ulong, this)(methods[2])(taskbar)
+
+
+def show_preview_in_taskbar():
+    """让正在显示的 QuickLook 预览窗口出现在任务栏（QuickLook 默认给它挂了隐藏的 owner 窗口，不显示任务栏按钮）。
+
+    只改窗口扩展样式并通知任务栏，可重复调用；返回 (可见的预览窗口数, 本次新加任务栏按钮的窗口数)。"""
+    visible, updated = [], []
+    try:
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        get_long = getattr(user32, 'GetWindowLongPtrW', None) or user32.GetWindowLongW
+        set_long = getattr(user32, 'SetWindowLongPtrW', None) or user32.SetWindowLongW
+        get_long.argtypes = [ctypes.wintypes.HWND, ctypes.c_int]
+        get_long.restype = ctypes.c_ssize_t
+        set_long.argtypes = [ctypes.wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+        set_long.restype = ctypes.c_ssize_t
+        user32.SetWindowPos.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        user32.IsWindowVisible.argtypes = [ctypes.wintypes.HWND]
+        user32.ShowWindow.argtypes = [ctypes.wintypes.HWND, ctypes.c_int]
+        user32.GetClassNameW.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.LPWSTR, ctypes.c_int]
+        callback_type = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        name = ctypes.create_unicode_buffer(128)
+
+        def visit(hwnd, _lparam):
+            if user32.GetClassNameW(hwnd, name, len(name)) and is_preview_window(name.value, user32.IsWindowVisible(hwnd)):
+                visible.append(hwnd)
+                style = get_long(hwnd, _GWL_EXSTYLE)
+                if not style & _WS_EX_APPWINDOW:
+                    set_long(hwnd, _GWL_EXSTYLE, style | _WS_EX_APPWINDOW)
+                    user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, _SWP_REFRESH_FRAME)
+                    if not _add_taskbar_tab(hwnd):
+                        # 兜底：隐藏再显示会让任务栏重新评估该窗口
+                        user32.ShowWindow(hwnd, 0)
+                        user32.ShowWindow(hwnd, 8)
+                    updated.append(hwnd)
+            return True
+
+        user32.EnumWindows.argtypes = [callback_type, ctypes.wintypes.LPARAM]
+        user32.EnumWindows(callback_type(visit), 0)
+    except Exception as error:
+        debug_print(f"[QuickLook] taskbar button failed: {error}")
+    return len(visible), len(updated)
+
+
+class QuickLookTaskbarWatcher(QObject):
+    """按空格预览后持续监视 QuickLook 预览窗口并补上任务栏按钮。
+
+    QuickLook 要等内容加载完才显示窗口（大文件可能十几秒），且每次关闭后再预览都会新建窗口，
+    所以不能只在固定时间点检查：开始监视后最长 WATCH_SECONDS 秒内等待窗口出现，窗口存在期间持续保持。"""
+
+    WATCH_SECONDS = 60
+    INTERVAL_MS = 200
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._deadline = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.INTERVAL_MS)
+        self._timer.timeout.connect(self._tick)
+
+    def watch(self):
+        self._deadline = time.monotonic() + self.WATCH_SECONDS
+        if not self._timer.isActive():
+            self._timer.start()
+        self._tick()
+
+    def _tick(self):
+        visible, _updated = show_preview_in_taskbar()
+        if not visible and time.monotonic() >= self._deadline:
+            self._timer.stop()
+
+
+def owned_process_id():
+    """本程序启动且仍在运行的 QuickLook 进程号；没有则返回 None。"""
+    process = _owned_process
+    if process is not None and process.poll() is None:
+        return process.pid
+    return None
 
 
 def stop_owned_process():
@@ -127,6 +252,17 @@ def stop_owned_process():
             process.terminate()
         except OSError:
             pass
+
+
+def stop_owned_process_if_idle(timeout_s=QUICKLOOK_IDLE_TIMEOUT_S):
+    """本程序启动的 QuickLook 空闲超过 timeout_s 秒则结束并释放其内存；返回是否已结束。"""
+    if owned_process_id() is None or _last_preview_at is None:
+        return False
+    if time.monotonic() - _last_preview_at < timeout_s:
+        return False
+    debug_print("[QuickLook] stopping idle QuickLook to release memory")
+    stop_owned_process()
+    return True
 
 
 def _file_sha256(path):

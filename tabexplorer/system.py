@@ -86,6 +86,65 @@ def get_process_memory_usage_mb():
     return None
 
 
+def get_process_resources(pid=None):
+    """返回进程的私有提交内存(MB)、句柄数、GDI 与 USER 对象数；pid 缺省为当前进程，失败返回 None。
+
+    工作集会被系统裁剪，无法反映真实占用；私有提交内存、句柄和 GDI/USER 对象才是判断泄漏的依据。"""
+    if os.name != 'nt':
+        return None
+    handle = None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD),
+                ('PeakWorkingSetSize', ctypes.c_size_t), ('WorkingSetSize', ctypes.c_size_t),
+                ('QuotaPeakPagedPoolUsage', ctypes.c_size_t), ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t), ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                ('PagefileUsage', ctypes.c_size_t), ('PeakPagefileUsage', ctypes.c_size_t),
+                ('PrivateUsage', ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        psapi = ctypes.WinDLL('psapi', use_last_error=True)
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.GetProcessHandleCount.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(COUNTERS), wintypes.DWORD]
+        user32.GetGuiResources.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        user32.GetGuiResources.restype = wintypes.DWORD
+
+        if pid is None:
+            target = kernel32.GetCurrentProcess()
+        else:
+            # PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION
+            target = handle = kernel32.OpenProcess(0x0400 | 0x1000, False, int(pid))
+            if not target:
+                return None
+        counters = COUNTERS()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(target, ctypes.byref(counters), counters.cb):
+            return None
+        handles = wintypes.DWORD(0)
+        kernel32.GetProcessHandleCount(target, ctypes.byref(handles))
+        return {
+            'commit_mb': round(float(counters.PrivateUsage) / (1024 * 1024), 2),
+            'handles': int(handles.value),
+            'gdi_objects': int(user32.GetGuiResources(target, 0)),
+            'user_objects': int(user32.GetGuiResources(target, 1)),
+        }
+    except Exception:
+        return None
+    finally:
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+
+
 # CPU 占用率采样状态（进程 CPU 时间 / 挂钟时间 增量法，无 psutil 依赖）
 _cpu_last_proc_time = None
 _cpu_last_wall_time = None
