@@ -3673,6 +3673,7 @@ class MainWindow(QMainWindow):
     def _capture_diagnostic_snapshot(self):
         if _debuglog._diagnostics is None:
             return
+        _debuglog._diagnostics.heartbeat()
         from PyQt5.QtCore import QT_VERSION_STR, PYQT_VERSION_STR
         try:
             panel = getattr(self, '_file_task_panel', None)

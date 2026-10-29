@@ -190,6 +190,27 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn('test_real_thread_dump', content)
         self.assertNotIn(str(Path(__file__).resolve().parent), content)
 
+    def test_hang_watchdog_dumps_stack_when_heartbeat_stops_and_close_cancels(self):
+        """心跳停止超时后自动写入线程栈；心跳持续或关闭后不写入。"""
+        import time
+        path = self.diagnostics.session / 'fault.log'
+        with path.open('ab', buffering=0) as target:
+            self.diagnostics.fault_file = target
+            try:
+                self.diagnostics.heartbeat(0.2)
+                self.diagnostics.heartbeat(0.5)
+                time.sleep(0.3)
+                self.assertEqual(path.stat().st_size, 0)
+                time.sleep(0.6)
+                self.assertGreater(path.stat().st_size, 0)
+                size = path.stat().st_size
+                self.diagnostics.heartbeat(0.2)
+                self.diagnostics.close()
+                time.sleep(0.5)
+                self.assertEqual(path.stat().st_size, size)
+            finally:
+                self.diagnostics.fault_file = None
+
     def test_process_probe_recognizes_current_process(self):
         """进程存活检查识别当前进程及无效 PID，不终止任何进程。"""
         import os

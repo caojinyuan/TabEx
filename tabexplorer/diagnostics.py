@@ -17,6 +17,7 @@ import zipfile
 
 MAX_LOG_BYTES = 256 * 1024
 MAX_SESSIONS = 5
+HANG_DUMP_SECONDS = 30  # 须明显大于主线程 10 秒一次的心跳间隔
 SAFE_LOG_TAGS = (
     '[ClosedTabs]', '[TabSwitch]', '[DirPoll]', '[AutoRefresh]',
     '[FileWatcher]', '[FolderSizeChecker]', '[AsyncLoad]', '[IExplorerBrowser]',
@@ -225,7 +226,22 @@ class Diagnostics:
             except (OSError, RuntimeError):
                 pass
 
+    def heartbeat(self, timeout=HANG_DUMP_SECONDS):
+        """主线程定时调用以重置看门狗；若主线程卡死超过 timeout 秒，
+        faulthandler 的 C 级看门狗线程会把所有线程的栈写入 fault.log（无需 GIL）。"""
+        if self.fault_file is None:
+            return
+        try:
+            faulthandler.dump_traceback_later(timeout, repeat=False, file=self.fault_file)
+        except (OSError, RuntimeError, ValueError):
+            pass
+
     def close(self):
+        if self.fault_file is not None:
+            try:
+                faulthandler.cancel_dump_traceback_later()
+            except (OSError, RuntimeError):
+                pass
         self.state['ended'] = time.strftime('%Y-%m-%dT%H:%M:%S')
         self.mark('closed' if self.state['status'] == 'running' else self.state['status'])
         if self.previous_hooks is not None:
