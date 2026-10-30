@@ -916,14 +916,16 @@ class CustomTabBar(QTabBar):
         # 固定标签纠正仅适用于左侧主标签组
         if tw is not self.main_window.tab_widget:
             return
-        # 获取被移动的标签页
-        moved_tab = self.main_window.tab_widget.widget(to_index)
+        # 获取被移动的标签页：tab_widget 的页面只是占位，真实标签在已同步的 content_stack
+        if content_stack is None:
+            return
+        moved_tab = content_stack.widget(to_index)
         if not moved_tab:
             return
         is_pinned = getattr(moved_tab, 'is_pinned', False)
         pinned_count = 0
         for i in range(self.count()):
-            tab = self.main_window.tab_widget.widget(i)
+            tab = content_stack.widget(i)
             if tab and getattr(tab, 'is_pinned', False):
                 pinned_count += 1
         
@@ -931,6 +933,6 @@ class CustomTabBar(QTabBar):
         if is_pinned and to_index >= pinned_count:
             # 固定标签页不能移动到非固定区域，移回固定区域末尾
             self.moveTab(to_index, pinned_count - 1)
-        elif not is_pinned and to_index < pinned_count - 1:
+        elif not is_pinned and to_index < pinned_count:
             # 非固定标签页不能移动到固定区域，移到非固定区域开头
             self.moveTab(to_index, pinned_count)

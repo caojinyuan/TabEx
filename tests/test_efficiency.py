@@ -349,3 +349,105 @@ class RuntimeIdentityTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class MenuLifecycleTests(QtTests):
+    def test_temporary_menus_and_rebuilt_submenus_are_released(self):
+        from PyQt5.QtCore import QPoint, QTimer
+        from PyQt5.QtWidgets import QMenu, QMenuBar
+        from tabexplorer.menus import clear_menu, exec_menu
+        owner = QWidget()
+        self.addCleanup(owner.deleteLater)
+        for _ in range(3):
+            menu = QMenu(owner)
+            chosen = menu.addAction('a')
+            QTimer.singleShot(20, lambda m=menu, a=chosen: (m.setActiveAction(a), m.close()))
+            exec_menu(menu, QPoint(0, 0))
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.assertEqual(owner.findChildren(QMenu), [])
+        bar = QMenuBar(owner)
+        for _ in range(4):
+            clear_menu(bar)
+            bar.addMenu('folder').addMenu('nested')
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.assertEqual(len(bar.findChildren(QMenu)), 2)
+        self.assertEqual(len(bar.actions()), 1)
+
+    def test_newer_view_mode_schedule_cancels_stale_retries(self):
+        from unittest.mock import call
+        from tabexplorer.explorer_tab import FileExplorerTab
+        host = types.SimpleNamespace(_is_cleaning_up=False,
+                                     _set_ieb_current_view_mode=Mock(return_value='unchanged'))
+        FileExplorerTab._schedule_view_mode(host, 4, (0, 20), 'details')
+        FileExplorerTab._schedule_view_mode(host, 6, (5,), 'tile')
+        QTest.qWait(80)
+        self.assertEqual(host._set_ieb_current_view_mode.call_args_list, [call(6)])
+
+    def test_minimize_pauses_visible_tabs_and_restore_resumes_only_current(self):
+        def make_tab():
+            tab = types.SimpleNamespace(_refresh_active=True)
+            tab.set_refresh_active = Mock(side_effect=lambda active: setattr(tab, '_refresh_active', active))
+            return tab
+        left, right, other = make_tab(), make_tab(), make_tab()
+        current = {'left': left, 'right': right}
+        group = lambda key: (types.SimpleNamespace(currentIndex=lambda: 0),
+                             types.SimpleNamespace(widget=lambda _index: current[key]))
+        window = types.SimpleNamespace(_all_groups=lambda: [group('left'), group('right')])
+        MainWindow._pause_visible_tabs_for_minimize(window)
+        self.assertFalse(left._refresh_active or right._refresh_active)
+        current['right'] = other
+        MainWindow._resume_tabs_after_minimize(window)
+        self.assertTrue(left._refresh_active)
+        self.assertFalse(right._refresh_active)
+        other.set_refresh_active.assert_not_called()
+        self.assertEqual(window._minimize_paused_tabs, [])
+
+class ChunkedContentScanTests(unittest.TestCase):
+    def test_chunks_keep_boundary_matches_and_utf16_alignment(self):
+        import re as _re
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'big.txt'
+            text = 'x' * 900 + 'BEGIN-' + 'y' * 300 + '-END' + 'z' * 1000
+            path.write_bytes(text.encode('utf-8'))
+            overlap = search.content_chunk_overlap_bytes(r'BEGIN-y+-END', True)
+            chunks = list(search._iter_decoded_chunks(str(path), 'utf-8', 1024, min(overlap, 512), 10 ** 6))
+            self.assertTrue(any(_re.search(r'BEGIN-y+-END', chunk) for chunk in chunks))
+            # 旧实现按关键词长度×2 重叠时，该跨块正则匹配会漏掉
+            narrow = list(search._iter_decoded_chunks(str(path), 'utf-8', 1024, 24, 10 ** 6))
+            self.assertFalse(any(_re.search(r'BEGIN-y+-END', chunk) for chunk in narrow))
+            wide = Path(directory) / 'wide.txt'
+            wide.write_bytes(('a' * 509 + '关键词' + 'b' * 600).encode('utf-16-le'))
+            chunks = list(search._iter_decoded_chunks(str(wide), 'utf-16-le', 1024, 17, 10 ** 6))
+            self.assertTrue(any('关键词' in chunk for chunk in chunks))
+            limited = list(search._iter_decoded_chunks(str(wide), 'utf-16-le', 256, 16, 512))
+            self.assertEqual(len(limited), 2)
+        self.assertEqual(search.content_chunk_overlap_bytes('abc', False) % 2, 0)
+        self.assertGreaterEqual(search.content_chunk_overlap_bytes('a', True), search.REGEX_CHUNK_OVERLAP_BYTES)
+
+class ChatStreamingTests(unittest.TestCase):
+    def test_streaming_http_error_closes_response(self):
+        import requests
+        from tabexplorer.chat import ChatWorker
+        response = Mock()
+        response.raise_for_status.side_effect = requests.exceptions.HTTPError('500')
+        session = Mock()
+        session.post.return_value = response
+        worker = ChatWorker([], 'http://localhost', '', 'model', stream=True)
+        with self.assertRaises(requests.exceptions.HTTPError):
+            worker._request(session)
+        response.close.assert_called_once_with()
+
+class TabPageReleaseTests(QtTests):
+    def test_removing_tabs_releases_placeholder_pages(self):
+        from PyQt5.QtWidgets import QTabWidget
+        from tabexplorer.mainwindow import _remove_tab_and_page
+        tabs = QTabWidget()
+        self.addCleanup(tabs.deleteLater)
+        for index in range(5):
+            tabs.addTab(QWidget(), str(index))
+        for _ in range(4):
+            _remove_tab_and_page(tabs, 0)
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.assertEqual(tabs.count(), 1)
+        self.assertEqual(tabs.tabText(0), '4')
+        stacked = tabs.findChild(QWidget, 'qt_tabwidget_stackedwidget')
+        self.assertEqual(len(stacked.findChildren(QWidget, options=Qt.FindDirectChildrenOnly)), 1)

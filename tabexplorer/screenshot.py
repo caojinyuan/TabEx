@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import QApplication, QFileDialog, QFrame, QHBoxLayout, QLin
 
 from .debuglog import debug_print
 from .i18n import tr
+from .menus import exec_menu
 
 
 MIN_SELECTION = 2
@@ -961,7 +962,7 @@ class PinWindow(QWidget):
         menu.addAction(tr("保存..."), lambda: save_pixmap_dialog(self._base))
         menu.addSeparator()
         menu.addAction(tr("关闭"), self.close)
-        menu.exec_(event.globalPos())
+        exec_menu(menu, event.globalPos())
 
     def _copy(self):
         clean = QPixmap(self._base)

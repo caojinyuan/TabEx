@@ -3299,6 +3299,28 @@ class TabGroupTests(unittest.TestCase):
         host.close.assert_called_once_with()
         self.assertEqual(host.closed_tabs_history[0]['path'], 'C:\\O')
 
+    def test_reordering_inside_group_keeps_pinned_tabs_first(self):
+        """组内拖动：普通标签拖进固定区（含最后一个固定位）被移到固定区之后；固定标签拖出固定区被移回；标签与内容保持同步。"""
+        from PyQt5.QtWidgets import QStackedWidget, QTabWidget, QWidget
+        from tabexplorer.tabbar import CustomTabBar
+        host = self.host([])
+        tab_widget, stack, bar = QTabWidget(), QStackedWidget(), CustomTabBar()
+        tab_widget.setTabBar(bar)
+        bar.main_window, bar.owner_tabwidget = host, tab_widget
+        host.tab_widget, host.content_stack = tab_widget, stack
+        for tab in (self.make_tab('P1', pinned=True), self.make_tab('P2', pinned=True),
+                    self.make_tab('A'), self.make_tab('B')):
+            stack.addWidget(tab)
+            tab_widget.addTab(QWidget(), tab.current_path)
+        titles = lambda: [tab_widget.tabText(index) for index in range(tab_widget.count())]
+        bar.moveTab(3, 1)
+        self.assertEqual(self.paths(stack), ['P1', 'P2', 'B', 'A'])
+        self.assertEqual(titles(), self.paths(stack))
+        bar.moveTab(0, 3)
+        self.assertEqual(self.paths(stack), ['P2', 'P1', 'B', 'A'])
+        self.assertEqual(titles(), self.paths(stack))
+        bar._drag_end_timer.stop()
+
 
 class PathParsingTests(unittest.TestCase):
     """地址栏、面包屑、Explorer 位置、慢盘判断和快捷键门控，共 9 个用例。不访问真实网络路径。"""

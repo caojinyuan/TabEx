@@ -2,7 +2,7 @@
 
 面向 **Windows x64** 的多标签页文件浏览器，类似 Clover。保留原生 Windows 文件视图，并提供标签管理、左右分屏、搜索和常用工具。
 
-**当前源码版本：v4.05**。自动刷新改为原地刷新，保留选中项、滚动位置与视图模式；文件任务面板只保留最近 50 条已完成记录，详见[更新记录](docs/DESIGN.md#changes)。
+**当前源码版本：v4.06**。修复长时间运行的内存与句柄累积（菜单、对话框、标签占位页、ctypes 类型缓存），最小化时暂停目录轮询，修正拖动标签时固定标签不再保持在最左侧的问题，详见[更新记录](docs/DESIGN.md#changes)。
 
 [下载发布版](https://github.com/caojinyuan/TabEx/releases/latest) · [快速开始](#quickstart) · [使用说明](#usage) · [快捷键](#shortcuts) · [设计文档](docs/DESIGN.md)
 

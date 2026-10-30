@@ -7,7 +7,7 @@ from unittest.mock import DEFAULT, MagicMock, patch
 ROOT = Path(__file__).resolve().parents[1]
 # 由底层到上层排列：同名对象以最先出现的模块（即定义处）为准
 MODULE_NAMES = (
-    'paths', 'i18n', 'constants', 'debuglog', 'json_store', 'theme', 'diagnostics', 'system', 'quicklook', 'hotkeys', 'title_shortcuts',
+    'paths', 'i18n', 'constants', 'debuglog', 'json_store', 'theme', 'menus', 'diagnostics', 'system', 'quicklook', 'hotkeys', 'title_shortcuts',
     'widgets', 'commands', 'context_tools', 'updates', 'workers', 'search', 'frequent', 'fileops', 'file_basket', 'pathbar', 'bookmarks', 'shellview', 'netstatus', 'screenshot',
     'navigation', 'explorer_tab', 'tabbar', 'ai_actions', 'chat', 'settings', 'persistence', 'mainwindow', 'app',
 )

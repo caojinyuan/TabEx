@@ -9,6 +9,7 @@ from PyQt5.QtGui import QDrag, QIcon
 from PyQt5.QtWidgets import QApplication, QFileIconProvider, QHBoxLayout, QLabel, QMenu, QToolButton, QWidget
 
 from . import theme as _theme
+from .menus import exec_menu
 from .i18n import tr
 from .system import is_supported_title_shortcut_path
 
@@ -364,7 +365,7 @@ class TitleShortcutBar(QWidget):
         ))
         open_dir_action = menu.addAction(tr("打开所在目录"))
         remove_action = menu.addAction(tr("移除该快捷方式"))
-        action = menu.exec_(btn.mapToGlobal(pos))
+        action = exec_menu(menu, btn.mapToGlobal(pos))
         if action == open_dir_action:
             self._open_containing_folder(path)
         elif action == remove_action:

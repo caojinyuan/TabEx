@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import QApplication, QLineEdit, QMenu, QWidget
 
 from . import debuglog as _debuglog
 from . import theme as _theme
+from .menus import exec_menu
 from .i18n import tr
 from .debuglog import debug_print
 
@@ -84,7 +85,7 @@ class SimplePathBar(QWidget):
     def set_path(self, path):
         new_path = path or ''
         path_changed = (new_path != self._current_path)
-        if _debuglog._DEBUG_MODE:
+        if _debuglog._DEBUG_MODE and (path_changed or self._in_edit):
             debug_print(f"[SimplePathBar] set_path: new='{new_path}', old='{self._current_path}', changed={path_changed}, in_edit={self._in_edit}")
         self._current_path = new_path
         if self._in_edit:
@@ -407,7 +408,7 @@ class SimplePathBar(QWidget):
                     except Exception:
                         pass
                     act.triggered.connect(lambda _=False, p=full: self.pathChanged.emit(p))
-            menu.exec_(QCursor.pos())
+            exec_menu(menu, QCursor.pos())
         except Exception as e:
             debug_print(f"[SimplePathBar] sibling menu error: {e}")
 

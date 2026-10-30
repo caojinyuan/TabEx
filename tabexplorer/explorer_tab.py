@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (
 )
 
 from . import theme as _theme
+from .menus import exec_menu
 from .paths import get_app_base_dir
 from .i18n import tr
 from .constants import (
@@ -1093,7 +1094,9 @@ class FileExplorerTab(QWidget, NavigationMixin):
         return '{20d04fe0-3aea-1069-a2d8-08002b30309d}' in s
 
     def _set_ieb_current_view_mode(self, view_mode):
-        """通过 IFolderView::SetCurrentViewMode 设置 IExplorerBrowser 视图模式。"""
+        """通过 IFolderView::SetCurrentViewMode 设置 IExplorerBrowser 视图模式。
+
+        返回 True 表示已设置，'unchanged' 表示已是目标模式（未调用 Set），False 表示失败。"""
         try:
             if not isinstance(self.explorer, IExplorerBrowserWidget):
                 return False
@@ -1130,6 +1133,13 @@ class FileExplorerTab(QWidget, NavigationMixin):
                     # IFolderView vtable: QI(0), AddRef(1), Release(2),
                     # GetCurrentViewMode(3), SetCurrentViewMode(4)
                     fv_vtbl = ctypes.c_void_p.from_address(fv_ptr.value).value
+                    get_mode_addr = ctypes.c_void_p.from_address(fv_vtbl + 3 * _vp_size).value
+                    _GET_VIEW_MODE = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                                        ctypes.POINTER(ctypes.c_uint))
+                    current_mode = ctypes.c_uint(0)
+                    if (_GET_VIEW_MODE(get_mode_addr)(fv_ptr.value, ctypes.byref(current_mode)) == 0
+                            and current_mode.value == int(view_mode)):
+                        return 'unchanged'
                     set_mode_addr = ctypes.c_void_p.from_address(fv_vtbl + 4 * _vp_size).value
                     _SET_VIEW_MODE = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_uint)
                     hr_set = _SET_VIEW_MODE(set_mode_addr)(fv_ptr.value, int(view_mode))
@@ -1149,15 +1159,7 @@ class FileExplorerTab(QWidget, NavigationMixin):
 
     def _force_tile_view_for_this_pc(self):
         """将“此电脑”视图强制切换到平铺（FVM_TILE=6）。"""
-        FVM_TILE = 6
-        delays_ms = (0, 140, 320, 620, 980, 1450)
-
-        def _try_force():
-            ok = self._set_ieb_current_view_mode(FVM_TILE)
-            debug_print(f"[ViewMode] force tile attempt ok={ok}")
-
-        for d in delays_ms:
-            QTimer.singleShot(d, _try_force)
+        self._schedule_view_mode(6, (0, 140, 320, 620, 980, 1450), "tile")
 
     def _force_details_view_for_local_path(self, local_path):
         """进入本地/UNC目录时强制详细视图（FVM_DETAILS=4）。"""
@@ -1176,12 +1178,22 @@ class FileExplorerTab(QWidget, NavigationMixin):
         except Exception:
             return
 
-        FVM_DETAILS = 4
-        delays_ms = (0, 120, 280, 520)
+        self._schedule_view_mode(4, (0, 120, 280, 520), f"details path='{local_path}'")
+
+    def _schedule_view_mode(self, view_mode, delays_ms, label):
+        """多次重试设置视图模式（新视图异步创建后可能被重置）。
+
+        新一轮调度会作废旧一轮的剩余重试，避免快速切换时旧目标覆盖新视图；
+        已是目标模式时不重复调用 Set，且仅在实际变更或失败时记录日志。"""
+        generation = getattr(self, '_view_mode_generation', 0) + 1
+        self._view_mode_generation = generation
 
         def _try_force():
-            ok = self._set_ieb_current_view_mode(FVM_DETAILS)
-            debug_print(f"[ViewMode] force details attempt ok={ok} path='{local_path}'")
+            if generation != self._view_mode_generation or getattr(self, '_is_cleaning_up', False):
+                return
+            result = self._set_ieb_current_view_mode(view_mode)
+            if result != 'unchanged':
+                debug_print(f"[ViewMode] force {label} ok={result}")
 
         for d in delays_ms:
             QTimer.singleShot(d, _try_force)
@@ -3294,7 +3306,7 @@ class FileExplorerTab(QWidget, NavigationMixin):
 
             menu.addSeparator()
 
-        menu.exec_(global_pos)
+        exec_menu(menu, global_pos)
         return True
 
     def quick_copy_selected_paths(self, selected_paths):

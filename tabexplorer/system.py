@@ -42,44 +42,70 @@ def format_file_size(size_bytes):
     return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
 
 
-def get_process_memory_usage_mb():
-    """Return current process working set in MB on Windows, else None."""
+def _init_win_process_api():
+    """进程信息相关 Win32 结构与函数只定义一次：函数内定义 ctypes 结构并调用 POINTER()
+    会在 ctypes 全局指针类型缓存中永久留下新类，周期调用时持续泄漏。"""
     if os.name != 'nt':
         return None
-    try:
-        import ctypes
-        from ctypes import wintypes
+    import ctypes
+    import types
+    from ctypes import wintypes
 
-        class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
-            _fields_ = [
-                ('cb', wintypes.DWORD),
-                ('PageFaultCount', wintypes.DWORD),
-                ('PeakWorkingSetSize', ctypes.c_size_t),
-                ('WorkingSetSize', ctypes.c_size_t),
-                ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
-                ('QuotaPagedPoolUsage', ctypes.c_size_t),
-                ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
-                ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
-                ('PagefileUsage', ctypes.c_size_t),
-                ('PeakPagefileUsage', ctypes.c_size_t),
-                ('PrivateUsage', ctypes.c_size_t),
-            ]
-
-        counters = PROCESS_MEMORY_COUNTERS_EX()
-        counters.cb = ctypes.sizeof(counters)
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        psapi = ctypes.WinDLL('psapi', use_last_error=True)
-        get_current_process = kernel32.GetCurrentProcess
-        get_current_process.restype = wintypes.HANDLE
-        get_process_memory_info = psapi.GetProcessMemoryInfo
-        get_process_memory_info.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX),
-            wintypes.DWORD,
+    class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+        _fields_ = [
+            ('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD),
+            ('PeakWorkingSetSize', ctypes.c_size_t), ('WorkingSetSize', ctypes.c_size_t),
+            ('QuotaPeakPagedPoolUsage', ctypes.c_size_t), ('QuotaPagedPoolUsage', ctypes.c_size_t),
+            ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t), ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+            ('PagefileUsage', ctypes.c_size_t), ('PeakPagefileUsage', ctypes.c_size_t),
+            ('PrivateUsage', ctypes.c_size_t),
         ]
-        get_process_memory_info.restype = wintypes.BOOL
 
-        if get_process_memory_info(get_current_process(), ctypes.byref(counters), counters.cb):
+    class FILETIME(ctypes.Structure):
+        _fields_ = [('dwLowDateTime', wintypes.DWORD), ('dwHighDateTime', wintypes.DWORD)]
+
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    psapi = ctypes.WinDLL('psapi', use_last_error=True)
+    user32 = ctypes.WinDLL('user32', use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.GetProcessHandleCount.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    filetime_ptr = ctypes.POINTER(FILETIME)
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, filetime_ptr, filetime_ptr, filetime_ptr, filetime_ptr]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX), wintypes.DWORD]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+    user32.GetGuiResources.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    user32.GetGuiResources.restype = wintypes.DWORD
+    return types.SimpleNamespace(ctypes=ctypes, wintypes=wintypes, kernel32=kernel32, psapi=psapi,
+                                 user32=user32, Counters=PROCESS_MEMORY_COUNTERS_EX, FILETIME=FILETIME)
+
+
+try:
+    _WIN_PROCESS_API = _init_win_process_api()
+except Exception:
+    _WIN_PROCESS_API = None
+
+
+def _process_counters(target):
+    api = _WIN_PROCESS_API
+    counters = api.Counters()
+    counters.cb = api.ctypes.sizeof(counters)
+    if not api.psapi.GetProcessMemoryInfo(target, api.ctypes.byref(counters), counters.cb):
+        return None
+    return counters
+
+
+def get_process_memory_usage_mb():
+    """Return current process working set in MB on Windows, else None."""
+    if _WIN_PROCESS_API is None:
+        return None
+    try:
+        counters = _process_counters(_WIN_PROCESS_API.kernel32.GetCurrentProcess())
+        if counters is not None:
             return round(float(counters.WorkingSetSize) / (1024 * 1024), 2)
     except Exception:
         return None
@@ -90,59 +116,34 @@ def get_process_resources(pid=None):
     """返回进程的私有提交内存(MB)、句柄数、GDI 与 USER 对象数；pid 缺省为当前进程，失败返回 None。
 
     工作集会被系统裁剪，无法反映真实占用；私有提交内存、句柄和 GDI/USER 对象才是判断泄漏的依据。"""
-    if os.name != 'nt':
+    api = _WIN_PROCESS_API
+    if api is None:
         return None
     handle = None
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        class COUNTERS(ctypes.Structure):
-            _fields_ = [
-                ('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD),
-                ('PeakWorkingSetSize', ctypes.c_size_t), ('WorkingSetSize', ctypes.c_size_t),
-                ('QuotaPeakPagedPoolUsage', ctypes.c_size_t), ('QuotaPagedPoolUsage', ctypes.c_size_t),
-                ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t), ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
-                ('PagefileUsage', ctypes.c_size_t), ('PeakPagefileUsage', ctypes.c_size_t),
-                ('PrivateUsage', ctypes.c_size_t),
-            ]
-
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        psapi = ctypes.WinDLL('psapi', use_last_error=True)
-        user32 = ctypes.WinDLL('user32', use_last_error=True)
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.GetProcessHandleCount.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(COUNTERS), wintypes.DWORD]
-        user32.GetGuiResources.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        user32.GetGuiResources.restype = wintypes.DWORD
-
         if pid is None:
-            target = kernel32.GetCurrentProcess()
+            target = api.kernel32.GetCurrentProcess()
         else:
             # PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION
-            target = handle = kernel32.OpenProcess(0x0400 | 0x1000, False, int(pid))
+            target = handle = api.kernel32.OpenProcess(0x0400 | 0x1000, False, int(pid))
             if not target:
                 return None
-        counters = COUNTERS()
-        counters.cb = ctypes.sizeof(counters)
-        if not psapi.GetProcessMemoryInfo(target, ctypes.byref(counters), counters.cb):
+        counters = _process_counters(target)
+        if counters is None:
             return None
-        handles = wintypes.DWORD(0)
-        kernel32.GetProcessHandleCount(target, ctypes.byref(handles))
+        handles = api.wintypes.DWORD(0)
+        api.kernel32.GetProcessHandleCount(target, api.ctypes.byref(handles))
         return {
             'commit_mb': round(float(counters.PrivateUsage) / (1024 * 1024), 2),
             'handles': int(handles.value),
-            'gdi_objects': int(user32.GetGuiResources(target, 0)),
-            'user_objects': int(user32.GetGuiResources(target, 1)),
+            'gdi_objects': int(api.user32.GetGuiResources(target, 0)),
+            'user_objects': int(api.user32.GetGuiResources(target, 1)),
         }
     except Exception:
         return None
     finally:
         if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            api.kernel32.CloseHandle(handle)
 
 
 # CPU 占用率采样状态（进程 CPU 时间 / 挂钟时间 增量法，无 psutil 依赖）
@@ -155,21 +156,12 @@ def get_process_cpu_percent():
     """返回本进程自上次调用以来的平均 CPU 占用率（0~100，按逻辑核归一）。
     Windows 用 GetProcessTimes 取内核+用户时间增量除以挂钟增量；非 Windows 返回 None。"""
     global _cpu_last_proc_time, _cpu_last_wall_time
-    if os.name != 'nt':
+    if _WIN_PROCESS_API is None:
         return None
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        class FILETIME(ctypes.Structure):
-            _fields_ = [('dwLowDateTime', wintypes.DWORD), ('dwHighDateTime', wintypes.DWORD)]
-
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.POINTER(FILETIME),
-                                             ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME),
-                                             ctypes.POINTER(FILETIME)]
-        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        api = _WIN_PROCESS_API
+        FILETIME, ctypes = api.FILETIME, api.ctypes
+        kernel32 = api.kernel32
         creation = FILETIME(); exitt = FILETIME(); kern = FILETIME(); user = FILETIME()
         if not kernel32.GetProcessTimes(kernel32.GetCurrentProcess(),
                                         ctypes.byref(creation), ctypes.byref(exitt),

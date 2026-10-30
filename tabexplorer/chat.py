@@ -7,6 +7,7 @@ from PyQt5.QtCore import pyqtSignal, Qt, QThread
 from PyQt5.QtWidgets import QHBoxLayout, QLabel, QMenu, QPushButton, QVBoxLayout, QWidget
 
 from . import theme as _theme
+from .menus import exec_menu
 from .paths import get_app_base_dir, get_app_config_path, get_app_data_path, translate_common_path
 from .i18n import tr
 from .constants import MAX_CHAT_HISTORY_MESSAGES, MAX_CHAT_MESSAGE_CHARS, MAX_CONTEXT_TOTAL_CHARS
@@ -71,7 +72,12 @@ class ChatWorker(QThread):
             return
         try:
             resp = session.post(url, headers=headers, json=payload, timeout=120, stream=True)
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except Exception:
+                # 流式响应不在 with 中：HTTP 错误时必须显式关闭，否则连接一直被占用
+                resp.close()
+                raise
         except requests.exceptions.SSLError:
             raise
         except requests.exceptions.ConnectionError as _ce:
@@ -408,7 +414,7 @@ class ChatPanel(QWidget):
         clear_action = menu.addAction(tr("清空聊天"))
         clear_action.triggered.connect(self.clear_chat)
         
-        menu.exec_(self.chat_display.mapToGlobal(pos))
+        exec_menu(menu, self.chat_display.mapToGlobal(pos))
 
     def clear_chat(self):
         self.cancel_actions()

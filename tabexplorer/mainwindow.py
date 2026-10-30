@@ -18,6 +18,7 @@ from . import debuglog as _debuglog
 from . import i18n as _i18n
 from . import search as _search
 from . import theme as _theme
+from .menus import clear_menu, exec_menu
 from .paths import get_app_config_path
 from .i18n import _set_app_language, tr
 from .constants import (
@@ -86,6 +87,15 @@ def _tab_git_branch(pane):
 def _tab_target_available(path):
     """网络/慢速位置不在 UI 线程探测（断线时会卡住界面），直接打开，由标签内提示条报告结果。"""
     return _path_is_slow_for_shell(path) or is_network_path(path) or os.path.exists(path)
+
+
+def _remove_tab_and_page(tab_widget, index):
+    """标签控件只用占位页显示标签，真实内容在 content_stack；removeTab 不删除页面，
+    不释放则每关闭/移动一个标签都会永久残留一个占位 QWidget。"""
+    page = tab_widget.widget(index)
+    tab_widget.removeTab(index)
+    if page is not None:
+        page.deleteLater()
 
 
 class MainWindow(QMainWindow):
@@ -1064,7 +1074,7 @@ class MainWindow(QMainWindow):
         for i in range(end, start - 1, -1):
             w = cs.widget(i)
             cs.removeWidget(w)
-            tw.removeTab(i)
+            _remove_tab_and_page(tw, i)
 
         # 整组拖动时，原分组边界随块移动后应视为普通成员，避免在新位置重建旧边界。
         self._clear_tab_group_separator_metadata(moving)
@@ -1146,7 +1156,7 @@ class MainWindow(QMainWindow):
         for i in range(end, start - 1, -1):
             w = src_cs.widget(i)
             src_cs.removeWidget(w)
-            src_tw.removeTab(i)
+            _remove_tab_and_page(src_tw, i)
 
         # 整组跨组拖动同样不保留原边界，整组保持原颜色插入。
         self._clear_tab_group_separator_metadata(moving)
@@ -1232,7 +1242,7 @@ class MainWindow(QMainWindow):
             content_widget.tab_group_separator_name = ""
         # 从源组移除（先内容栈后标签栏，保持索引同步）
         src_cs.removeWidget(content_widget)
-        src_tw.removeTab(src_index)
+        _remove_tab_and_page(src_tw, src_index)
         # 插入到目标组（占位标签 + 实际内容，索引保持同步）
         dst_cs.insertWidget(dest_index, content_widget)
         dst_tw.insertTab(dest_index, QWidget(), title)
@@ -1960,7 +1970,7 @@ class MainWindow(QMainWindow):
             return
         # 从左侧分离（先 content_stack 再 tab_widget，保持索引同步）
         self.content_stack.removeWidget(content)
-        self.tab_widget.removeTab(idx)
+        _remove_tab_and_page(self.tab_widget, idx)
         # 显示右侧分屏 UI 布局（加入分割器并设置尺寸）
         self._activate_split_layout()
         # 放入右侧标签组（占位标签 + 实际内容，索引保持同步）
@@ -1989,7 +1999,7 @@ class MainWindow(QMainWindow):
         while stw.count() > 0:
             content = scs.widget(0)
             title = stw.tabText(0)
-            stw.removeTab(0)
+            _remove_tab_and_page(stw, 0)
             if content is None:
                 continue
             scs.removeWidget(content)
@@ -2198,7 +2208,7 @@ class MainWindow(QMainWindow):
                 content_stack.removeWidget(widget)
                 if widget:
                     widget.deleteLater()
-            tab_widget.removeTab(index)
+            _remove_tab_and_page(tab_widget, index)
             self._apply_tab_grouping_for_pane(tab_widget)
             self._schedule_session_snapshot()
         else:
@@ -2210,7 +2220,7 @@ class MainWindow(QMainWindow):
                     content_stack.removeWidget(widget)
                     if widget:
                         widget.deleteLater()
-                tab_widget.removeTab(index)
+                _remove_tab_and_page(tab_widget, index)
                 self._teardown_split_group()
                 self._apply_tab_grouping_for_pane(self.tab_widget)
                 self._schedule_session_snapshot()
@@ -2962,11 +2972,40 @@ class MainWindow(QMainWindow):
             was_minimized = bool(event.oldState() & Qt.WindowMinimized)
             now_minimized = bool(self.windowState() & Qt.WindowMinimized)
 
+            # 最小化：暂停各组当前标签的目录轮询与 COM 路径同步，期间变化只记为待刷新
+            if now_minimized and not was_minimized:
+                self._pause_visible_tabs_for_minimize()
             # 从最小化恢复：重新武装当前标签的刷新与路径同步（安全网）
             if was_minimized and not now_minimized:
+                self._resume_tabs_after_minimize()
                 QTimer.singleShot(0, lambda: self._reactivate_current_tab_refresh(rebuild_pathbar=True))
         
         super().changeEvent(event)
+
+    def _pause_visible_tabs_for_minimize(self):
+        paused = []
+        for tab_widget, content_stack in self._all_groups():
+            tab = content_stack.widget(tab_widget.currentIndex()) if content_stack is not None else None
+            if tab is not None and getattr(tab, '_refresh_active', False) and hasattr(tab, 'set_refresh_active'):
+                try:
+                    tab.set_refresh_active(False)
+                    paused.append(tab)
+                except Exception:
+                    pass
+        self._minimize_paused_tabs = paused
+        if paused:
+            debug_print(f"[Minimize] Paused refresh for {len(paused)} visible tab(s)")
+
+    def _resume_tabs_after_minimize(self):
+        paused, self._minimize_paused_tabs = getattr(self, '_minimize_paused_tabs', []), []
+        for tab_widget, content_stack in self._all_groups():
+            tab = content_stack.widget(tab_widget.currentIndex()) if content_stack is not None else None
+            # 只恢复仍是本组当前标签的标签；期间被关闭或切走的不再激活
+            if tab is not None and any(tab is item for item in paused):
+                try:
+                    tab.set_refresh_active(True)
+                except Exception:
+                    pass
 
 
 
@@ -4129,7 +4168,9 @@ class MainWindow(QMainWindow):
         box.setDetailedText('\n'.join(paths))
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         box.setDefaultButton(QMessageBox.No)
-        if box.exec_() == QMessageBox.Yes:
+        confirmed = box.exec_() == QMessageBox.Yes
+        box.deleteLater()
+        if confirmed:
             tab._run_file_batch_op('permanent_delete', paths)
 
     def show_settings_menu(self):
@@ -4216,6 +4257,7 @@ class MainWindow(QMainWindow):
     def show_bookmark_dialog(self):
         dlg = BookmarkDialog(self.bookmark_manager, self)
         dlg.exec_()
+        dlg.deleteLater()
     
     def check_for_updates(self, manual=True):
         """后台查询 GitHub 最新发布；只提示，不下载。"""
@@ -4358,25 +4400,25 @@ class MainWindow(QMainWindow):
         menu = QMenu()
         # 图标可用emoji或标准QIcon
         if is_pinned:
-            pin_action = QAction(tr("🔨 取消固定"), self)
+            pin_action = QAction(tr("🔨 取消固定"), menu)
             pin_action.triggered.connect(lambda: self.unpin_tab(tab_index, tw))
             menu.addAction(pin_action)
         else:
-            pin_action = QAction(tr("📌 固定"), self)
+            pin_action = QAction(tr("📌 固定"), menu)
             pin_action.triggered.connect(lambda: self.pin_tab(tab_index, tw))
             menu.addAction(pin_action)
 
         # 添加“添加书签”菜单项，使用书签emoji
-        add_bm_action = QAction(tr("📑 添加书签"), self)
+        add_bm_action = QAction(tr("📑 添加书签"), menu)
         add_bm_action.triggered.connect(lambda: self.add_tab_bookmark(tab))
         menu.addAction(add_bm_action)
 
         if hasattr(tab, 'set_auto_refresh_frozen'):
             if tab.is_auto_refresh_frozen():
-                refresh_action = QAction(tr("▶ 恢复自动刷新"), self)
+                refresh_action = QAction(tr("▶ 恢复自动刷新"), menu)
                 refresh_action.triggered.connect(lambda: self.toggle_tab_auto_refresh(tab_index, False, tw))
             else:
-                refresh_action = QAction(tr("⏸ 冻结自动刷新"), self)
+                refresh_action = QAction(tr("⏸ 冻结自动刷新"), menu)
                 refresh_action.triggered.connect(lambda: self.toggle_tab_auto_refresh(tab_index, True, tw))
             menu.addAction(refresh_action)
 
@@ -4401,7 +4443,7 @@ class MainWindow(QMainWindow):
         close_others.setEnabled(bool(self._closable_tabs(tw, tab, right_only=False)))
         close_right.setEnabled(bool(self._closable_tabs(tw, tab, right_only=True)))
 
-        menu.exec_(tw.tabBar().mapToGlobal(pos))
+        exec_menu(menu, tw.tabBar().mapToGlobal(pos))
 
     def _reveal_hidden_current_tab(self, tab_widget, index):
         """选中了折叠分组中被隐藏的标签时展开该分组。"""
@@ -4587,14 +4629,15 @@ class MainWindow(QMainWindow):
         dialog = AddBookmarkDialog(self.bookmark_manager, default_name,
                                    getattr(self, '_last_bookmark_folder_id', None), self)
         accepted = dialog.exec_() == QDialog.Accepted
+        folder_id, name = dialog.folder_id(), dialog.bookmark_name()
+        dialog.deleteLater()
         # 对话框关闭后，强制将焦点设回主窗口，防止QAxWidget拦截快捷键
         self.setFocus()
         if not accepted:
             return
-        folder_id = dialog.folder_id()
         self._last_bookmark_folder_id = folder_id
         url = "file:///" + path.replace("\\", "/")
-        if self.bookmark_manager.add_bookmark(folder_id, dialog.bookmark_name(), url):
+        if self.bookmark_manager.add_bookmark(folder_id, name, url):
             self.populate_bookmark_bar_menu()
         else:
             show_toast(self, tr("添加失败"), tr("未能添加书签，请检查父文件夹。"), level="warning")
@@ -6267,7 +6310,7 @@ class MainWindow(QMainWindow):
         
         bm.save_bookmarks()
         # 清除现有菜单并重新填充
-        self.menu_bar.clear()
+        clear_menu(self.menu_bar)
         self.populate_bookmark_bar_menu()
     
     def show_bookmark_context_menu(self, pos, bookmark_id, bookmark_name):
@@ -6304,7 +6347,7 @@ class MainWindow(QMainWindow):
         delete_action.triggered.connect(lambda: self.confirm_delete_bookmark(bookmark_id, bookmark_name))
         
         debug_print(f"[DEBUG] Showing menu...")
-        menu.exec_(pos)
+        exec_menu(menu, pos)
         debug_print(f"[DEBUG] Menu closed")
 
     def confirm_delete_bookmark(self, bookmark_id, bookmark_name):
@@ -6314,7 +6357,7 @@ class MainWindow(QMainWindow):
 
     def populate_bookmark_bar_menu(self):
         self.ensure_default_icons_on_bookmark_bar()
-        self.menu_bar.clear()
+        clear_menu(self.menu_bar)
         
         bm = self.bookmark_manager
         tree = bm.get_tree()

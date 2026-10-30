@@ -264,6 +264,36 @@ def _patch_tortoise_overlays():
 
 # Cache of directories already preloaded (overlay icons persist in system image list)
 _OVERLAY_PRELOADED_DIRS = set()
+_OVERLAY_PRELOADED_DIRS_MAX = 2000
+
+
+class _SHFILEINFOW(ctypes.Structure):
+    _fields_ = [
+        ('hIcon', ctypes.wintypes.HICON),
+        ('iIcon', ctypes.c_int),
+        ('dwAttributes', ctypes.wintypes.DWORD),
+        ('szDisplayName', ctypes.c_wchar * 260),
+        ('szTypeName', ctypes.c_wchar * 80),
+    ]
+
+
+_SHFILEINFO_API = None
+
+
+def _shfileinfo_api():
+    """结构与函数原型只定义一次：在函数内定义 ctypes 结构并调用 POINTER() 会在全局指针
+    类型缓存中永久留下新类；独立的 WinDLL 也避免在后台线程改写共享 windll 的 argtypes。"""
+    global _SHFILEINFO_API
+    if _SHFILEINFO_API is None:
+        shell32 = ctypes.WinDLL('shell32')
+        get_info = shell32.SHGetFileInfoW
+        get_info.argtypes = [ctypes.c_wchar_p, ctypes.wintypes.DWORD,
+                             ctypes.POINTER(_SHFILEINFOW), ctypes.c_uint, ctypes.c_uint]
+        get_info.restype = ctypes.c_void_p
+        destroy_icon = ctypes.WinDLL('user32').DestroyIcon
+        destroy_icon.argtypes = [ctypes.wintypes.HICON]
+        _SHFILEINFO_API = (_SHFILEINFOW, get_info, destroy_icon)
+    return _SHFILEINFO_API
 
 
 def _file_url_to_path(url):
@@ -358,24 +388,8 @@ def _preload_overlay_icons(directory_path):
         return
     try:
         import ctypes
-        import ctypes.wintypes
-
-        class _SHFILEINFOW(ctypes.Structure):
-            _fields_ = [
-                ('hIcon', ctypes.wintypes.HICON),
-                ('iIcon', ctypes.c_int),
-                ('dwAttributes', ctypes.wintypes.DWORD),
-                ('szDisplayName', ctypes.c_wchar * 260),
-                ('szTypeName', ctypes.c_wchar * 80),
-            ]
-
-        _SHGetFileInfoW = ctypes.windll.shell32.SHGetFileInfoW
-        _SHGetFileInfoW.argtypes = [ctypes.c_wchar_p, ctypes.wintypes.DWORD,
-                                    ctypes.POINTER(_SHFILEINFOW), ctypes.c_uint,
-                                    ctypes.c_uint]
-        _SHGetFileInfoW.restype = ctypes.c_void_p
-
-        _DestroyIcon = ctypes.windll.user32.DestroyIcon
+        api = _shfileinfo_api()
+        _SHFILEINFOW, _SHGetFileInfoW, _DestroyIcon = api
 
         # SHGFI_ICON=0x100, SHGFI_SMALLICON=0x1, SHGFI_OVERLAYINDEX=0x40
         FLAGS = 0x100 | 0x1 | 0x40
@@ -423,6 +437,8 @@ def _preload_overlay_icons(directory_path):
             debug_print(f"[TortoiseGit] Pre-loaded overlay icons: "
                         f"{sorted(loaded_overlays)} ({count} files scanned)")
             # Mark directory as preloaded (overlay icons are process-global)
+            if len(_OVERLAY_PRELOADED_DIRS) >= _OVERLAY_PRELOADED_DIRS_MAX:
+                _OVERLAY_PRELOADED_DIRS.clear()  # 仅是跳过重复预加载的缓存，清空后最多多预加载一次
             _OVERLAY_PRELOADED_DIRS.add(directory_path)
 
     except Exception:

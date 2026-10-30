@@ -778,6 +778,7 @@ class FileTaskPanel(QDialog):
             box.setText(record['row'].text(2))
             box.setDetailedText('\n'.join(record['errors']) or tr("无错误"))
             box.exec_()
+            box.deleteLater()
 
     def clear_completed(self):
         for record in list(self.records):
@@ -1251,7 +1252,9 @@ def _confirm_file_preview(parent, title, description, before, after):
     buttons.button(QDialogButtonBox.Cancel).setText(tr("取消"))
     buttons.button(QDialogButtonBox.Cancel).setDefault(True)
     layout.addWidget(buttons)
-    return dialog.exec_() == QDialog.Accepted
+    accepted = dialog.exec_() == QDialog.Accepted
+    dialog.deleteLater()
+    return accepted
 
 
 def _atomic_reviewed_write(path, expected, content):

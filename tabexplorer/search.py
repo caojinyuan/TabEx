@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
 
 from . import debuglog as _debuglog
 from . import theme as _theme
+from .menus import clear_menu, exec_menu
 from .i18n import tr
 from .debuglog import debug_print
 from .system import detect_notepad_plus_plus, format_file_size, launch_detached, launch_detached_async
@@ -66,6 +67,40 @@ def modified_after_timestamp(days, now=None):
         local = time.localtime(now)
         return time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, -1))
     return now - days * 86400
+
+
+REGEX_CHUNK_OVERLAP_BYTES = 64 * 1024  # 正则匹配长度无上限，按 64 KB 重叠覆盖跨块的常见匹配
+
+
+def content_chunk_overlap_bytes(keyword, use_regex):
+    """分块重叠字节数：普通关键词按最宽编码（UTF-8 每字符最多 4 字节）加单词边界余量。"""
+    overlap = len(str(keyword)) * 4 + 16
+    if use_regex:
+        overlap = max(overlap, REGEX_CHUNK_OVERLAP_BYTES)
+    return overlap + (overlap % 2)
+
+
+def _iter_decoded_chunks(path, encoding, chunk_size, overlap_bytes, max_bytes):
+    """按字节偏移分块读取并解码，相邻块重叠 overlap_bytes。
+
+    文本模式的 tell() 是不透明 cookie，不能做算术回退；这里始终用二进制偏移，
+    步长保持偶数以免 UTF-16 解码错位。"""
+    overlap_bytes = max(0, min(int(overlap_bytes), int(chunk_size) // 2))
+    step = int(chunk_size) - overlap_bytes
+    step -= step % 2
+    step = max(2, step)
+    position = scanned = 0
+    with open(path, 'rb') as stream:
+        while scanned < max_bytes:
+            stream.seek(position)
+            data = stream.read(chunk_size)
+            if not data:
+                return
+            scanned += len(data)
+            yield data.decode(encoding, errors='ignore')
+            if len(data) < chunk_size:
+                return
+            position += step
 
 
 def compile_search_pattern(keyword, match_case=False, match_whole_word=False, use_regex=False):
@@ -1348,7 +1383,7 @@ class SearchDialog(QDialog):
 
     def _rebuild_presets_menu(self):
         menu = self.presets_menu
-        menu.clear()
+        clear_menu(menu)
         presets = self._search_presets()
         save_action = menu.addAction(tr("保存当前条件..."), self.save_search_preset)
         save_action.setEnabled(presets is not None)
@@ -2139,29 +2174,19 @@ class SearchDialog(QDialog):
                                                     ext_encoding_cache[file_ext] = encoding
                                                 break
                                         else:
-                                            with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
-                                                # 大文件分块读取（有总扫描上限）
-                                                overlap = len(keyword) * 2  # 重叠区域，防止关键词被分割
-                                                scanned_bytes = 0
-                                                while True:
-                                                    if scanned_bytes >= max_scan_bytes:
-                                                        break
-                                                    chunk = f.read(chunk_size)
-                                                    if not chunk:
-                                                        break
-                                                    scanned_bytes += len(chunk)
-                                                    if _matches_text(chunk):
-                                                        matched = True
-                                                        match_type = "📄"
-                                                        content_matched = True
-                                                        if file_ext:
-                                                            ext_encoding_cache[file_ext] = encoding
-                                                        break
-                                                    # 回退overlap字节，避免关键词跨块
-                                                    if len(chunk) == chunk_size:
-                                                        f.seek(f.tell() - overlap)
-                                                if content_matched:
+                                            # 大文件分块读取（有总扫描上限），重叠区域防止匹配被分割
+                                            for chunk in _iter_decoded_chunks(
+                                                    file_path, encoding, chunk_size,
+                                                    content_chunk_overlap_bytes(keyword, use_regex), max_scan_bytes):
+                                                if _matches_text(chunk):
+                                                    matched = True
+                                                    match_type = "📄"
+                                                    content_matched = True
+                                                    if file_ext:
+                                                        ext_encoding_cache[file_ext] = encoding
                                                     break
+                                            if content_matched:
+                                                break
                                     except UnicodeError:
                                         continue
                                     except Exception as e:
@@ -2401,7 +2426,7 @@ class SearchDialog(QDialog):
             system_dialog_action = menu.addAction(tr("选择其他应用..."))
             system_dialog_action.triggered.connect(lambda: self.open_result_with_system_dialog(file_path))
 
-        menu.exec_(self.result_list.viewport().mapToGlobal(pos))
+        exec_menu(menu, self.result_list.viewport().mapToGlobal(pos))
 
     def request_ai_file_analysis(self, file_path):
         if not file_path or not os.path.isfile(file_path):
