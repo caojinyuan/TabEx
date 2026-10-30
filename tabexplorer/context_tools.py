@@ -3,6 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 import os
+import json
 import shutil
 from string import Formatter
 import subprocess
@@ -10,6 +11,8 @@ import uuid
 
 from PyQt5 import sip
 from PyQt5.QtCore import QThread, Qt, pyqtSignal
+from PyQt5.QtGui import QDesktopServices
+from PyQt5.QtCore import QUrl
 from PyQt5.QtWidgets import (
     QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QStyle, QToolButton, QVBoxLayout,
@@ -19,6 +22,8 @@ from .debuglog import debug_print
 from .i18n import tr
 from .system import _retain_thread_until_finished
 from .widgets import show_toast
+
+_tool_readiness = {}
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,8 @@ def default_tools():
          'args': ['/e', '/u', '{file1}', '{file2}'], 'cwd': '{cwd}'},
         {'id': 'winmerge-folders', 'name': tr("WinMerge：比较左右目录"), 'program': 'WinMergeU.exe',
          'args': ['/r', '/e', '/u', '{left}', '{right}'], 'cwd': '{cwd}'},
+        {'id': 'vscode-diff', 'name': tr("VS Code：比较两个文件"), 'program': 'Code.exe',
+         'args': ['--reuse-window', '--diff', '{file1}', '{file2}'], 'cwd': '{cwd}'},
     ]
 
 
@@ -146,10 +153,32 @@ def resolve_program(program):
     elif program.casefold() == 'winmergeu.exe':
         locations = [os.path.join(os.environ.get(key, ''), 'WinMerge', 'WinMergeU.exe')
                      for key in ('ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA')]
+        locations.append(os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs', 'WinMerge', 'WinMergeU.exe'))
     for path in locations:
         if os.path.isabs(path) and os.path.isfile(path):
             return path
     raise FileNotFoundError(tr("找不到工具程序: {}").format(program))
+
+def tool_download_url(program):
+    return {'winmergeu.exe': 'https://winmerge.org/downloads/',
+            'code.exe': 'https://code.visualstudio.com/Download'}.get(os.path.basename(program).casefold(), '')
+
+
+class ToolProbeWorker(QThread):
+    completed = pyqtSignal(object)
+
+    def __init__(self, programs):
+        super().__init__()
+        self.programs = list(dict.fromkeys(programs))
+
+    def run(self):
+        results = {}
+        for program in self.programs:
+            try:
+                results[program] = (resolve_program(program), '')
+            except (OSError, ValueError) as error:
+                results[program] = ('', str(error))
+        self.completed.emit(results)
 
 
 class ToolLaunchWorker(QThread):
@@ -205,6 +234,13 @@ def populate_tools_menu(menu, tools, context, owner):
         try:
             args, cwd = prepare_tool(tool, context)
             action.setToolTip(subprocess.list2cmdline(args) + '\n' + cwd)
+            resolved, error = _tool_readiness.get(tool['program'], ('', ''))
+            if error:
+                action.setEnabled(False)
+                action.setProperty('unavailable_reason', error)
+                action.setToolTip(error + '\n' + tr("请在配置外部工具中检测或重新选择程序"))
+            elif resolved:
+                action.setToolTip(resolved + '\n' + action.toolTip())
             action.triggered.connect(
                 lambda checked=False, selected=tool: launch_context_tool(owner, selected, context))
         except ValueError as error:
@@ -214,11 +250,14 @@ def populate_tools_menu(menu, tools, context, owner):
 
 
 class ContextToolsDialog(QDialog):
-    def __init__(self, tools, parent=None):
+    def __init__(self, tools, parent=None, context=None):
         super().__init__(parent)
         self.setWindowTitle(tr("配置外部工具"))
         self.resize(800, 570)
         self.tools = deepcopy(tools)
+        self.context = context or ToolContext()
+        self._probe_worker = None
+        self._probe_again = False
         self._current = None
         layout = QVBoxLayout(self)
         body = QHBoxLayout()
@@ -245,6 +284,27 @@ class ContextToolsDialog(QDialog):
         form.addRow(tr("工作目录"), self.cwd)
         body.addLayout(form, 2)
         layout.addLayout(body)
+        self.tool_status = QLabel(self)
+        self.tool_status.setWordWrap(True)
+        self.tool_status.setTextFormat(Qt.PlainText)
+        self.tool_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.tool_status)
+        readiness = QHBoxLayout()
+        self.detect_button = QPushButton(tr("检测工具"), self)
+        self.detect_button.clicked.connect(self.detect_tools)
+        self.download_button = QPushButton(tr("打开官方下载页"), self)
+        self.download_button.clicked.connect(self.open_download_page)
+        self.preview_button = QPushButton(tr("预览启动参数（不执行）"), self)
+        self.preview_button.setToolTip(tr("仅预览参数，不会启动程序"))
+        self.preview_button.clicked.connect(self.preview_arguments)
+        for button in (self.detect_button, self.download_button, self.preview_button):
+            readiness.addWidget(button)
+        layout.addLayout(readiness)
+        self.argument_preview = QPlainTextEdit(self)
+        self.argument_preview.setReadOnly(True)
+        self.argument_preview.setMaximumHeight(110)
+        self.argument_preview.hide()
+        layout.addWidget(self.argument_preview)
         hint = QLabel(tr("占位符：{cwd} 当前目录；{selected} 多选；{file} 单选；"
                         "{file1}/{file2} 双选；{left}/{right} 左右目录；{line}/{column} 匹配位置。\n"
                         "只启动本机工具，不自动安装或上传文件。自定义工具会按所填参数执行。"), self)
@@ -265,6 +325,66 @@ class ContextToolsDialog(QDialog):
         for tool in self.tools:
             self._add_item(tool)
         self.list.setCurrentRow(0)
+        self.program.editingFinished.connect(self.detect_tools)
+        self.detect_tools()
+
+    def detect_tools(self):
+        self.save_current()
+        if self._probe_worker is not None:
+            self._probe_again = True
+            return
+        programs = [self.list.item(index).data(Qt.UserRole).get('program', '')
+                    for index in range(self.list.count())]
+        self.detect_button.setEnabled(False)
+        self.tool_status.setText(tr("正在检测工具..."))
+        worker = ToolProbeWorker([program for program in programs if program])
+        self._probe_worker = worker
+        worker.completed.connect(self._tools_detected)
+        worker.start()
+        _retain_thread_until_finished(worker)
+
+    def _tools_detected(self, results):
+        _tool_readiness.update(results)
+        self._probe_worker = None
+        self.detect_button.setEnabled(True)
+        for index in range(self.list.count()):
+            item = self.list.item(index)
+            tool = item.data(Qt.UserRole)
+            path, error = results.get(tool.get('program', ''), ('', ''))
+            state = tr("已就绪") if path else (tr("路径失效") if os.path.dirname(tool.get('program', ''))
+                                             else tr("未安装或未找到"))
+            item.setText(tool['name'] + ' · ' + state)
+            item.setToolTip(path or error)
+        self._show_tool_status()
+        if self._probe_again:
+            self._probe_again = False
+            self.detect_tools()
+
+    def _show_tool_status(self):
+        program = self.program.text().strip()
+        self.download_button.setEnabled(bool(tool_download_url(program)))
+        self.download_button.setToolTip(tool_download_url(program))
+        path, error = _tool_readiness.get(program, ('', ''))
+        self.tool_status.setText((tr("已就绪") + ': ' + path) if path
+                                 else error or tr("尚未检测，请选择程序后点击检测"))
+
+    def open_download_page(self):
+        url = tool_download_url(self.program.text().strip())
+        if not url or not QDesktopServices.openUrl(QUrl(url)):
+            show_toast(self, tr("外部工具"), tr("无法打开官方下载页"), level='error')
+
+    def preview_arguments(self):
+        self.save_current()
+        self.argument_preview.show()
+        if self._current is None:
+            self.argument_preview.setPlainText(tr("请先选择工具"))
+            return
+        try:
+            args, cwd = prepare_tool(self._current.data(Qt.UserRole), self.context)
+            self.argument_preview.setPlainText(
+                tr("工作目录") + ': ' + cwd + '\n' + json.dumps(args, ensure_ascii=False, indent=2))
+        except ValueError as error:
+            self.argument_preview.setPlainText(tr("当前不可用: {}").format(error))
 
     def _add_item(self, tool):
         item = QListWidgetItem(str(tool.get('name', '')), self.list)
@@ -287,6 +407,8 @@ class ContextToolsDialog(QDialog):
         self.program.setText(tool.get('program', ''))
         self.arguments.setPlainText('\n'.join(tool.get('args', [])))
         self.cwd.setText(tool.get('cwd', '{cwd}'))
+        self.argument_preview.clear()
+        self._show_tool_status()
 
     def add_tool(self):
         item = self._add_item({'id': uuid.uuid4().hex, 'name': tr("新工具"),

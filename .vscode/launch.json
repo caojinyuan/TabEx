@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "TabEx (project Python 3.13.13)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}\\.venv\\python-3.13.13\\python.exe",
+            "program": "${workspaceFolder}\\TabEx.py",
+            "cwd": "${workspaceFolder}",
+            "pythonArgs": ["-E", "-s", "-X", "utf8"],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

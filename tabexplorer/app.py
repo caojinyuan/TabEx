@@ -102,6 +102,7 @@ def main():
 
     # 创建窗口（图标在 MainWindow.__init__ 内部生成）
     window = MainWindow()
+    window._app_started_at = started_at
     window._instance_coordinator = coordinator
     coordinator.set_receiver(window.open_path_signal.emit)
     window._diagnostic_timer = QTimer(window)

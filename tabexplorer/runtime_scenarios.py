@@ -98,20 +98,56 @@ def lifecycle_steps(check):
         dialog.search_filename_cb.setChecked(False)
         dialog.search_content_cb.setChecked(True)
         dialog.file_type_input.setText('txt')
+        dialog.scope_combo.setCurrentIndex(1)
         dialog.search_input.setEditText('sample')
         dialog.start_search()
         thread = dialog.search_thread
-        yield 'streamed content preview ready', lambda: (
+        yield 'project-scoped content preview ready', lambda: (
             not thread.is_alive() and dialog.current_result_count == 1
             and dialog.open_match_button.isEnabled())
         if (dialog.result_model.result_for_row(0).get('line') != 2
                 or 'sample match' not in dialog.match_preview.toPlainText()):
             raise AssertionError('Content match line/preview is incorrect')
         dialog.close()
+        from .context_tools import ContextToolsDialog, configured_tools
+        tool_dialog = ContextToolsDialog(configured_tools(w.config), w, w._external_tool_context())
+        yield 'tool probes complete', lambda: tool_dialog._probe_worker is None
+        if not tool_dialog.tool_status.text():
+            raise AssertionError('Tool readiness has no visible explanation')
+        tool_dialog.preview_arguments()
+        if not tool_dialog.argument_preview.toPlainText():
+            raise AssertionError('Tool argument preview is empty')
+        tool_dialog.close()
+        tool_dialog.deleteLater()
         w._rebuild_external_tools_menu()
         actions = w.external_tools_menu.actions()
-        if not actions[0].isEnabled() or actions[3].isEnabled():
+        if actions[3].isEnabled() or (not actions[0].isEnabled()
+                                      and not actions[0].property('unavailable_reason')):
             raise AssertionError('External tool context availability is incorrect')
+        w.add_paths_to_basket([str(root / 'fixture' / 'match.txt')] * 2)
+        basket = w.get_file_basket()
+        if len(basket.all_paths()) != 1:
+            raise AssertionError('Basket did not deduplicate paths')
+        basket.clear()
+        if not (root / 'fixture' / 'match.txt').exists():
+            raise AssertionError('Clearing the basket deleted a file')
+        from .fileops import DirectoryCompareDialog
+        compare = DirectoryCompareDialog(w, str(root / 'compare-left'), str(root / 'compare-right'))
+        compare.start_compare()
+        yield 'directory differences complete', lambda: not compare.running
+        compare.difference_filter.setCurrentIndex(compare.difference_filter.findData('changed'))
+        differences = [compare.table.topLevelItem(index) for index in range(compare.table.topLevelItemCount())
+                       if not compare.table.topLevelItem(index).isHidden()]
+        if len(differences) != 1:
+            raise AssertionError('Directory difference filtering is incorrect')
+        compare.table.setCurrentItem(differences[0])
+        if not compare.view_diff_button.isEnabled():
+            raise AssertionError('Content comparison action unavailable for a valid pair')
+        compare.close()
+        compare.deleteLater()
+        import sys
+        if sys.executable not in w.runtime_information():
+            raise AssertionError('Runtime identity does not show the actual interpreter')
 
         source, missing = root / 'fixture' / 'sample.bin', root / 'fixture' / 'missing.bin'
         destination = root / 'destination'

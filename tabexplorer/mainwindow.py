@@ -3859,6 +3859,8 @@ class MainWindow(QMainWindow):
         self.file_tasks_action = menu.addAction(tr('文件任务'), self.show_file_tasks)
         self.directory_compare_action = menu.addAction(tr('目录差异比较...'), self.show_directory_compare)
         menu.addAction(tr('批量重命名预览...'), self.preview_batch_rename)
+        menu.addAction(tr('添加选中项到收集篮'), lambda: self.add_selection_to_basket())
+        menu.addAction(tr('文件收集篮'), lambda: self.show_file_basket())
         menu.addSection(tr('导航'))
         self.frequent_dirs_action = menu.addAction(
             _hotkey_hint(self.config, tr('常用目录...'), 'frequent_dirs'), self.show_frequent_dirs)
@@ -3881,6 +3883,31 @@ class MainWindow(QMainWindow):
         menu.addSection(tr('诊断'))
         self.export_diagnostics_action = menu.addAction(tr('导出崩溃诊断包...'), self.export_diagnostics)
         menu.addAction(tr('检查更新...'), lambda: self.check_for_updates(manual=True))
+        menu.addAction(tr('关于 TabEx...'), lambda: self.show_about())
+
+    def runtime_information(self):
+        import sys
+        import platform
+        from .paths import get_app_base_dir
+        values = (
+            (tr("版本"), APP_VERSION),
+            (tr("运行方式"), tr("打包 EXE") if getattr(sys, 'frozen', False) else tr("源码运行")),
+            (tr("启动时间"), time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self._app_started_at))),
+            (tr("Python 版本"), platform.python_version()),
+            (tr("解释器 / 可执行文件"), sys.executable),
+            (tr("程序目录"), get_app_base_dir()),
+            (tr("配置目录"), get_app_data_path()),
+        )
+        return '\n'.join(f'{label}: {value}' for label, value in values)
+
+    def show_about(self):
+        from PyQt5.QtWidgets import QMessageBox
+        dialog = QMessageBox(QMessageBox.Information, tr("关于 TabEx"), self.runtime_information(),
+                             QMessageBox.Ok, self)
+        dialog.setTextFormat(Qt.PlainText)
+        dialog.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        dialog.exec_()
+        dialog.deleteLater()
 
     def _external_tool_context(self):
         from .context_tools import ToolContext
@@ -3910,7 +3937,7 @@ class MainWindow(QMainWindow):
         except ValueError as error:
             show_toast(self, tr("外部工具"), str(error), level='error')
             return
-        dialog = ContextToolsDialog(tools, self)
+        dialog = ContextToolsDialog(tools, self, self._external_tool_context())
         if dialog.exec_():
             self.config['external_tools'] = dialog.tools
             self.save_config(immediate=True)
@@ -4047,6 +4074,33 @@ class MainWindow(QMainWindow):
         panel.show()
         panel.raise_()
         panel.activateWindow()
+
+    def get_file_basket(self):
+        from .file_basket import FileBasketDialog
+        if getattr(self, '_file_basket', None) is None:
+            self._file_basket = FileBasketDialog(self)
+        return self._file_basket
+
+    def show_file_basket(self):
+        basket = self.get_file_basket()
+        basket.show()
+        basket.raise_()
+        basket.activateWindow()
+
+    def add_paths_to_basket(self, paths):
+        basket = self.get_file_basket()
+        added = basket.add_paths(paths)
+        show_toast(self, tr("文件收集篮"),
+                   tr("新增 {} 项，共 {} 项；重复路径不会再次添加").format(added, basket.table.topLevelItemCount()),
+                   action_text=tr("打开收集篮"), action=self.show_file_basket)
+
+    def add_selection_to_basket(self):
+        pane = self.get_active_pane()
+        paths = pane._get_selected_paths() if hasattr(pane, '_get_selected_paths') else []
+        if not paths:
+            show_toast(self, tr("文件收集篮"), tr("请先选择文件或文件夹"), level='warning')
+            return
+        self.add_paths_to_basket(paths)
 
     def permanently_delete_selected(self):
         from PyQt5.QtWidgets import QMessageBox
@@ -4668,6 +4722,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._app_started_at = time.time()
 
         self.server_socket = None
         self.server_thread = None

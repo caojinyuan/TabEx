@@ -901,7 +901,9 @@ class SettingsDialog(QDialog):
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, tr("外部工具"), self._external_tools_error)
             return
-        dialog = ContextToolsDialog(self.external_tools, self)
+        owner = self.parent()
+        context = owner._external_tool_context() if hasattr(owner, '_external_tool_context') else None
+        dialog = ContextToolsDialog(self.external_tools, self, context)
         if dialog.exec_():
             self.external_tools = dialog.tools
         dialog.deleteLater()

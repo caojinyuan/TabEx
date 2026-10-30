@@ -184,8 +184,12 @@ _theme.add_widget_hook(_refresh_themed_icon)
 
 
 def _position_toasts():
+    from PyQt5 import sip
     offsets = {}
     for toast in list(_active_toasts):
+        if sip.isdeleted(toast):
+            _active_toasts.remove(toast)
+            continue
         anchor = toast.parentWidget()
         bounds = anchor.window().geometry() if anchor else QApplication.primaryScreen().availableGeometry()
         offset = offsets.get(anchor, 0)
@@ -207,6 +211,7 @@ class ToastMessage(QWidget):
         )
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.destroyed.connect(lambda: _active_toasts.remove(self) if self in _active_toasts else None)
 
         bg_map = {
             "info": "#1767b5",

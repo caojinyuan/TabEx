@@ -41,6 +41,14 @@ def validate(command, report, seconds=10, tabs=10, scenario='smoke', cycles=3, w
         (data / 'fixture').mkdir()
         (data / 'fixture' / 'sample.bin').write_bytes(b'sample payload\n' * 65536)
         (data / 'fixture' / 'match.txt').write_text('first line\nsample match\n', encoding='utf-8')
+        (data / 'fixture' / 'build').mkdir()
+        (data / 'fixture' / 'build' / 'ignored.txt').write_text('sample build output', encoding='utf-8')
+        (data / 'fixture' / 'ignored.txt').write_text('sample ignored', encoding='utf-8')
+        (data / 'fixture' / '.gitignore').write_text('ignored.txt\n', encoding='utf-8')
+        for side in ('compare-left', 'compare-right'):
+            (data / side).mkdir()
+            (data / side / 'different.txt').write_text(side, encoding='utf-8')
+        (data / 'compare-left' / 'only.txt').write_text('only left', encoding='utf-8')
         (data / 'destination').mkdir()
         (data / '.tabex-validation').write_text('isolated', encoding='ascii')
         (data / 'config.json').write_text(json.dumps({

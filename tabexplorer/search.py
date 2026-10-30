@@ -277,40 +277,56 @@ def _rg_text(value):
     return base64.b64decode(value['bytes']).decode('utf-8', errors='replace')
 
 
-def iter_ripgrep_matches(task, keyword, search_path, extensions=(), match_case=False,
-                        match_whole_word=False, use_regex=False, flush_callback=None):
-    """Stream one match per file; bound pipe buffering and stop the process on cancellation."""
+PROJECT_EXCLUSIONS = ('**/.git/**', '**/node_modules/**', '**/.venv/**',
+                      '**/__pycache__/**', '**/build/**', '**/dist/**')
+
+
+def parse_search_exclusions(text):
+    patterns = []
+    for pattern in text.split(';'):
+        pattern = pattern.strip().replace('\\', '/')
+        if not pattern:
+            continue
+        if pattern.startswith('!') or '\x00' in pattern or '\n' in pattern:
+            raise ValueError(tr("排除规则请用分号分隔，不要添加 ! 前缀"))
+        if pattern.endswith('/'):
+            pattern = '**/' + pattern.strip('/') + '/**'
+        if pattern not in patterns:
+            patterns.append(pattern)
+    return tuple(patterns)
+
+
+def _scope_arguments(task):
+    project = getattr(task, 'project_mode', False)
+    args = ['--no-require-git'] if project else ['-uu']
+    patterns = (*PROJECT_EXCLUSIONS, *task.exclusions) if project else getattr(task, 'exclusions', ())
+    for pattern in patterns:
+        args.extend(['--iglob', '!' + pattern])
+    return args
+
+
+def _iter_rg_output(task, command, json_output=True, flush_callback=None):
+    """Keep both JSON matches and NUL-delimited candidate enumeration cancellable and bounded."""
     import subprocess
     import tempfile
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(
+            command, cwd=task.search_path, stdout=subprocess.PIPE, stderr=errors,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        messages = queue.Queue(maxsize=8)
+        stop_reader = threading.Event()
 
-    command = [task.ripgrep_path, '--no-config', '--json', '--line-buffered', '--max-count', '1',
-               '-uu', '-s' if match_case else '-i']
-    if not use_regex:
-        command.append('-F')
-    if match_whole_word:
-        command.append('-w')
-    for extension in sorted(extensions):
-        command.extend(['--iglob', f'*.{extension}'])
-    passes = [[]] if keyword.isascii() else [[], ['-E', 'gbk']]
-    for encoding in passes:
-        with tempfile.TemporaryFile() as errors:
-            process = subprocess.Popen(
-                command + encoding + ['-e', keyword, '--', search_path],
-                stdout=subprocess.PIPE, stderr=errors,
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-            messages = queue.Queue(maxsize=8)
-            stop_reader = threading.Event()
-
-            def enqueue(value):
-                while not stop_reader.is_set():
-                    try:
-                        messages.put(value, timeout=.05)
-                        return
-                    except queue.Full:
-                        continue
-
-            def read_output():
+        def enqueue(value):
+            while not stop_reader.is_set():
                 try:
+                    messages.put(value, timeout=.05)
+                    return
+                except queue.Full:
+                    continue
+
+        def read_output():
+            try:
+                if json_output:
                     while not stop_reader.is_set():
                         line = process.stdout.readline(1024 * 1024 + 1)
                         if not line:
@@ -326,29 +342,92 @@ def iter_ripgrep_matches(task, keyword, search_path, extensions=(), match_case=F
                             enqueue({'type': 'match', 'data': {'path': path}, 'preview_unavailable': True})
                         else:
                             enqueue(json.loads(line))
-                except (OSError, ValueError, KeyError, IndexError) as error:
-                    enqueue(error)
-                finally:
-                    enqueue(None)
+                else:
+                    pending = b''
+                    while not stop_reader.is_set():
+                        chunk = process.stdout.read1(65536)
+                        if not chunk:
+                            if pending:
+                                raise ValueError(tr("搜索引擎路径输出不完整"))
+                            break
+                        records = (pending + chunk).split(b'\0')
+                        pending = records.pop()
+                        if len(pending) > 1024 * 1024:
+                            raise ValueError(tr("搜索引擎输出过长"))
+                        for record in records:
+                            enqueue(record.decode('utf-8'))
+            except (OSError, ValueError, KeyError, IndexError) as error:
+                enqueue(error)
+            finally:
+                enqueue(None)
 
-            reader = threading.Thread(target=read_output, name='rg-output', daemon=True)
-            try:
-                reader.start()
-                while True:
-                    if not task.is_searching:
-                        raise _SearchCancelled()
-                    try:
-                        event = messages.get(timeout=.05)
-                    except queue.Empty:
-                        if flush_callback is not None:
-                            flush_callback()
-                        continue
-                    if event is None:
-                        break
-                    if isinstance(event, Exception):
-                        raise event
-                    if event.get('type') != 'match':
-                        continue
+        reader = threading.Thread(target=read_output, name='rg-output', daemon=True)
+        try:
+            reader.start()
+            while True:
+                if not task.is_searching:
+                    raise _SearchCancelled()
+                try:
+                    event = messages.get(timeout=.05)
+                except queue.Empty:
+                    if flush_callback is not None:
+                        flush_callback()
+                    continue
+                if event is None:
+                    break
+                if isinstance(event, Exception):
+                    raise event
+                yield event
+            while process.poll() is None:
+                if not task.is_searching:
+                    raise _SearchCancelled()
+                stop_reader.wait(.05)
+            if process.returncode not in (0, 1):
+                errors.seek(0)
+                raise OSError(errors.read(4096).decode('utf-8', errors='replace')
+                              or tr("搜索引擎退出码: {}").format(process.returncode))
+        finally:
+            stop_reader.set()
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            if reader.ident is not None:
+                reader.join()
+            process.stdout.close()
+
+
+def iter_search_entries(task):
+    if getattr(task, 'project_mode', False) or getattr(task, 'exclusions', ()):
+        from contextlib import closing
+        command = [task.ripgrep_path, '--no-config', '--files', '--null', *_scope_arguments(task),
+                   '--', task.search_path]
+        with closing(_iter_rg_output(task, command, json_output=False)) as paths:
+            for path in paths:
+                yield os.path.dirname(path), [], [os.path.basename(path)]
+    else:
+        yield from os.walk(task.search_path)
+
+
+def iter_ripgrep_matches(task, keyword, search_path, extensions=(), match_case=False,
+                        match_whole_word=False, use_regex=False, flush_callback=None):
+    from contextlib import closing
+    command = [task.ripgrep_path, '--no-config', '--json', '--line-buffered', '--max-count', '1',
+               '-s' if match_case else '-i']
+    if not use_regex:
+        command.append('-F')
+    if match_whole_word:
+        command.append('-w')
+    if not getattr(task, 'project_mode', False):
+        for extension in sorted(extensions):
+            command.extend(['--iglob', f'*.{extension}'])
+    command.extend(_scope_arguments(task))
+    passes = [[]] if keyword.isascii() else [[], ['-E', 'gbk']]
+    for encoding in passes:
+        with closing(_iter_rg_output(
+                task, command + encoding + ['-e', keyword, '--', search_path],
+                flush_callback=flush_callback)) as events:
+            for event in events:
+                if event.get('type') == 'match':
                     data = event['data']
                     result = {'path': os.path.normpath(_rg_text(data['path']))}
                     if event.get('preview_unavailable'):
@@ -370,22 +449,6 @@ def iter_ripgrep_matches(task, keyword, search_path, extensions=(), match_case=F
                         result.update(line=data['line_number'], column=column + 1,
                                       preview=('…' if start else '') + raw[start:start + 500].rstrip('\r\n'))
                     yield result
-                while process.poll() is None:
-                    if not task.is_searching:
-                        raise _SearchCancelled()
-                    stop_reader.wait(.05)
-                if process.returncode not in (0, 1):
-                    errors.seek(0)
-                    raise OSError(errors.read(4096).decode('utf-8', errors='replace')
-                                  or tr("搜索引擎退出码: {}").format(process.returncode))
-            finally:
-                stop_reader.set()
-                if process.poll() is None:
-                    process.kill()
-                process.wait()
-                if reader.ident is not None:
-                    reader.join()
-                process.stdout.close()
 
 
 def _content_result(match, info):
@@ -413,11 +476,14 @@ class _SearchResultQueue(queue.Queue):
 
 
 class _SearchTask:
-    def __init__(self, search_path, everything_path, max_results, ripgrep_path=None):
-        self.search_path = search_path
+    def __init__(self, search_path, everything_path, max_results, ripgrep_path=None,
+                 project_mode=False, exclusions=()):
+        self.search_path = os.path.abspath(search_path)
         self.everything_path = everything_path
         self.ripgrep_path = ripgrep_path
         self.max_results = max_results
+        self.project_mode = project_mode
+        self.exclusions = tuple(exclusions)
         self.cancel_event = threading.Event()
         self.result_queue = _SearchResultQueue(self.cancel_event)
         self.queue_overflow_count = 0
@@ -599,7 +665,15 @@ class SearchResultsTableModel(QAbstractTableModel):
         if key_fn is None or len(self._rows) <= 1:
             return
         self.layoutAboutToBeChanged.emit()
+        indexes = self.persistentIndexList()
+        identities = [id(self._rows[index.row()]) for index in indexes]
         self._rows.sort(key=key_fn, reverse=(order == Qt.DescendingOrder))
+        if indexes:
+            selected = set(identities)
+            positions = {id(row): position for position, row in enumerate(self._rows) if id(row) in selected}
+            self.changePersistentIndexList(
+                indexes, [self.index(positions[identity], index.column())
+                          for index, identity in zip(indexes, identities)])
         self.layoutChanged.emit()
 
     def clear(self):
@@ -862,6 +936,22 @@ class SearchDialog(QDialog):
         file_type_layout.addWidget(self.file_type_input)
         layout.addLayout(file_type_layout)
 
+        scope_layout = QHBoxLayout()
+        scope_layout.addWidget(QLabel(tr("搜索范围:")))
+        self.scope_combo = QComboBox(self)
+        self.scope_combo.addItem(tr("全量搜索"), False)
+        self.scope_combo.addItem(tr("工程文件"), True)
+        scope_layout.addWidget(self.scope_combo)
+        self.exclusions_input = QLineEdit(self)
+        self.exclusions_input.setPlaceholderText(tr("排除规则，如 build/;*.log;vendor/**"))
+        self.exclusions_input.setClearButtonEnabled(True)
+        scope_layout.addWidget(self.exclusions_input, 1)
+        layout.addLayout(scope_layout)
+        self.scope_combo.setToolTip(tr("工程模式遵守 Git/ripgrep 忽略规则，排除隐藏项、依赖和构建目录；只返回文件"))
+        self.exclusions_input.setToolTip(tr("规则相对于搜索目录；启用排除规则后只返回文件，需要 ripgrep"))
+        self.scope_combo.currentIndexChanged.connect(self.on_scope_changed)
+        self.exclusions_input.textChanged.connect(self.on_scope_changed)
+
         # 大小 / 修改时间筛选与常用搜索
         filter_layout = QHBoxLayout()
         filter_layout.addWidget(QLabel(tr("大小:")))
@@ -914,7 +1004,7 @@ class SearchDialog(QDialog):
         self.result_list.setColumnWidth(2, SEARCH_RESULT_DATE_COL_WIDTH)
         self.result_list.setColumnWidth(3, SEARCH_RESULT_SIZE_COL_WIDTH)
         self.result_list.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.result_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.result_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.result_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.result_list.setWordWrap(False)
         self.result_list.doubleClicked.connect(self.on_result_double_clicked)
@@ -948,7 +1038,14 @@ class SearchDialog(QDialog):
         self.open_match_button = QPushButton(tr("在 VS Code 中打开匹配行"), self)
         self.open_match_button.setEnabled(False)
         self.open_match_button.clicked.connect(self.open_match_in_editor)
-        layout.addWidget(self.open_match_button, 0, Qt.AlignRight)
+        result_actions = QHBoxLayout()
+        self.basket_button = QPushButton(tr("添加选中项到收集篮"), self)
+        self.basket_button.setEnabled(hasattr(self.main_window, 'add_paths_to_basket'))
+        self.basket_button.clicked.connect(self.add_selected_results_to_basket)
+        result_actions.addWidget(self.basket_button)
+        result_actions.addStretch(1)
+        result_actions.addWidget(self.open_match_button)
+        layout.addLayout(result_actions)
         self.result_list.selectionModel().currentRowChanged.connect(self.update_match_preview)
         self.result_model.modelReset.connect(self.update_match_preview)
         self.result_model.layoutChanged.connect(self.update_match_preview)
@@ -993,6 +1090,18 @@ class SearchDialog(QDialog):
         launch_context_tool(self, tool, ToolContext(
             cwd=os.path.dirname(result['path']), selected=(result['path'],),
             line=result['line'], column=result.get('column', 1)))
+
+    def selected_result_paths(self):
+        return [self.result_model.path_for_row(index.row())
+                for index in self.result_list.selectionModel().selectedRows()]
+
+    def add_selected_results_to_basket(self):
+        paths = self.selected_result_paths()
+        if not paths:
+            show_toast(self, tr("文件收集篮"), tr("请先选择文件或文件夹"), level='warning')
+            return
+        if hasattr(self.main_window, 'add_paths_to_basket'):
+            self.main_window.add_paths_to_basket(paths)
 
     def _release_search_resources(self):
         self.is_searching = False
@@ -1144,6 +1253,15 @@ class SearchDialog(QDialog):
         else:
             # 禁用Everything时，恢复文件内容搜索选项
             self.search_content_cb.setEnabled(True)
+
+    def on_scope_changed(self, *args):
+        scoped = self.scope_combo.currentData() or bool(self.exclusions_input.text().strip())
+        if scoped:
+            self.use_everything_cb.setChecked(False)
+        self.use_everything_cb.setEnabled(bool(self.everything_path) and not scoped)
+        self.use_everything_cb.setToolTip(
+            tr("工程模式或排除规则使用 ripgrep，不使用 Everything") if scoped
+            else tr("使用Everything搜索引擎\n路径: {}\n仅支持搜索文件名，不支持搜索文件内容").format(self.everything_path or '-'))
     
     def clear_search_cache(self):
         """清除所有搜索缓存（内部使用，软件关闭时自动调用）"""
@@ -1184,9 +1302,13 @@ class SearchDialog(QDialog):
             'min_size': self.min_size_input.text().strip(),
             'max_size': self.max_size_input.text().strip(),
             'modified_days': self.modified_combo.currentData(),
+            'project_mode': self.scope_combo.currentData(),
+            'exclusions': self.exclusions_input.text().strip(),
         }
 
     def apply_search_preset(self, preset):
+        self.scope_combo.setCurrentIndex(1 if preset.get('project_mode', False) else 0)
+        self.exclusions_input.setText(str(preset.get('exclusions', '')))
         self.search_input.setCurrentText(str(preset.get('keyword', '')))
         self.file_type_input.setText(str(preset.get('file_types', '')))
         self.search_filename_cb.setChecked(bool(preset.get('search_filename', True)))
@@ -1288,12 +1410,22 @@ class SearchDialog(QDialog):
         except ValueError as error:
             show_toast(self, tr("大小格式无效"), tr("请输入如 10KB、5MB、1.5GB 的大小：{}").format(error), level="warning")
             return
-        extra_key = f"{use_regex}|{self.min_size_input.text().strip()}|{self.max_size_input.text().strip()}|{self.modified_combo.currentData()}"
+        try:
+            exclusions = parse_search_exclusions(self.exclusions_input.text())
+        except ValueError as error:
+            show_toast(self, tr("搜索范围"), str(error), level='warning')
+            return
+        project_mode = bool(self.scope_combo.currentData())
+        if (project_mode or exclusions) and not self.ripgrep_path:
+            show_toast(self, tr("搜索范围"), tr("工程模式和排除规则需要 ripgrep，请恢复组件或使用全量搜索"), level='error')
+            return
+        extra_key = f"{use_regex}|{self.min_size_input.text().strip()}|{self.max_size_input.text().strip()}|{self.modified_combo.currentData()}|{project_mode}|{exclusions}"
         previous_task = getattr(self, '_search_task', None)
         if previous_task:
             previous_task.cancel_event.set()
         self.is_searching = False
-        self._search_task = _SearchTask(search_path, self.everything_path, self.max_results, self.ripgrep_path)
+        self._search_task = _SearchTask(search_path, self.everything_path, self.max_results,
+                                       self.ripgrep_path, project_mode, exclusions)
         self.result_queue = self._search_task.result_queue
         
         # 获取文件类型过滤
@@ -1485,6 +1617,9 @@ class SearchDialog(QDialog):
     
     def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None, use_everything=False, match_case=False, match_whole_word=False,
                   use_regex=False, filters=None):
+        scoped = getattr(self, 'project_mode', False) or getattr(self, 'exclusions', ())
+        if scoped and (use_everything or not getattr(self, 'ripgrep_path', None)):
+            raise ValueError(tr("工程模式和排除规则需要 ripgrep，请恢复组件或使用全量搜索"))
         metadata_degrade_count = 0
         whole_word_pattern = compile_search_pattern(keyword, match_case, match_whole_word, use_regex)
         whole_word_pattern_bytes = None
@@ -1715,6 +1850,7 @@ class SearchDialog(QDialog):
         search_warnings = []
         search_failed = False
         streamed_paths = set()
+        entries = None
         try:
             rg_matches = None
             if search_content and keyword and getattr(self, 'ripgrep_path', None):
@@ -1731,6 +1867,8 @@ class SearchDialog(QDialog):
                             if normalized in streamed_paths:
                                 continue
                             extension = os.path.splitext(path)[1][1:].lower()
+                            if file_extensions and extension not in file_extensions:
+                                continue
                             if extension in binary_file_extensions:
                                 skipped_binary_files += 1
                                 continue
@@ -1766,7 +1904,7 @@ class SearchDialog(QDialog):
                     self.result_queue.put({'type': 'status', 'text': warning})
             folder_count = 0
             last_status_update_ms = int(time.time() * 1000)
-            entries = () if results_limited or (rg_matches is not None and not search_filename) else os.walk(self.search_path)
+            entries = () if results_limited or (rg_matches is not None and not search_filename) else iter_search_entries(self)
             for root, dirs, files in entries:
                 if not self.is_searching:
                     debug_print(tr("[Search] 搜索被中断"))
@@ -2084,6 +2222,9 @@ class SearchDialog(QDialog):
             debug_print(f"[Search] error: {e}")
             search_failed = True
             search_warnings.append(tr("搜索未完成: {}").format(e))
+        finally:
+            if hasattr(entries, 'close'):
+                entries.close()
         
         # 添加剩余的结果（队列满时等待）
         if results_buffer:
@@ -2211,7 +2352,8 @@ class SearchDialog(QDialog):
         if not file_path or not os.path.exists(file_path):
             return
 
-        self.result_list.selectRow(row)
+        if not self.result_list.selectionModel().isSelected(index):
+            self.result_list.selectRow(row)
 
         menu = QMenu(self)
 
@@ -2220,6 +2362,8 @@ class SearchDialog(QDialog):
 
         open_folder_action = menu.addAction(tr("打开所在目录"))
         open_folder_action.triggered.connect(lambda: self._open_result_parent_folder(file_path))
+        basket_action = menu.addAction(tr("添加选中项到收集篮"), self.add_selected_results_to_basket)
+        basket_action.setEnabled(hasattr(self.main_window, 'add_paths_to_basket'))
 
         if os.path.isfile(file_path):
             from .context_tools import ToolContext, configured_tools, populate_tools_menu
@@ -2228,8 +2372,9 @@ class SearchDialog(QDialog):
             try:
                 populate_tools_menu(
                     tools_menu, configured_tools(getattr(self.main_window, 'config', {})),
-                    ToolContext(cwd=os.path.dirname(file_path), selected=(file_path,),
-                                line=result.get('line', 0), column=result.get('column', 1)), self)
+                    ToolContext(cwd=os.path.dirname(file_path), selected=tuple(self.selected_result_paths()),
+                                line=result.get('line', 0) if len(self.selected_result_paths()) == 1 else 0,
+                                column=result.get('column', 1)), self)
             except ValueError as error:
                 tools_menu.addAction(str(error)).setEnabled(False)
             default_action = menu.addAction(tr("用系统默认程序打开"))

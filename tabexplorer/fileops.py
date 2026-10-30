@@ -1024,6 +1024,34 @@ class DirectoryCompareDialog(QDialog):
         self.table.setSelectionMode(QTreeWidget.ExtendedSelection)
         self.table.itemDoubleClicked.connect(self.open_item)
         layout.addWidget(self.table)
+        from PyQt5.QtWidgets import QComboBox
+        from .context_tools import configured_tools, default_tools
+        compare_controls = QHBoxLayout()
+        self.difference_filter = QComboBox(self)
+        for label, key in (("全部差异", 'all'), ("仅左侧", 'left'), ("仅右侧", 'right'),
+                           ("内容不同", 'changed'), ("错误或未比较", 'other')):
+            self.difference_filter.addItem(tr(label), key)
+        self.difference_filter.currentIndexChanged.connect(self.filter_differences)
+        compare_controls.addWidget(self.difference_filter)
+        self.compare_tool_combo = QComboBox(self)
+        try:
+            configured = configured_tools(getattr(parent, 'config', {}))
+        except ValueError as error:
+            configured = []
+            show_toast(self, tr("外部工具"), str(error), level='error')
+        for preset_id in ('vscode-diff', 'winmerge-files'):
+            tool = next((entry for entry in configured if entry.get('id') == preset_id), None)
+            if tool is None:
+                tool = next(entry for entry in default_tools() if entry['id'] == preset_id)
+                tool['name'] += tr("（默认预设）")
+            self.compare_tool_combo.addItem(tool['name'], tool)
+        compare_controls.addWidget(self.compare_tool_combo, 1)
+        self.view_diff_button = QPushButton(tr("查看内容差异"), self)
+        self.view_diff_button.setEnabled(False)
+        self.view_diff_button.clicked.connect(self.view_content_difference)
+        self.table.itemSelectionChanged.connect(self.update_diff_action)
+        compare_controls.addWidget(self.view_diff_button)
+        layout.addLayout(compare_controls)
         controls = QHBoxLayout()
         self.start_button = QPushButton(tr("比较"), self)
         self.stop_button = QPushButton(tr("停止"), self)
@@ -1063,6 +1091,7 @@ class DirectoryCompareDialog(QDialog):
         cancel_event, results = self.cancel_event, self.results
         self.table.clear()
         self.running = True
+        self.update_diff_action()
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.status.setText(tr("比较中"))
@@ -1093,12 +1122,14 @@ class DirectoryCompareDialog(QDialog):
                 for column, value in enumerate(payload):
                     row.setToolTip(column, value)
                 self.table.addTopLevelItem(row)
+                row.setHidden(not self._matches_difference(row))
             else:
                 self.running = False
                 self.timer.stop()
                 self.start_button.setEnabled(True)
                 self.stop_button.setEnabled(False)
                 self.status.setText(payload if kind == 'error' else tr("比较完成，差异项: ") + str(self.table.topLevelItemCount()))
+                self.update_diff_action()
                 break
 
     def stop_compare(self):
@@ -1108,6 +1139,38 @@ class DirectoryCompareDialog(QDialog):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status.setText(tr("已停止"))
+        self.update_diff_action()
+
+    def _matches_difference(self, item):
+        states = {'left': tr("仅左侧"), 'right': tr("仅右侧"), 'changed': tr("内容不同")}
+        key = self.difference_filter.currentData()
+        return (key == 'all' or (item.text(1) not in states.values() if key == 'other'
+                                else item.text(1) == states[key]))
+
+    def filter_differences(self):
+        self.table.clearSelection()
+        for index in range(self.table.topLevelItemCount()):
+            item = self.table.topLevelItem(index)
+            item.setHidden(not self._matches_difference(item))
+        self.update_diff_action()
+
+    def update_diff_action(self):
+        rows = [item for item in self.table.selectedItems() if not item.isHidden()]
+        available = (not self.running and len(rows) == 1 and rows[0].text(1) == tr("内容不同")
+                     and bool(rows[0].text(2) and rows[0].text(3)))
+        self.view_diff_button.setEnabled(available)
+        self.view_diff_button.setToolTip(tr("选择一个两侧均存在且内容不同的文件") if not available
+                                        else tr("使用选定工具比较左右文件，不自动复制"))
+
+    def view_content_difference(self):
+        self.update_diff_action()
+        if not self.view_diff_button.isEnabled():
+            return
+        from .context_tools import ToolContext, launch_context_tool
+        row = next(item for item in self.table.selectedItems() if not item.isHidden())
+        launch_context_tool(self, self.compare_tool_combo.currentData(), ToolContext(
+            cwd=os.path.dirname(row.text(2)), selected=(row.text(2), row.text(3)),
+            left=self.paths[0].text(), right=self.paths[1].text()))
 
     def open_item(self, item, column):
         path = item.text(3 if column == 3 else 2) or item.text(3)
@@ -1119,7 +1182,8 @@ class DirectoryCompareDialog(QDialog):
         from PyQt5.QtWidgets import QMessageBox
         if self.running:
             return
-        rows = [tuple(item.text(column) for column in range(4)) for item in self.table.selectedItems()]
+        rows = [tuple(item.text(column) for column in range(4))
+                for item in self.table.selectedItems() if not item.isHidden()]
         if not rows:
             show_toast(self, tr("目录同步"), tr("请先在比较结果中选择要复制的项"), level="info")
             return
