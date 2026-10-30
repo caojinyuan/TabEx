@@ -1,6 +1,9 @@
 """崩溃诊断包：临时目录内验证隐私、保留、容量和导出，不触发真实崩溃。"""
 
+from contextlib import ExitStack
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -60,6 +63,63 @@ class DiagnosticsTests(unittest.TestCase):
         with zipfile.ZipFile(bundle) as archive:
             state = json.loads(archive.read(f'sessions/{self.diagnostics.session.name}/session.json'))
             self.assertEqual(state['status'], 'fatal')
+
+    def test_legacy_sessions_migrate_without_moving_live_instances(self):
+        legacy = self.root / 'legacy'
+        states = (
+            {'status': 'closed', 'ended': '2026-10-30', 'pid': 123},
+            {'status': 'fatal', 'pid': 456},
+            {'status': 'running', 'pid': 789},
+        )
+        sources = []
+        for index, state in enumerate(states):
+            source = legacy / f'20261029-00000{index}-12345678'
+            source.mkdir(parents=True)
+            (source / 'session.json').write_text(json.dumps(state), encoding='utf-8')
+            (source / 'fault.log').write_bytes(b'preserved stack\r\n')
+            sources.append(source)
+        with patch('tabexplorer.diagnostics._process_alive', side_effect=lambda pid: pid == 789):
+            self.diagnostics.migrate_sessions([legacy])
+        for source in sources[:2]:
+            self.assertFalse(source.exists())
+            self.assertEqual((self.diagnostics.directory / source.name / 'fault.log').read_bytes(),
+                             b'preserved stack\r\n')
+        self.assertTrue(sources[2].is_dir())
+        self.assertFalse((self.diagnostics.directory / sources[2].name).exists())
+        bundle = self.root / 'migrated.zip'
+        self.diagnostics.export(bundle)
+        with zipfile.ZipFile(bundle) as archive:
+            self.assertIn(f'sessions/{sources[1].name}/fault.log', archive.namelist())
+
+    def test_existing_migrated_session_does_not_overwrite_legacy_or_current_data(self):
+        source = self.root / 'legacy' / '20261029-000000-12345678'
+        target = self.diagnostics.directory / source.name
+        source.mkdir(parents=True)
+        target.mkdir()
+        (source / 'fault.log').write_bytes(b'legacy')
+        (target / 'fault.log').write_bytes(b'current')
+        self.diagnostics.migrate_sessions([source.parent])
+        self.assertEqual((source / 'fault.log').read_bytes(), b'legacy')
+        self.assertEqual((target / 'fault.log').read_bytes(), b'current')
+
+    def test_failed_migration_keeps_original_and_cleans_incomplete_copy(self):
+        source = self.root / 'legacy' / '20261029-000000-12345678'
+        source.mkdir(parents=True)
+        (source / 'session.json').write_text('{"ended": "2026-10-30"}', encoding='utf-8')
+        (source / 'fault.log').write_bytes(b'original')
+
+        def partial_copy(_source, target, **_options):
+            target.mkdir()
+            (target / 'fault.log').write_bytes(b'partial')
+            raise PermissionError('copy failed')
+
+        with patch('shutil.copytree', side_effect=partial_copy), patch('sys.stderr', new_callable=io.StringIO) as stderr:
+            self.diagnostics.migrate_sessions([source.parent])
+        self.assertIn('copy failed', stderr.getvalue())
+        self.assertEqual((source / 'fault.log').read_bytes(), b'original')
+        self.assertFalse((self.diagnostics.directory / source.name).exists())
+        self.assertEqual(list(self.diagnostics.directory.glob('.migrating-*')), [])
+        self.assertIn('log_migration_failed', (self.diagnostics.session / 'events.jsonl').read_text())
 
     def test_exception_records_stack_without_message_or_source(self):
         """异常保留类型、函数和行号，但不记录可能含密钥的异常消息和源码行。"""
@@ -335,7 +395,7 @@ class QtDiagnosticsTests(unittest.TestCase):
                 patch.object(QMessageBox, 'information') as information, \
                 patch_all('show_toast') as toast, \
                 patch.object(QMessageBox, 'warning') as warning, \
-                patch.object(self.diagnostics, 'export', side_effect=export), \
+                patch.object(self.diagnostics, 'export', side_effect=export) as export_mock, \
                 patch_all('_DEBUG_LOG_PATH', str(self.root / 'missing.log')):
             try:
                 host.export_diagnostics_action.trigger()
@@ -355,6 +415,7 @@ class QtDiagnosticsTests(unittest.TestCase):
             toast.call_args.kwargs['action']()
             host.add_new_tab.assert_called_once_with(str(self.root))
             warning.assert_not_called()
+            export_mock.assert_called_once_with(str(target), str(self.root / 'missing.log'))
         with zipfile.ZipFile(target) as archive:
             self.assertIsNone(archive.testzip())
             snapshot = json.loads(archive.read(f'sessions/{self.diagnostics.session.name}/snapshot.json'))
@@ -416,28 +477,12 @@ class QtDiagnosticsTests(unittest.TestCase):
             'python_threads', 'thread_names', 'tabs', 'hibernated_tabs',
             'running_background_threads', 'running_tasks', 'search_windows', 'toasts', 'time'})
 
-    def test_startup_falls_back_when_primary_directory_is_read_only(self):
-        """首选目录无权限时回退临时目录；两处都失败时不阻止软件启动。"""
-        service = Mock()
-        with patch('tabexplorer.diagnostics.Diagnostics', side_effect=[PermissionError('denied'), service]) as factory, \
-                patch.dict('os.environ', {'LOCALAPPDATA': str(self.root / 'readonly')}), \
-                patch('tempfile.gettempdir', return_value=str(self.root / 'fallback')):
-            self.module._start_diagnostics()
-        self.assertEqual(factory.call_count, 2)
-        self.assertEqual(Path(factory.call_args.args[0]), self.root / 'fallback' / 'TabEx' / 'diagnostics')
-        service.install.assert_called_once()
-        service.capture_debug.assert_called_once()
-        with patch_all('_diagnostics', None), \
-                patch('tabexplorer.diagnostics.Diagnostics', side_effect=PermissionError('denied')):
-            self.module._start_diagnostics()
-            self.assertIsNone(self.module._diagnostics)
-
     def test_packaged_mode_uses_executable_directory_and_records_mode(self):
         """模拟 frozen 标记确认 EXE 使用稳定日志目录，诊断注明打包模式；不代替实机打包测试。"""
         with patch.object(self.module.sys, 'frozen', True, create=True), \
                 patch.object(self.module.sys, 'executable', str(self.root / 'TabExplorer.exe')):
-            self.assertEqual(Path(self.module.get_app_data_path('TabEx_debug_latest.log')),
-                             self.root / 'TabEx_debug_latest.log')
+            self.assertEqual(Path(self.module.get_app_log_path('TabEx_debug_latest.log')),
+                             self.root / 'logs' / 'TabEx_debug_latest.log')
             packaged = Diagnostics(self.root / 'packaged', self.module.APP_VERSION)
         self.addCleanup(packaged.close)
         self.assertTrue(packaged.state['frozen'])
@@ -446,6 +491,150 @@ class QtDiagnosticsTests(unittest.TestCase):
         with zipfile.ZipFile(target) as archive:
             state = json.loads(archive.read(f'sessions/{packaged.session.name}/session.json'))
             self.assertTrue(state['frozen'])
+
+
+class LogDirectoryTests(unittest.TestCase):
+    def setUp(self):
+        from tabexplorer import debuglog
+        self.debuglog = debuglog
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        self.stack.enter_context(patch.dict(os.environ, {
+            'TABEX_DATA_DIR': str(self.root), 'LOCALAPPDATA': str(self.root / 'local')}))
+        self.stack.enter_context(patch('tempfile.gettempdir', return_value=str(self.root / 'temp')))
+        self.stack.enter_context(patch('tabexplorer.paths.get_app_base_dir', return_value=str(self.root)))
+        self.stack.enter_context(patch.object(debuglog, '_diagnostics', None))
+        self.stack.enter_context(patch.object(debuglog, '_DEBUG_LOG_PATH', str(self.root / 'logs' / 'TabEx_debug_latest.log')))
+        self.stack.enter_context(patch.object(debuglog, '_DEBUG_LOG_READY', False))
+        self.addCleanup(self.close_diagnostics)
+
+    def close_diagnostics(self):
+        if self.debuglog._diagnostics is not None:
+            self.debuglog._diagnostics.close()
+            self.debuglog._diagnostics = None
+
+    def test_all_logs_share_directory_and_legacy_debug_is_captured_before_reset(self):
+        original = self.root / 'TabEx_debug_latest.log'
+        original.write_bytes(b'[ClosedTabs] previous-session\r\n')
+        self.debuglog._start_diagnostics()
+        service = self.debuglog._diagnostics
+        self.assertEqual(service.directory, self.root / 'logs' / 'diagnostics')
+        debug = Path(self.debuglog._DEBUG_LOG_PATH)
+        self.assertEqual(debug.parent, self.root / 'logs')
+        self.assertEqual(debug.read_bytes(), b'[ClosedTabs] previous-session\r\n')
+        self.assertFalse(original.exists())
+        self.debuglog._init_debug_log_file()
+        self.debuglog._append_debug_log_line('[TabSwitch] current-session')
+        self.assertIn('current-session', debug.read_text(encoding='utf-8'))
+        bundle = self.root / 'bundle.zip'
+        service.export(bundle, debug)
+        with zipfile.ZipFile(bundle) as archive:
+            previous = f'sessions/{service.session.name}/previous-debug-filtered.log'
+            self.assertIn('previous-session', archive.read(previous).decode('utf-8'))
+            self.assertIn('current-session', archive.read('debug-filtered.log').decode('utf-8'))
+        self.assertEqual(list(self.root.glob('*.log')), [])
+        self.assertTrue((service.session / 'fault.log').is_file())
+
+    def test_existing_debug_log_takes_priority_without_deleting_old_root_log(self):
+        original = self.root / 'TabEx_debug_latest.log'
+        original.write_bytes(b'legacy')
+        target = Path(self.debuglog._DEBUG_LOG_PATH)
+        target.parent.mkdir()
+        target.write_bytes(b'current')
+        self.debuglog._start_diagnostics()
+        self.assertEqual(original.read_bytes(), b'legacy')
+        self.assertEqual(target.read_bytes(), b'current')
+
+    def test_failed_debug_migration_preserves_original_and_reports_error(self):
+        original = self.root / 'TabEx_debug_latest.log'
+        original.write_bytes(b'[ClosedTabs] original')
+        with patch('shutil.move', side_effect=PermissionError('locked')), \
+                patch('sys.stderr', new_callable=io.StringIO) as stderr:
+            self.debuglog._start_diagnostics()
+        self.assertIn('locked', stderr.getvalue())
+        self.assertEqual(original.read_bytes(), b'[ClosedTabs] original')
+        captured = self.debuglog._diagnostics.session / 'previous-debug-filtered.log'
+        self.assertIn('original', captured.read_text(encoding='utf-8'))
+
+    def test_read_only_primary_falls_back_with_debug_and_diagnostics_together(self):
+        for rejected, expected in ((1, self.root / 'local' / 'TabEx' / 'logs'),
+                                   (2, self.root / 'temp' / 'TabEx' / 'logs')):
+            with self.subTest(rejected=rejected):
+                attempts = []
+
+                def create(directory, version):
+                    attempts.append(Path(directory))
+                    if len(attempts) <= rejected:
+                        raise PermissionError('denied')
+                    return Diagnostics(directory, version)
+
+                with patch.dict(os.environ, TABEX_DATA_DIR=''), \
+                        patch('tabexplorer.diagnostics.Diagnostics', side_effect=create), \
+                        patch('sys.stderr', new_callable=io.StringIO) as stderr:
+                    self.debuglog._start_diagnostics()
+                    self.debuglog._init_debug_log_file()
+                self.assertIn('denied', stderr.getvalue())
+                self.assertEqual(len(attempts), rejected + 1)
+                self.assertEqual(self.debuglog._diagnostics.directory, expected / 'diagnostics')
+                self.assertEqual(Path(self.debuglog._DEBUG_LOG_PATH), expected / 'TabEx_debug_latest.log')
+                self.assertTrue(Path(self.debuglog._DEBUG_LOG_PATH).is_file())
+                from tabexplorer.mainwindow import MainWindow
+                host = Mock(_app_started_at=0)
+                self.assertIn(str(expected), MainWindow.runtime_information(host))
+                self.close_diagnostics()
+
+    def test_all_unwritable_directories_disable_diagnostics_without_stopping_startup(self):
+        with patch.dict(os.environ, TABEX_DATA_DIR=''), \
+                patch('tabexplorer.diagnostics.Diagnostics', side_effect=PermissionError('denied')) as factory, \
+                patch('sys.stderr', new_callable=io.StringIO) as stderr:
+            self.debuglog._start_diagnostics()
+        self.assertEqual(factory.call_count, 3)
+        self.assertIsNone(self.debuglog._diagnostics)
+        self.assertIn('diagnostics unavailable', stderr.getvalue())
+
+    def test_data_override_never_migrates_or_falls_back_to_personal_logs(self):
+        personal = self.root / 'local' / 'TabEx' / 'diagnostics' / '20261029-000000-12345678'
+        personal.mkdir(parents=True)
+        (personal / 'session.json').write_text('{"ended": "2026-10-30"}', encoding='utf-8')
+        self.debuglog._start_diagnostics()
+        self.assertTrue(personal.is_dir())
+        self.assertFalse((self.debuglog._diagnostics.directory / personal.name).exists())
+        self.close_diagnostics()
+        with patch('tabexplorer.diagnostics.Diagnostics', side_effect=PermissionError('denied')) as factory, \
+                patch('sys.stderr', new_callable=io.StringIO):
+            self.debuglog._start_diagnostics()
+        self.assertEqual(factory.call_count, 1)
+        self.assertIsNone(self.debuglog._diagnostics)
+
+    def test_normal_startup_migrates_inactive_user_data_sessions(self):
+        personal = self.root / 'local' / 'TabEx' / 'diagnostics' / '20261029-000000-12345678'
+        personal.mkdir(parents=True)
+        (personal / 'session.json').write_text('{"ended": "2026-10-30"}', encoding='utf-8')
+        (personal / 'fault.log').write_bytes(b'previous fault')
+        with patch.dict(os.environ, TABEX_DATA_DIR=''):
+            self.debuglog._start_diagnostics()
+        self.assertFalse(personal.exists())
+        migrated = self.debuglog._diagnostics.directory / personal.name / 'fault.log'
+        self.assertEqual(migrated.read_bytes(), b'previous fault')
+
+    def test_primary_directory_recovers_sessions_from_previous_fallback(self):
+        fallback = self.root / 'temp' / 'TabEx' / 'logs' / 'diagnostics' / '20261029-000000-12345678'
+        fallback.mkdir(parents=True)
+        (fallback / 'session.json').write_text('{"ended": "2026-10-30"}', encoding='utf-8')
+        (fallback / 'fault.log').write_bytes(b'fallback fault')
+        with patch.dict(os.environ, TABEX_DATA_DIR=''):
+            self.debuglog._start_diagnostics()
+        self.assertFalse(fallback.exists())
+        migrated = self.debuglog._diagnostics.directory / fallback.name / 'fault.log'
+        self.assertEqual(migrated.read_bytes(), b'fallback fault')
+
+    def test_log_initialization_failure_is_visible(self):
+        with patch('os.makedirs', side_effect=PermissionError('denied')), \
+                patch('sys.stderr', new_callable=io.StringIO) as stderr:
+            self.debuglog._init_debug_log_file()
+        self.assertFalse(self.debuglog._DEBUG_LOG_READY)
+        self.assertIn('Cannot initialize log file', stderr.getvalue())
 
 
 if __name__ == '__main__':

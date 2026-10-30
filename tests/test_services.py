@@ -205,7 +205,7 @@ class ConfigPathTests(unittest.TestCase):
         self.addCleanup(environment.stop)
 
     def test_legacy_files_move_without_changing_content(self):
-        from tabexplorer.paths import get_app_config_path, get_app_data_path
+        from tabexplorer.paths import get_app_config_path, get_app_data_path, get_app_log_path
         for name in self.names:
             with self.subTest(name=name):
                 original = self.root / name
@@ -216,7 +216,7 @@ class ConfigPathTests(unittest.TestCase):
                 self.assertFalse(original.exists())
                 self.assertEqual(get_app_config_path(name), str(target))
         self.assertEqual(get_app_data_path('chat_history.json'), str(self.root / 'chat_history.json'))
-        self.assertEqual(get_app_data_path('TabEx_debug_latest.log'), str(self.root / 'TabEx_debug_latest.log'))
+        self.assertEqual(get_app_log_path('TabEx_debug_latest.log'), str(self.root / 'logs' / 'TabEx_debug_latest.log'))
         self.assertEqual(get_app_data_path('QuickLook'), str(self.root / 'QuickLook'))
 
     def test_existing_config_takes_priority_without_overwriting_either_file(self):

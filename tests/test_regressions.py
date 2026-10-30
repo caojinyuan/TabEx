@@ -2599,6 +2599,8 @@ class HotkeyAndUpdateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.module._fetch_latest_release()
         self.assertGreater(self.module._version_tuple('3.100'), self.module._version_tuple('v3.99'))
+        self.assertGreater(self.module._version_tuple('4.01'), self.module._version_tuple('3.100'))
+        self.assertGreater(self.module._version_tuple('4.02'), self.module._version_tuple('4.01'))
 
     def test_update_errors_are_readable(self):
         """GitHub 限流和超时转换为可读提示。"""
@@ -3299,7 +3301,7 @@ class TabGroupTests(unittest.TestCase):
 
 
 class PathParsingTests(unittest.TestCase):
-    """地址栏、面包屑、Explorer 位置、慢盘判断和快捷键门控，共 8 个用例。不访问真实网络路径。"""
+    """地址栏、面包屑、Explorer 位置、慢盘判断和快捷键门控，共 9 个用例。不访问真实网络路径。"""
 
     @classmethod
     def setUpClass(cls):
@@ -3416,6 +3418,17 @@ class PathParsingTests(unittest.TestCase):
                 launch.assert_called_once_with('cmd', directory)
                 host.path_bar.set_path.assert_called_with(directory)
                 toast.assert_not_called()
+
+    def test_same_address_can_retry_after_navigation_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host, change = self.path_bar_host(directory)
+            host.net_banner = types.SimpleNamespace(isHidden=lambda: False)
+            change(directory)
+            host.navigate_to.assert_called_once_with(directory)
+            host.navigate_to.reset_mock()
+            host.net_banner.isHidden = lambda: True
+            change(directory)
+            host.navigate_to.assert_not_called()
 
     def test_explorer_location_parsing(self):
         """Explorer 窗口位置：本地与 UNC 的 file: 地址、此电脑等 CLSID、控制面板及名称回退都能转换；未知位置回到主目录。"""
@@ -3651,7 +3664,7 @@ class ThemeTests(unittest.TestCase):
 
 
 class NetworkBannerTests(unittest.TestCase):
-    """网络位置不可用提示条：原因说明、重试、重新连接、超时与过期失败，共 6 个用例。不访问真实网络。"""
+    """位置不可用提示条：原因说明、失败后导航恢复、重试、重新连接、超时与过期失败，共 7 个用例。"""
 
     UNC = '\\\\srv\\share\\team'
     BAD_NETPATH = -2147024843  # HRESULT_FROM_WIN32(ERROR_BAD_NETPATH)
@@ -3757,6 +3770,56 @@ class NetworkBannerTests(unittest.TestCase):
             self.settle()
         self.assertFalse(host.net_banner.isVisible())
         self.assertTrue(host._explorer_placeholder.isHidden())
+
+    def test_initial_failure_does_not_defer_recovery_as_background_navigation(self):
+        """错误占位隐藏 Shell 控件后，导航到有效父目录或 Shell 位置必须恢复控件并实际发出导航。"""
+        tab = self.module.FileExplorerTab
+        with tempfile.TemporaryDirectory() as directory:
+            for path, is_shell, background in ((directory, False, False),
+                                               ('shell:MyComputerFolder', True, False),
+                                               (directory, False, True)):
+                with self.subTest(path=path, background=background):
+                    host = self.banner_host()
+                    old_explorer = host.explorer
+                    host.explorer = self.module.IExplorerBrowserWidget(host)
+                    host.layout().replaceWidget(old_explorer, host.explorer)
+                    old_explorer.hide()
+                    old_explorer.deleteLater()
+                    host.explorer.show()
+                    host.current_path = str(Path(directory) / 'missing' / 'nested')
+                    host.main_window = None
+                    host.path_bar = Mock()
+                    for name in ('_normalize_local_path', '_mark_expected_navigation',
+                                 '_perform_navigation', 'navigate_to'):
+                        setattr(host, name, types.MethodType(getattr(tab, name), host))
+                    host._is_control_panel_path = lambda _path: False
+                    host._is_slow_path = lambda _path: False
+                    host._is_mycomputer_shell_target = lambda _path: False
+                    for name in ('_resume_path_sync_after_navigation', 'update_explorer_status',
+                                 '_update_dir_polling', 'update_tab_title', '_add_to_history'):
+                        setattr(host, name, Mock())
+                    self.settle()
+                    host._on_navigation_failed(host.current_path, -2147024894)
+                    self.settle()
+                    self.assertTrue(host.explorer.isHidden())
+                    self.assertTrue(host.net_banner.isVisible())
+                    if background:
+                        host.hide()
+                    with patch.object(host.explorer, '_ensure_browser', return_value=True), \
+                            patch.object(host.explorer, '_navigate_sync') as navigate, \
+                            patch_all('_path_is_slow_for_shell', return_value=False):
+                        host.navigate_to(path, is_shell=is_shell, skip_async_check=True)
+                        if background:
+                            navigate.assert_not_called()
+                            self.assertEqual(host.explorer._pending_path, path)
+                            host.show()
+                            self.settle()
+                        navigate.assert_called_once_with(path)
+                        self.assertIsNone(host.explorer._pending_path)
+                        self.assertFalse(host.explorer.isHidden())
+                        host._on_navigation_succeeded()
+                        self.settle()
+                        self.assertFalse(host.net_banner.isVisible())
 
     def test_timeout_and_reconnect_results(self):
         """导航超时提示连接超时；重新连接在后台线程执行并传入主窗口句柄：成功后重新打开，取消时恢复原提示，

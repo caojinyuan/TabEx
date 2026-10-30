@@ -34,6 +34,18 @@ def lifecycle_steps(check):
     while True:
         left = w.get_current_tab_widget()
         yield 'base view ready', lambda: ready(left, root)
+        missing = root / 'missing-location' / 'nested'
+        w.add_new_tab(str(missing))
+        recovered = w.get_current_tab_widget()
+        yield 'initial missing location shows placeholder', lambda: (
+            recovered.net_banner.isVisible() and recovered.explorer.isHidden()
+            and not recovered.explorer._has_view)
+        recovered.on_path_bar_changed(str(root))
+        yield 'address parent recovery reaches native folder', lambda: (
+            ready(recovered, root) and recovered.explorer.isVisible()
+            and recovered._explorer_placeholder.isHidden() and not recovered.net_banner.isVisible())
+        w.close_tab(w.content_stack.indexOf(recovered))
+        yield 'recovered tab closes cleanly', lambda: w.tab_widget.count() == 1 and ready(left, root)
         w.add_new_tab(str(root))
         right = w.get_current_tab_widget()
         yield 'second view ready', lambda: ready(right, root)

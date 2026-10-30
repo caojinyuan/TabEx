@@ -2,36 +2,61 @@
 
 import io
 import os
+import shutil
+import sys
 import threading
 import time
 
-from .paths import get_app_data_path
+from .paths import get_app_data_path, get_app_log_path
 from .constants import APP_VERSION
 
 
 # 全局调试开关
 _DEBUG_MODE = False  # 生产环境关闭，避免性能损耗
 _EXPLORER_MONITOR_DEBUG = False  # Explorer Monitor 单独的日志开关
-_DEBUG_LOG_PATH = get_app_data_path("TabEx_debug_latest.log")
+_DEBUG_LOG_PATH = get_app_log_path("TabEx_debug_latest.log")
 _DEBUG_LOG_LOCK = threading.Lock()
 _DEBUG_LOG_READY = False
 _diagnostics = None
 
 
 def _start_diagnostics():
-    global _diagnostics
+    global _diagnostics, _DEBUG_LOG_PATH
     from .diagnostics import Diagnostics
     import tempfile
-    for base in (os.environ.get('LOCALAPPDATA'), tempfile.gettempdir()):
-        if not base:
-            continue
+    directories = [get_app_log_path()]
+    legacy_directories = []
+    if not os.environ.get('TABEX_DATA_DIR'):
+        for base in (os.environ.get('LOCALAPPDATA'), tempfile.gettempdir()):
+            if base:
+                directories.append(os.path.join(base, 'TabEx', 'logs'))
+                legacy_directories.append(os.path.join(base, 'TabEx', 'diagnostics'))
+                legacy_directories.append(os.path.join(base, 'TabEx', 'logs', 'diagnostics'))
+    _diagnostics = None
+    _DEBUG_LOG_PATH = get_app_log_path("TabEx_debug_latest.log")
+    for directory in dict.fromkeys(directories):
+        service = None
         try:
-            _diagnostics = Diagnostics(os.path.join(base, 'TabEx', 'diagnostics'), APP_VERSION)
-            _diagnostics.install()
-            _diagnostics.capture_debug(_DEBUG_LOG_PATH)
-            return
-        except OSError:
+            service = Diagnostics(os.path.join(directory, 'diagnostics'), APP_VERSION)
+            service.install()
+        except OSError as error:
+            if service is not None:
+                service.close()
+            print(f"[Diagnostics] Cannot use log directory {directory}: {error}", file=sys.stderr)
             continue
+        _diagnostics = service
+        _DEBUG_LOG_PATH = os.path.join(directory, "TabEx_debug_latest.log")
+        previous_debug = get_app_data_path("TabEx_debug_latest.log")
+        if os.path.isfile(previous_debug) and not os.path.exists(_DEBUG_LOG_PATH):
+            try:
+                shutil.move(previous_debug, _DEBUG_LOG_PATH)
+            except OSError as error:
+                service.record('log_migration_failed', str(error))
+                print(f"[Diagnostics] Cannot migrate previous debug log: {error}", file=sys.stderr)
+        service.migrate_sessions(legacy_directories)
+        service.capture_debug(_DEBUG_LOG_PATH if os.path.isfile(_DEBUG_LOG_PATH) else previous_debug)
+        return
+    print("[Diagnostics] No writable log directory; diagnostics unavailable.", file=sys.stderr)
 
 
 def _diagnostic_event(kind, details):
@@ -44,11 +69,13 @@ def _init_debug_log_file():
     global _DEBUG_LOG_READY
     try:
         with _DEBUG_LOG_LOCK:
+            os.makedirs(os.path.dirname(_DEBUG_LOG_PATH), exist_ok=True)
             with open(_DEBUG_LOG_PATH, "w", encoding="utf-8", errors="replace") as f:
                 f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + "[DebugLog] session started\n")
         _DEBUG_LOG_READY = True
-    except Exception:
+    except OSError as error:
         _DEBUG_LOG_READY = False
+        print(f"[DebugLog] Cannot initialize log file {_DEBUG_LOG_PATH}: {error}", file=sys.stderr)
 
 
 def _append_debug_log_line(message):

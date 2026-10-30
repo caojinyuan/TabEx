@@ -82,6 +82,7 @@ _LANG_EN = {
     "解释器 / 可执行文件": "Interpreter / Executable",
     "程序目录": "Application Directory",
     "配置目录": "Configuration Directory",
+    "日志目录": "Log Directory",
     "VS Code：打开当前目录": "VS Code: Open Current Folder",
     "VS Code：打开选中项": "VS Code: Open Selection",
     "VS Code：打开匹配行": "VS Code: Open Matching Line",

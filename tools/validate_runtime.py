@@ -85,11 +85,17 @@ def validate(command, report, seconds=10, tabs=10, scenario='smoke', cycles=3, w
                     raise RuntimeError(f'Exit code: {code}\n' + details + '\n'
                                        + output.read(16384).decode('utf-8', errors='replace'))
                 result = json.loads(report.read_text(encoding='utf-8'))
-                sessions = list((Path(temporary) / 'local' / 'TabEx' / 'diagnostics').glob('*/session.json'))
+                sessions = list((data / 'logs' / 'diagnostics').glob('*/session.json'))
                 states = [json.loads(path.read_text(encoding='utf-8')).get('status') for path in sessions]
                 result['clean_exit'] = bool(states) and all(state == 'closed' for state in states)
                 result['single_instance'] = len(sessions) == 1
-                result['ok'] = result['ok'] and result['clean_exit'] and result['single_instance']
+                result['logs_in_data_directory'] = (
+                    (data / 'logs' / 'TabEx_debug_latest.log').is_file()
+                    and not (data / 'TabEx_debug_latest.log').exists()
+                    and not (Path(temporary) / 'local' / 'TabEx' / 'logs').exists()
+                    and not (Path(temporary) / 'local' / 'TabEx' / 'diagnostics').exists())
+                result['ok'] = (result['ok'] and result['clean_exit'] and result['single_instance']
+                                and result['logs_in_data_directory'])
                 report.write_text(json.dumps(result, indent=2), encoding='utf-8')
                 if not result['ok']:
                     raise RuntimeError(json.dumps(result))

@@ -27,7 +27,7 @@ from .constants import (
     RESOURCE_WARN_PERCENT, SESSION_SNAPSHOT_DEBOUNCE_MS, SESSION_SNAPSHOT_INTERVAL_MS,
     SESSION_SNAPSHOT_MIN_INTERVAL_MS, SYNC_BROWSE_SETTLE_MS,
 )
-from .debuglog import _DEBUG_LOG_PATH, debug_print, set_debug_mode, set_explorer_monitor_debug
+from .debuglog import debug_print, set_debug_mode, set_explorer_monitor_debug
 from .system import (
     get_process_memory_usage_mb, get_process_resources, get_system_cpu_percent, get_system_memory_status, HAS_PYWIN,
     is_supported_title_shortcut_path, launch_detached, launch_shell_tool, normalize_external_launch_dir,
@@ -3897,6 +3897,7 @@ class MainWindow(QMainWindow):
             (tr("解释器 / 可执行文件"), sys.executable),
             (tr("程序目录"), get_app_base_dir()),
             (tr("配置目录"), get_app_config_path()),
+            (tr("日志目录"), os.path.dirname(_debuglog._DEBUG_LOG_PATH)),
         )
         return '\n'.join(f'{label}: {value}' for label, value in values)
 
@@ -4050,7 +4051,7 @@ class MainWindow(QMainWindow):
                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
                     return
         self._capture_diagnostic_snapshot()
-        worker = DiagnosticExportWorker(_debuglog._diagnostics, destination, _DEBUG_LOG_PATH)
+        worker = DiagnosticExportWorker(_debuglog._diagnostics, destination, _debuglog._DEBUG_LOG_PATH)
         self._diagnostic_export_worker = worker
         self.export_diagnostics_action.setEnabled(False)
         worker.finished.connect(self._diagnostic_export_finished)

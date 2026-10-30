@@ -1196,6 +1196,8 @@ class FileExplorerTab(QWidget):
 
     def _mark_expected_navigation(self, path, is_shell):
         """记录短时导航期望，用于过滤乱序/迟到的 NavigateComplete2。"""
+        # 错误占位隐藏的 Shell 控件必须先恢复，否则 IEB 会把本次导航延后到控件显示时。
+        self._set_explorer_placeholder(False)
         try:
             self._expected_nav_path = str(path or '')
             self._expected_nav_is_shell = bool(is_shell)
@@ -1850,10 +1852,12 @@ class FileExplorerTab(QWidget):
             self.navigate_to(path, is_shell=True)
             return
 
-        # 路径与当前路径相同时（如 resizeEvent 误触发 pathChanged），跳过导航，防止循环刷新
+        # 正常显示同一路径时避免重复刷新；失败后地址栏重输同一路径应允许重试。
         current_norm = getattr(self, 'current_path', '').replace('/', '\\').lower().rstrip('\\')
         path_norm = path.replace('/', '\\').lower().rstrip('\\')
-        if path_norm == current_norm:
+        banner = getattr(self, 'net_banner', None)
+        failed_navigation = banner is not None and not banner.isHidden()
+        if path_norm == current_norm and not failed_navigation:
             debug_print(f"[PathBar] on_path_bar_changed: same as current_path, skip navigate")
             return
 

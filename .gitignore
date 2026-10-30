@@ -19,6 +19,9 @@ QuickLook.extracting/
 !.vscode/launch.json
 !.vscode/settings.json
 
+# Application logs and diagnostic sessions
+/logs/
+
 # Backup files
 *.bak
 *.broken-*

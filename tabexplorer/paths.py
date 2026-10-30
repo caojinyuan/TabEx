@@ -18,6 +18,11 @@ def get_app_data_path(*parts):
     return os.path.join(base, *parts)
 
 
+def get_app_log_path(*parts):
+    """Return a stable log path outside the bundled application resources."""
+    return get_app_data_path('logs', *parts)
+
+
 def get_app_config_path(file_name=''):
     """Resolve a configuration file, migrating a legacy root file without overwriting."""
     directory = get_app_data_path('config')

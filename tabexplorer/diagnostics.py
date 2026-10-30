@@ -121,6 +121,31 @@ class Diagnostics:
         _write_json(self.session / 'session.json', self.state)
         self._prune()
 
+    def migrate_sessions(self, directories):
+        """Move inactive legacy sessions; publish complete copies before removing originals."""
+        import shutil
+        for directory in dict.fromkeys(directories):
+            for source in sorted(Path(directory).glob('????????-??????-????????')):
+                target = self.directory / source.name
+                if source.is_symlink() or not source.is_dir() or target.exists():
+                    continue
+                try:
+                    state = json.loads((source / 'session.json').read_text(encoding='utf-8'))
+                    if not isinstance(state, dict):
+                        raise ValueError('Invalid diagnostic session metadata')
+                    if not state.get('ended') and _process_alive(state.get('pid')):
+                        continue
+                    # The old user-data directory may be on another drive.
+                    with tempfile.TemporaryDirectory(prefix='.migrating-', dir=self.directory) as temporary:
+                        staged = Path(temporary) / source.name
+                        shutil.copytree(source, staged, symlinks=True)
+                        os.rename(staged, target)
+                    shutil.rmtree(source)
+                except (OSError, ValueError) as error:
+                    self.record('log_migration_failed', str(error))
+                    print(f"[Diagnostics] Cannot migrate session {source.name}: {error}", file=sys.stderr)
+        self._prune()
+
     def _prune(self):
         import shutil
         sessions = sorted(self.directory.glob('????????-??????-????????'), reverse=True)
