@@ -25,7 +25,7 @@ from .constants import (
     HOUSEKEEPING_INTERVAL_MS, MAX_ACTIVE_TOASTS,
     MAX_CLOSED_TABS_HISTORY, MAX_SEARCH_HISTORY, RESOURCE_CRIT_PERCENT, RESOURCE_SAMPLE_INTERVAL_S,
     RESOURCE_WARN_PERCENT, SESSION_SNAPSHOT_DEBOUNCE_MS, SESSION_SNAPSHOT_INTERVAL_MS,
-    SESSION_SNAPSHOT_MIN_INTERVAL_MS, SYNC_BROWSE_FOLLOW_GUARD_S, SYNC_BROWSE_SETTLE_MS,
+    SESSION_SNAPSHOT_MIN_INTERVAL_MS, SYNC_BROWSE_SETTLE_MS,
 )
 from .debuglog import _DEBUG_LOG_PATH, debug_print, set_debug_mode, set_explorer_monitor_debug
 from .system import (
@@ -3616,15 +3616,24 @@ class MainWindow(QMainWindow):
     def _set_sync_browse(self, enabled):
         self._sync_browse = bool(enabled)
         self._sync_pending = None
+        timer = getattr(self, '_sync_browse_timer', None)
+        if timer is not None:
+            timer.stop()
+        for _tabs, stack in self._all_groups():
+            for index in range(stack.count()):
+                stack.widget(index)._sync_follow_target = None
         action = getattr(self, 'sync_browse_action', None)
         if action is not None:
             action.setChecked(self._sync_browse)
+        debug_print(f"[SyncBrowse] enabled={self._sync_browse}")
 
     def _queue_sync_browse(self, tab, old_path, new_path):
+        follow_target = getattr(tab, '_sync_follow_target', None)
+        tab._sync_follow_target = None
         if not getattr(self, '_sync_browse', False) or not getattr(self, '_split_active', False):
             return
-        if time.monotonic() < getattr(tab, '_sync_follow_until', 0):
-            return  # 这次变化来自同步跟随，不反向驱动
+        if follow_target == self._normalize_path_for_compare(new_path):
+            return  # 只消耗这次跟随的目标路径，不屏蔽随后发生的手动导航
         left, right = self.get_current_tab_widget(), self._get_split_pane()
         follower = right if tab is left else left if tab is right else None
         if follower is None or follower is tab:
@@ -3645,10 +3654,14 @@ class MainWindow(QMainWindow):
         from PyQt5 import sip
         from .paths import map_sync_path
         pending, self._sync_pending = getattr(self, '_sync_pending', None), None
-        if pending is None or not getattr(self, '_sync_browse', False):
+        if (pending is None or not getattr(self, '_sync_browse', False)
+                or not getattr(self, '_split_active', False)):
             return
         leader, follower = pending['leader'], pending['follower']
         if sip.isdeleted(leader) or sip.isdeleted(follower):
+            return
+        left, right = self.get_current_tab_widget(), self._get_split_pane()
+        if not ((leader is left and follower is right) or (leader is right and follower is left)):
             return
         if getattr(follower, 'current_path', '') != pending['follower_base']:
             return  # 另一侧已被用户移动，不再跟随
@@ -3661,7 +3674,8 @@ class MainWindow(QMainWindow):
             show_toast(self, tr("分屏同步浏览"), tr("另一侧没有对应目录：{}").format(target), level="warning",
                        duration=2500)
             return
-        follower._sync_follow_until = time.monotonic() + SYNC_BROWSE_FOLLOW_GUARD_S
+        follower._sync_follow_target = self._normalize_path_for_compare(target)
+        debug_print(f"[SyncBrowse] follow: {pending['follower_base']} -> {target}")
         follower.navigate_to(target)
 
     def _capture_named_workspace(self):

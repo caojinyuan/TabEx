@@ -30,7 +30,6 @@ APP_INTERNAL_CHANGE_FILENAMES = {
 FREQUENT_DIR_SETTLE_MS = 1500  # 目录停留超过该时长才计入常用目录
 FREQUENT_DIR_SAVE_DELAY_MS = 5000  # 常用目录记录的写盘防抖
 SYNC_BROWSE_SETTLE_MS = 300  # 分屏同步浏览：一侧路径稳定后再让另一侧跟随
-SYNC_BROWSE_FOLLOW_GUARD_S = 3.0  # 跟随导航产生的路径变化在该时间内不反向驱动
 
 # 大文件夹异步加载配置
 LARGE_FOLDER_THRESHOLD = 1000  # 超过此数量文件视为大文件夹

@@ -225,6 +225,156 @@ class FrequentDirsTests(unittest.TestCase):
 
 
 class SyncBrowseTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        for side in ('left', 'right'):
+            (self.root / side / 'sub' / 'nested').mkdir(parents=True)
+        names = ('on_tab_path_changed', '_queue_sync_browse', '_apply_sync_browse',
+                 '_set_sync_browse', '_normalize_path_for_compare', '_all_groups',
+                 'get_current_tab_widget', 'get_tab_widget', '_get_split_pane')
+        host_type = type('SyncHost', (QWidget,), {name: getattr(app.MainWindow, name) for name in names})
+        self.host = host_type()
+        self.addCleanup(self.dispose_host)
+        self.host._record_frequent_visit = Mock()
+        self.host._split_active = True
+        self.left = self.make_tab('left')
+        self.right = self.make_tab('right')
+        for prefix, tab in (('', self.left), ('split_', self.right)):
+            tabs, stack = QTabWidget(self.host), QStackedWidget(self.host)
+            tabs.addTab(QWidget(), 'tab')
+            stack.addWidget(tab)
+            setattr(self.host, prefix + 'tab_widget', tabs)
+            setattr(self.host, prefix + 'content_stack', stack)
+        self.host._set_sync_browse(True)
+
+    def dispose_host(self):
+        from PyQt5 import sip
+        sip.delete(self.host)
+
+    def make_tab(self, side):
+        tab_type = type('PathTab', (QWidget,), {'current_path': app.FileExplorerTab.current_path})
+        tab = tab_type(self.host)
+        tab.main_window = self.host
+        tab.current_path = str(self.root / side)
+        tab.navigate_to = Mock(side_effect=lambda path: setattr(tab, 'current_path', path))
+        tab._is_slow_path = lambda path: False
+        return tab
+
+    def settle(self):
+        from PyQt5.QtTest import QTest
+        QTest.qWait(app.SYNC_BROWSE_SETTLE_MS + 150)
+
+    def test_same_directory_navigation_follows_both_ways_without_dead_time(self):
+        """两侧起始目录相同：进入子目录后立即从跟随侧返回，再次进入时仍双向联动。"""
+        self.right._current_path = self.left.current_path
+        base = self.root / 'left'
+        self.left.current_path = str(base / 'sub')
+        self.settle()
+        self.assertEqual(self.right.current_path, str(base / 'sub'))
+        self.right.current_path = str(base)
+        self.settle()
+        self.assertEqual(self.left.current_path, str(base))
+        self.left.current_path = str(base / 'sub' / 'nested')
+        self.settle()
+        self.assertEqual(self.right.current_path, str(base / 'sub' / 'nested'))
+        self.assertEqual(self.left.navigate_to.call_count, 1)
+        self.assertEqual(self.right.navigate_to.call_count, 2)
+
+    def test_delayed_follow_completion_does_not_schedule_reverse_navigation(self):
+        """异步跟随超过原来的 3 秒后完成，也不应触发反向导航。"""
+        self.right.navigate_to.side_effect = None
+        self.left.current_path = str(self.root / 'left' / 'sub')
+        self.settle()
+        target = self.right.navigate_to.call_args.args[0]
+        with patch('tabexplorer.mainwindow.time.monotonic', return_value=time.monotonic() + 10):
+            self.right.current_path = target
+        self.assertIsNone(self.host._sync_pending)
+        self.assertFalse(self.host._sync_browse_timer.isActive())
+
+    def test_pending_navigation_does_not_move_a_switched_out_tab(self):
+        """防抖等待中切换任何一侧的标签，旧配对不应继续联动隐藏标签。"""
+        for prefix in ('', 'split_'):
+            with self.subTest(side=prefix or 'left'):
+                self.left._current_path = str(self.root / 'left')
+                self.right._current_path = str(self.root / 'right')
+                self.left.current_path = str(self.root / 'left' / 'sub')
+                stack = getattr(self.host, prefix + 'content_stack')
+                tabs = getattr(self.host, prefix + 'tab_widget')
+                extra = self.make_tab('right')
+                stack.addWidget(extra)
+                tabs.addTab(QWidget(), 'other')
+                tabs.setCurrentIndex(tabs.count() - 1)
+                self.settle()
+                self.right.navigate_to.assert_not_called()
+                tabs.setCurrentIndex(0)
+
+    def test_disabled_missing_unrelated_and_background_paths_do_not_follow(self):
+        """关闭同步、缺少对应目录、无关跳转及后台标签变化均不移动另一侧。"""
+        self.host._set_sync_browse(False)
+        self.left.current_path = str(self.root / 'left' / 'sub')
+        self.settle()
+        self.right.navigate_to.assert_not_called()
+        self.host._set_sync_browse(True)
+        self.left.current_path = str(self.root / 'right')
+        self.settle()
+        self.right.navigate_to.assert_not_called()
+        self.left._current_path = str(self.root / 'left')
+        (self.root / 'left' / 'missing').mkdir()
+        with patch_all('show_toast') as toast:
+            self.left.current_path = str(self.root / 'left' / 'missing')
+            self.settle()
+            toast.assert_called_once()
+        self.right.navigate_to.assert_not_called()
+        background = self.make_tab('left')
+        background.current_path = str(self.root / 'left' / 'sub')
+        self.settle()
+        self.right.navigate_to.assert_not_called()
+
+    def test_rapid_navigation_coalesces_to_the_final_relative_path(self):
+        """连续进入多级目录合并为一次跟随，不丢失最初的相对路径基准。"""
+        self.left.current_path = str(self.root / 'left' / 'sub')
+        self.left.current_path = str(self.root / 'left' / 'sub' / 'nested')
+        self.settle()
+        self.right.navigate_to.assert_called_once_with(str(self.root / 'right' / 'sub' / 'nested'))
+        self.left.navigate_to.assert_not_called()
+
+    def test_disabling_sync_clears_pending_and_follow_targets(self):
+        """关掉同步取消待执行导航；再次启用不沿用未完成跟随的屏蔽标记。"""
+        self.left.current_path = str(self.root / 'left' / 'sub')
+        self.host._set_sync_browse(False)
+        self.settle()
+        self.right.navigate_to.assert_not_called()
+        self.assertIsNone(self.host._sync_pending)
+        self.left._current_path = str(self.root / 'left')
+        self.host._set_sync_browse(True)
+        self.right.navigate_to.side_effect = None
+        self.left.current_path = str(self.root / 'left' / 'sub')
+        self.settle()
+        self.assertIsNotNone(self.right._sync_follow_target)
+        self.host._set_sync_browse(False)
+        self.host._set_sync_browse(True)
+        self.assertIsNone(self.right._sync_follow_target)
+        self.left._current_path = str(self.root / 'left')
+        self.right.current_path = str(self.root / 'right' / 'sub')
+        self.settle()
+        self.assertEqual(self.left.current_path, str(self.root / 'left' / 'sub'))
+
+    def test_failed_follow_clears_only_its_own_target(self):
+        """导航失败清理对应跟随标记，过期的其他目标失败不影响新请求。"""
+        target = str(self.root / 'right' / 'sub')
+        self.right._sync_follow_target = self.host._normalize_path_for_compare(target)
+        self.right._handle_navigation_failure = Mock()
+        app.FileExplorerTab._on_navigation_failed(self.right, str(self.root / 'right'), 1)
+        self.assertIsNotNone(self.right._sync_follow_target)
+        app.FileExplorerTab._on_navigation_failed(self.right, target, 1)
+        self.assertIsNone(self.right._sync_follow_target)
+
     def test_relative_moves_are_mirrored_and_unrelated_jumps_ignored(self):
         """进入子目录、返回上级按相对路径映射到另一侧；跨盘或无关跳转、越过根目录和虚拟位置不跟随。"""
         map_sync_path = app.map_sync_path

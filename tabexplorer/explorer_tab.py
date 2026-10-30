@@ -1112,6 +1112,8 @@ class FileExplorerTab(QWidget):
 
     def _on_navigation_failed(self, path, hr):
         """导航失败：hr 非 0 为路径解析失败；hr 为 0 是 Shell 内部导航失败，仅对网络位置提示。"""
+        if getattr(self, '_sync_follow_target', None) == os.path.normcase(os.path.normpath(path)):
+            self._sync_follow_target = None
         # 可能在 Shell 的 COM 回调内触发，延后改布局；其间若有导航成功则忽略本次失败
         seq = getattr(self, '_nav_success_seq', 0)
         QTimer.singleShot(0, lambda: self._handle_navigation_failure(path, hr, seq))
@@ -3283,6 +3285,7 @@ class FileExplorerTab(QWidget):
             self._perform_navigation(path, add_to_history)
         else:
             debug_print(f"[navigate_to] Path does not exist: {path}")
+            self._sync_follow_target = None
             if is_network_path(path):
                 # 盘符仍记录为网络驱动器但当前未连接
                 self._show_network_error(path, ERROR_CONNECTION_UNAVAIL)
