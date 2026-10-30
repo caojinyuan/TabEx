@@ -21,6 +21,7 @@ HOTKEY_COMMANDS = (
     ('next_tab', 'switch_tab', 'Ctrl+Tab', '下一个标签'),
     ('prev_tab', 'switch_tab', 'Ctrl+Shift+Tab', '上一个标签'),
     ('search', 'search', 'Ctrl+F', '打开搜索对话框'),
+    ('command_palette', 'command_palette', 'Ctrl+Shift+P', '查找功能'),
     ('quick_find_current_dir', 'quick_find_current_dir', 'Ctrl+G', '检索当前目录文件夹/文件名'),
     ('frequent_dirs', 'frequent_dirs', 'Ctrl+J', '常用目录跳转'),
     ('go_back', 'navigate', 'Alt+Left', '后退'),
@@ -104,7 +105,9 @@ def _hotkey_text(config, command):
 
 
 def _hotkey_hint(config, label, command):
-    key = _hotkey_text(config, command)
+    enable_key = _HOTKEY_ENABLE_KEYS.get(command)
+    enabled = enable_key is None or config.get('hotkeys', {}).get(enable_key, True)
+    key = _hotkey_text(config, command) if enabled else ''
     return f"{label} ({key})" if key else label
 
 

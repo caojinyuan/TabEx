@@ -706,7 +706,8 @@ class FileTaskPanel(QDialog):
 
         if record['errors'] or record['cancelled']:
             show_toast(owner, tr('文件任务'), record.get('summary', ''), level='warning',
-                       action_text=tr('查看任务'), action=show_record)
+                       action_text=tr('查看任务') if record['cancelled'] else tr('查看失败项 / 重试'),
+                       action=show_record)
         else:
             path = record['destination'] or (os.path.dirname(record['paths'][0]) if record['paths'] else '')
             action = (lambda: owner.add_new_tab(path)) if path and hasattr(owner, 'add_new_tab') else show_record

@@ -1978,7 +1978,8 @@ class InterfaceTests(unittest.TestCase):
             groups.append((tabs, stack))
             panes.append(pane)
         owner = types.SimpleNamespace(content_stack=groups[0][1], _split_active=True,
-                                      _all_groups=lambda: groups, get_active_pane=lambda: panes[1])
+                                      _all_groups=lambda: groups, get_active_pane=lambda: panes[1],
+                                      _refresh_context_actions=Mock())
         before = [pane.path_bar.size() for pane in panes]
         update = self.module.MainWindow._update_active_pane_indicator
         update(owner)

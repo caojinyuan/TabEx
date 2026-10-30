@@ -21,6 +21,27 @@ def tr(zh_text):
 
 
 _LANG_EN = {
+    "查找功能": "Find a Command",
+    "输入功能名称或快捷键，例如：同步、比较、工作区": "Search commands or shortcuts, e.g. sync, compare, workspace",
+    "功能": "Command",
+    "已开启": "On",
+    "没有匹配的功能": "No matching commands",
+    "工具": "Tools",
+    "作用于{}": "Applies to {} pane",
+    "作用于当前目录": "Applies to the current folder",
+    "请先开启左右分屏": "Open split view first",
+    "同步进入子目录和返回上级；不联动滚动条、选中项或文件内容":
+        "Follow folder navigation and parent moves; scrolling, selection and file contents are not synchronized",
+    "同步导航：开": "Sync: On",
+    "同步导航：关": "Sync: Off",
+    "当前操作：{}": "Active pane: {}",
+    "当前不可用，请检查设置或当前标签状态": "Unavailable: check settings or the current tab",
+    "查看失败项 / 重试": "View Failures / Retry",
+    "打开命令提示符": "Open Command Prompt",
+    "打开 PowerShell": "Open PowerShell",
+    "打开 Git Bash": "Open Git Bash",
+    "打开 TortoiseGit 提交": "Open TortoiseGit Commit",
+    "计算器": "Calculator",
     "切换到第 N 个标签（Ctrl+9 为最后一个）": "Switch to Nth tab (Ctrl+9 = last)",
     "关闭当前标签页": "Close Current Tab",
     "下一个标签": "Next Tab",

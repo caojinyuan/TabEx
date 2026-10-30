@@ -10,7 +10,7 @@ import time
 from PyQt5.QtCore import pyqtSignal, pyqtSlot, QDir, QEvent, Qt, QTimer
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
-    QAction, QApplication, QDialog, QFrame, QHBoxLayout, QInputDialog, QMainWindow, QMenu, QPushButton,
+    QAction, QApplication, QDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QPushButton,
     QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -1500,6 +1500,87 @@ class MainWindow(QMainWindow):
             path_bar = getattr(pane, 'path_bar', None)
             if path_bar is not None:
                 path_bar.set_pane_active(active, split)
+        self._refresh_context_actions()
+
+    def _refresh_context_actions(self):
+        split = bool(getattr(self, '_split_active', False))
+        pane = self.get_active_pane() if hasattr(self, 'content_stack') else None
+        path = str(getattr(pane, 'current_path', '') or '')
+        local = bool(path) and not path.startswith(('shell:', '::'))
+        side = tr('右侧') if split and pane is self._get_split_pane() else tr('左侧')
+        scope = tr('作用于{}').format(side) if split else tr('作用于当前目录')
+        for name in ('search_button', 'back_button', 'forward_button', 'cmd_button',
+                     'powershell_button', 'git_bash_button', 'git_log_button', 'git_commit_button'):
+            button = getattr(self, name, None)
+            if button is None:
+                continue
+            base = (_toolbar_hotkey_tooltip(self, name) if name in _TOOLBAR_HOTKEY_TOOLTIPS
+                    else str(button.property('pane_hint') or button.toolTip()))
+            reason = tr('请先打开一个文件夹') if name == 'search_button' and not local else ''
+            if name == 'search_button':
+                button.setEnabled(local)
+                button.setProperty('unavailable_reason', reason)
+            button.setToolTip('\n'.join(part for part in (base, scope, path, reason) if part))
+            button.setAccessibleName(base + ' · ' + scope)
+        action = getattr(self, 'sync_browse_action', None)
+        if action is not None:
+            reason = '' if split else tr('请先开启左右分屏')
+            action.setEnabled(split)
+            action.setProperty('unavailable_reason', reason)
+            action.setToolTip(reason or tr('同步进入子目录和返回上级；不联动滚动条、选中项或文件内容'))
+        controls = getattr(self, 'split_controls', None)
+        if controls is not None:
+            controls.setVisible(split)
+            self.directory_compare_action.setText(tr('目录差异比较...'))
+            self.sync_browse_button.setText(tr('同步导航：开') if getattr(self, '_sync_browse', False)
+                                            else tr('同步导航：关'))
+            self.split_scope_label.setText(tr('当前操作：{}').format(side))
+            self.split_scope_label.setToolTip(path)
+        for attr, label, command in (('command_palette_action', '查找功能', 'command_palette'),
+                                     ('frequent_dirs_action', '常用目录...', 'frequent_dirs')):
+            action = getattr(self, attr, None)
+            if action is not None:
+                action.setText(_hotkey_hint(self.config, tr(label), command))
+
+    def _resize_tools_button(self):
+        button = getattr(self, 'workspace_tools_button', None)
+        if button is None:
+            return
+        button.setText(tr('工具'))
+        expanded = self.width() >= int(900 * self.dpi_scale)
+        button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon if expanded else Qt.ToolButtonIconOnly)
+        width = max(int(32 * self.dpi_scale), button.sizeHint().width()) if expanded else int(32 * self.dpi_scale)
+        button.setFixedWidth(width)
+
+    def show_command_palette(self):
+        from .commands import CommandPalette, menu_commands
+        self._refresh_context_actions()
+        dialog = CommandPalette(self)
+        commands = [(label, action) for label, action in menu_commands(self.workspace_tools_menu)
+                    if action is not self.command_palette_action]
+        for name, label in (
+                ('add_tab_button', '新建标签页'), ('reopen_tab_button', '恢复关闭的标签页'),
+                ('tab_list_button', '查找标签'), ('search_button', '搜索当前文件夹'),
+                ('back_button', '后退'), ('forward_button', '前进'), ('split_view_btn', '分屏对比'),
+                ('insert_group_btn', '插入分组'), ('bookmark_button', '书签管理'),
+                ('cmd_button', '打开命令提示符'), ('powershell_button', '打开 PowerShell'),
+                ('git_bash_button', '打开 Git Bash'), ('git_log_button', '打开 TortoiseGit 日志'),
+                ('git_commit_button', '打开 TortoiseGit 提交'), ('calculator_button', '计算器'),
+                ('settings_button', '设置'), ('ai_chat_btn', 'AI 助手面板')):
+            button = getattr(self, name)
+            text = _toolbar_hotkey_tooltip(self, name) if name in _TOOLBAR_HOTKEY_TOOLTIPS else tr(label)
+            action = QAction(button.icon(), text, dialog)
+            action.setToolTip(button.toolTip())
+            available = button.isEnabled() and not button.isHidden()
+            action.setEnabled(available)
+            action.setProperty('unavailable_reason', '' if available else (
+                button.property('unavailable_reason') or tr('当前不可用，请检查设置或当前标签状态')))
+            action.triggered.connect(button.click)
+            commands.append((text, action))
+        dialog.set_commands(commands)
+        if dialog.exec_() == QDialog.Accepted and dialog.selected_action is not None:
+            dialog.selected_action.trigger()
+        dialog.deleteLater()
     
     def open_tortoisegit_log_current_tab(self):
         """打开当前标签页的 TortoiseGit 日志（作用于活动面板，分屏时跟随最近交互的一侧）"""
@@ -1855,6 +1936,7 @@ class MainWindow(QMainWindow):
         _QTimer.singleShot(0, self._sync_split_tabbar_width)
         if hasattr(self, 'split_view_btn'):
             self.split_view_btn.setChecked(True)
+        self._refresh_context_actions()
 
     def _enter_split_view(self):
         """把当前标签从左侧标签组移动到右侧标签组（含其嵌入内容、历史与状态）。"""
@@ -2610,6 +2692,7 @@ class MainWindow(QMainWindow):
 
         from PyQt5.QtWidgets import QStyle
         self.workspace_tools_button = QToolButton(self)
+        self.workspace_tools_button.setText(tr("工具"))
         self.workspace_tools_button.setToolTip(tr("工作区与文件工具"))
         _set_tool_icon(self.workspace_tools_button, 'workspace-tools', QStyle.SP_FileDialogDetailedView)
         self.workspace_tools_button.setFixedSize(btn_size, btn_size)
@@ -2618,6 +2701,8 @@ class MainWindow(QMainWindow):
         self._populate_workspace_tools_menu(tools_menu)
         self.workspace_tools_menu = tools_menu
         self.workspace_tools_button.setMenu(tools_menu)
+        tools_menu.setToolTipsVisible(True)
+        tools_menu.aboutToShow.connect(lambda: self._refresh_context_actions())
         titlebar_layout.addWidget(self.workspace_tools_button)
 
         self.file_tasks_button = QToolButton(self)
@@ -2800,6 +2885,9 @@ class MainWindow(QMainWindow):
             button.setAccessibleName(button.toolTip())
         self.bookmark_button = bookmark_btn
         self.settings_button = settings_btn
+        for button in (self.cmd_button, self.powershell_button, self.git_bash_button,
+                       self.git_log_button, self.git_commit_button):
+            button.setProperty('pane_hint', button.toolTip())
         main_layout.addWidget(titlebar)
     
     def toggle_maximize(self):
@@ -3439,6 +3527,7 @@ class MainWindow(QMainWindow):
             'prev_tab': lambda: self._cycle_main_tab(-1),
             'switch_tab_number': lambda: self._select_tab_by_number(vk - 0x30),
             'search': self.show_search_dialog,
+            'command_palette': lambda: self.show_command_palette(),
             'quick_find_current_dir': self.quick_find_in_current_directory,
             'frequent_dirs': self.show_frequent_dirs,
             'go_back': self.go_back_current_tab,
@@ -3508,6 +3597,7 @@ class MainWindow(QMainWindow):
                 button = getattr(stack.widget(index), 'cancel_file_op_btn', None)
                 if button is not None:
                     button.setToolTip(_hotkey_hint(self.config, tr("取消当前后台复制/删除"), 'cancel_file_op'))
+        self._refresh_context_actions()
 
     def preview_batch_rename(self):
         tab = self.get_active_pane()
@@ -3560,6 +3650,7 @@ class MainWindow(QMainWindow):
         # 路径稳定一段时间后才计入常用目录，避免导航过程中的瞬时路径
         QTimer.singleShot(FREQUENT_DIR_SETTLE_MS, lambda: self._record_frequent_visit(ref, new_path))
         self._queue_sync_browse(tab, old_path, new_path)
+        self._refresh_context_actions()
 
     def _get_frequent_dirs(self):
         store = getattr(self, '_frequent_dirs', None)
@@ -3625,6 +3716,7 @@ class MainWindow(QMainWindow):
         action = getattr(self, 'sync_browse_action', None)
         if action is not None:
             action.setChecked(self._sync_browse)
+        self._refresh_context_actions()
         debug_print(f"[SyncBrowse] enabled={self._sync_browse}")
 
     def _queue_sync_browse(self, tab, old_path, new_path):
@@ -3760,9 +3852,11 @@ class MainWindow(QMainWindow):
 
     def _populate_workspace_tools_menu(self, menu):
         from PyQt5.QtWidgets import QStyle
+        self.command_palette_action = menu.addAction(
+            _hotkey_hint(self.config, tr('查找功能'), 'command_palette'), lambda: self.show_command_palette())
         menu.addSection(tr('文件操作'))
         self.file_tasks_action = menu.addAction(tr('文件任务'), self.show_file_tasks)
-        menu.addAction(tr('目录差异比较...'), self.show_directory_compare)
+        self.directory_compare_action = menu.addAction(tr('目录差异比较...'), self.show_directory_compare)
         menu.addAction(tr('批量重命名预览...'), self.preview_batch_rename)
         menu.addSection(tr('导航'))
         self.frequent_dirs_action = menu.addAction(
@@ -5209,6 +5303,27 @@ class MainWindow(QMainWindow):
         # 将菜单栏添加到主布局
         main_layout.addWidget(self.menu_bar)
 
+        self.split_controls = QWidget(self)
+        self.split_controls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        split_controls_layout = QHBoxLayout(self.split_controls)
+        split_controls_layout.setContentsMargins(6, 2, 6, 2)
+        self.sync_browse_button = QToolButton(self.split_controls)
+        self.sync_browse_button.setDefaultAction(self.sync_browse_action)
+        self.sync_browse_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.compare_directories_button = QToolButton(self.split_controls)
+        self.compare_directories_button.setDefaultAction(self.directory_compare_action)
+        self.compare_directories_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.split_scope_label = QLabel(self.split_controls)
+        self.split_scope_label.setMinimumWidth(0)
+        self.split_scope_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        split_controls_layout.addWidget(self.sync_browse_button)
+        split_controls_layout.addWidget(self.compare_directories_button)
+        split_controls_layout.addWidget(self.split_scope_label, 1)
+        _theme.bind_style(self.split_controls, 'QToolButton { padding: 4px; border: 1px solid #d0d0d0; }'
+                          'QToolButton:checked { background: #dceafa; border-color: #739bca; }')
+        self.split_controls.hide()
+        main_layout.addWidget(self.split_controls)
+
         # 主分割器，左树右标签
         self.splitter = ResizableSplitter()
         self.splitter.setOrientation(Qt.Horizontal)
@@ -5271,6 +5386,7 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         """窗口大小改变事件"""
         super().resizeEvent(event)
+        self._resize_tools_button()
 
     def _bring_to_front(self):
         """强制将窗口置顶并获取焦点（兼容 Windows 防偷焦机制）"""

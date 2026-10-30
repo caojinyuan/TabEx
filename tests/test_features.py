@@ -242,6 +242,7 @@ class SyncBrowseTests(unittest.TestCase):
         self.host = host_type()
         self.addCleanup(self.dispose_host)
         self.host._record_frequent_visit = Mock()
+        self.host._refresh_context_actions = Mock()
         self.host._split_active = True
         self.left = self.make_tab('left')
         self.right = self.make_tab('right')
