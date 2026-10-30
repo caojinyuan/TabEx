@@ -29,6 +29,32 @@ def get_bundled_path(file_name):
     return None
 
 
+def map_sync_path(leader_old, leader_new, follower_base):
+    """分屏同步浏览：一侧从 leader_old 进入子目录或返回上级到 leader_new 时，返回另一侧应前往的路径。
+
+    另一侧从 follower_base 出发做相同的相对移动；跳到无关目录、虚拟位置或越过盘符根时返回 None。"""
+    from pathlib import PureWindowsPath
+    paths = (leader_old, leader_new, follower_base)
+    if not all(isinstance(path, str) and path and not path.startswith(('shell:', '::')) for path in paths):
+        return None
+    old_parts = PureWindowsPath(leader_old).parts
+    new_parts = PureWindowsPath(leader_new).parts
+
+    def folded(parts):
+        return [part.casefold() for part in parts]
+
+    if len(new_parts) > len(old_parts) and folded(new_parts[:len(old_parts)]) == folded(old_parts):
+        return str(PureWindowsPath(follower_base, *new_parts[len(old_parts):]))
+    if len(new_parts) < len(old_parts) and folded(old_parts[:len(new_parts)]) == folded(new_parts):
+        target = PureWindowsPath(follower_base)
+        for _level in range(len(old_parts) - len(new_parts)):
+            if target.parent == target:
+                return None
+            target = target.parent
+        return str(target)
+    return None
+
+
 # 常用中英文目录名对照表
 _COMMON_PATH_PAIRS = [
     ("Users", "用户"),

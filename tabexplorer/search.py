@@ -2,6 +2,7 @@
 
 import os
 import queue
+import re
 import stat
 import threading
 import time
@@ -38,6 +39,56 @@ SEARCH_METADATA_DEGRADE_QUEUE_RATIO = 0.75  # 触发降级的队列占用比例
 SEARCH_RESULT_TYPE_COL_WIDTH = 90
 SEARCH_RESULT_DATE_COL_WIDTH = 155
 SEARCH_RESULT_SIZE_COL_WIDTH = 100
+# 修改时间筛选：(显示名, 天数)；0 不限，-1 从今天 0 点起
+SEARCH_MODIFIED_RANGES = (('不限', 0), ('今天', -1), ('最近 7 天', 7), ('最近 30 天', 30), ('最近一年', 365))
+_SIZE_UNITS = {'': 1, 'b': 1, 'k': 1024, 'kb': 1024, 'm': 1024 ** 2, 'mb': 1024 ** 2, 'g': 1024 ** 3, 'gb': 1024 ** 3}
+
+
+def parse_size_text(text):
+    """'10MB'、'1.5 g'、'500' → 字节数；空文本返回 None，无法识别时抛出 ValueError。"""
+    value = str(text or '').strip().lower().replace(' ', '')
+    if not value:
+        return None
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)([kmg]?b?)', value)
+    if not match:
+        raise ValueError(text)
+    return int(float(match.group(1)) * _SIZE_UNITS[match.group(2)])
+
+
+def modified_after_timestamp(days, now=None):
+    """修改时间筛选的起始时间戳；0 表示不限（返回 None），-1 表示今天 0 点。"""
+    if not days:
+        return None
+    now = time.time() if now is None else now
+    if days < 0:
+        local = time.localtime(now)
+        return time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, -1))
+    return now - days * 86400
+
+
+def compile_search_pattern(keyword, match_case=False, match_whole_word=False, use_regex=False):
+    """正则或全词匹配时返回编译后的模式；普通子串匹配返回 None。正则无效时抛出 re.error。"""
+    if not use_regex and not match_whole_word:
+        return None
+    body = keyword if use_regex else re.escape(keyword)
+    if match_whole_word:
+        body = rf'\b(?:{body})\b'
+    return re.compile(body, 0 if match_case else re.IGNORECASE)
+
+
+def passes_search_filters(filters, size, mtime, is_dir):
+    """大小筛选只保留文件（设置后排除文件夹）；修改时间筛选对文件和文件夹都生效。"""
+    if not filters:
+        return True
+    min_size, max_size = filters.get('min_size'), filters.get('max_size')
+    if (min_size is not None or max_size is not None) and is_dir:
+        return False
+    if min_size is not None and size < min_size:
+        return False
+    if max_size is not None and size > max_size:
+        return False
+    after = filters.get('modified_after')
+    return after is None or mtime >= after
 
 
 def apply_runtime_performance_config(perf_cfg=None):
@@ -175,10 +226,10 @@ class SearchCache:
         self._lock = threading.RLock()
         self._timestamps = {}
     
-    def get_key(self, search_path, keyword, search_filename, search_content, file_types, match_case=False, match_whole_word=False, use_everything=False):
+    def get_key(self, search_path, keyword, search_filename, search_content, file_types, match_case=False, match_whole_word=False, use_everything=False, extra=''):
         """生成缓存键"""
         import hashlib
-        key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}|{match_case}|{match_whole_word}|{use_everything}"
+        key_str = f"{search_path}|{keyword}|{search_filename}|{search_content}|{file_types}|{match_case}|{match_whole_word}|{use_everything}|{extra}"
         return hashlib.md5(key_str.encode()).hexdigest()
     
     def get(self, key):
@@ -647,6 +698,10 @@ class SearchDialog(QDialog):
         self.match_whole_word_cb = QCheckBox(tr("全词匹配"))
         self.match_whole_word_cb.setToolTip(tr("仅匹配完整单词，避免命中更长字符串的一部分"))
         type_options.addWidget(self.match_whole_word_cb)
+
+        self.use_regex_cb = QCheckBox(tr("正则"))
+        self.use_regex_cb.setToolTip(tr("按正则表达式匹配文件名和文件内容（Python 语法）"))
+        type_options.addWidget(self.use_regex_cb)
         
         # Everything搜索选项
         self.use_everything_cb = QCheckBox(tr("使用 Everything（不支持搜索文件内容）"))
@@ -664,7 +719,7 @@ class SearchDialog(QDialog):
         type_options.addStretch(1)
         # 窄窗口下允许复选框文字被压缩，而不是撑宽整个对话框
         for checkbox in (self.search_filename_cb, self.search_content_cb, self.match_case_cb,
-                         self.match_whole_word_cb, self.use_everything_cb):
+                         self.match_whole_word_cb, self.use_regex_cb, self.use_everything_cb):
             checkbox.setMinimumWidth(24)
         layout.addLayout(type_options)
         
@@ -678,6 +733,36 @@ class SearchDialog(QDialog):
         self.file_type_input.setStyleSheet("QLineEdit { padding: 5px; }")
         file_type_layout.addWidget(self.file_type_input)
         layout.addLayout(file_type_layout)
+
+        # 大小 / 修改时间筛选与常用搜索
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel(tr("大小:")))
+        self.min_size_input = QLineEdit()
+        self.max_size_input = QLineEdit()
+        for edit, hint in ((self.min_size_input, tr("最小，如 10KB")), (self.max_size_input, tr("最大，如 5MB"))):
+            edit.setPlaceholderText(hint)
+            edit.setClearButtonEnabled(True)
+            edit.setToolTip(tr("支持 B、KB、MB、GB；设置大小后只显示文件"))
+            edit.setMaximumWidth(130)
+        filter_layout.addWidget(self.min_size_input)
+        filter_layout.addWidget(QLabel("~"))
+        filter_layout.addWidget(self.max_size_input)
+        filter_layout.addSpacing(10)
+        filter_layout.addWidget(QLabel(tr("修改时间:")))
+        self.modified_combo = QComboBox()
+        for label, days in SEARCH_MODIFIED_RANGES:
+            self.modified_combo.addItem(tr(label), days)
+        filter_layout.addWidget(self.modified_combo)
+        filter_layout.addStretch(1)
+        self.presets_btn = QToolButton()
+        self.presets_btn.setText(tr("常用搜索"))
+        self.presets_btn.setToolTip(tr("保存或套用搜索条件（不含搜索路径）"))
+        self.presets_btn.setPopupMode(QToolButton.InstantPopup)
+        self.presets_menu = QMenu(self.presets_btn)
+        self.presets_menu.aboutToShow.connect(self._rebuild_presets_menu)
+        self.presets_btn.setMenu(self.presets_menu)
+        filter_layout.addWidget(self.presets_btn)
+        layout.addLayout(filter_layout)
         
         # 状态标签
         self.status_label = QLabel(tr("就绪"))
@@ -895,6 +980,95 @@ class SearchDialog(QDialog):
         global _search_cache
         _search_cache.clear()
         debug_print(tr("[Search] 搜索缓存已清除"))
+
+    def _collect_search_filters(self):
+        """读取大小/修改时间筛选；没有任何筛选时返回 None，大小无法识别时抛出 ValueError。"""
+        min_size = parse_size_text(self.min_size_input.text())
+        max_size = parse_size_text(self.max_size_input.text())
+        if min_size is not None and max_size is not None and min_size > max_size:
+            raise ValueError(f"{self.min_size_input.text().strip()} > {self.max_size_input.text().strip()}")
+        filters = {'min_size': min_size, 'max_size': max_size,
+                   'modified_after': modified_after_timestamp(self.modified_combo.currentData())}
+        return filters if any(value is not None for value in filters.values()) else None
+
+    # ── 常用搜索（保存在 config.json 的 search_presets，不含搜索路径） ──────────────
+    def _search_presets(self):
+        config = getattr(self.main_window, 'config', None)
+        if not isinstance(config, dict):
+            return None
+        presets = config.get('search_presets')
+        if not isinstance(presets, list):
+            presets = config['search_presets'] = []
+        return presets
+
+    def _current_search_conditions(self):
+        return {
+            'keyword': self.search_input.currentText().strip(),
+            'file_types': self.file_type_input.text().strip(),
+            'search_filename': self.search_filename_cb.isChecked(),
+            'search_content': self.search_content_cb.isChecked(),
+            'match_case': self.match_case_cb.isChecked(),
+            'match_whole_word': self.match_whole_word_cb.isChecked(),
+            'use_regex': self.use_regex_cb.isChecked(),
+            'use_everything': self.use_everything_cb.isChecked(),
+            'min_size': self.min_size_input.text().strip(),
+            'max_size': self.max_size_input.text().strip(),
+            'modified_days': self.modified_combo.currentData(),
+        }
+
+    def apply_search_preset(self, preset):
+        self.search_input.setCurrentText(str(preset.get('keyword', '')))
+        self.file_type_input.setText(str(preset.get('file_types', '')))
+        self.search_filename_cb.setChecked(bool(preset.get('search_filename', True)))
+        self.match_case_cb.setChecked(bool(preset.get('match_case', False)))
+        self.match_whole_word_cb.setChecked(bool(preset.get('match_whole_word', False)))
+        self.use_regex_cb.setChecked(bool(preset.get('use_regex', False)))
+        if self.use_everything_cb.isEnabled():
+            self.use_everything_cb.setChecked(bool(preset.get('use_everything', False)))
+        if self.search_content_cb.isEnabled():
+            self.search_content_cb.setChecked(bool(preset.get('search_content', False)))
+        self.min_size_input.setText(str(preset.get('min_size', '')))
+        self.max_size_input.setText(str(preset.get('max_size', '')))
+        index = self.modified_combo.findData(preset.get('modified_days', 0))
+        self.modified_combo.setCurrentIndex(max(index, 0))
+
+    def save_search_preset(self):
+        from PyQt5.QtWidgets import QInputDialog
+        presets = self._search_presets()
+        if presets is None:
+            return
+        default = self.search_input.currentText().strip() or self.file_type_input.text().strip()
+        name, accepted = QInputDialog.getText(self, tr("保存常用搜索"), tr("名称"), text=default)
+        name = name.strip()
+        if not accepted or not name:
+            return
+        preset = dict(self._current_search_conditions(), name=name)
+        presets[:] = [item for item in presets if isinstance(item, dict) and item.get('name') != name] + [preset]
+        self.main_window.save_config()
+        show_toast(self, tr("常用搜索"), tr("已保存“{}”").format(name), level="success")
+
+    def delete_search_preset(self, name):
+        presets = self._search_presets()
+        if presets is None:
+            return
+        presets[:] = [item for item in presets if isinstance(item, dict) and item.get('name') != name]
+        self.main_window.save_config()
+
+    def _rebuild_presets_menu(self):
+        menu = self.presets_menu
+        menu.clear()
+        presets = self._search_presets()
+        save_action = menu.addAction(tr("保存当前条件..."), self.save_search_preset)
+        save_action.setEnabled(presets is not None)
+        presets = [item for item in presets or [] if isinstance(item, dict) and item.get('name')]
+        if not presets:
+            return
+        menu.addSeparator()
+        for preset in presets:
+            menu.addAction(preset['name'], lambda checked=False, item=preset: self.apply_search_preset(item))
+        delete_menu = menu.addMenu(tr("删除常用搜索"))
+        for preset in presets:
+            delete_menu.addAction(preset['name'], lambda checked=False, name=preset['name']: self.delete_search_preset(name))
     
     def start_search(self):
         keyword = self.search_input.currentText().strip()  # 改用currentText获取输入或选中的文本
@@ -934,6 +1108,17 @@ class SearchDialog(QDialog):
         
         # 更新搜索路径
         self.search_path = search_path
+        use_regex = self.use_regex_cb.isChecked() and not keyword_is_empty
+        try:
+            compile_search_pattern(keyword, self.match_case_cb.isChecked(), self.match_whole_word_cb.isChecked(), use_regex)
+            filters = self._collect_search_filters()
+        except re.error as error:
+            show_toast(self, tr("正则表达式无效"), str(error), level="warning")
+            return
+        except ValueError as error:
+            show_toast(self, tr("大小格式无效"), tr("请输入如 10KB、5MB、1.5GB 的大小：{}").format(error), level="warning")
+            return
+        extra_key = f"{use_regex}|{self.min_size_input.text().strip()}|{self.max_size_input.text().strip()}|{self.modified_combo.currentData()}"
         previous_task = getattr(self, '_search_task', None)
         if previous_task:
             previous_task.cancel_event.set()
@@ -955,6 +1140,7 @@ class SearchDialog(QDialog):
             self.match_case_cb.isChecked(),
             self.match_whole_word_cb.isChecked(),
             use_everything,
+            extra=extra_key,
         )
         cached_results = _search_cache.get(cache_key)
         
@@ -1007,7 +1193,8 @@ class SearchDialog(QDialog):
         match_whole_word = self.match_whole_word_cb.isChecked()
         self.search_thread = threading.Thread(
             target=self._search_task.run,
-            args=(keyword, do_search_filename, do_search_content, file_types, cache_key, use_everything, match_case, match_whole_word)
+            args=(keyword, do_search_filename, do_search_content, file_types, cache_key, use_everything, match_case,
+                  match_whole_word, use_regex, filters)
         )
         self.search_thread.daemon = True
         self.search_thread.start()
@@ -1026,15 +1213,16 @@ class SearchDialog(QDialog):
             self._queue_idle_ticks = 0
             self._ensure_ui_update_timer(220)
     
-    def search_with_everything(self, keyword, search_path, file_types="", match_case=False, match_whole_word=False):
+    def search_with_everything(self, keyword, search_path, file_types="", match_case=False, match_whole_word=False,
+                               use_regex=False, filters=None):
         """使用Everything进行搜索"""
         import subprocess
-        import re
+
+        pattern = compile_search_pattern(keyword, match_case, match_whole_word, use_regex)
 
         def _matches_filename(name):
-            if match_whole_word:
-                flags = 0 if match_case else re.IGNORECASE
-                return bool(re.search(rf'\b{re.escape(keyword)}\b', name, flags))
+            if pattern is not None:
+                return bool(pattern.search(name))
             if match_case:
                 return keyword in name
             return keyword.lower() in name.lower()
@@ -1048,7 +1236,15 @@ class SearchDialog(QDialog):
                 cmd += ['-path', search_path]
             
             if keyword:
-                cmd.append(keyword)
+                cmd += ['-r', keyword] if use_regex else [keyword]
+            # Everything 端先粗筛大小和日期，结果再由 passes_search_filters 精确过滤
+            if filters:
+                if filters.get('min_size') is not None:
+                    cmd.append(f"size:>={filters['min_size']}")
+                if filters.get('max_size') is not None:
+                    cmd.append(f"size:<={filters['max_size']}")
+                if filters.get('modified_after') is not None:
+                    cmd.append('dm:>=' + time.strftime('%Y-%m-%d', time.localtime(filters['modified_after'])))
             
             # 添加文件类型过滤（为空则不限制）
             if file_types:
@@ -1117,7 +1313,8 @@ class SearchDialog(QDialog):
             debug_print(f"[Everything] Error: {e}")
             raise
     
-    def search_with_ripgrep(self, keyword, search_path, file_extensions=(), match_case=False, match_whole_word=False):
+    def search_with_ripgrep(self, keyword, search_path, file_extensions=(), match_case=False, match_whole_word=False,
+                            use_regex=False):
         """用 ripgrep 找出内容包含关键词的文件，返回规范化路径集合；失败或取消时返回 None（调用方回退到 Python 扫描）。"""
         import subprocess
 
@@ -1125,8 +1322,9 @@ class SearchDialog(QDialog):
         if not ripgrep_path or not keyword:
             return None
 
-        base_cmd = [ripgrep_path, '--no-config', '-l', '--null', '-F', '-uu', '--no-messages',
-                    '-s' if match_case else '-i']
+        # 正则模式不加 -F；ripgrep 不支持的写法（如反向引用）会报错，由调用方回退到 Python 扫描
+        base_cmd = [ripgrep_path, '--no-config', '-l', '--null'] + ([] if use_regex else ['-F']) + [
+            '-uu', '--no-messages', '-s' if match_case else '-i']
         if match_whole_word:
             base_cmd.append('-w')
         for ext in sorted(file_extensions):
@@ -1174,18 +1372,14 @@ class SearchDialog(QDialog):
         debug_print(f"[ripgrep] Found {len(matches)} matching files")
         return matches
 
-    def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None, use_everything=False, match_case=False, match_whole_word=False):
-        import re
-
+    def do_search(self, keyword, search_filename, search_content, file_types="", cache_key=None, use_everything=False, match_case=False, match_whole_word=False,
+                  use_regex=False, filters=None):
         metadata_degrade_count = 0
-        whole_word_pattern = None
+        whole_word_pattern = compile_search_pattern(keyword, match_case, match_whole_word, use_regex)
         whole_word_pattern_bytes = None
-        if match_whole_word:
-            whole_word_flags = 0 if match_case else re.IGNORECASE
-            whole_word_pattern = re.compile(rf'\b{re.escape(keyword)}\b', whole_word_flags)
-            if keyword.isascii():
-                byte_flags = 0 if match_case else re.IGNORECASE
-                whole_word_pattern_bytes = re.compile(rb'\b' + re.escape(keyword.encode('ascii', errors='ignore')) + rb'\b', byte_flags)
+        if match_whole_word and not use_regex and keyword.isascii():
+            byte_flags = 0 if match_case else re.IGNORECASE
+            whole_word_pattern_bytes = re.compile(rb'\b' + re.escape(keyword.encode('ascii', errors='ignore')) + rb'\b', byte_flags)
 
         def _matches_text(value):
             if not isinstance(value, str) or not value:
@@ -1206,7 +1400,7 @@ class SearchDialog(QDialog):
             return keyword_bytes_lower in value.lower()
 
         def _should_degrade_metadata():
-            if not SEARCH_METADATA_DEGRADE_ENABLED:
+            if not SEARCH_METADATA_DEGRADE_ENABLED or filters:
                 return False
             try:
                 pending = self.result_queue.qsize()
@@ -1220,7 +1414,9 @@ class SearchDialog(QDialog):
             self.result_queue.put({'type': 'status', 'text': tr('Using Everything搜索引擎...')})
             
             try:
-                results = self.search_with_everything(keyword, self.search_path, file_types, match_case=match_case, match_whole_word=match_whole_word)
+                results = self.search_with_everything(keyword, self.search_path, file_types, match_case=match_case,
+                                                      match_whole_word=match_whole_word, use_regex=use_regex,
+                                                      filters=filters)
                 
                 if not self.is_searching:
                     return
@@ -1228,6 +1424,7 @@ class SearchDialog(QDialog):
                 # 将Everything结果添加到显示队列
                 batch_size = 200
                 batch_items = []
+                shown_count = 0
                 for file_path in results:
                     if not self.is_searching:
                         break
@@ -1239,6 +1436,7 @@ class SearchDialog(QDialog):
                         file_type = file_ext[1:].upper() if file_ext else tr("无")
                         sort_date_ts = None
                         sort_size_bytes = None
+                        stat_info = None
                         if _should_degrade_metadata():
                             metadata_degrade_count += 1
                             mtime = "-"
@@ -1260,6 +1458,10 @@ class SearchDialog(QDialog):
                                 size_str = "-"
                                 is_dir = os.path.isdir(file_path)
 
+                        if filters and (stat_info is None or not passes_search_filters(
+                                filters, stat_info.st_size, stat_info.st_mtime, is_dir)):
+                            continue
+
                         if is_dir:
                             display_name = f"📁 {file_path}"
                             file_type = tr('文件夹')
@@ -1276,6 +1478,7 @@ class SearchDialog(QDialog):
                             'sort_date_ts': sort_date_ts,
                             'sort_size_bytes': sort_size_bytes,
                         })
+                        shown_count += 1
                         if len(batch_items) >= batch_size:
                             self.add_search_results_batch(batch_items, timeout=0.5)
                             batch_items = []
@@ -1289,7 +1492,7 @@ class SearchDialog(QDialog):
                         pass
                 
                 # 搜索完成
-                final_count = len(results)
+                final_count = shown_count
                 degrade_note = tr("，元数据降级 {} 条").format(metadata_degrade_count) if metadata_degrade_count > 0 else ""
                 self.result_queue.put({'type': 'status', 'text': tr("Everything搜索完成，共找到 {} 个结果{}").format(final_count, degrade_note)})
                 
@@ -1301,7 +1504,8 @@ class SearchDialog(QDialog):
         # 原有的搜索逻辑
         found_count = 0
         keyword_lower = keyword.lower()
-        keyword_is_ascii = keyword.isascii()
+        # 正则模式不走按字节子串匹配的快速路径，统一解码后用正则匹配
+        keyword_is_ascii = keyword.isascii() and not use_regex
         keyword_bytes = keyword.encode('ascii', errors='ignore') if keyword_is_ascii else b''
         keyword_bytes_lower = keyword_lower.encode('ascii', errors='ignore') if keyword_is_ascii else b''
         results_buffer = []  # 结果缓冲区
@@ -1397,7 +1601,8 @@ class SearchDialog(QDialog):
             rg_matches = None
             if search_content and keyword and getattr(self, 'ripgrep_path', None):
                 self.result_queue.put({'type': 'status', 'text': tr('使用 ripgrep 搜索文件内容...')})
-                rg_matches = self.search_with_ripgrep(keyword, self.search_path, file_extensions, match_case, match_whole_word)
+                rg_matches = self.search_with_ripgrep(keyword, self.search_path, file_extensions, match_case,
+                                                      match_whole_word, use_regex)
                 if rg_matches is None:
                     debug_print("[Search] ripgrep unavailable, falling back to Python content scan")
             scanned_files = 0
@@ -1424,8 +1629,15 @@ class SearchDialog(QDialog):
                         
                         # 使用Python内置的字符串搜索（已优化）
                         if _matches_text(dirname):
-                            found_count += 1
                             dir_path = os.path.join(root, dirname)
+                            if filters:
+                                try:
+                                    dir_stat = os.stat(dir_path)
+                                except OSError:
+                                    continue
+                                if not passes_search_filters(filters, 0, dir_stat.st_mtime, True):
+                                    continue
+                            found_count += 1
                             
                             # 获取文件夹信息
                             if _should_degrade_metadata():
@@ -1513,6 +1725,15 @@ class SearchDialog(QDialog):
                             pass  # 超时后继续搜索
                     
                     file_path = os.path.join(root, filename)
+                    file_stat = None
+                    if filters:
+                        # 先按大小/日期过滤，避免对不符合条件的文件做内容扫描
+                        try:
+                            file_stat = os.stat(file_path)
+                        except OSError:
+                            continue
+                        if not passes_search_filters(filters, file_stat.st_size, file_stat.st_mtime, False):
+                            continue
                     matched = False
                     match_type = ""
                     
@@ -1666,7 +1887,7 @@ class SearchDialog(QDialog):
                             size_str = "-"
                         else:
                             try:
-                                stat_info = os.stat(file_path)
+                                stat_info = file_stat or os.stat(file_path)
                                 mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
                                 size_bytes = stat_info.st_size
                                 sort_date_ts = stat_info.st_mtime

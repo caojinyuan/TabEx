@@ -71,6 +71,108 @@ class BookmarkDialog(QDialog):
                 show_toast(self, tr("路径错误"), tr("路径不存在: {}").format(local_path2), level="warning")
 
 
+class AddBookmarkDialog(QDialog):
+    """添加书签：填写名称并在文件夹树中选择保存位置，默认书签栏，可就地新建文件夹。"""
+
+    def __init__(self, bookmark_manager, name, preferred_folder_id=None, parent=None):
+        from PyQt5.QtWidgets import QDialogButtonBox, QLineEdit
+        super().__init__(parent)
+        self.setWindowTitle(tr("添加书签"))
+        self.resize(420, 420)
+        self.bookmark_manager = bookmark_manager
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(tr("名称:")))
+        self.name_edit = QLineEdit(name)
+        self.name_edit.selectAll()
+        layout.addWidget(self.name_edit)
+        layout.addWidget(QLabel(tr("保存到:")))
+        self.folder_tree = QTreeWidget()
+        self.folder_tree.setHeaderHidden(True)
+        layout.addWidget(self.folder_tree, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText(tr("确定"))
+        buttons.button(QDialogButtonBox.Cancel).setText(tr("取消"))
+        new_folder_btn = buttons.addButton(tr("新建文件夹..."), QDialogButtonBox.ActionRole)
+        new_folder_btn.clicked.connect(self._create_folder)
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._populate(preferred_folder_id)
+
+    def _populate(self, select_id=None):
+        self.folder_tree.clear()
+        tree = self.bookmark_manager.get_tree() or {}
+        bar = tree.get('bookmark_bar')
+        items = {}
+
+        def add(node, parent_item):
+            item = QTreeWidgetItem([f"📁 {node.get('name', '')}"])
+            item.setData(0, Qt.UserRole, node.get('id'))
+            if parent_item is None:
+                self.folder_tree.addTopLevelItem(item)
+            else:
+                parent_item.addChild(item)
+            items[node.get('id')] = item
+            for child in node.get('children', []) or []:
+                if isinstance(child, dict) and child.get('type') == 'folder':
+                    add(child, item)
+
+        for root in tree.values():
+            if isinstance(root, dict) and root.get('type') == 'folder':
+                add(root, None)
+        self.folder_tree.expandAll()
+        target = items.get(select_id) or items.get(bar.get('id') if isinstance(bar, dict) else None)
+        if target is None and self.folder_tree.topLevelItemCount():
+            target = self.folder_tree.topLevelItem(0)
+        if target is not None:
+            self.folder_tree.setCurrentItem(target)
+
+    def folder_id(self):
+        item = self.folder_tree.currentItem()
+        return item.data(0, Qt.UserRole) if item is not None else None
+
+    def bookmark_name(self):
+        return self.name_edit.text().strip()
+
+    def _create_folder(self):
+        parent_id = self.folder_id()
+        if not parent_id:
+            return
+        name, ok = QInputDialog.getText(self, tr("新建文件夹"), tr("文件夹名称："))
+        name = (name or '').strip()
+        if ok and name:
+            self._populate(self.bookmark_manager.add_folder(parent_id, name))
+
+    def _accept_if_valid(self):
+        if not self.bookmark_name():
+            self.name_edit.setFocus()
+            return
+        if self.folder_id():
+            self.accept()
+
+
+def is_builtin_bookmark(node):
+    """书签栏左侧的内置项（此电脑/桌面/回收站/下载）由程序维护，不提供右键删除。"""
+    return isinstance(node, dict) and node.get('builtin') is True
+
+
+def _builtin_key(node, specs):
+    """返回内置项的 key；普通书签返回 None。旧版本没有标记时按“图标前缀 + 同 URL 或同名”识别。"""
+    if not isinstance(node, dict) or node.get('type') != 'url':
+        return None
+    if 'builtin' in node:
+        return (node.get('builtin_key') or '__obsolete__') if node.get('builtin') is True else None
+    name = str(node.get('name', ''))
+    url = str(node.get('url', '')).lower()
+    for key, icon, zh_name, spec_url in specs:
+        if not name.startswith(icon):
+            continue
+        label = name[len(icon):].strip()
+        if url == str(spec_url).lower() or label in (zh_name, tr(zh_name)):
+            return key
+    return None
+
+
 def _preserve_unreadable_file(path):
     """把无法解析的数据文件改名保留，避免随后写入默认内容时覆盖用户数据；返回备份路径。"""
     backup = f"{path}.broken-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -184,6 +286,75 @@ class BookmarkManager:
     def get_tree(self):
         # 返回完整树结构
         return self.bookmark_tree
+
+    def _new_node_id(self):
+        used = _bookmark_ids(self.bookmark_tree.values())
+        next_id = int(time.time() * 1000000)
+        while str(next_id) in used:
+            next_id += 1
+        return str(next_id)
+
+    def ensure_builtin_bookmarks(self, specs):
+        """把内置书签放在书签栏最左侧并标记 builtin；返回是否有改动。
+
+        specs: [(key, 图标, 中文名, url)]。已有内置项保留原 ID；与内置项同名的普通书签不受影响。"""
+        bar = self.bookmark_tree.get('bookmark_bar') if isinstance(self.bookmark_tree, dict) else None
+        if not isinstance(bar, dict) or not isinstance(bar.get('children'), list):
+            return False
+        before = json.dumps(bar['children'], ensure_ascii=False, sort_keys=True)
+        spec_keys = {spec[0] for spec in specs}
+        existing, kept = {}, []
+        for node in bar['children']:
+            key = _builtin_key(node, specs)
+            if key is None:
+                kept.append(node)
+            elif key in spec_keys and key not in existing:
+                existing[key] = node
+        builtin_nodes = []
+        for key, icon, zh_name, url in specs:
+            old = existing.get(key) or {}
+            node_id = str(old.get('id') or self._new_node_id())
+            builtin_nodes.append({
+                "date_added": str(old.get('date_added') or node_id),
+                "id": node_id,
+                "name": f"{icon} {tr(zh_name)}",
+                "type": "url",
+                "url": url,
+                "builtin": True,
+                "builtin_key": key,
+            })
+        bar['children'] = builtin_nodes + kept
+        return json.dumps(bar['children'], ensure_ascii=False, sort_keys=True) != before
+
+    def iter_folders(self):
+        """按树顺序返回 (文件夹节点, 层级)，用于选择书签保存位置。"""
+        result = []
+
+        def walk(node, depth):
+            if isinstance(node, dict) and node.get('type') == 'folder':
+                result.append((node, depth))
+                for child in node.get('children', []) or []:
+                    walk(child, depth + 1)
+
+        for root in (self.bookmark_tree or {}).values():
+            walk(root, 0)
+        return result
+
+    def add_folder(self, parent_folder_id, name):
+        """在指定文件夹下新建子文件夹；返回新文件夹 ID，父文件夹不存在时返回 None。"""
+        parent = next((node for node, _depth in self.iter_folders() if node.get('id') == parent_folder_id), None)
+        if parent is None:
+            return None
+        folder_id = self._new_node_id()
+        parent.setdefault('children', []).append({
+            "date_added": folder_id,
+            "id": folder_id,
+            "name": name,
+            "type": "folder",
+            "children": [],
+        })
+        self.save_bookmarks()
+        return folder_id
 
     def add_bookmark(self, parent_folder_id, name, url):
         # 在指定文件夹下添加书签
@@ -754,6 +925,9 @@ class BookmarkManagerDialog(QDialog):
                         node['group_color'] = original.get('group_color')
                     if 'group_collapsed' in original:
                         node['group_collapsed'] = bool(original.get('group_collapsed', False))
+                if is_builtin_bookmark(original):
+                    node['builtin'] = True
+                    node['builtin_key'] = original.get('builtin_key')
                 return node
             return None
         
@@ -1044,7 +1218,7 @@ class BookmarkManagerDialog(QDialog):
                 show_toast(self, tr("导出成功"), tr("书签已成功导出到:\n{}").format(file_path), level="success")
                 print(f"[Bookmark Export] Successfully exported to: {file_path}")
             except Exception as e:
-                show_toast(self, tr("导出失败"), f"导出书签时出错:\n{str(e)}", level="error")
+                show_toast(self, tr("导出失败"), tr("导出书签时出错:\n{}").format(e), level="error")
                 print(f"[Bookmark Export] Error: {e}")
     
     def import_bookmarks(self):
@@ -1117,5 +1291,5 @@ class BookmarkManagerDialog(QDialog):
             show_toast(self, tr("格式错误"), tr("导入的文件不是有效的JSON格式"), level="error")
             print(f"[Bookmark Import] Invalid JSON format: {file_path}")
         except Exception as e:
-            show_toast(self, tr("导入失败"), f"导入书签时出错:\n{str(e)}", level="error")
+            show_toast(self, tr("导入失败"), tr("导入书签时出错:\n{}").format(e), level="error")
             print(f"[Bookmark Import] Error: {e}")

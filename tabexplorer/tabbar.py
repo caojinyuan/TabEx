@@ -13,6 +13,7 @@ from . import theme as _theme
 from .i18n import tr
 from .debuglog import debug_print
 from .widgets import _set_tool_icon
+from .bookmarks import is_builtin_bookmark
 
 
 class DragDropTabWidget(QTabWidget):
@@ -133,6 +134,41 @@ class DragDropTabWidget(QTabWidget):
             event.ignore()
 
 
+def _tab_group_color(pane):
+    if pane is None or bool(getattr(pane, 'is_pinned', False)):
+        return ''
+    return str(getattr(pane, 'bookmark_group_color', '') or '').strip()
+
+
+def tab_group_runs(panes):
+    """返回 [(起始索引, 结束索引, 颜色)]：连续同色的非固定标签构成一个分组。"""
+    runs, index = [], 0
+    while index < len(panes):
+        color = _tab_group_color(panes[index])
+        if not color:
+            index += 1
+            continue
+        end = index
+        while end + 1 < len(panes) and _tab_group_color(panes[end + 1]) == color:
+            end += 1
+        runs.append((index, end, color))
+        index = end + 1
+    return runs
+
+
+class _GroupChip(QToolButton):
+    """分组首个标签左侧的名称标签；点击折叠/展开分组。"""
+
+    def set_group(self, text, color, tooltip):
+        self.setText(text)
+        self.setToolTip(tooltip)
+        style = (f"QToolButton {{ background: {color}; color: #1f1f1f; border: none; border-radius: 6px;"
+                 f" padding: 0px 6px; font-size: 8pt; font-weight: bold; }}")
+        if self.styleSheet() != style:
+            self.setStyleSheet(style)
+        self.adjustSize()
+
+
 # 自定义MenuBar以支持右键菜单
 class CustomMenuBar(QMenuBar):
     def __init__(self, parent=None):
@@ -160,13 +196,7 @@ class CustomMenuBar(QMenuBar):
                     
                     debug_print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
                     
-                    # 检查是否是特殊书签（不允许删除）
-                    special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
-                    is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
-                    
-                    debug_print(f"[DEBUG] Is special bookmark: {is_special}")
-                    
-                    if not is_special:
+                    if not is_builtin_bookmark(node):
                         global_pos = self.mapToGlobal(pos)
                         debug_print(f"[DEBUG] Showing context menu at: {global_pos}")
                         self.main_window.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
@@ -443,6 +473,63 @@ class CustomTabBar(QTabBar):
         if tw is not None:
             return tw
         return self.parentWidget()
+
+    def refresh_group_decorations(self):
+        """按分组首个标签同步组名与折叠状态，隐藏折叠组的其余标签，并在组首显示名称标签。"""
+        mw = getattr(self, 'main_window', None)
+        cs = mw._content_stack_for(self._owner_tw()) if mw is not None and hasattr(mw, '_content_stack_for') else None
+        if cs is None:
+            return
+        count = min(self.count(), cs.count())
+        panes = [cs.widget(index) for index in range(count)]
+        show_colors = bool(getattr(mw, 'config', {}).get('show_tab_group_markers', True))
+        visible = [True] * count
+        chips = {}
+        grouped = set()
+        current = self.currentIndex()
+        for start, end, color in tab_group_runs(panes):
+            head = panes[start]
+            name = str(getattr(head, 'tab_group_name', '') or '').strip()
+            collapsed = bool(getattr(head, 'tab_group_collapsed', False))
+            if collapsed and start < current <= end:
+                # 折叠组中的隐藏标签被选中（快捷键、查找标签等）时自动展开
+                collapsed = False
+            for index in range(start, end + 1):
+                grouped.add(index)
+                panes[index].tab_group_name = name
+                panes[index].tab_group_collapsed = collapsed
+                visible[index] = not collapsed or index == start
+            if name or collapsed:
+                size = end - start + 1
+                text = (f"▸ {name} · {size}" if name else f"▸ {size}") if collapsed else name
+                tip = tr("点击展开分组") if collapsed else tr("点击折叠分组")
+                chips[start] = (text, color if show_colors else '#d0d0d0', tip)
+        for index, pane in enumerate(panes):
+            if index not in grouped and pane is not None:
+                pane.tab_group_name = ''
+                pane.tab_group_collapsed = False
+        for index in range(count):
+            if self.isTabVisible(index) != visible[index]:
+                self.setTabVisible(index, visible[index])
+            chip = self.tabButton(index, QTabBar.LeftSide)
+            spec = chips.get(index)
+            if spec is None:
+                if isinstance(chip, _GroupChip):
+                    self.setTabButton(index, QTabBar.LeftSide, None)
+                    chip.deleteLater()
+                continue
+            if not isinstance(chip, _GroupChip):
+                chip = _GroupChip(self)
+                chip.setCursor(Qt.PointingHandCursor)
+                chip.clicked.connect(lambda _checked=False, button=chip: self._on_group_chip_clicked(button))
+                self.setTabButton(index, QTabBar.LeftSide, chip)
+            chip.set_group(*spec)
+
+    def _on_group_chip_clicked(self, chip):
+        index = self.tabAt(chip.mapToParent(QPoint(1, 1)))
+        mw = getattr(self, 'main_window', None)
+        if index >= 0 and mw is not None and hasattr(mw, 'toggle_tab_group_collapsed'):
+            mw.toggle_tab_group_collapsed(index, self._owner_tw())
 
     def _on_drag_end_timeout(self):
         """拖拽结束后触发一次完整的 on_tab_changed（去抖后执行）"""

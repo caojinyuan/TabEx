@@ -21,10 +21,11 @@ from . import theme as _theme
 from .paths import get_app_data_path
 from .i18n import _set_app_language, tr
 from .constants import (
-    APP_VERSION, HOUSEKEEPING_GC_EVERY_N, HOUSEKEEPING_INTERVAL_MS, MAX_ACTIVE_TOASTS,
+    APP_VERSION, FREQUENT_DIR_SAVE_DELAY_MS, FREQUENT_DIR_SETTLE_MS, HOUSEKEEPING_GC_EVERY_N,
+    HOUSEKEEPING_INTERVAL_MS, MAX_ACTIVE_TOASTS,
     MAX_CLOSED_TABS_HISTORY, MAX_SEARCH_HISTORY, RESOURCE_CRIT_PERCENT, RESOURCE_SAMPLE_INTERVAL_S,
     RESOURCE_WARN_PERCENT, SESSION_SNAPSHOT_DEBOUNCE_MS, SESSION_SNAPSHOT_INTERVAL_MS,
-    SESSION_SNAPSHOT_MIN_INTERVAL_MS,
+    SESSION_SNAPSHOT_MIN_INTERVAL_MS, SYNC_BROWSE_FOLLOW_GUARD_S, SYNC_BROWSE_SETTLE_MS,
 )
 from .debuglog import _DEBUG_LOG_PATH, debug_print, set_debug_mode, set_explorer_monitor_debug
 from .system import (
@@ -59,13 +60,13 @@ from .fileops import (
     _confirm_file_preview, CopyConflictDialog, DirectoryCompareDialog, FileTaskPanel, _find_copy_conflicts,
     _plan_batch_rename,
 )
-from .bookmarks import BookmarkDialog, BookmarkManager, BookmarkManagerDialog, _preserve_unreadable_file
+from .bookmarks import BookmarkDialog, BookmarkManager, BookmarkManagerDialog, _preserve_unreadable_file, is_builtin_bookmark
 from .shellview import (
     _explorer_location_to_path, _ieb_keyboard_filter, _path_is_slow_for_shell, _shell_file_operation_window_open,
 )
 from .netstatus import is_network_path
 from .explorer_tab import FileExplorerTab
-from .tabbar import CustomMenuBar, CustomTabBar, DragDropTabWidget, _tab_display_labels, TabListDialog
+from .tabbar import CustomMenuBar, CustomTabBar, DragDropTabWidget, _tab_display_labels, tab_group_runs, TabListDialog
 from .chat import ChatPanel
 from .settings import SettingsDialog
 from .persistence import ConfigStore, SessionController
@@ -111,38 +112,19 @@ class MainWindow(QMainWindow):
     open_path_signal = pyqtSignal(str)
 
     def ensure_default_icons_on_bookmark_bar(self):
-        """确保四个常用书签（带图标）始终在最左侧且不会被覆盖。"""
+        """确保内置书签（此电脑/桌面/回收站/下载）始终在最左侧。"""
         bm = self.bookmark_manager
-        tree = bm.get_tree()
-        bar = tree.get('bookmark_bar')
-        if not bar or 'children' not in bar:
-            return
-        import time
         from PyQt5.QtCore import QStandardPaths
         downloads_path = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
         if not downloads_path or not os.path.exists(downloads_path):
             downloads_path = os.path.join(os.path.expanduser('~'), 'Downloads')
-        icon_map = [
-            ("🖥️", tr("此电脑"), "shell:MyComputerFolder"),
-            ("🗔", "桌面", "shell:Desktop"),
-            ("🗑️", tr("回收站"), "shell:RecycleBinFolder"),
-            ("⬇️", "下载", downloads_path),
-        ]
-        names_set = set([n for _, n, _ in icon_map])
-        bar['children'] = [c for c in bar['children'] if not (c.get('type') == 'url' and any(c.get('name', '').replace(icon, '').strip() == n for icon, n, _ in icon_map))]
-        now = int(time.time() * 1000000)
-        def make_bm(icon, name, url):
-            nonlocal now
-            now += 1
-            return {
-                "date_added": str(now),
-                "id": str(now),
-                "name": f"{icon} {name}",
-                "type": "url",
-                "url": url
-            }
-        bar['children'] = [make_bm(icon, name, url) for icon, name, url in icon_map] + bar['children']
-        bm.save_bookmarks()
+        if bm.ensure_builtin_bookmarks([
+            ("computer", "🖥️", "此电脑", "shell:MyComputerFolder"),
+            ("desktop", "🗔", "桌面", "shell:Desktop"),
+            ("recycle", "🗑️", "回收站", "shell:RecycleBinFolder"),
+            ("downloads", "⬇️", "下载", downloads_path),
+        ]):
+            bm.save_bookmarks()
 
     def _group_palette(self):
         return [
@@ -227,6 +209,9 @@ class MainWindow(QMainWindow):
             tab.tab_group_separator_name = ""
             tab.bookmark_group_color = str(getattr(tab, 'bookmark_group_color', '') or '').strip()
             self._apply_tab_group_color(tab_widget, i, tab)
+        bar = tab_widget.tabBar()
+        if hasattr(bar, 'refresh_group_decorations'):
+            bar.refresh_group_decorations()
 
     def insert_tab_group_marker(self, side='right'):
         """F4 分组切换：创建/取消“当前标签及其左侧连续同色（或未分组）标签”的分组。"""
@@ -781,7 +766,11 @@ class MainWindow(QMainWindow):
         rect = bar.tabRect(idx)
         if not rect.isValid():
             return min(max(idx, 0), count)
-        return idx if local.x() < rect.center().x() else idx + 1
+        slot = idx if local.x() < rect.center().x() else idx + 1
+        # 落在折叠分组的组首之后时，插到整个折叠组后面
+        while slot < count and hasattr(bar, 'isTabVisible') and not bar.isTabVisible(slot):
+            slot += 1
+        return slot
 
     def _normalize_drop_insert_index(self, tab_widget, raw_index):
         if tab_widget is None:
@@ -890,13 +879,18 @@ class MainWindow(QMainWindow):
 
         right_idx = first_idx + len(tabs)
         target_color = ""
+        target_name, target_collapsed = "", False
         if 0 <= right_idx < cs.count():
             right_tab = cs.widget(right_idx)
             if right_tab is not None and not bool(getattr(right_tab, 'is_pinned', False)):
                 target_color = str(getattr(right_tab, 'bookmark_group_color', '') or '').strip()
+                target_name = str(getattr(right_tab, 'tab_group_name', '') or '')
+                target_collapsed = bool(getattr(right_tab, 'tab_group_collapsed', False))
 
         for t in tabs:
             t.bookmark_group_color = target_color
+            t.tab_group_name = target_name if target_color else ""
+            t.tab_group_collapsed = target_collapsed if target_color else False
             t.tab_group_separator_after = False
             t.tab_group_separator_color = ""
             t.tab_group_separator_name = ""
@@ -1782,6 +1776,7 @@ class MainWindow(QMainWindow):
         # 拖拽重排期间仅同步显示，跳过重型刷新切换（与左侧 on_tab_changed 一致）
         if getattr(self, '_tab_drag_in_progress', False):
             return
+        self._reveal_hidden_current_tab(getattr(self, 'split_tab_widget', None), index)
         # 仅右侧当前可见标签保持高频刷新；其余右侧后台标签暂停轮询，
         # 避免多次切换后累积多个活跃面板导致 COM/scandir 高频轮询卡顿
         for i in range(scs.count()):
@@ -1926,6 +1921,8 @@ class MainWindow(QMainWindow):
     def _teardown_split_group(self):
         """收起右侧标签组：隐藏其标签栏与内容栈，从分割器移除并恢复单组布局。"""
         self._split_active = False
+        if getattr(self, '_sync_browse', False):
+            self._set_sync_browse(False)
         stw = getattr(self, 'split_tab_widget', None)
         scs = getattr(self, 'split_content_stack', None)
         if stw is not None:
@@ -1996,7 +1993,8 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str, bool)
     def add_new_tab(self, path="", is_shell=False, select_file=None, target_tabwidget=None, activate=True,
                     bookmark_group_color=None, bookmark_source_node_id=None,
-                    tab_group_separator_after=False, tab_group_separator_color="", tab_group_separator_name=""):
+                    tab_group_separator_after=False, tab_group_separator_color="", tab_group_separator_name="",
+                    tab_group_name="", tab_group_collapsed=False):
         # 默认新建标签页为“此电脑”
         if not path:
             path = 'shell:MyComputerFolder'
@@ -2026,6 +2024,8 @@ class MainWindow(QMainWindow):
         tab.tab_group_separator_after = bool(tab_group_separator_after)
         tab.tab_group_separator_color = str(tab_group_separator_color or "")
         tab.tab_group_separator_name = str(tab_group_separator_name or "")
+        tab.tab_group_name = str(tab_group_name or "")
+        tab.tab_group_collapsed = bool(tab_group_collapsed)
         
         # 同时添加到 tab_widget（占位标签）和 content_stack（实际内容）
         tab_index = tab_widget.addTab(QWidget(), "")
@@ -2207,6 +2207,7 @@ class MainWindow(QMainWindow):
             # 拖拽进行中：仅同步 content_stack，跳过一切重型操作，等拖拽结束后统一执行
             if getattr(self, '_tab_drag_in_progress', False):
                 return
+            self._reveal_hidden_current_tab(self.tab_widget, index)
 
             # 切换标签页后重置“活动面板”为当前标签，避免快捷键仍指向旧分屏/旧标签
             self._active_pane = None
@@ -2830,13 +2831,7 @@ class MainWindow(QMainWindow):
                     
                     debug_print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
                     
-                    # 检查是否是特殊书签（不允许删除）
-                    special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
-                    is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
-                    
-                    debug_print(f"[DEBUG] Is special bookmark: {is_special}")
-                    
-                    if not is_special:
+                    if not is_builtin_bookmark(node):
                         global_pos = event.globalPos()
                         debug_print(f"[DEBUG] Showing context menu at: {global_pos}")
                         self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
@@ -3081,7 +3076,7 @@ class MainWindow(QMainWindow):
                 if len(full_paths) == 1:
                     show_toast(self, tr("复制成功"), tr("路径: {}").format(full_paths[0]), level="info")
                 else:
-                    show_toast(self, tr("复制成功"), f"已复制 {len(full_paths)} 个路径", level="info")
+                    show_toast(self, tr("复制成功"), tr("已复制 {} 个路径").format(len(full_paths)), level="info")
             else:
                 # 只拷贝文件名
                 filenames_text = ", ".join(names)
@@ -3089,7 +3084,7 @@ class MainWindow(QMainWindow):
                 if len(names) == 1:
                     show_toast(self, tr("复制成功"), tr("文件名: {}").format(names[0]), level="info")
                 else:
-                    show_toast(self, tr("复制成功"), f"已复制 {len(names)} 个文件名", level="info")
+                    show_toast(self, tr("复制成功"), tr("已复制 {} 个文件名").format(len(names)), level="info")
         else:
             # 未选中文件时，复制路径栏地址，按设置分隔符
             separator = self.config.get("breadcrumb_copy_separator", "/")
@@ -3263,7 +3258,7 @@ class MainWindow(QMainWindow):
         selected_path = matched_paths[0]
         if len(matched_paths) > 1:
             picker = QuickFindResultsDialog(matched_paths, self)
-            picker.setWindowTitle(f"选择匹配项（共 {len(matched_paths)} 项）")
+            picker.setWindowTitle(tr("选择匹配项（共 {} 项）").format(len(matched_paths)))
             ok = picker.exec_()
             self._guard_shortcuts_after_modal()
             if not ok or not picker.selected_path:
@@ -3406,16 +3401,24 @@ class MainWindow(QMainWindow):
 
     def _cycle_main_tab(self, step):
         count = self.tab_widget.count()
-        if count:
-            self.tab_widget.setCurrentIndex((self.tab_widget.currentIndex() + step) % count)
+        if not count:
+            return
+        bar = self.tab_widget.tabBar()
+        index = self.tab_widget.currentIndex()
+        for _attempt in range(count):
+            index = (index + step) % count
+            if bar.isTabVisible(index):
+                break
+        self.tab_widget.setCurrentIndex(index)
 
     def _select_tab_by_number(self, number):
-        """Ctrl+1..8 切到活动标签组第 N 个标签，Ctrl+9 切到最后一个。"""
+        """Ctrl+1..8 切到活动标签组第 N 个可见标签（折叠分组只算组首），Ctrl+9 切到最后一个。"""
         tabs = self.get_active_group_tabwidget()
-        count = tabs.count()
-        index = count - 1 if number == 9 else number - 1
-        if 0 <= index < count:
-            tabs.setCurrentIndex(index)
+        bar = tabs.tabBar()
+        visible = [index for index in range(tabs.count()) if bar.isTabVisible(index)]
+        position = len(visible) - 1 if number == 9 else number - 1
+        if 0 <= position < len(visible):
+            tabs.setCurrentIndex(visible[position])
 
     def _run_shortcut(self, vk, ctrl, shift, alt):
         """执行按键组合绑定的命令，返回是否命中已启用的快捷键。"""
@@ -3437,6 +3440,7 @@ class MainWindow(QMainWindow):
             'switch_tab_number': lambda: self._select_tab_by_number(vk - 0x30),
             'search': self.show_search_dialog,
             'quick_find_current_dir': self.quick_find_in_current_directory,
+            'frequent_dirs': self.show_frequent_dirs,
             'go_back': self.go_back_current_tab,
             'go_forward': self.go_forward_current_tab,
             'go_up': self.go_up_current_tab,
@@ -3549,6 +3553,117 @@ class MainWindow(QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
 
+    # ── 常用目录与分屏同步浏览（由 FileExplorerTab.current_path 变化驱动） ─────────────
+    def on_tab_path_changed(self, tab, old_path, new_path):
+        import weakref
+        ref = weakref.ref(tab)
+        # 路径稳定一段时间后才计入常用目录，避免导航过程中的瞬时路径
+        QTimer.singleShot(FREQUENT_DIR_SETTLE_MS, lambda: self._record_frequent_visit(ref, new_path))
+        self._queue_sync_browse(tab, old_path, new_path)
+
+    def _get_frequent_dirs(self):
+        store = getattr(self, '_frequent_dirs', None)
+        if store is None:
+            from .frequent import FrequentDirs
+            store = self._frequent_dirs = FrequentDirs()
+        return store
+
+    def _record_frequent_visit(self, ref, path):
+        from PyQt5 import sip
+        tab = ref()
+        if tab is None or sip.isdeleted(tab) or getattr(tab, 'current_path', None) != path:
+            return
+        if self._get_frequent_dirs().record(path):
+            timer = getattr(self, '_frequent_save_timer', None)
+            if timer is None:
+                timer = self._frequent_save_timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self._save_frequent_dirs)
+            timer.start(FREQUENT_DIR_SAVE_DELAY_MS)
+
+    def _save_frequent_dirs(self):
+        store = getattr(self, '_frequent_dirs', None)
+        if store is not None:
+            store.save()
+
+    def show_frequent_dirs(self):
+        from .frequent import FrequentDirsDialog
+        store = self._get_frequent_dirs()
+        dialog = FrequentDirsDialog(store, self)
+        accepted = dialog.exec_() == QDialog.Accepted
+        dialog.deleteLater()
+        self._save_frequent_dirs()
+        if not accepted or not dialog.selected_path:
+            return
+        path = dialog.selected_path
+        pane = self.get_active_pane()
+        if dialog.open_in_new_tab or pane is None or not hasattr(pane, 'navigate_to'):
+            self.add_new_tab(path, target_tabwidget=self.get_active_group_tabwidget())
+        else:
+            pane.navigate_to(path)
+
+    def toggle_sync_browse(self):
+        enabled = not getattr(self, '_sync_browse', False)
+        if enabled and not getattr(self, '_split_active', False):
+            key = _hotkey_text(self.config, 'split_view')
+            show_toast(self, tr("分屏同步浏览"),
+                       tr("请先按 {} 打开左右分屏").format(key) if key else tr("请先打开左右分屏"), level="warning")
+            enabled = False
+        self._set_sync_browse(enabled)
+        if enabled:
+            show_toast(self, tr("分屏同步浏览"), tr("已开启：一侧进入子目录或返回上级时，另一侧做相同移动"), level="info")
+
+    def _set_sync_browse(self, enabled):
+        self._sync_browse = bool(enabled)
+        self._sync_pending = None
+        action = getattr(self, 'sync_browse_action', None)
+        if action is not None:
+            action.setChecked(self._sync_browse)
+
+    def _queue_sync_browse(self, tab, old_path, new_path):
+        if not getattr(self, '_sync_browse', False) or not getattr(self, '_split_active', False):
+            return
+        if time.monotonic() < getattr(tab, '_sync_follow_until', 0):
+            return  # 这次变化来自同步跟随，不反向驱动
+        left, right = self.get_current_tab_widget(), self._get_split_pane()
+        follower = right if tab is left else left if tab is right else None
+        if follower is None or follower is tab:
+            return
+        pending = getattr(self, '_sync_pending', None)
+        if pending is None or pending['leader'] is not tab:
+            # 以第一次变化前的两侧路径为基准，连续多次变化合并为一次跟随
+            pending = self._sync_pending = {'leader': tab, 'follower': follower, 'leader_base': old_path,
+                                            'follower_base': getattr(follower, 'current_path', '')}
+        timer = getattr(self, '_sync_browse_timer', None)
+        if timer is None:
+            timer = self._sync_browse_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._apply_sync_browse)
+        timer.start(SYNC_BROWSE_SETTLE_MS)
+
+    def _apply_sync_browse(self):
+        from PyQt5 import sip
+        from .paths import map_sync_path
+        pending, self._sync_pending = getattr(self, '_sync_pending', None), None
+        if pending is None or not getattr(self, '_sync_browse', False):
+            return
+        leader, follower = pending['leader'], pending['follower']
+        if sip.isdeleted(leader) or sip.isdeleted(follower):
+            return
+        if getattr(follower, 'current_path', '') != pending['follower_base']:
+            return  # 另一侧已被用户移动，不再跟随
+        target = map_sync_path(pending['leader_base'], getattr(leader, 'current_path', ''), pending['follower_base'])
+        if not target or self._normalize_path_for_compare(target) == self._normalize_path_for_compare(
+                pending['follower_base']):
+            return
+        is_slow = getattr(follower, '_is_slow_path', lambda _path: False)(target)
+        if not is_slow and not os.path.isdir(target):
+            show_toast(self, tr("分屏同步浏览"), tr("另一侧没有对应目录：{}").format(target), level="warning",
+                       duration=2500)
+            return
+        follower._sync_follow_until = time.monotonic() + SYNC_BROWSE_FOLLOW_GUARD_S
+        follower.navigate_to(target)
+
     def _capture_named_workspace(self):
         return SessionController(self)._capture_named_workspace()
 
@@ -3599,7 +3714,9 @@ class MainWindow(QMainWindow):
                     activate=False, bookmark_group_color=entry.get('bookmark_group_color', ''),
                     tab_group_separator_after=entry.get('tab_group_separator_after', False),
                     tab_group_separator_color=entry.get('tab_group_separator_color', ''),
-                    tab_group_separator_name=entry.get('tab_group_separator_name', ''))
+                    tab_group_separator_name=entry.get('tab_group_separator_name', ''),
+                    tab_group_name=entry.get('tab_group_name', ''),
+                    tab_group_collapsed=bool(entry.get('tab_group_collapsed', False)))
                 opened.append(index)
                 if index < 0:
                     failures.append(path)
@@ -3633,6 +3750,12 @@ class MainWindow(QMainWindow):
         self.file_tasks_action = menu.addAction(tr('文件任务'), self.show_file_tasks)
         menu.addAction(tr('目录差异比较...'), self.show_directory_compare)
         menu.addAction(tr('批量重命名预览...'), self.preview_batch_rename)
+        menu.addSection(tr('导航'))
+        self.frequent_dirs_action = menu.addAction(
+            _hotkey_hint(self.config, tr('常用目录...'), 'frequent_dirs'), self.show_frequent_dirs)
+        self.sync_browse_action = menu.addAction(tr('分屏同步浏览'), self.toggle_sync_browse)
+        self.sync_browse_action.setCheckable(True)
+        self.sync_browse_action.setChecked(bool(getattr(self, '_sync_browse', False)))
         workspace = menu.addMenu(tr('工作区'))
         workspace.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
         workspace.addAction(tr('保存命名工作区...'), self.save_named_workspace)
@@ -3848,6 +3971,7 @@ class MainWindow(QMainWindow):
             self.config["hotkeys"]["copy_filename"] = dlg.hotkey_copy_filename.isChecked()
             self.config["hotkeys"]["copy_filepath"] = dlg.hotkey_copy_filepath.isChecked()
             self.config["hotkeys"]["quick_find_current_dir"] = dlg.hotkey_quick_find_current_dir.isChecked()
+            self.config["hotkeys"]["frequent_dirs"] = dlg.hotkey_frequent_dirs.isChecked()
             self.config["hotkeys"]["split_view"] = dlg.hotkey_split_view.isChecked()
             self.config["hotkeys"]["insert_group_bookmark"] = dlg.hotkey_insert_group_bookmark.isChecked()
             self.config["hotkeys"]["screenshot"] = dlg.hotkey_screenshot.isChecked()
@@ -4044,7 +4168,189 @@ class MainWindow(QMainWindow):
                 refresh_action.triggered.connect(lambda: self.toggle_tab_auto_refresh(tab_index, True, tw))
             menu.addAction(refresh_action)
 
+        menu.addSeparator()
+        menu.addAction(tr("复制路径"), lambda: self.copy_tab_path(tab))
+        menu.addAction(tr("复制标签"), lambda: self.duplicate_tab(tab, tw))
+        menu.addAction(tr("移到左侧") if is_right else tr("移到右侧"), lambda: self.move_tab_to_other_group(tab, tw))
+
+        group = self._tab_group_range(tw, tab_index)
+        if group is not None:
+            collapsed = bool(getattr(tab, 'tab_group_collapsed', False))
+            menu.addSeparator()
+            menu.addAction(tr("命名分组..."), lambda: self.rename_tab_group(tab, tw))
+            menu.addAction(tr("展开分组") if collapsed else tr("折叠分组"),
+                           lambda: self.set_tab_group_collapsed(tab, tw, not collapsed))
+            menu.addAction(tr("取消分组"), lambda: self.ungroup_tab_group(tab, tw))
+            menu.addAction(tr("关闭该分组"), lambda: self.close_tab_group(tab, tw))
+
+        menu.addSeparator()
+        close_others = menu.addAction(tr("关闭其他标签"), lambda: self.close_other_tabs(tab, tw))
+        close_right = menu.addAction(tr("关闭右侧标签"), lambda: self.close_tabs_to_right(tab, tw))
+        close_others.setEnabled(bool(self._closable_tabs(tw, tab, right_only=False)))
+        close_right.setEnabled(bool(self._closable_tabs(tw, tab, right_only=True)))
+
         menu.exec_(tw.tabBar().mapToGlobal(pos))
+
+    def _reveal_hidden_current_tab(self, tab_widget, index):
+        """选中了折叠分组中被隐藏的标签时展开该分组。"""
+        bar = tab_widget.tabBar() if tab_widget is not None else None
+        if bar is not None and 0 <= index < bar.count() and not bar.isTabVisible(index):
+            self._apply_tab_grouping_for_pane(tab_widget)
+
+    def copy_tab_path(self, tab):
+        path = str(getattr(tab, 'current_path', '') or '')
+        if not path:
+            return
+        if not path.startswith(('shell:', '::')):
+            separator = self.config.get("breadcrumb_copy_separator", "/")
+            path = path.replace("\\", "/").replace("/", separator)
+        QApplication.clipboard().setText(path)
+        show_toast(self, tr("复制成功"), tr("路径: {}").format(path), level="info")
+
+    def duplicate_tab(self, tab, target_tabwidget=None):
+        """在原标签右侧打开同一路径的新标签，并加入原标签的分组。"""
+        tw, cs, _is_right = self._resolve_group(target_tabwidget)
+        path = str(getattr(tab, 'current_path', '') or '')
+        index = cs.indexOf(tab) if cs is not None else -1
+        if not path or index < 0:
+            return -1
+        pinned = bool(getattr(tab, 'is_pinned', False))
+        new_index = self.add_new_tab(
+            path, is_shell=path.startswith('shell:'), target_tabwidget=tw,
+            bookmark_group_color='' if pinned else getattr(tab, 'bookmark_group_color', ''),
+            tab_group_name='' if pinned else getattr(tab, 'tab_group_name', ''))
+        if new_index >= 0 and not pinned and new_index != index + 1:
+            tw.tabBar().moveTab(new_index, index + 1)
+            new_index = index + 1
+        return new_index
+
+    def move_tab_to_other_group(self, tab, target_tabwidget=None):
+        """左侧标签移到右侧分屏（未分屏时开启分屏），右侧标签移回左侧。"""
+        tw, cs, is_right = self._resolve_group(target_tabwidget)
+        index = cs.indexOf(tab) if cs is not None else -1
+        if index < 0:
+            return False
+        if not getattr(self, '_split_active', False):
+            if is_right:
+                return False
+            self.tab_widget.setCurrentIndex(index)
+            self._enter_split_view()
+            return True
+        destination = self.tab_widget if is_right else self.split_tab_widget
+        return self.move_tab_across_groups(tw, tab, destination, None)
+
+    def _closable_tabs(self, target_tabwidget, keep_tab, right_only):
+        """“关闭其他/右侧标签”的目标：同组内除保留标签和固定标签以外的标签。"""
+        _tw, cs, _is_right = self._resolve_group(target_tabwidget)
+        if cs is None:
+            return []
+        keep_index = cs.indexOf(keep_tab)
+        return [cs.widget(i) for i in range(cs.count())
+                if i != keep_index and (not right_only or i > keep_index)
+                and cs.widget(i) is not None and not bool(getattr(cs.widget(i), 'is_pinned', False))]
+
+    def _close_tab_widgets(self, target_tabwidget, tabs, keep_tab=None):
+        """按对象关闭同组内的多个标签（索引在关闭过程中会变化）；左侧组至少保留一个标签。"""
+        tw, cs, is_right = self._resolve_group(target_tabwidget)
+        closed = 0
+        for tab in list(tabs):
+            index = cs.indexOf(tab)
+            if index < 0 or (not is_right and tw.count() <= 1):
+                continue
+            self.close_tab(index, target_tabwidget=tw)
+            closed += 1
+        if keep_tab is not None and cs.indexOf(keep_tab) >= 0:
+            tw.setCurrentIndex(cs.indexOf(keep_tab))
+        if closed:
+            key = _hotkey_text(self.config, 'reopen_tab')
+            hint = tr("已关闭 {} 个标签页").format(closed)
+            if key:
+                hint += tr("，可按 {} 恢复").format(key)
+            show_toast(self, tr("关闭标签"), hint, level="info", duration=2500)
+        return closed
+
+    def close_other_tabs(self, tab, target_tabwidget=None):
+        return self._close_tab_widgets(target_tabwidget, self._closable_tabs(target_tabwidget, tab, False), tab)
+
+    def close_tabs_to_right(self, tab, target_tabwidget=None):
+        return self._close_tab_widgets(target_tabwidget, self._closable_tabs(target_tabwidget, tab, True), tab)
+
+    def _tab_group_range(self, target_tabwidget, index):
+        """返回 index 所在分组的 (start, end)，未分组或固定标签返回 None。"""
+        _tw, cs, _is_right = self._resolve_group(target_tabwidget)
+        if cs is None:
+            return None
+        panes = [cs.widget(i) for i in range(cs.count())]
+        return next(((start, end) for start, end, _color in tab_group_runs(panes) if start <= index <= end), None)
+
+    def _tab_group_members(self, tab, target_tabwidget):
+        _tw, cs, _is_right = self._resolve_group(target_tabwidget)
+        group = self._tab_group_range(target_tabwidget, cs.indexOf(tab)) if cs is not None else None
+        return [] if group is None else [cs.widget(i) for i in range(group[0], group[1] + 1)]
+
+    def _after_tab_group_change(self, target_tabwidget):
+        tw, _cs, _is_right = self._resolve_group(target_tabwidget)
+        self._apply_tab_grouping_for_pane(tw)
+        self._schedule_session_snapshot()
+
+    def rename_tab_group(self, tab, target_tabwidget=None):
+        members = self._tab_group_members(tab, target_tabwidget)
+        if not members:
+            return False
+        old_name = str(getattr(members[0], 'tab_group_name', '') or '')
+        text, ok = QInputDialog.getText(self, tr("命名分组"), tr("分组名称（留空则不显示名称）："), text=old_name)
+        self.setFocus()
+        if not ok:
+            return False
+        for member in members:
+            member.tab_group_name = text.strip()
+        self._after_tab_group_change(target_tabwidget)
+        return True
+
+    def set_tab_group_collapsed(self, tab, target_tabwidget, collapsed):
+        tw, cs, _is_right = self._resolve_group(target_tabwidget)
+        members = self._tab_group_members(tab, target_tabwidget)
+        if not members:
+            return False
+        if collapsed and tw.currentIndex() in [cs.indexOf(member) for member in members[1:]]:
+            tw.setCurrentIndex(cs.indexOf(members[0]))
+        for member in members:
+            member.tab_group_collapsed = bool(collapsed)
+        self._after_tab_group_change(tw)
+        return True
+
+    def toggle_tab_group_collapsed(self, index, target_tabwidget=None):
+        _tw, cs, _is_right = self._resolve_group(target_tabwidget)
+        tab = cs.widget(index) if cs is not None and 0 <= index < cs.count() else None
+        if tab is None:
+            return False
+        return self.set_tab_group_collapsed(tab, target_tabwidget,
+                                            not bool(getattr(tab, 'tab_group_collapsed', False)))
+
+    def ungroup_tab_group(self, tab, target_tabwidget=None):
+        tw, _cs, _is_right = self._resolve_group(target_tabwidget)
+        members = self._tab_group_members(tab, target_tabwidget)
+        if not members:
+            return False
+        for member in members:
+            member.bookmark_group_color = ''
+            member.tab_group_name = ''
+            member.tab_group_collapsed = False
+        self._apply_tab_grouping_for_pane(tw)
+        self._move_ungrouped_tabs_before_existing_ungrouped(tw, members)
+        self.save_pinned_tabs()
+        self._schedule_session_snapshot()
+        return True
+
+    def close_tab_group(self, tab, target_tabwidget=None):
+        tw, _cs, is_right = self._resolve_group(target_tabwidget)
+        members = self._tab_group_members(tab, target_tabwidget)
+        if not members:
+            return 0
+        if not is_right and len(members) >= tw.count():
+            # 左侧组不能被关空，否则会关闭整个窗口
+            self.add_new_tab(target_tabwidget=tw)
+        return self._close_tab_widgets(tw, members)
 
     def toggle_tab_auto_refresh(self, tab_index, frozen, target_tabwidget=None):
         _tw, cs, _is_right = self._resolve_group(target_tabwidget)
@@ -4061,42 +4367,22 @@ class MainWindow(QMainWindow):
         )
 
     def add_tab_bookmark(self, tab):
-        # 选择父文件夹
-        bm = self.bookmark_manager
-        tree = bm.get_tree()
-        folder_list = []
-        def collect_folders(node):
-            if isinstance(node, dict):
-                if node.get('type') == 'folder':
-                    folder_list.append((node.get('id'), node.get('name')))
-                    for child in node.get('children', []):
-                        collect_folders(child)
-            elif isinstance(node, list):
-                for item in node:
-                    collect_folders(item)
-        for root in tree.values():
-            collect_folders(root)
-        if not folder_list:
-            show_toast(self, tr("无可用书签文件夹"), tr("请先在 bookmarks.json 中添加至少一个文件夹。"), level="warning")
+        path = getattr(tab, 'current_path', '') if tab is not None else ''
+        if not path:
             return
-        # 选择父文件夹
-        folder_names = [f"{name} (id:{fid})" for fid, name in folder_list]
-        from PyQt5.QtWidgets import QInputDialog
-        idx, ok = QInputDialog.getItem(self, tr("选择书签文件夹"), tr("请选择父文件夹："), folder_names, 0, False)
+        from .bookmarks import AddBookmarkDialog
+        default_name = os.path.basename(path.rstrip('\\/')) or path
+        dialog = AddBookmarkDialog(self.bookmark_manager, default_name,
+                                   getattr(self, '_last_bookmark_folder_id', None), self)
+        accepted = dialog.exec_() == QDialog.Accepted
         # 对话框关闭后，强制将焦点设回主窗口，防止QAxWidget拦截快捷键
         self.setFocus()
-        if not ok:
+        if not accepted:
             return
-        folder_id = folder_list[folder_names.index(idx)][0]
-        # 输入书签名称
-        name, ok = QInputDialog.getText(self, tr("书签名称"), tr("请输入书签名称："), text=os.path.basename(tab.current_path))
-        # 对话框关闭后，强制将焦点设回主窗口
-        self.setFocus()
-        if not ok or not name:
-            return
-        # 保存到 bookmarks.json
-        url = "file:///" + tab.current_path.replace("\\", "/")
-        if bm.add_bookmark(folder_id, name, url):
+        folder_id = dialog.folder_id()
+        self._last_bookmark_folder_id = folder_id
+        url = "file:///" + path.replace("\\", "/")
+        if self.bookmark_manager.add_bookmark(folder_id, dialog.bookmark_name(), url):
             self.populate_bookmark_bar_menu()
         else:
             show_toast(self, tr("添加失败"), tr("未能添加书签，请检查父文件夹。"), level="warning")
@@ -4357,6 +4643,7 @@ class MainWindow(QMainWindow):
         self._config_store = ConfigStore(get_app_data_path("config.json"))
         config = self._config_store.load()
         self._config_recovered_backup = self._config_store.recovered_backup
+        self._config_secret_unreadable = self._config_store.secret_unreadable
         return config
     
     def save_config(self, immediate=False):
@@ -4575,6 +4862,18 @@ class MainWindow(QMainWindow):
             show_toast(self, tr("数据文件无法读取"),
                        tr("{} 无法解析，原文件已另存为 {}，本次使用默认内容").format(name.split('.broken-')[0], name),
                        level="warning")
+        if getattr(self, '_config_secret_unreadable', False):
+            show_toast(self, tr("AI 密钥无法解密"),
+                       tr("配置可能来自其他电脑或 Windows 用户，请在 设置 → AI 助手 中重新填写"),
+                       level="warning")
+
+    def _repair_startup_shortcut(self):
+        import sys
+        if not getattr(sys, 'frozen', False):
+            return
+        from .system import repair_stale_startup_shortcut
+        if repair_stale_startup_shortcut(sys.executable):
+            show_toast(self, tr("开机启动"), tr("程序位置已变化，开机启动已改为当前位置"), level="info")
 
     def ensure_default_bookmarks(self):
         bm = self.bookmark_manager
@@ -5076,6 +5375,8 @@ class MainWindow(QMainWindow):
                                 tab_group_separator_after=tab_info.get('tab_group_separator_after', False),
                                 tab_group_separator_color=tab_info.get('tab_group_separator_color', ''),
                                 tab_group_separator_name=tab_info.get('tab_group_separator_name', ''),
+                                tab_group_name=tab_info.get('tab_group_name', ''),
+                                tab_group_collapsed=bool(tab_info.get('tab_group_collapsed', False)),
                             )
                     debug_print(f"[App] 恢复缓存标签后标签页数: {self.tab_widget.count()}")
                 else:
@@ -5167,6 +5468,8 @@ class MainWindow(QMainWindow):
             current_path = None
         self._update_window_title(current_path)
         self._warn_recovered_data_files()
+        from PyQt5.QtCore import QTimer as _StartupTimer
+        _StartupTimer.singleShot(5000, self._repair_startup_shortcut)
         debug_print("[Performance] Delayed initialization completed")
     
     def start_instance_server(self):
@@ -5541,6 +5844,7 @@ class MainWindow(QMainWindow):
             screenshot.shutdown()
 
         self._active_pane = None
+        self._save_frequent_dirs()
 
         # 先保存会话快照（此时分屏仍处于激活态，确保 split_session 被正确持久化）；
         # 若先合并分屏再保存，_split_active 会被清为 False 导致分屏状态丢失、重启无法恢复
@@ -5730,28 +6034,21 @@ class MainWindow(QMainWindow):
         is_group_separator = self._is_group_separator_node(node)
         menu = QMenu(self)
 
-        insert_left_action = menu.addAction(tr("在左侧插入分组"))
-        insert_right_action = menu.addAction(tr("在右侧插入分组"))
-
         if is_group_separator:
-            menu.addSeparator()
             rename_group_action = menu.addAction(tr("重命名分组"))
             collapse_group_action = menu.addAction(
                 tr("展开分组") if bool(node.get('group_collapsed', False)) else tr("折叠分组")
             )
             close_group_tabs_action = menu.addAction(tr("关闭该分组标签页"))
             keep_only_group_tabs_action = menu.addAction(tr("仅保留当前分组标签页"))
+            menu.addSeparator()
         else:
             rename_group_action = None
             collapse_group_action = None
             close_group_tabs_action = None
             keep_only_group_tabs_action = None
 
-        menu.addSeparator()
-        
         delete_action = menu.addAction(tr("🗑️ 删除书签"))
-        insert_left_action.triggered.connect(lambda: self._insert_group_relative_to(bookmark_id, side='left'))
-        insert_right_action.triggered.connect(lambda: self._insert_group_relative_to(bookmark_id, side='right'))
         if rename_group_action is not None:
             rename_group_action.triggered.connect(lambda: self.rename_group_bookmark(bookmark_id))
         if collapse_group_action is not None:
@@ -5766,12 +6063,6 @@ class MainWindow(QMainWindow):
         menu.exec_(pos)
         debug_print(f"[DEBUG] Menu closed")
 
-    def _insert_group_relative_to(self, bookmark_id, side='right'):
-        if not bookmark_id:
-            return False
-        self._last_bookmark_node_id = bookmark_id
-        return self.insert_group_bookmark(side=side)
-    
     def confirm_delete_bookmark(self, bookmark_id, bookmark_name):
         """直接删除书签并给出轻量提示"""
         self.delete_bookmark_by_id(bookmark_id)
@@ -5821,12 +6112,9 @@ class MainWindow(QMainWindow):
                 for child in node.get('children', []):
                     add_menu_items(menu, child)
             elif node.get('type') == 'url':
-                # 判断是否为四个常用项目
-                special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
                 name = node.get('name', '')
-                is_special = any(name.startswith(icon) for icon in special_icons)
                 is_group_separator = self._is_group_separator_node(node)
-                if is_special:
+                if is_builtin_bookmark(node):
                     action = parent_menu.addAction(name)
                 elif is_group_separator:
                     prefix = "◨" if bool(node.get('group_collapsed', False)) else "◧"
@@ -5851,12 +6139,9 @@ class MainWindow(QMainWindow):
                 if effective_color and menubar.actions():
                     action_group_colors[menubar.actions()[-1]] = effective_color
             elif child.get('type') == 'url':
-                # 判断是否为四个常用项目
-                special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
                 name = child.get('name', '')
-                is_special = any(name.startswith(icon) for icon in special_icons)
                 is_group_separator = self._is_group_separator_node(child)
-                if is_special:
+                if is_builtin_bookmark(child):
                     action = menubar.addAction(name)
                 elif is_group_separator:
                     prefix = "◨" if bool(child.get('group_collapsed', False)) else "◧"
@@ -5887,11 +6172,7 @@ class MainWindow(QMainWindow):
             bookmark_id = node.get('id')
             bookmark_name = node.get('name', '')
             
-            # 检查是否是特殊书签（不允许删除）
-            special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
-            is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
-            
-            if not is_special:
+            if not is_builtin_bookmark(node):
                 global_pos = menubar.mapToGlobal(pos)
                 self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
     
@@ -5928,13 +6209,7 @@ class MainWindow(QMainWindow):
                         
                         debug_print(f"[DEBUG] Found bookmark: {bookmark_name} (ID: {bookmark_id})")
                         
-                        # 检查是否是特殊书签（不允许删除）
-                        special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
-                        is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
-                        
-                        debug_print(f"[DEBUG] Is special bookmark: {is_special}")
-                        
-                        if not is_special:
+                        if not is_builtin_bookmark(node):
                             global_pos = self.menu_bar.mapToGlobal(pos)
                             debug_print(f"[DEBUG] Showing context menu at: {global_pos}")
                             self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)
@@ -5960,13 +6235,7 @@ class MainWindow(QMainWindow):
                         
                         debug_print(f"[DEBUG] Found bookmark in submenu: {bookmark_name} (ID: {bookmark_id})")
                         
-                        # 检查是否是特殊书签（不允许删除）
-                        special_icons = ["🖥️", "🗔", "🗑️", "🚀", "⬇️"]
-                        is_special = any(bookmark_name.startswith(icon) for icon in special_icons)
-                        
-                        debug_print(f"[DEBUG] Is special bookmark: {is_special}")
-                        
-                        if not is_special:
+                        if not is_builtin_bookmark(node):
                             global_pos = obj.mapToGlobal(pos)
                             debug_print(f"[DEBUG] Showing context menu at: {global_pos}")
                             self.show_bookmark_context_menu(global_pos, bookmark_id, bookmark_name)

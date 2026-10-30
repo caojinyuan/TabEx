@@ -11,6 +11,35 @@ from .search import apply_runtime_performance_config
 from .bookmarks import _preserve_unreadable_file
 from .theme import normalize_mode
 
+_CRYPTPROTECT_UI_FORBIDDEN = 0x01
+
+
+def protect_secret(text):
+    """用 Windows DPAPI 加密（仅当前 Windows 用户可解密），返回 base64 文本；不可用时返回空串。"""
+    try:
+        import base64
+        import win32crypt
+        blob = win32crypt.CryptProtectData(text.encode('utf-8'), 'TabEx', None, None, None,
+                                           _CRYPTPROTECT_UI_FORBIDDEN)
+        return base64.b64encode(blob).decode('ascii')
+    except Exception as error:
+        debug_print(f"[Config] DPAPI protect failed: {error}")
+        return ''
+
+
+def unprotect_secret(token):
+    """解密 protect_secret 的结果；失败（如配置来自其他用户或电脑）返回 None。"""
+    try:
+        import base64
+        import win32crypt
+        _description, data = win32crypt.CryptUnprotectData(base64.b64decode(token), None, None, None,
+                                                           _CRYPTPROTECT_UI_FORBIDDEN)
+        return data.decode('utf-8')
+    except Exception as error:
+        debug_print(f"[Config] DPAPI unprotect failed: {error}")
+        return None
+
+
 class ConfigStore:
     def __init__(self, path):
         self.path = os.fspath(path)
@@ -18,6 +47,39 @@ class ConfigStore:
         self.recovered_backup = None
         self.write_blocked = False
         self.last_error = ''
+        self.secret_unreadable = False
+        # DPAPI 密文每次加密都不同；明文未变时复用上次密文，保持“内容未变不写盘”
+        self._protected_key = ('', '')
+
+    def _decrypt_api_key(self, config):
+        ai = config.get("ai_chat")
+        if not isinstance(ai, dict):
+            return
+        token = ai.pop("api_key_protected", "")
+        if not isinstance(token, str) or not token:
+            return
+        plain = unprotect_secret(token)
+        if plain is None:
+            self.secret_unreadable = True
+            ai["api_key"] = ""
+            return
+        ai["api_key"] = plain
+        self._protected_key = (plain, token)
+
+    def _disk_view(self, config):
+        """返回写盘用的配置：AI 密钥替换为 DPAPI 密文，内存中的 config 不变。"""
+        ai = config.get("ai_chat")
+        key = ai.get("api_key") if isinstance(ai, dict) else None
+        if not isinstance(key, str) or not key:
+            return config
+        cached_plain, cached_token = self._protected_key
+        token = cached_token if cached_plain == key and cached_token else protect_secret(key)
+        if not token:
+            return config
+        self._protected_key = (key, token)
+        disk_ai = {k: v for k, v in ai.items() if k != "api_key"}
+        disk_ai["api_key_protected"] = token
+        return {**config, "ai_chat": disk_ai}
 
     @staticmethod
     def _merge_defaults(config, defaults):
@@ -51,6 +113,7 @@ class ConfigStore:
             "show_tab_group_markers": True,  # 默认显示标签分组颜色
             "tab_hibernate_minutes": 30,  # 后台标签闲置多久后释放 Shell 视图：0=关闭
             "hotkey_bindings": {},  # 自定义按键 {命令: "Ctrl+T"}；未列出的命令使用默认按键
+            "search_presets": [],  # 常用搜索条件（不含搜索路径）
             "auto_update_check": False,  # 默认关闭；开启后每天最多查询一次 GitHub 最新发布，只提示不下载
             "last_update_check": 0,
             "update_notified_version": "",
@@ -63,6 +126,7 @@ class ConfigStore:
                 "switch_tab_number": True, # Ctrl+1..9
                 "search": True,            # Ctrl+F
                 "quick_find_current_dir": True,  # Ctrl+G
+                "frequent_dirs": True,     # Ctrl+J - 常用目录跳转
                 "navigate": True,          # Alt+Left/Right
                 "go_up": True,             # Alt+Up
                 "refresh": True,           # F5
@@ -88,6 +152,7 @@ class ConfigStore:
             "system_prompt": "",  # 留空则使用内置默认提示词
             "panel_width": 360,  # 面板宽度（像素）
             "panel_visible": False,  # AI面板是否可见
+            "allow_insecure_tls": False,  # 仅内网自签名服务：跳过 HTTPS 证书校验
         }
         default_config["performance"] = {
             "content_search_chunk_size": _search.CONTENT_SEARCH_CHUNK_SIZE,
@@ -144,6 +209,7 @@ class ConfigStore:
                     config.pop("resource_snapshot_logging", None)
                     config.pop("resource_snapshot_interval_ms", None)
                     config["theme"] = normalize_mode(config.get("theme"))
+                    self._decrypt_api_key(config)
 
                     apply_runtime_performance_config(config.get("performance"))
                     _set_app_language(config.get("language", "zh"))
@@ -168,7 +234,7 @@ class ConfigStore:
         if self.write_blocked:
             return False
         try:
-            new_content = json.dumps(config, ensure_ascii=False, indent=2)
+            new_content = json.dumps(self._disk_view(config), ensure_ascii=False, indent=2)
             last_written = getattr(self, 'last_written', None)
             if last_written is None and os.path.isfile(config_path):
                 # 仅首次落盘读取磁盘内容做比较，之后与内存中的上次写入内容比较
@@ -219,6 +285,8 @@ class SessionController:
                     'tab_group_separator_after': bool(getattr(tab, 'tab_group_separator_after', False)),
                     'tab_group_separator_color': str(getattr(tab, 'tab_group_separator_color', '') or ''),
                     'tab_group_separator_name': str(getattr(tab, 'tab_group_separator_name', '') or ''),
+                    'tab_group_name': str(getattr(tab, 'tab_group_name', '') or ''),
+                    'tab_group_collapsed': bool(getattr(tab, 'tab_group_collapsed', False)),
                 })
             if tabs:
                 groups.append({'tabs': tabs, 'active_index': tab_widget.currentIndex()})
@@ -274,6 +342,8 @@ class SessionController:
                 'tab_group_separator_after': bool(getattr(tab, 'tab_group_separator_after', False)),
                 'tab_group_separator_color': str(getattr(tab, 'tab_group_separator_color', '') or ''),
                 'tab_group_separator_name': str(getattr(tab, 'tab_group_separator_name', '') or ''),
+                'tab_group_name': str(getattr(tab, 'tab_group_name', '') or ''),
+                'tab_group_collapsed': bool(getattr(tab, 'tab_group_collapsed', False)),
             })
 
         return cached_tabs
@@ -316,6 +386,8 @@ class SessionController:
                 'tab_group_separator_after': bool(getattr(tab, 'tab_group_separator_after', False)),
                 'tab_group_separator_color': str(getattr(tab, 'tab_group_separator_color', '') or ''),
                 'tab_group_separator_name': str(getattr(tab, 'tab_group_separator_name', '') or ''),
+                'tab_group_name': str(getattr(tab, 'tab_group_name', '') or ''),
+                'tab_group_collapsed': bool(getattr(tab, 'tab_group_collapsed', False)),
             })
         if not tabs:
             return state
@@ -383,6 +455,8 @@ class SessionController:
                     tab_group_separator_after=tab_info.get('tab_group_separator_after', False),
                     tab_group_separator_color=tab_info.get('tab_group_separator_color', ''),
                     tab_group_separator_name=tab_info.get('tab_group_separator_name', ''),
+                    tab_group_name=tab_info.get('tab_group_name', ''),
+                    tab_group_collapsed=bool(tab_info.get('tab_group_collapsed', False)),
                 )
                 added += 1
             except Exception as e:

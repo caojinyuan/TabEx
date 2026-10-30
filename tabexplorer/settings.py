@@ -2,18 +2,61 @@
 
 import os
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import QCheckBox, QDialog, QLabel, QPushButton, QVBoxLayout
 
 from . import theme as _theme
 from .paths import get_app_base_dir
 from .i18n import _set_app_language, tr
 from .debuglog import set_debug_mode, set_explorer_monitor_debug
-from .system import normalize_terminal_tool_name
+from .system import create_http_session, normalize_terminal_tool_name
 from .hotkeys import (
     _format_hotkey, _hotkey_bindings, HOTKEY_COMMANDS, _parse_hotkey, _validate_hotkey_bindings,
 )
 from .widgets import show_toast
+
+
+def parse_model_names(payload):
+    """从 /models 响应中提取去重后的模型/Agent 名称。"""
+    entries = payload.get("data", []) if isinstance(payload, dict) else payload
+    names = []
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, str):
+            name = entry
+        elif isinstance(entry, dict):
+            name = entry.get("id") or entry.get("name")
+        else:
+            name = None
+        if name and str(name) not in names:
+            names.append(str(name))
+    return names
+
+
+class ModelListWorker(QThread):
+    """后台读取模型列表，网络慢或不通时设置窗口仍可操作。"""
+    completed = pyqtSignal(object, str)  # names, error
+
+    def __init__(self, api_url, api_key, allow_insecure, parent=None):
+        super().__init__(parent)
+        self.api_url = api_url
+        self.api_key = api_key
+        self.allow_insecure = allow_insecure
+
+    def run(self):
+        import requests
+        names, error = [], ''
+        try:
+            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            with create_http_session(self.allow_insecure) as session:
+                response = session.get(self.api_url + "/models", headers=headers, timeout=8)
+                response.raise_for_status()
+                names = parse_model_names(response.json())
+        except requests.exceptions.SSLError as exc:
+            error = tr("证书校验失败（内网自签名服务可勾选“允许不受信任的 HTTPS 证书”）: {}").format(exc)
+        except Exception as exc:
+            error = str(exc) or type(exc).__name__
+        if not self.isInterruptionRequested():
+            self.completed.emit(names, error)
 
 
 class SettingsDialog(QDialog):
@@ -229,6 +272,12 @@ class SettingsDialog(QDialog):
         self.auto_startup_cb.setStyleSheet("font-size: 11pt; padding: 5px;")
         self.auto_startup_cb.setToolTip(tr("在 Windows 启动时自动运行 TabExplorer.exe"))
         startup_layout.addWidget(self.auto_startup_cb)
+        stale_target = self._startup_target_mismatch()
+        if stale_target:
+            startup_hint = QLabel(tr("开机启动目前指向 {}，保持勾选并点击“确定”将改为当前程序。").format(stale_target))
+            startup_hint.setWordWrap(True)
+            _theme.bind_style(startup_hint, "color:#b26a00; font-size:8.5pt; padding:0 4px;")
+            startup_layout.addWidget(startup_hint)
         startup_group.setLayout(startup_layout)
         compact_groupbox(startup_group)
         for i in range(startup_layout.count()):
@@ -387,7 +436,7 @@ class SettingsDialog(QDialog):
             url, model, tip = self.ai_preset_combo.itemData(idx)
             if url:
                 self.ai_api_url_edit.setText(url)
-                self.ai_model_edit.setText(model)
+                self.ai_model_combo.setCurrentText(model)
             if tip:
                 self.ai_key_tip_label.setText(f"💡 {tip}")
                 self.ai_key_tip_label.setVisible(True)
@@ -429,6 +478,13 @@ class SettingsDialog(QDialog):
         api_key_row.addWidget(self.ai_api_key_edit, 1)
         api_key_row.addWidget(eye_btn)
         ai_layout.addLayout(api_key_row)
+        self.ai_insecure_tls_cb = QCheckBox(tr("允许不受信任的 HTTPS 证书（不安全，仅用于内网自签名服务）"))
+        self.ai_insecure_tls_cb.setChecked(bool(config.get("ai_chat", {}).get("allow_insecure_tls", False)))
+        self.ai_insecure_tls_cb.setToolTip(tr(
+            "默认校验证书，并信任 Windows 证书库中的企业根证书。\n"
+            "勾选后不校验证书，API 密钥和发送的文件内容可能被中间人截获。"
+        ))
+        ai_layout.addWidget(self.ai_insecure_tls_cb)
         # 模型名称
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel(tr("模型名称:")))
@@ -453,57 +509,19 @@ class SettingsDialog(QDialog):
             if not api_url:
                 self.ai_model_status.setText(tr("请先填写 API 地址。"))
                 return
+            if self._models_worker is not None:
+                return
             self.ai_fetch_models_btn.setEnabled(False)
             self.ai_fetch_models_btn.setText(tr("获取中…"))
             self.ai_model_status.setText("")
-            from PyQt5.QtWidgets import QApplication
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            try:
-                import requests
-                headers = {}
-                api_key = self.ai_api_key_edit.text().strip()
-                if api_key:
-                    headers["Authorization"] = f"Bearer {api_key}"
-                response = requests.get(
-                    api_url + "/models", headers=headers, timeout=8, verify=False
-                )
-                response.raise_for_status()
-                payload = response.json()
-                entries = payload.get("data", []) if isinstance(payload, dict) else payload
-                model_names = []
-                if isinstance(entries, list):
-                    for entry in entries:
-                        if isinstance(entry, str):
-                            name = entry
-                        elif isinstance(entry, dict):
-                            name = entry.get("id") or entry.get("name")
-                        else:
-                            name = None
-                        if name and str(name) not in model_names:
-                            model_names.append(str(name))
-                if not model_names:
-                    self.ai_model_status.setText(
-                        tr("接口未返回可用模型/Agent。请在服务端创建或授权 Agent 后重试。")
-                    )
-                    return
-                current_model = self.ai_model_combo.currentText().strip()
-                self.ai_model_combo.clear()
-                self.ai_model_combo.addItems(model_names)
-                if current_model in model_names:
-                    self.ai_model_combo.setCurrentText(current_model)
-                else:
-                    self.ai_model_combo.setCurrentIndex(-1)
-                    self.ai_model_combo.setEditText("")
-                self.ai_model_status.setText(
-                    tr("已获取 {} 个可用模型/Agent。请选择一个。").format(len(model_names))
-                )
-            except Exception as error:
-                self.ai_model_status.setText(tr("获取模型失败: {}").format(error))
-            finally:
-                QApplication.restoreOverrideCursor()
-                self.ai_fetch_models_btn.setEnabled(True)
-                self.ai_fetch_models_btn.setText(tr("获取模型"))
+            worker = ModelListWorker(
+                api_url, self.ai_api_key_edit.text().strip(), self.ai_insecure_tls_cb.isChecked(), self
+            )
+            worker.completed.connect(self._on_models_fetched)
+            self._models_worker = worker
+            worker.start()
 
+        self._models_worker = None
         self.ai_fetch_models_btn.clicked.connect(_fetch_ai_models)
         # 系统提示词
         from PyQt5.QtWidgets import QPlainTextEdit as _PE
@@ -623,43 +641,33 @@ class SettingsDialog(QDialog):
     
     def _is_auto_startup_enabled(self):
         """检查是否已启用开机启动"""
+        from .system import get_startup_shortcut_path
         try:
-            startup_path = self._get_startup_shortcut_path()
-            return os.path.exists(startup_path)
+            return os.path.exists(get_startup_shortcut_path())
         except Exception:
             return False
-    
-    def _get_startup_shortcut_path(self):
-        """获取启动项快捷方式路径"""
-        # 使用环境变量获取启动文件夹，避免依赖 winshell
-        startup_folder = os.path.join(
-            os.environ.get('APPDATA', ''),
-            'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'
-        )
-        return os.path.join(startup_folder, "TabExplorer.lnk")
-    
+
+    def _startup_target_mismatch(self):
+        """开机启动快捷方式存在但不指向当前程序时，返回它的目标路径。"""
+        from .system import get_startup_shortcut_path, read_shortcut_target, same_file_path
+        exe_path = self._get_exe_path()
+        if not exe_path or not self._is_auto_startup_enabled():
+            return ''
+        target = read_shortcut_target(get_startup_shortcut_path())
+        return '' if same_file_path(target, exe_path) else (target or '?')
+
     def _set_auto_startup(self, enabled):
         """设置开机启动"""
+        from .system import get_startup_shortcut_path, write_startup_shortcut
         try:
-            shortcut_path = self._get_startup_shortcut_path()
-            
+            shortcut_path = get_startup_shortcut_path()
+
             if enabled:
-                # 获取 TabExplorer.exe 路径
                 exe_path = self._get_exe_path()
                 if not exe_path or not os.path.exists(exe_path):
                     show_toast(self.parent(), tr("错误"), tr("未找到 TabExplorer.exe，请确保程序已正确安装"), level="error")
                     return False
-                
-                # 创建快捷方式（使用 win32com）
-                from win32com.client import Dispatch
-                
-                shell = Dispatch('WScript.Shell')
-                shortcut = shell.CreateShortCut(shortcut_path)
-                shortcut.Targetpath = exe_path
-                shortcut.WorkingDirectory = os.path.dirname(exe_path)
-                shortcut.IconLocation = exe_path
-                shortcut.save()
-                
+                write_startup_shortcut(exe_path, shortcut_path)
                 show_toast(self.parent(), tr("成功"), tr("已启用开机自动启动"), level="success")
                 return True
             else:
@@ -739,13 +747,44 @@ class SettingsDialog(QDialog):
         elif error:
             self.quicklook_status_label.setText(tr("下载失败: {}（再次点击可从断点继续）").format(error))
 
+    def _on_models_fetched(self, names, error):
+        worker, self._models_worker = self._models_worker, None
+        if worker is not None:
+            worker.wait(2000)
+            worker.deleteLater()
+        self.ai_fetch_models_btn.setEnabled(True)
+        self.ai_fetch_models_btn.setText(tr("获取模型"))
+        if error:
+            self.ai_model_status.setText(tr("获取模型失败: {}").format(error))
+            return
+        if not names:
+            self.ai_model_status.setText(tr("接口未返回可用模型/Agent。请在服务端创建或授权 Agent 后重试。"))
+            return
+        current_model = self.ai_model_combo.currentText().strip()
+        self.ai_model_combo.clear()
+        self.ai_model_combo.addItems(names)
+        if current_model in names:
+            self.ai_model_combo.setCurrentText(current_model)
+        else:
+            self.ai_model_combo.setCurrentIndex(-1)
+            self.ai_model_combo.setEditText("")
+        self.ai_model_status.setText(tr("已获取 {} 个可用模型/Agent。请选择一个。").format(len(names)))
+
     def done(self, result):
         # 关闭设置窗口时中断下载，已下载的部分保留，下次从断点继续
+        from .system import _retain_thread_until_finished
         worker, self._quicklook_worker = getattr(self, '_quicklook_worker', None), None
         if worker is not None:
-            from .system import _retain_thread_until_finished
             worker.requestInterruption()
             _retain_thread_until_finished(worker)
+        models_worker, self._models_worker = getattr(self, '_models_worker', None), None
+        if models_worker is not None:
+            try:
+                models_worker.completed.disconnect(self._on_models_fetched)
+            except (TypeError, RuntimeError):
+                pass
+            models_worker.requestInterruption()
+            _retain_thread_until_finished(models_worker)
         super().done(result)
 
     def _create_hotkey_group(self, config, compact_widget):
@@ -859,7 +898,7 @@ class SettingsDialog(QDialog):
             # 处理开机启动设置
             auto_startup_enabled = self.auto_startup_cb.isChecked()
             current_enabled = self._is_auto_startup_enabled()
-            if auto_startup_enabled != current_enabled:
+            if auto_startup_enabled != current_enabled or (auto_startup_enabled and self._startup_target_mismatch()):
                 self._set_auto_startup(auto_startup_enabled)
             
             self.parent().config["enable_explorer_monitor"] = self.monitor_cb.isChecked()
@@ -934,6 +973,7 @@ class SettingsDialog(QDialog):
                 "model": self.ai_model_combo.currentText().strip() or "gpt-3.5-turbo",
                 "system_prompt": self.ai_system_prompt_edit.toPlainText().strip(),
                 "panel_width": self.ai_panel_width_spin.value(),
+                "allow_insecure_tls": self.ai_insecure_tls_cb.isChecked(),
             }
 
             # 保存语言设置并应用

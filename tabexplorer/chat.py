@@ -11,7 +11,7 @@ from .paths import get_app_base_dir, get_app_data_path, translate_common_path
 from .i18n import tr
 from .constants import MAX_CHAT_HISTORY_MESSAGES, MAX_CHAT_MESSAGE_CHARS, MAX_CONTEXT_TOTAL_CHARS
 from .debuglog import debug_print
-from .system import launch_detached, _retain_thread_until_finished
+from .system import create_http_session, launch_detached, _retain_thread_until_finished
 from .widgets import show_toast
 from .fileops import _atomic_reviewed_write, _confirm_file_preview
 from .ai_actions import _AiActionMethods, AiActionWorker
@@ -28,90 +28,98 @@ class ChatWorker(QThread):
     token_received = pyqtSignal(str)   # 流式逐块 token
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, messages, api_url, api_key, model, stream=True, parent=None):
+    def __init__(self, messages, api_url, api_key, model, stream=True, parent=None, allow_insecure=False):
         super().__init__(parent)
         self.messages = messages
         self.api_url = api_url.rstrip('/')
         self.api_key = api_key
         self.model = model
         self.stream = stream
+        self.allow_insecure = bool(allow_insecure)
 
     def run(self):
+        import requests
         try:
-            import requests, json as _json
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}" if self.api_key else "",
-            }
-            payload = {
-                "model": self.model,
-                "messages": self.messages,
-                "stream": self.stream,
-            }
-            url = self.api_url + '/chat/completions'
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            if self.stream:
-                try:
-                    resp = requests.post(url, headers=headers, json=payload,
-                                         timeout=120, verify=False, stream=True)
-                    resp.raise_for_status()
-                except requests.exceptions.ConnectionError as _ce:
-                    if 'prematurely' in str(_ce).lower() or 'protocol' in str(_ce).lower():
-                        self.error_occurred.emit(
-                            tr('❌ 流式响应被服务器提前关闭（上下文可能过长）。\n') + str(_ce)
-                        )
-                        return
-                    raise
-                full_content = []
-                try:
-                    for raw_line in resp.iter_lines():
-                        if self.isInterruptionRequested():
-                            break
-                        if not raw_line:
-                            continue
-                        line = raw_line.decode('utf-8', errors='replace') if isinstance(raw_line, bytes) else raw_line
-                        if not line.startswith('data: '):
-                            continue
-                        data_str = line[6:].strip()
-                        if data_str == '[DONE]':
-                            break
-                        try:
-                            data = _json.loads(data_str)
-                            chunk = ((data.get('choices') or [{}])[0]
-                                     .get('delta', {}).get('content')) or ''
-                            if chunk:
-                                full_content.append(chunk)
-                                self.token_received.emit(chunk)
-                        except Exception:
-                            pass
-                except Exception as _se:
-                    _msg = str(_se)
-                    if 'prematurely' in _msg.lower() or 'protocol' in _msg.lower():
-                        partial = ''.join(full_content)
-                        if partial:
-                            # 已收到部分内容，仍然返回
-                            self.response_received.emit(partial)
-                        else:
-                            self.error_occurred.emit(
-                                tr('❌ 流式响应被服务器提前关闭（上下文可能过长，请清空聊天记录重试）。\n') + _msg
-                            )
-                        return
-                    raise
-                finally:
-                    resp.close()
-                if self.isInterruptionRequested():
-                    return
-                self.response_received.emit(''.join(full_content))
-            else:
-                with requests.post(url, headers=headers, json=payload, timeout=120, verify=False) as resp:
-                    resp.raise_for_status()
-                    data = resp.json()
-                    content = data['choices'][0]['message']['content']
-                if not self.isInterruptionRequested():
-                    self.response_received.emit(content)
+            with create_http_session(self.allow_insecure) as session:
+                self._request(session)
+        except requests.exceptions.SSLError as e:
+            self.error_occurred.emit(
+                tr("❌ HTTPS 证书校验失败。内网自签名服务可在 设置 → AI 助手 勾选“允许不受信任的 HTTPS 证书”。\n") + str(e)
+            )
         except Exception as e:
             self.error_occurred.emit(str(e))
+
+    def _request(self, session):
+        import requests, json as _json
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}" if self.api_key else "",
+        }
+        payload = {
+            "model": self.model,
+            "messages": self.messages,
+            "stream": self.stream,
+        }
+        url = self.api_url + '/chat/completions'
+        if not self.stream:
+            with session.post(url, headers=headers, json=payload, timeout=120) as resp:
+                resp.raise_for_status()
+                content = resp.json()['choices'][0]['message']['content']
+            if not self.isInterruptionRequested():
+                self.response_received.emit(content)
+            return
+        try:
+            resp = session.post(url, headers=headers, json=payload, timeout=120, stream=True)
+            resp.raise_for_status()
+        except requests.exceptions.SSLError:
+            raise
+        except requests.exceptions.ConnectionError as _ce:
+            if 'prematurely' in str(_ce).lower() or 'protocol' in str(_ce).lower():
+                self.error_occurred.emit(
+                    tr('❌ 流式响应被服务器提前关闭（上下文可能过长）。\n') + str(_ce)
+                )
+                return
+            raise
+        full_content = []
+        try:
+            for raw_line in resp.iter_lines():
+                if self.isInterruptionRequested():
+                    break
+                if not raw_line:
+                    continue
+                line = raw_line.decode('utf-8', errors='replace') if isinstance(raw_line, bytes) else raw_line
+                if not line.startswith('data: '):
+                    continue
+                data_str = line[6:].strip()
+                if data_str == '[DONE]':
+                    break
+                try:
+                    data = _json.loads(data_str)
+                    chunk = ((data.get('choices') or [{}])[0]
+                             .get('delta', {}).get('content')) or ''
+                    if chunk:
+                        full_content.append(chunk)
+                        self.token_received.emit(chunk)
+                except Exception:
+                    pass
+        except Exception as _se:
+            _msg = str(_se)
+            if 'prematurely' in _msg.lower() or 'protocol' in _msg.lower():
+                partial = ''.join(full_content)
+                if partial:
+                    # 已收到部分内容，仍然返回
+                    self.response_received.emit(partial)
+                else:
+                    self.error_occurred.emit(
+                        tr('❌ 流式响应被服务器提前关闭（上下文可能过长，请清空聊天记录重试）。\n') + _msg
+                    )
+                return
+            raise
+        finally:
+            resp.close()
+        if self.isInterruptionRequested():
+            return
+        self.response_received.emit(''.join(full_content))
 
 
 class ChatPanel(QWidget):
@@ -804,7 +812,8 @@ class ChatPanel(QWidget):
         self._streaming_chars = 0
         self.send_btn.setEnabled(False)
         self.status_lbl.setText(tr("⏳ AI 思考中…"))
-        self.worker = ChatWorker(full_messages, api_url, api_key, model, stream=True, parent=self)
+        self.worker = ChatWorker(full_messages, api_url, api_key, model, stream=True, parent=self,
+                                 allow_insecure=cfg.get("allow_insecure_tls", False))
         self.worker.token_received.connect(self._on_token)
         self.worker.response_received.connect(self._on_response)
         self.worker.error_occurred.connect(self._on_error)
@@ -1033,7 +1042,8 @@ class ChatPanel(QWidget):
 
         self._streaming_chars = 0
         self.status_lbl.setText(tr("⏳ AI 第 {} 轮推理中…").format(step))
-        self.worker = ChatWorker(full_messages, api_url, api_key, model, stream=True, parent=self)
+        self.worker = ChatWorker(full_messages, api_url, api_key, model, stream=True, parent=self,
+                                 allow_insecure=cfg.get("allow_insecure_tls", False))
         self.worker.token_received.connect(self._on_token)
         self.worker.response_received.connect(self._on_response)
         self.worker.error_occurred.connect(self._on_error)
@@ -1238,20 +1248,30 @@ class ChatPanel(QWidget):
 
     # ── 聊天记录持久化 ──────────────────────────────────────────────────────────
     def _save_history(self):
-        """保存聊天记录到 JSON 文件。"""
+        """保存聊天记录到 JSON 文件（原子替换）；失败时每次运行只提示一次。"""
         import json
+        tmp_path = self.history_file + '.tmp'
         try:
             before_len = len(self.messages)
             self._trim_chat_history()
             if len(self.messages) != before_len:
                 self._rebuild_chat_display()
-            with open(self.history_file, 'w', encoding='utf-8') as f:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(self.messages, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.history_file)
+            self._history_save_warned = False
         except Exception as e:
-            print(tr("保存聊天记录失败: {}").format(e))
+            debug_print(f"[Chat] save history failed: {e}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            if not getattr(self, '_history_save_warned', False):
+                self._history_save_warned = True
+                show_toast(self.main_window, tr("聊天记录保存失败"), str(e), level="warning")
 
     def _load_history(self):
-        """从 JSON 文件加载聊天记录。"""
+        """从 JSON 文件加载聊天记录；文件损坏时改名保留，避免被随后的保存覆盖。"""
         import json
         if os.path.exists(self.history_file):
             try:
@@ -1266,7 +1286,12 @@ class ChatPanel(QWidget):
                 self._save_history()
             except Exception as e:
                 self._is_loading_history = False
-                print(tr("加载聊天记录失败: {}").format(e))
+                self.messages = []
+                debug_print(f"[Chat] load history failed: {e}")
+                from .bookmarks import _preserve_unreadable_file
+                backup = _preserve_unreadable_file(self.history_file) if isinstance(e, ValueError) else ''
+                detail = tr("原文件已另存为 {}").format(os.path.basename(backup)) if backup else str(e)
+                show_toast(self.main_window, tr("聊天记录无法读取"), detail, level="warning")
 
     def _delete_history(self):
         """删除保存的聊天记录文件。"""
@@ -1274,7 +1299,8 @@ class ChatPanel(QWidget):
             if os.path.exists(self.history_file):
                 os.remove(self.history_file)
         except Exception as e:
-            print(tr("删除聊天记录文件失败: {}").format(e))
+            debug_print(f"[Chat] delete history failed: {e}")
+            show_toast(self.main_window, tr("删除聊天记录文件失败"), str(e), level="warning")
 
     def _get_action_base_dir(self):
         """获取动作执行的基准目录（当前标签目录）。"""

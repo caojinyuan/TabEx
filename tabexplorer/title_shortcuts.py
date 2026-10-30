@@ -291,7 +291,7 @@ class TitleShortcutBar(QWidget):
             btn.setFixedSize(self._button_size, self._button_size)
             icon_px = max(12, min(self._icon_size + 1, self._button_size - 4))
             btn.setIconSize(QSize(icon_px, icon_px))
-            btn.setToolTip(f"{os.path.basename(path)}\n{path}\n左键启动应用/快捷方式，右键移除，拖拽可排序")
+            btn.setToolTip(f"{os.path.basename(path)}\n{path}\n" + tr("左键启动应用/快捷方式，右键移除，拖拽可排序"))
             # Use cached icon or defer loading to avoid SHGetFileInfo blocking startup
             cached_icon = self._icon_cache.get(path)
             if cached_icon is not None:

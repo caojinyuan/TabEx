@@ -930,6 +930,68 @@ def _compare_directories(left_root, right_root, cancel_event, emit):
         emit((relative, state, left[2] if left else '', right[2] if right else ''))
 
 
+def plan_compare_copy(rows, left_root, right_root, to_right):
+    """根据比较结果行规划“复制到另一侧”。
+
+    rows: [(相对路径, 差异, 左侧路径, 右侧路径)]。返回 (copies, replaced, skipped)：
+    copies 为 {目标目录: [来源路径]}；replaced 为“内容不同”时需先移入回收站的目标文件；
+    skipped 为类型不同、读取失败等不能复制的相对路径。目录整体缺失时只复制该目录，跳过其下已选子项。"""
+    only_source = tr("仅左侧") if to_right else tr("仅右侧")
+    differs = tr("内容不同")
+    target_root = right_root if to_right else left_root
+    chosen, skipped = [], []
+    for relative, state, left_path, right_path in rows:
+        source = left_path if to_right else right_path
+        if source and state in (only_source, differs):
+            chosen.append((relative, state, source))
+        else:
+            skipped.append(relative)
+    copied_dirs = {os.path.normcase(relative) for relative, state, source in chosen
+                   if state == only_source and os.path.isdir(source)}
+    copies, replaced = {}, []
+    for relative, state, source in chosen:
+        parents = []
+        parent = os.path.dirname(os.path.normcase(relative))
+        while parent:
+            parents.append(parent)
+            parent = os.path.dirname(parent)
+        if any(parent in copied_dirs for parent in parents):
+            continue
+        destination = os.path.join(target_root, os.path.dirname(relative)) if os.path.dirname(relative) else target_root
+        if state == differs:
+            replaced.append(os.path.join(target_root, relative))
+        copies.setdefault(destination, []).append(source)
+    return copies, replaced, skipped
+
+
+def _start_compare_copies(owner, copies, replaced=()):
+    """启动复制任务；同名项一律跳过，不生成副本。replaced 中仍存在的目标（未能移入回收站）对应来源不再复制。"""
+    def key(path):
+        return os.path.normcase(os.path.normpath(path))
+
+    blocked = {key(path) for path in replaced if os.path.lexists(path)}
+    panel = owner.get_file_task_panel()
+    workers = int(getattr(owner, 'config', {}).get('file_op_max_workers', 0) or 0)
+    started = 0
+    for destination, sources in copies.items():
+        sources = [source for source in sources
+                   if key(os.path.join(destination, os.path.basename(os.path.normpath(source)))) not in blocked]
+        if not sources:
+            continue
+        try:
+            os.makedirs(destination, exist_ok=True)
+        except OSError as error:
+            show_toast(owner, tr("目录同步"), tr("无法创建目录 {}: {}").format(destination, error), level="error")
+            continue
+        panel.start_task('copy', sources, destination, workers,
+                         conflict_actions={source: 'skip' for source in sources})
+        started += len(sources)
+    if blocked:
+        show_toast(owner, tr("目录同步"), tr("{} 个目标文件未能移入回收站，已跳过对应复制").format(len(blocked)),
+                   level="warning")
+    return started
+
+
 class DirectoryCompareDialog(QDialog):
     def __init__(self, parent, left_path, right_path):
         super().__init__(parent)
@@ -958,6 +1020,7 @@ class DirectoryCompareDialog(QDialog):
         self.table.header().setSectionResizeMode(3, QHeaderView.Stretch)
         self.table.setColumnWidth(0, 200)
         self.table.setColumnWidth(1, 140)
+        self.table.setSelectionMode(QTreeWidget.ExtendedSelection)
         self.table.itemDoubleClicked.connect(self.open_item)
         layout.addWidget(self.table)
         controls = QHBoxLayout()
@@ -967,9 +1030,16 @@ class DirectoryCompareDialog(QDialog):
         self.status = QLabel('', self)
         self.start_button.clicked.connect(self.start_compare)
         self.stop_button.clicked.connect(self.stop_compare)
+        self.copy_right_button = QPushButton(tr("复制到右侧 →"), self)
+        self.copy_left_button = QPushButton(tr("← 复制到左侧"), self)
+        for button, to_right in ((self.copy_right_button, True), (self.copy_left_button, False)):
+            button.setToolTip(tr("复制选中的“仅一侧存在”和“内容不同”项；覆盖前把目标旧文件移入回收站"))
+            button.clicked.connect(lambda _checked=False, direction=to_right: self.copy_selected(direction))
         controls.addWidget(self.start_button)
         controls.addWidget(self.stop_button)
         controls.addWidget(self.status, 1)
+        controls.addWidget(self.copy_left_button)
+        controls.addWidget(self.copy_right_button)
         layout.addLayout(controls)
         self.timer = QTimer(self)
         self.timer.setInterval(60)
@@ -1042,6 +1112,40 @@ class DirectoryCompareDialog(QDialog):
         path = item.text(3 if column == 3 else 2) or item.text(3)
         if path:
             self.parent().add_new_tab(os.path.dirname(path), select_file=os.path.basename(path))
+
+    def copy_selected(self, to_right):
+        """把选中的差异项复制到另一侧：内容不同的先把目标旧文件移入回收站，再复制。"""
+        from PyQt5.QtWidgets import QMessageBox
+        if self.running:
+            return
+        rows = [tuple(item.text(column) for column in range(4)) for item in self.table.selectedItems()]
+        if not rows:
+            show_toast(self, tr("目录同步"), tr("请先在比较结果中选择要复制的项"), level="info")
+            return
+        left, right = [edit.text().strip() for edit in self.paths]
+        copies, replaced, skipped = plan_compare_copy(rows, left, right, to_right)
+        total = sum(len(sources) for sources in copies.values())
+        if not total:
+            show_toast(self, tr("目录同步"), tr("选中项没有可复制到该侧的内容"), level="info")
+            return
+        side = tr("右侧") if to_right else tr("左侧")
+        message = tr("将 {} 项复制到{}。").format(total, side)
+        if replaced:
+            message += tr("其中 {} 个内容不同的文件会先把{}旧文件移入回收站。").format(len(replaced), side)
+        if skipped:
+            message += tr("{} 项类型不同或无法复制，将跳过。").format(len(skipped))
+        if QMessageBox.question(self, tr("目录同步"), message + '\n' + tr("是否继续？"),
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        owner = self.parent()
+        if replaced:
+            worker = owner.get_file_task_panel().start_task('delete', replaced)
+            worker.completed.connect(
+                lambda *_result, plan=copies, targets=list(replaced): _start_compare_copies(owner, plan, targets))
+        else:
+            _start_compare_copies(owner, copies)
+        owner.show_file_tasks()
+        self.status.setText(tr("已提交复制任务，完成后可重新比较"))
 
     def closeEvent(self, event):
         self.stop_compare()

@@ -399,6 +399,94 @@ def launch_shell_tool(tool_name, cwd=None):
     raise ValueError(f"Unsupported tool: {tool_name}")
 
 
+def create_http_session(allow_insecure=False):
+    """返回 requests 会话：校验证书时同时信任 certifi 与 Windows 证书库（含企业内网根证书）。"""
+    import requests
+    session = requests.Session()
+    if allow_insecure:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        session.verify = False
+        return session
+
+    import ssl
+    from requests.adapters import HTTPAdapter
+    # Windows 下默认上下文会加载系统 ROOT/CA 证书库；再补上 certifi 以覆盖系统尚未缓存的公共根证书
+    context = ssl.create_default_context()
+    try:
+        import certifi
+        context.load_verify_locations(certifi.where())
+    except Exception as error:
+        debug_print(f"[HTTP] certifi bundle unavailable: {error}")
+
+    class _SystemTrustAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            kwargs['ssl_context'] = context
+            return super().init_poolmanager(*args, **kwargs)
+
+        def proxy_manager_for(self, proxy, **proxy_kwargs):
+            proxy_kwargs['ssl_context'] = context
+            return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+    session.mount('https://', _SystemTrustAdapter())
+    return session
+
+
+# ==================== 开机启动快捷方式 ====================
+STARTUP_SHORTCUT_NAME = "TabExplorer.lnk"
+
+
+def get_startup_shortcut_path():
+    startup_folder = os.path.join(
+        os.environ.get('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'
+    )
+    return os.path.join(startup_folder, STARTUP_SHORTCUT_NAME)
+
+
+def read_shortcut_target(shortcut_path):
+    """返回 .lnk 指向的目标路径；读取失败返回空字符串。"""
+    try:
+        from win32com.client import Dispatch
+        return str(Dispatch('WScript.Shell').CreateShortCut(shortcut_path).Targetpath or '')
+    except Exception as error:
+        debug_print(f"[Startup] read shortcut failed: {error}")
+        return ''
+
+
+def write_startup_shortcut(exe_path, shortcut_path=None):
+    from win32com.client import Dispatch
+    shortcut = Dispatch('WScript.Shell').CreateShortCut(shortcut_path or get_startup_shortcut_path())
+    shortcut.Targetpath = exe_path
+    shortcut.WorkingDirectory = os.path.dirname(exe_path)
+    shortcut.IconLocation = exe_path
+    shortcut.save()
+
+
+def same_file_path(first, second):
+    if not first or not second:
+        return False
+    return os.path.normcase(os.path.abspath(first)) == os.path.normcase(os.path.abspath(second))
+
+
+def repair_stale_startup_shortcut(exe_path, shortcut_path=None):
+    """开机启动快捷方式指向的程序已不存在（EXE 被移动）时改指向当前程序；返回是否修改。
+
+    旧目标仍存在时不改动，避免临时运行的其他副本抢走开机启动。"""
+    shortcut_path = shortcut_path or get_startup_shortcut_path()
+    if not exe_path or not os.path.isfile(shortcut_path):
+        return False
+    target = read_shortcut_target(shortcut_path)
+    if not target or same_file_path(target, exe_path) or os.path.exists(target):
+        return False
+    try:
+        write_startup_shortcut(exe_path, shortcut_path)
+    except Exception as error:
+        debug_print(f"[Startup] repair shortcut failed: {error}")
+        return False
+    debug_print(f"[Startup] shortcut retargeted: {target} -> {exe_path}")
+    return True
+
+
 def is_supported_title_shortcut_path(path):
     return isinstance(path, str) and bool(path) and os.path.isfile(path) and path.lower().endswith(TITLE_SHORTCUT_EXTENSIONS)
 

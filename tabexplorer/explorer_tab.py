@@ -119,6 +119,24 @@ class FileExplorerTab(QWidget):
     _global_mouse_hook_handle = None
     _global_mouse_hook_cb = None
 
+    @property
+    def current_path(self):
+        return self._current_path
+
+    @current_path.setter
+    def current_path(self, value):
+        # 路径赋值分散在导航、COM 同步等多处；集中在这里通知主窗口（常用目录、分屏同步浏览）
+        old = getattr(self, '_current_path', None)
+        self._current_path = value
+        if old is None or old == value:
+            return
+        hook = getattr(getattr(self, 'main_window', None), 'on_tab_path_changed', None)
+        if callable(hook):
+            try:
+                hook(self, old, value)
+            except Exception as error:
+                debug_print(f"[PathHook] {error}")
+
     def _force_remove_watcher(self, path):
         """强制移除watcher路径，防止事件风暴"""
         try:
@@ -371,7 +389,7 @@ class FileExplorerTab(QWidget):
             _SHELL_PATH_MAP = {
                 'shell:RecycleBinFolder': tr('回收站'),
                 'shell:MyComputerFolder': tr('此电脑'),
-                'shell:Desktop': '桌面',
+                'shell:Desktop': tr('桌面'),
                 'shell:NetworkPlacesFolder': tr('网络'),
             }
             path = self.current_path

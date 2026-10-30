@@ -22,6 +22,7 @@ HOTKEY_COMMANDS = (
     ('prev_tab', 'switch_tab', 'Ctrl+Shift+Tab', '上一个标签'),
     ('search', 'search', 'Ctrl+F', '打开搜索对话框'),
     ('quick_find_current_dir', 'quick_find_current_dir', 'Ctrl+G', '检索当前目录文件夹/文件名'),
+    ('frequent_dirs', 'frequent_dirs', 'Ctrl+J', '常用目录跳转'),
     ('go_back', 'navigate', 'Alt+Left', '后退'),
     ('go_forward', 'navigate', 'Alt+Right', '前进'),
     ('go_up', 'go_up', 'Alt+Up', '返回上级目录'),

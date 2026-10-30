@@ -1732,7 +1732,7 @@ class InterfaceTests(unittest.TestCase):
                             'preview_batch_rename', 'save_named_workspace', 'open_named_workspace',
                             'delete_named_workspace', 'permanently_delete_selected', 'export_diagnostics',
                             'insert_tab_group_marker', 'toggle_split_view', 'show_bookmark_manager_dialog',
-                            'show_settings_menu', 'toggle_chat_panel'):
+                            'show_settings_menu', 'toggle_chat_panel', 'show_frequent_dirs', 'toggle_sync_browse'):
                         setattr(host, name, Mock())
                     layout = QVBoxLayout(host)
                     host.create_custom_titlebar(layout)
@@ -1798,18 +1798,22 @@ class InterfaceTests(unittest.TestCase):
             self.app.setFont(saved_font)
 
     def test_tools_menu_groups_danger_and_preserves_actions(self):
-        """工具菜单区分文件、工作区、截图、危险操作和诊断，保留原操作连接。"""
+        """工具菜单区分文件、导航、工作区、截图、危险操作和诊断，保留原操作连接。"""
         from PyQt5.QtWidgets import QMenu, QToolButton
         callbacks = {name: Mock() for name in (
             'show_file_tasks', 'show_directory_compare', 'preview_batch_rename', 'save_named_workspace',
             'open_named_workspace', 'delete_named_workspace', 'permanently_delete_selected', 'export_diagnostics',
-            'check_for_updates', 'start_screenshot')}
-        owner = types.SimpleNamespace(style=self.app.style, **callbacks)
+            'check_for_updates', 'start_screenshot', 'show_frequent_dirs', 'toggle_sync_browse')}
+        owner = types.SimpleNamespace(style=self.app.style, config={}, **callbacks)
         menu = QMenu()
         self.addCleanup(menu.deleteLater)
         self.module.MainWindow._populate_workspace_tools_menu(owner, menu)
         sections = [action.text() for action in menu.actions() if action.isSeparator()]
-        self.assertEqual(sections, ['文件操作', '截图', '危险操作', '诊断'])
+        self.assertEqual(sections, ['文件操作', '导航', '截图', '危险操作', '诊断'])
+        owner.frequent_dirs_action.trigger()
+        callbacks['show_frequent_dirs'].assert_called_once()
+        self.assertIn('Ctrl+J', owner.frequent_dirs_action.text())
+        self.assertTrue(owner.sync_browse_action.isCheckable())
         owner.screenshot_action.trigger()
         callbacks['start_screenshot'].assert_called_once_with(250)
         workspaces = next(action.menu() for action in menu.actions() if action.menu())
@@ -3095,7 +3099,8 @@ class SessionPersistenceTests(unittest.TestCase):
         self.assertEqual([item['path'] for item in cached], ['C:\\Work', 'C:\\Work', 'shell:RecycleBinFolder'])
         self.assertEqual(cached[0], {
             'path': 'C:\\Work', 'is_shell': False, 'bookmark_group_color': '#E57373',
-            'tab_group_separator_after': True, 'tab_group_separator_color': '#E57373', 'tab_group_separator_name': 'G'})
+            'tab_group_separator_after': True, 'tab_group_separator_color': '#E57373', 'tab_group_separator_name': 'G',
+            'tab_group_name': '', 'tab_group_collapsed': False})
         self.assertTrue(cached[2]['is_shell'])
 
     def test_split_session_only_when_active_and_index_clamped(self):
