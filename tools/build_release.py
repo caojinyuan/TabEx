@@ -23,10 +23,11 @@ def build(root=ROOT, install=True, output=None, run=None, verify=None):
     verify = verify or validate
     python = [sys.executable, '-X', 'utf8']
     if install:
-        run(python + ['-m', 'pip', 'install', '-r', str(root / 'requirements-build.txt')], cwd=root, check=True)
+        run(python + ['-m', 'pip', 'install', '-r', str(root / 'requirements' / 'requirements-build.txt')],
+            cwd=root, check=True)
     run(python + ['-W', 'ignore::DeprecationWarning', '-m', 'unittest', 'discover', '-s', 'tests'],
         cwd=root, check=True)
-    bundled_tools = [root / name for name in ('es.exe', 'rg.exe', '7zr.exe')]
+    bundled_tools = [root / 'tools' / name for name in ('es.exe', 'rg.exe', '7zr.exe')]
     for tool in bundled_tools:
         if not tool.is_file():
             raise FileNotFoundError(f'Bundled tool not found: {tool}')
@@ -38,7 +39,7 @@ def build(root=ROOT, install=True, output=None, run=None, verify=None):
             '--workpath', str(stage / 'work'), '--specpath', str(stage),
             '--add-data', str(root / 'icons') + ';icons',
         ]
-        command.extend(arg for tool in bundled_tools for arg in ('--add-data', str(tool) + ';.'))
+        command.extend(arg for tool in bundled_tools for arg in ('--add-data', str(tool) + ';tools'))
         icon = root / 'icons' / 'TabExplorer.ico'
         if icon.exists():
             command.extend(['--icon', str(icon)])

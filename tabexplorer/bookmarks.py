@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
 )
 
 from . import theme as _theme
-from .paths import get_app_data_path, translate_common_path
+from .paths import get_app_config_path, translate_common_path
 from .i18n import tr
 from .debuglog import debug_print
 from .widgets import show_toast
@@ -215,7 +215,7 @@ class BookmarkManager:
         if os.path.isabs(config_file):
             self.config_file = config_file
         else:
-            self.config_file = get_app_data_path(config_file)
+            self.config_file = get_app_config_path(config_file)
         self.bookmark_tree = self.load_bookmarks()
         # 优化：延迟保存机制，避免频繁写入磁盘
         self._save_timer = None

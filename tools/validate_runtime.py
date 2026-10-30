@@ -51,7 +51,8 @@ def validate(command, report, seconds=10, tabs=10, scenario='smoke', cycles=3, w
         (data / 'compare-left' / 'only.txt').write_text('only left', encoding='utf-8')
         (data / 'destination').mkdir()
         (data / '.tabex-validation').write_text('isolated', encoding='ascii')
-        (data / 'config.json').write_text(json.dumps({
+        (data / 'config').mkdir()
+        (data / 'config' / 'config.json').write_text(json.dumps({
             'enable_explorer_monitor': False, 'auto_update_check': False,
             'enable_cache_tabs': True, 'cached_tabs': [{'path': str(data)}],
             'pinned_tabs': [], 'debug_mode': False,

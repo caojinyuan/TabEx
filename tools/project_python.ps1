@@ -82,7 +82,7 @@ try {
     try {
         switch ($Action) {
             'Install' {
-                & $python -X utf8 -m pip --isolated install --no-user -r (Join-Path $root 'requirements.txt')
+                & $python -X utf8 -m pip --isolated install --no-user -r (Join-Path $root 'requirements\requirements.txt')
                 if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
             }
             'Run' {

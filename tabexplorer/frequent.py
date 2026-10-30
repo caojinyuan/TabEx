@@ -1,4 +1,4 @@
-"""常用目录：按访问次数和最近访问时间（frecency）排序，保存在数据目录的 frequent_dirs.json。"""
+"""常用目录：按访问次数和最近访问时间（frecency）排序，保存在配置目录的 frequent_dirs.json。"""
 
 import json
 import os
@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
 
 from .i18n import tr
 from .debuglog import debug_print
-from .paths import get_app_data_path
+from .paths import get_app_config_path
 
 MAX_FREQUENT_DIRS = 500
 # 访问次数总和超过该值时整体衰减，旧的高频目录逐渐让位给近期常用目录
@@ -40,7 +40,7 @@ def is_recordable_dir(path):
 
 class FrequentDirs:
     def __init__(self, path=None):
-        self.path = os.fspath(path) if path else get_app_data_path('frequent_dirs.json')
+        self.path = os.fspath(path) if path else get_app_config_path('frequent_dirs.json')
         self.entries = {}
         self.dirty = False
         self._load()

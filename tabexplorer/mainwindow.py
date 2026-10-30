@@ -18,7 +18,7 @@ from . import debuglog as _debuglog
 from . import i18n as _i18n
 from . import search as _search
 from . import theme as _theme
-from .paths import get_app_data_path
+from .paths import get_app_config_path
 from .i18n import _set_app_language, tr
 from .constants import (
     APP_VERSION, FREQUENT_DIR_SAVE_DELAY_MS, FREQUENT_DIR_SETTLE_MS, HOUSEKEEPING_GC_EVERY_N,
@@ -3896,7 +3896,7 @@ class MainWindow(QMainWindow):
             (tr("Python 版本"), platform.python_version()),
             (tr("解释器 / 可执行文件"), sys.executable),
             (tr("程序目录"), get_app_base_dir()),
-            (tr("配置目录"), get_app_data_path()),
+            (tr("配置目录"), get_app_config_path()),
         )
         return '\n'.join(f'{label}: {value}' for label, value in values)
 
@@ -4841,7 +4841,7 @@ class MainWindow(QMainWindow):
             print(f"[Icon] ✗ Failed to set TE icon: {e}")
     
     def load_config(self):
-        self._config_store = ConfigStore(get_app_data_path("config.json"))
+        self._config_store = ConfigStore(get_app_config_path("config.json"))
         config = self._config_store.load()
         self._config_recovered_backup = self._config_store.recovered_backup
         self._config_secret_unreadable = self._config_store.secret_unreadable
@@ -4862,7 +4862,7 @@ class MainWindow(QMainWindow):
     def _flush_config_to_disk(self):
         store = getattr(self, "_config_store", None)
         if store is None:
-            store = self._config_store = ConfigStore(get_app_data_path("config.json"))
+            store = self._config_store = ConfigStore(get_app_config_path("config.json"))
         result = store.save(self.config)
         self._last_config_written = store.last_written
         if not result and isinstance(self, QWidget) and not getattr(self, '_config_save_warning_shown', False):

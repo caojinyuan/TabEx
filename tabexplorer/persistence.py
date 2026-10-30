@@ -167,7 +167,7 @@ class ConfigStore:
         }
 
         try:
-            # 首先尝试加载主配置文件（使用程序所在目录的绝对路径）
+            # 首先尝试加载指定路径的主配置文件
             config_path = self.path
             if os.path.exists(config_path):
                 with open(config_path, "r", encoding="utf-8") as f:

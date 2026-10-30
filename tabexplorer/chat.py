@@ -7,7 +7,7 @@ from PyQt5.QtCore import pyqtSignal, Qt, QThread
 from PyQt5.QtWidgets import QHBoxLayout, QLabel, QMenu, QPushButton, QVBoxLayout, QWidget
 
 from . import theme as _theme
-from .paths import get_app_base_dir, get_app_data_path, translate_common_path
+from .paths import get_app_base_dir, get_app_config_path, get_app_data_path, translate_common_path
 from .i18n import tr
 from .constants import MAX_CHAT_HISTORY_MESSAGES, MAX_CHAT_MESSAGE_CHARS, MAX_CONTEXT_TOTAL_CHARS
 from .debuglog import debug_print
@@ -134,7 +134,7 @@ class ChatPanel(QWidget):
         self._closing = False
         self._request_cancelled = False
         self.history_file = get_app_data_path("chat_history.json")
-        self.workflow_file = get_app_data_path("ai_workflows.json")
+        self.workflow_file = get_app_config_path("ai_workflows.json")
         self.workflow_templates = self._load_workflow_templates()
         self._is_loading_history = False
         # 给 ChatPanel 独立的 Win32 HWND，避免 QAxWidget(Shell Explorer) 抢占鼠标/键盘头

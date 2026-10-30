@@ -18,6 +18,24 @@ def get_app_data_path(*parts):
     return os.path.join(base, *parts)
 
 
+def get_app_config_path(file_name=''):
+    """Resolve a configuration file, migrating a legacy root file without overwriting."""
+    directory = get_app_data_path('config')
+    os.makedirs(directory, exist_ok=True)
+    if not file_name:
+        return directory
+    target = os.path.join(directory, file_name)
+    legacy = get_app_data_path(file_name)
+    if not os.path.exists(target) and os.path.isfile(legacy):
+        try:
+            os.rename(legacy, target)
+        except (FileExistsError, FileNotFoundError):
+            # Another process may have migrated the same file during startup.
+            if not os.path.isfile(target):
+                raise
+    return target
+
+
 def get_bundled_path(file_name):
     """返回随程序内置的文件路径（打包后位于 PyInstaller 解压目录，源码运行时位于项目根目录）。"""
     roots = [getattr(sys, '_MEIPASS', None), get_app_base_dir()]

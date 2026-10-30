@@ -303,7 +303,7 @@ def install_quicklook(progress=None, cancelled=None, url=QUICKLOOK_URL, sha256=Q
     中断的下载保留 .part 文件，下次从断点继续；校验失败的文件会被删除。"""
     progress = progress or (lambda done, total: None)
     cancelled = cancelled or (lambda: False)
-    seven_zip = get_bundled_path('7zr.exe')
+    seven_zip = get_bundled_path(os.path.join('tools', '7zr.exe'))
     if not seven_zip:
         raise QuickLookInstallError(tr("缺少解压组件 7zr.exe"))
     target = quicklook_dir()

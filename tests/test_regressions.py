@@ -2347,7 +2347,7 @@ class OptimizationTests(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as directory:
             host = types.SimpleNamespace(config={'a': 1})
-            path = Path(directory) / 'config.json'
+            path = Path(directory) / 'config' / 'config.json'
             with patch_all('get_app_data_path', side_effect=lambda *parts: os.path.join(directory, *parts)):
                 flush = self.module.MainWindow._flush_config_to_disk
                 flush(host)

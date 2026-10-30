@@ -57,15 +57,13 @@
 
 ## 🆕 最近更新(只保留最新)
 
-### v3.99 (2026-10-30)
-- **工具就绪检测**：配置窗口自动在后台检查程序，区分已就绪、未安装和路径失效；支持打开官方下载页及预览实际参数（不执行）。新增 VS Code 双文件比较预设，并检测 WinMerge 按用户安装目录。
-- **工程搜索与排除规则**：新增工程文件模式、分号分隔的排除规则，随常用搜索保存；文件名枚举与内容扫描使用相同范围，不兼容正则回退时也不会绕过忽略规则。全量且无排除规则时保持原行为。
-- **目录差异直达编辑器**：比较结果支持按差异类型筛选，选中一对内容不同的文件可直接用 VS Code / WinMerge 打开，不自动复制；隐藏的结果不参与复制。
-- **跨目录文件收集篮**：从文件面板或搜索结果追加路径，去重后复制路径或交给文件任务队列统一复制。同名保留两者，失效来源明确报错，移除引用不会删除文件。
-- **统一调试与运行身份**：F5 配置固定使用项目 Python 3.13.13；“工具 → 关于 TabEx”显示源码/EXE、启动时间、解释器版本及运行目录。
-- **稳定性**：修复通知随父窗口销毁后遗留失效引用、导致下一次通知触发 Qt 异常的问题；搜索结果排序时保留当前项及多选文件的身份，避免收集或复制错误项目；新增范围一致性、工具检测、收集篮、运行身份和界面回归用例。
-- **验证**：全量回归共 296 项，295 项通过、1 项跳过（离屏界面测试采用 96 DPI 字体基准）。源码原生验收通过 2 轮预热 + 5 轮有效循环、154 个检查步骤，覆盖工程搜索、工具检测与参数预览、收集篮去重、目录差异筛选、单实例和正常退出；资源预算无超限，UI 心跳额外延迟 P95 为 110 ms、P99 为 350 ms。小时级长稳、真实断网和新 EXE 验收尚未执行，这些数据不是跨机器性能承诺。
-- **升级**：先停止旧进程再启动源码。旧 EXE 需重新打包，源码修改不会替换已发布 EXE；已有工具配置可通过“添加缺少的预设”加入 VS Code 比较项。
+### v3.100 (2026-10-30)
+- **工具集中管理**：将 `rg.exe`、`7zr.exe`、`es.exe` 移入 [tools/](tools/)，同步更新搜索、QuickLook 解压和 PyInstaller 资源路径；工具内容不变，搜索工具原有的系统路径回退仍保留。
+- **独立配置目录**：`config.json`、`bookmarks.json`、`frequent_dirs.json`、`ai_workflows.json` 统一读写到程序目录下的 `config/`；“关于 TabEx”显示实际配置目录。聊天记录、调试日志和 QuickLook 便携目录的位置保持不变。
+- **兼容旧配置**：新目录中缺少对应文件时，按需迁入根目录的旧配置且不修改内容；新旧文件同时存在时优先使用新目录版本，不覆盖或删除旧文件。`TABEX_DATA_DIR` 指定的数据目录仍隔离，配置位于其 `config/` 子目录；个人配置不随仓库或 EXE 分发。
+- **依赖文件归档**：运行与构建依赖统一移入 [requirements/](requirements/)，同步更新安装、打包脚本和文档；依赖版本与批处理入口不变，构建依赖仍通过相对路径包含运行依赖。
+- **验证**：全量回归共 308 项，307 项通过、1 项因离屏平台不渲染文字/emoji 而跳过（96 DPI 字体基准）。pip 离线试运行确认移动后的依赖列表和相对引用有效；源码原生冒烟完成 10 个操作，单实例、最小化恢复及正常退出检查通过。本次未重新打包 EXE，也未执行小时级长稳。
+- **升级**：先退出旧进程再启动新源码；使用 EXE 时需重新构建，旧版 EXE 仍读取旧配置路径，不能直接使用新目录布局。
 
 ---
 
@@ -74,17 +72,22 @@
 **从可执行文件运行**（推荐）：
 1. 从 [Releases](../../releases/latest) 下载 `TabExplorer.exe`
 2. 双击运行即可
-3. 程序会在 `TabExplorer.exe` 同目录读写以下持久化文件：
-  - `config.json`：应用设置、固定标签、标题栏快捷方式、会话缓存、常用搜索；AI API 密钥以 Windows DPAPI 加密保存为 `api_key_protected`，只有当前 Windows 用户能解密
-  - `bookmarks.json`：书签数据
+3. 程序会在 `TabExplorer.exe` 同目录的 `config/` 中读写配置文件（源码运行时位于项目根目录的 `config/`）：
+  - `config/config.json`：应用设置、固定标签、标题栏快捷方式、会话缓存、常用搜索；AI API 密钥以 Windows DPAPI 加密保存为 `api_key_protected`，只有当前 Windows 用户能解密
+  - `config/bookmarks.json`：书签数据
+  - `config/frequent_dirs.json`：常用目录的访问次数与最近访问时间
+  - `config/ai_workflows.json`：AI 快捷工作流模板
+  - 配置或书签文件无法解析时，原文件在 `config/` 中保留为 `config.json.broken-日期-时间` 或 `bookmarks.json.broken-日期-时间`，可手动修复后改回原名
+4. 聊天记录和日志仍保存在程序同目录：
   - `chat_history.json`：AI 聊天历史
-  - `frequent_dirs.json`：常用目录的访问次数与最近访问时间
-  - 配置或书签文件无法解析时，原文件保留为 `config.json.broken-日期-时间` 或 `bookmarks.json.broken-日期-时间`，可手动修复后改回原名
+  - `TabEx_debug_latest.log`：最新调试日志
+
+升级时请先退出旧程序。读取配置时，若 `config/` 中缺少对应文件，会自动迁入根目录的旧文件，内容不变；若新旧位置同时存在，则使用 `config/` 中的版本，不覆盖或删除根目录旧文件。设置 `TABEX_DATA_DIR` 时，配置目录为该数据目录下的 `config/`，不会读取或迁移程序目录的个人配置。旧版 EXE 仍使用旧路径，需重新打包后才支持此布局。
 
 **从源码运行**（Windows x64，无需预装 Python）：
 1. 双击 `0_install_requirements.bat`：首次运行会下载固定版本 Python 3.13.13 x64，校验 SHA-512 后将完整运行时放到项目 `.venv/python-3.13.13/`，并安装依赖，不影响系统 Python，无需管理员权限
 2. 双击 `1_run_TabEx.bat` 启动程序（仅使用项目本地 Python，不回退到系统 Python 或旧 `.venv/Scripts`）
-3. 若使用 AI 功能，确保 `requests` 已安装并在 `config.json` 或设置界面中填写 AI 服务配置
+3. 若使用 AI 功能，确保 `requests` 已安装并在 `config/config.json` 或设置界面中填写 AI 服务配置
 4. VS Code 中选择 F5 配置 **TabEx (project Python 3.13.13)**。仓库的 [launch.json](.vscode/launch.json) 明确指定项目解释器，并使用 `-E -s -X utf8` 隔离 Python 环境变量、用户包和文本编码；不会回退到旧解释器。首次缺少运行时或依赖时先执行安装脚本。正在运行的旧调试进程需要手动停止后重新启动。
 
 通过“工具 → 关于 TabEx”可核对实际版本、源码/EXE 模式、启动时间、Python 版本、可执行文件路径和配置目录；信息可选择复制，不会自动上传。
@@ -173,7 +176,7 @@ AI 的 `PATCH_FILE` 和 `WRITE_FILE` 在写入前展示差异；预览后发现�
 - 记录保存在 `frequent_dirs.json`，最多 500 条，访问总数过多时整体衰减，让近期常用目录靠前；快捷键可在设置中改键或停用
 
 ### Everything 搜索（推荐）
-1. 只需安装并启动 [Everything](https://www.voidtools.com/) 并等待索引完成；命令行工具 `es.exe` 已内置在工程根目录并会被打包进 `TabExplorer.exe`，无需单独下载或在设置中指定路径
+1. 只需安装并启动 [Everything](https://www.voidtools.com/) 并等待索引完成；命令行工具 `es.exe` 已内置在工程的 `tools/` 目录并会被打包进 `TabExplorer.exe`，无需单独下载或在设置中指定路径
 2. 在 TabExplorer 中按 `Ctrl+F` 打开搜索，勾选"使用 Everything"即可享受毫秒级搜索；Everything 不支持搜索文件内容（只搜索文件名），启用后“搜索文件内容”不可用，需搜内容请取消勾选，结果中的文件夹显示为 📁 和“文件夹”类型
 
 ### 流式内容搜索与匹配预览
@@ -326,7 +329,7 @@ AI 的 `PATCH_FILE` 和 `WRITE_FILE` 在写入前展示差异；预览后发现�
 - 支持将目录直接拖入 AI 面板：自动生成目录结构预览；若输入框为空会自动发起目录结构分析
 - 拖拽文件到 AI 面板时，若输入框为空会自动发起文件分析；若输入框已有内容则仅展示内容，避免打断手动提问
 - AI 面板提供快捷工作流按钮：`目录巡检`、`代码审阅`、`变更说明`，点击后会自动注入预设提示词并启动多步分析
-- 快捷工作流模板存放在独立文件 `ai_workflows.json`（不占用 `config.json`），可按需自定义模板内容
+- 快捷工作流模板存放在独立文件 `config/ai_workflows.json`（不占用 `config/config.json`），可按需自定义模板内容
 
 ### 检查更新
 - 手动检查：工具菜单 `检查更新...`，或设置窗口底部的“立即检查”；会明确提示“已是最新版本”、新版本或失败原因，点击“查看更新”在浏览器打开发布页。只提示，不下载、不安装
@@ -368,7 +371,7 @@ AI 的 `PATCH_FILE` 和 `WRITE_FILE` 在写入前展示差异；预览后发现�
 - 下次启动时自动恢复，继续上次的工作
 - 恢复顺序：先加载固定标签，再恢复缓存标签
 - 可在设置中启用/禁用（默认开启）
-- 打包版与源码版都会将会话缓存持久化到各自运行目录下的 `config.json`
+- 打包版与源码版都会将会话缓存持久化到各自程序目录下的 `config/config.json`
 
 ### 书签管理
 - 支持文件夹层级组织
@@ -503,7 +506,7 @@ python -m coverage html --data-file="$env:TEMP\tabex-coverage" -d "$env:TEMP\tab
 .\2_build_exe.bat
 ```
 
-无需预装 Python，也无需提前删除旧输出。脚本自动准备项目本地 Python 3.13.13，再安装 [requirements-build.txt](requirements-build.txt) 中的构建依赖，执行回归测试，在临时目录打包，并启动使用隔离数据的 EXE 进行原生冒烟验证。全部通过才替换原 EXE；程序占用目标文件导致替换失败时旧版本仍保留。替换前请退出旧程序。
+无需预装 Python，也无需提前删除旧输出。脚本自动准备项目本地 Python 3.13.13，再安装 [requirements-build.txt](requirements/requirements-build.txt) 中的构建依赖，执行回归测试，在临时目录打包，并启动使用隔离数据的 EXE 进行原生冒烟验证。全部通过才替换原 EXE；程序占用目标文件导致替换失败时旧版本仍保留。替换前请退出旧程序。
 
 独立输出验证版，不替换现有程序：
 ```powershell
@@ -519,7 +522,7 @@ python -m coverage html --data-file="$env:TEMP\tabex-coverage" -d "$env:TEMP\tab
 .\.venv\python-3.13.13\python.exe -s -X utf8 tools\validate_runtime.py --exe artifacts\TabExplorer-validated.exe --seconds 10 --tabs 10 --report artifacts\packaged.json
 ```
 
-验证器使用临时 `TABEX_DATA_DIR` 和 `LOCALAPPDATA`，不加载个人配置、书签、聊天记录，也不开启外部 Explorer 监听。数据目录与资源目录独立，默认用户运行的数据位置不变。测试会短暂显示真实原生窗口，不要手工操作该窗口。报告包括首个视图就绪耗时、Qt 心跳 P95/P99/最大延迟、内存、句柄、线程和标签计数，以及单实例、导航和正常退出结果。截图是人工检查材料，不等于自动视觉正确性判定。
+验证器使用临时 `TABEX_DATA_DIR` 和 `LOCALAPPDATA`，配置写入临时数据目录的 `config/`，不加载个人配置、书签、聊天记录，也不开启外部 Explorer 监听。数据目录与资源目录独立，不修改用户配置。测试会短暂显示真实原生窗口，不要手工操作该窗口。报告包括首个视图就绪耗时、Qt 心跳 P95/P99/最大延迟、内存、句柄、线程和标签计数，以及单实例、导航和正常退出结果。截图是人工检查材料，不等于自动视觉正确性判定。
 
 默认 `smoke` 场景保留原来的启动/标签/导航/单实例/退出检查。`--scenario lifecycle` 增加原生分屏双向连续导航、关闭分屏、标签休眠/唤醒/关闭、搜索取消/关闭/重开、排队复制取消后续作、来源文件缺失后的重试、临时输出清理、最小化恢复。复制结果按字节验证；删除仅针对验证目录中的已知临时输出。重试确认由验证器在隔离窗口中自动点击，不改变正式运行时的确认行为。
 
@@ -553,9 +556,10 @@ python -m coverage html --data-file="$env:TEMP\tabex-coverage" -d "$env:TEMP\tab
 
 ### 项目文件说明
 - `TabEx.py` - 启动入口，包含版本号 `APP_VERSION`（唯一来源，打包脚本与检查更新都读取这一行）
-- `es.exe` - Everything 命令行工具（voidtools ES，MIT），搜索时直接调用，打包时嵌入 EXE
-- `rg.exe` - ripgrep 15.2.0（MIT/Unlicense），“搜索文件内容”优先使用它扫描，失败时自动回退到 Python 扫描；打包时嵌入 EXE，许可证文本在 `third_party_licenses/`
-- `7zr.exe` - 7-Zip 独立命令行解压器（LGPL），仅用于解压下载的 QuickLook 便携包；打包时嵌入 EXE
+- `tools/es.exe` - Everything 命令行工具（voidtools ES，MIT），搜索时直接调用，打包时嵌入 EXE
+- `tools/rg.exe` - ripgrep 15.2.0（MIT/Unlicense），“搜索文件内容”优先使用它扫描，失败时自动回退到 Python 扫描；打包时嵌入 EXE，许可证文本在 `third_party_licenses/`
+- `tools/7zr.exe` - 7-Zip 独立命令行解压器（LGPL），仅用于解压下载的 QuickLook 便携包；打包时嵌入 EXE
+- `config/` - 本地配置目录，包含应用设置、书签、常用目录和 AI 工作流模板；不随仓库或 EXE 分发
 - `tabexplorer/quicklook.py` - QuickLook 下载（断点续传、哈希校验）、解压与空格预览调用
 - `tabexplorer/frequent.py` - 常用目录记录（frecency 排序、`frequent_dirs.json`）与跳转窗口
 - `tabexplorer/` - 功能模块（按依赖从底层到上层）：
@@ -570,9 +574,9 @@ python -m coverage html --data-file="$env:TEMP\tabex-coverage" -d "$env:TEMP\tab
 - `tabexplorer/persistence.py` - 配置存储和会话收集/恢复
 - `tabexplorer/instance.py` - 进程锁和本地实例消息
 - `tabexplorer/runtime_validation.py`、`tools/validate_runtime.py` - 隔离的原生启动与性能趋势验证
-- `tools/build_release.py`、`requirements-build.txt` - 可验证、失败保留旧版本的构建流程
+- `tools/build_release.py`、[requirements/requirements-build.txt](requirements/requirements-build.txt) - 可验证、失败保留旧版本的构建流程
 - `tests/` - 回归测试；`tests/app_modules.py` 汇总各模块供测试读取，`patch_all()` 在所有导入了同一名称的模块中同时替换
-- `requirements.txt` - Python 运行依赖列表
+- [requirements/requirements.txt](requirements/requirements.txt) - Python 运行依赖列表；构建依赖列表通过相对路径引用它
 - `tools/project_python.ps1` - 下载、校验并管理固定版本的项目本地 Python，统一安装、运行与构建入口
 - `0_install_requirements.bat` - 安装项目本地 Python 及运行依赖（无需系统 Python）
 - `1_run_TabEx.bat` - 源码运行脚本
@@ -580,4 +584,4 @@ python -m coverage html --data-file="$env:TEMP\tabex-coverage" -d "$env:TEMP\tab
 - [icons/generate_icon.py](icons/generate_icon.py) - 应用图标生成脚本（需要 Pillow：`pip install pillow`）；在项目根目录运行 `python icons/generate_icon.py`
 - [icons/TabExplorer.ico](icons/TabExplorer.ico) - 应用图标，生成脚本输出到此位置，打包时直接使用
 
-> `config.json`、`bookmarks.json`、`chat_history.json`、`frequent_dirs.json` 及损坏时保留的 `*.broken-*` 备份均为运行时自动生成的本地数据文件，已在 `.gitignore` 中忽略，不随仓库分发。
+> `config/` 中的四个 JSON 配置文件、根目录的 `chat_history.json` 及损坏时保留的 `*.broken-*` 备份均为运行时自动生成的本地数据文件，已在 `.gitignore` 中忽略，不随仓库分发。

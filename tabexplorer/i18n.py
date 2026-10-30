@@ -2,7 +2,7 @@
 
 import json
 
-from .paths import get_app_data_path
+from .paths import get_app_config_path
 
 
 _app_language = "zh"  # default; overridden from config.json at startup
@@ -1273,8 +1273,9 @@ _LANG_EN = {
 }
 
 
+_language_config_path = get_app_config_path('config.json')
 try:
-    with open(get_app_data_path('config.json'), 'r', encoding='utf-8') as _lf:
+    with open(_language_config_path, 'r', encoding='utf-8') as _lf:
         _app_language = json.load(_lf).get('language', 'zh')
 except Exception:
     _app_language = 'zh'

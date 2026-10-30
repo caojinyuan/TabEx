@@ -717,7 +717,7 @@ class SearchResultsTableModel(QAbstractTableModel):
 # Everything 搜索引擎集成
 def _bundled_tool_path(file_name):
     from .paths import get_bundled_path
-    return get_bundled_path(file_name)
+    return get_bundled_path(os.path.join('tools', file_name))
 
 
 def get_bundled_es_path():
