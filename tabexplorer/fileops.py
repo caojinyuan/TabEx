@@ -538,6 +538,7 @@ class FileTaskPanel(QDialog):
         self.resize(960, 400)
         self.records = []
         self.max_running_tasks = 2
+        self.max_finished_records = 50
         layout = QVBoxLayout(self)
         self.table = QTreeWidget(self)
         self.table.setHeaderLabels([tr("操作"), tr("目标 / 来源"), tr("状态"), tr("进度")])
@@ -684,6 +685,7 @@ class FileTaskPanel(QDialog):
                 finished_record = record
                 break
         worker.deleteLater()
+        self._prune_finished_records(keep=finished_record)
         self._start_queued_tasks()
         if not self.has_running_tasks():
             self.timer.stop()
@@ -691,6 +693,14 @@ class FileTaskPanel(QDialog):
         self.tasks_changed.emit()
         if finished_record is not None:
             self._notify_task_result(finished_record)
+
+    def _prune_finished_records(self, keep=None):
+        """长时间运行时已完成任务（含完整路径列表、错误与续传状态）会无限累积，只保留最近若干条。"""
+        finished = [record for record in self.records if record['done']]
+        excess = len(finished) - self.max_finished_records
+        for record in [record for record in finished if record is not keep][:max(0, excess)]:
+            self.table.takeTopLevelItem(self.table.indexOfTopLevelItem(record['row']))
+            self.records.remove(record)
 
     def _notify_task_result(self, record):
         owner = self.parent()

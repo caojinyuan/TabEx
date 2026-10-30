@@ -890,6 +890,10 @@ class IExplorerBrowserWidget(QWidget):
     def _do_refresh(self):
         if self._resolving_generation == self._nav_generation:
             return  # 慢盘导航仍在解析：刷新旧视图会作废该导航
+        # 优先原地 IShellView::Refresh（同 Explorer F5）：保留选中项、滚动位置与视图模式，
+        # 且不重建 DefView；无视图或失败时才回退为重新导航。
+        if self._has_view and self._refresh_shell_view():
+            return
         if self._location_url:
             self._navigate_url(self._location_url)
 
@@ -1025,16 +1029,17 @@ class IExplorerBrowserWidget(QWidget):
         self._overlay_refreshing = False
 
     def _refresh_shell_view(self):
-        """Call IShellView::Refresh() to force the DefView to re-render items."""
+        """Call IShellView::Refresh() to force the DefView to re-render items. Returns True on S_OK."""
         if not self._browser:
-            return
+            return False
+        hr = None
         try:
             from comtypes import GUID as _GUID
             iid_sv = _GUID("{000214E3-0000-0000-C000-000000000046}")
             ppv_result = self._browser.GetCurrentView(ctypes.byref(iid_sv))
             iface_ptr = int(ppv_result) if ppv_result else 0
             if not iface_ptr:
-                return
+                return False
             try:
                 # IShellView vtable layout (inherits IOleWindow):
                 # [QI(0), AddRef(1), Release(2), GetWindow(3),
@@ -1060,6 +1065,8 @@ class IExplorerBrowserWidget(QWidget):
                 _RELEASE(release_addr)(iface_ptr)
         except Exception as e:
             debug_print(f"[TortoiseGit] _refresh_shell_view error: {e}")
+            return False
+        return hr == 0
 
     # ── 左侧目录树配色校正 ────────────────────────────────────────────────────
 

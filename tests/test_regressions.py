@@ -3864,10 +3864,21 @@ class NetworkBannerTests(unittest.TestCase):
         widget._on_pidl_resolved(host, '\\\\srv\\old', None, self.BAD_NETPATH, 1)
         host.navigationFailed.emit.assert_not_called()
         refresh = types.SimpleNamespace(_nav_generation=3, _resolving_generation=3, _location_url='file:///C:/x',
-                                        _navigate_url=Mock())
+                                        _navigate_url=Mock(), _has_view=False,
+                                        _refresh_shell_view=Mock(return_value=True))
         widget._do_refresh(refresh)
         refresh._navigate_url.assert_not_called()
         refresh._resolving_generation = None
+        widget._do_refresh(refresh)
+        refresh._navigate_url.assert_called_once_with('file:///C:/x')
+        refresh._refresh_shell_view.assert_not_called()
+        # 已有视图时原地 IShellView::Refresh，保留选中/滚动/视图模式，不重新导航
+        refresh._navigate_url.reset_mock()
+        refresh._has_view = True
+        widget._do_refresh(refresh)
+        refresh._refresh_shell_view.assert_called_once_with()
+        refresh._navigate_url.assert_not_called()
+        refresh._refresh_shell_view.return_value = False
         widget._do_refresh(refresh)
         refresh._navigate_url.assert_called_once_with('file:///C:/x')
         sync = types.SimpleNamespace(_nav_generation=5, _browser=Mock(), navigationFailed=Mock())

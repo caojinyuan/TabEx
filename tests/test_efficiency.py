@@ -226,6 +226,18 @@ class CompareAndBasketTests(QtTests):
         dialog.difference_filter.setCurrentIndex(dialog.difference_filter.findData('other'))
         self.assertFalse(rows[2].isHidden())
 
+    def test_task_panel_prunes_oldest_finished_records_only(self):
+        self.panel.max_finished_records = 2
+        records = []
+        for index, done in enumerate((True, True, False, True)):
+            row = QTreeWidgetItem([str(index)])
+            self.panel.table.addTopLevelItem(row)
+            records.append({'row': row, 'done': done, 'worker': None})
+        self.panel.records = list(records)
+        self.panel._prune_finished_records(keep=records[3])
+        self.assertEqual(self.panel.records, [records[1], records[2], records[3]])
+        self.assertEqual(self.panel.table.topLevelItemCount(), 3)
+
     def test_basket_deduplicates_references_and_removal_never_deletes_files(self):
         basket = FileBasketDialog(self.owner)
         paths = [str(self.left / 'same.txt'), str(self.right / 'same.txt')]
