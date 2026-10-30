@@ -1,6 +1,5 @@
 """常用目录：按访问次数和最近访问时间（frecency）排序，保存在配置目录的 frequent_dirs.json。"""
 
-import json
 import os
 import time
 
@@ -10,8 +9,8 @@ from PyQt5.QtWidgets import (
 )
 
 from .i18n import tr
-from .debuglog import debug_print
 from .paths import get_app_config_path
+from .json_store import JsonFileStore
 
 MAX_FREQUENT_DIRS = 500
 # 访问次数总和超过该值时整体衰减，旧的高频目录逐渐让位给近期常用目录
@@ -38,9 +37,9 @@ def is_recordable_dir(path):
     return bool(os.path.splitdrive(path)[0]) and os.path.isabs(path)
 
 
-class FrequentDirs:
+class FrequentDirs(JsonFileStore):
     def __init__(self, path=None):
-        self.path = os.fspath(path) if path else get_app_config_path('frequent_dirs.json')
+        super().__init__(path if path else get_app_config_path('frequent_dirs.json'), list)
         self.entries = {}
         self.dirty = False
         self._load()
@@ -50,15 +49,8 @@ class FrequentDirs:
         return os.path.normcase(os.path.normpath(path))
 
     def _load(self):
-        try:
-            with open(self.path, 'r', encoding='utf-8') as handle:
-                data = json.load(handle)
-        except FileNotFoundError:
-            return
-        except (OSError, ValueError) as error:
-            debug_print(f"[Frequent] load failed: {error}")
-            return
-        for item in data if isinstance(data, list) else []:
+        data = self.read([])
+        for item in data:
             if isinstance(item, dict) and is_recordable_dir(item.get('path')):
                 try:
                     count, last = float(item.get('count', 1)), float(item.get('last', 0))
@@ -105,20 +97,10 @@ class FrequentDirs:
     def save(self):
         if not self.dirty:
             return True
-        tmp_path = self.path + '.tmp'
-        try:
-            with open(tmp_path, 'w', encoding='utf-8') as handle:
-                json.dump(list(self.entries.values()), handle, ensure_ascii=False, indent=1)
-            os.replace(tmp_path, self.path)
+        if super().save(list(self.entries.values()), indent=1):
             self.dirty = False
             return True
-        except OSError as error:
-            debug_print(f"[Frequent] save failed: {error}")
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            return False
+        return False
 
 
 class FrequentDirsDialog(QDialog):

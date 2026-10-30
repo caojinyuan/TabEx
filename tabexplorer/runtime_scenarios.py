@@ -44,6 +44,12 @@ def lifecycle_steps(check):
         yield 'address parent recovery reaches native folder', lambda: (
             ready(recovered, root) and recovered.explorer.isVisible()
             and recovered._explorer_placeholder.isHidden() and not recovered.net_banner.isVisible())
+        recovered.navigate_to(str(root / 'navigation'))
+        checker = recovered.folder_checker
+        if checker is None or not checker.wait(2000):
+            raise AssertionError('Folder checker did not finish for queued-navigation test')
+        recovered.navigate_to(str(root / 'fixture'), skip_async_check=True)
+        yield 'queued old folder check cannot override newer native target', lambda: ready(recovered, root / 'fixture')
         w.close_tab(w.content_stack.indexOf(recovered))
         yield 'recovered tab closes cleanly', lambda: w.tab_widget.count() == 1 and ready(left, root)
         w.add_new_tab(str(root))

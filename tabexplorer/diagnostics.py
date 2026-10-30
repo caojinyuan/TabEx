@@ -14,6 +14,8 @@ import traceback
 import uuid
 import zipfile
 
+from .constants import DEBUG_LOG_BACKUP_COUNT
+
 
 MAX_LOG_BYTES = 256 * 1024
 MAX_SESSIONS = 5
@@ -59,6 +61,14 @@ def filtered_debug_log(path):
         if message.startswith(SAFE_LOG_TAGS):
             lines.append(redact(line))
     return '\n'.join(lines)
+
+
+def _debug_log_files(path):
+    for index in range(DEBUG_LOG_BACKUP_COUNT + 1):
+        suffix = f'.{index}' if index else ''
+        candidate = Path(str(path) + suffix)
+        if not candidate.is_symlink() and (not index or candidate.is_file()):
+            yield suffix, candidate
 
 
 def _process_alive(pid):
@@ -239,10 +249,12 @@ class Diagnostics:
         self.mark(self.state['status'])
 
     def capture_debug(self, path):
-        try:
-            (self.session / 'previous-debug-filtered.log').write_text(filtered_debug_log(path), encoding='utf-8')
-        except OSError:
-            pass
+        for suffix, candidate in _debug_log_files(path):
+            try:
+                (self.session / f'previous-debug-filtered{suffix}.log').write_text(
+                    filtered_debug_log(candidate), encoding='utf-8')
+            except OSError:
+                pass
 
     def dump_threads(self):
         if self.fault_file is not None:
@@ -290,7 +302,8 @@ class Diagnostics:
                 continue
             for name in ('session.json', 'snapshot.json', 'events.jsonl', 'events.previous.jsonl',
                          'resources.jsonl', 'resources.previous.jsonl',
-                         'fault.log', 'previous-debug-filtered.log'):
+                         'fault.log', 'previous-debug-filtered.log',
+                         *(f'previous-debug-filtered.{index}.log' for index in range(1, DEBUG_LOG_BACKUP_COUNT + 1))):
                 path = session / name
                 if path.is_file() and not path.is_symlink():
                     try:
@@ -298,10 +311,11 @@ class Diagnostics:
                     except OSError:
                         warnings.append(f'Unreadable: {session.name}/{name}')
         if debug_path:
-            try:
-                entries['debug-filtered.log'] = filtered_debug_log(debug_path)
-            except OSError:
-                warnings.append('Debug log unavailable')
+            for suffix, candidate in _debug_log_files(debug_path):
+                try:
+                    entries[f'debug-filtered{suffix}.log'] = filtered_debug_log(candidate)
+                except OSError:
+                    warnings.append('Debug log unavailable' if not suffix else f'Debug log backup {suffix} unavailable')
         entries['manifest.json'] = json.dumps({
             'schema': 1, 'app_version': self.version, 'created': time.strftime('%Y-%m-%dT%H:%M:%S'),
             'files': sorted(entries), 'warnings': warnings,

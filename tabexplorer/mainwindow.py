@@ -3658,6 +3658,11 @@ class MainWindow(QMainWindow):
         if store is None:
             from .frequent import FrequentDirs
             store = self._frequent_dirs = FrequentDirs()
+            store.error_handler = self._notify_data_save_error
+            if store.last_error:
+                detail = (tr("原文件已另存为 {}").format(os.path.basename(store.recovered_backup))
+                          if store.recovered_backup else store.last_error)
+                show_toast(self, tr("数据文件无法读取"), detail, level="warning")
         return store
 
     def _record_frequent_visit(self, ref, path):
@@ -3968,6 +3973,12 @@ class MainWindow(QMainWindow):
         return self._file_task_panel
 
     def _capture_diagnostic_snapshot(self):
+        log_error = _debuglog._DEBUG_LOG_ERROR
+        if log_error and not getattr(self, '_debug_log_warning_shown', False):
+            self._debug_log_warning_shown = True
+            show_toast(self, tr("日志写入失败"), log_error, level="warning")
+        elif not log_error:
+            self._debug_log_warning_shown = False
         if _debuglog._diagnostics is None:
             return
         _debuglog._diagnostics.heartbeat()
@@ -4750,6 +4761,7 @@ class MainWindow(QMainWindow):
         
         # 初始化书签管理器
         self.bookmark_manager = BookmarkManager()
+        self.bookmark_manager.error_handler = self._notify_data_save_error
         self._last_bookmark_node_id = None
         self._bookmark_effective_colors = {}
         # 检查并自动添加常用书签
@@ -5064,10 +5076,18 @@ class MainWindow(QMainWindow):
             show_toast(self, tr("数据文件无法读取"),
                        tr("{} 无法解析，原文件已另存为 {}，本次使用默认内容").format(name.split('.broken-')[0], name),
                        level="warning")
+        for store in (getattr(self, '_config_store', None), getattr(self, 'bookmark_manager', None)):
+            if store is not None and getattr(store, 'write_blocked', False):
+                show_toast(self, tr("数据文件无法读取"),
+                           tr("已禁止覆盖 {}，请修复文件或权限后重新启动。").format(os.path.basename(store.path)),
+                           level="warning")
         if getattr(self, '_config_secret_unreadable', False):
             show_toast(self, tr("AI 密钥无法解密"),
                        tr("配置可能来自其他电脑或 Windows 用户，请在 设置 → AI 助手 中重新填写"),
                        level="warning")
+
+    def _notify_data_save_error(self, path, error):
+        show_toast(self, tr("数据保存失败"), f"{os.path.basename(path)}: {error}", level="warning")
 
     def _repair_startup_shortcut(self):
         import sys

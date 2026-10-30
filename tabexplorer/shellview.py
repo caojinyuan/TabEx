@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import QSizePolicy, QWidget
 from . import theme as _theme
 from .i18n import tr
 from .debuglog import dbg_exc, debug_print
+from .paths import is_slow_path
 from .system import HAS_PYWIN, _retain_thread_until_finished
 from .hotkeys import _hotkey_reserved_combos
 
@@ -314,20 +315,7 @@ def _explorer_location_to_path(location, location_name=None):
 def _path_is_slow_for_shell(path):
     """模块级慢盘判断：UNC / OneDrive / 映射网络盘上同步 Shell 调用可能阻塞 UI 线程。
     供 _preload_overlay_icons 早退使用（与 FileExplorerTab._is_slow_path 逻辑一致）。"""
-    if not path:
-        return False
-    if path.startswith('\\\\') or path.startswith('//'):
-        return True
-    if 'onedrive' in path.replace('\\', '/').lower():
-        return True
-    try:
-        import ctypes
-        drive = os.path.splitdrive(path)[0]
-        if drive and ctypes.windll.kernel32.GetDriveTypeW(drive + '\\') == 4:  # DRIVE_REMOTE
-            return True
-    except Exception:
-        pass
-    return False
+    return is_slow_path(path)
 
 
 def _shell_file_operation_window_open():
@@ -790,6 +778,8 @@ class IExplorerBrowserWidget(QWidget):
     def _navigate(self, path):
         if not _COMTYPES_AVAILABLE:
             return
+        self._nav_generation += 1
+        self._resolving_generation = None
         if not self.isVisible():
             self._pending_path = path
             return
@@ -808,6 +798,7 @@ class IExplorerBrowserWidget(QWidget):
         """同步导航（本地快盘）：UI 线程内解析 PIDL 并浏览。"""
         # 作废在途的慢盘解析，避免其结果稍后把视图拉回旧目标或误报失败
         self._nav_generation += 1
+        self._resolving_generation = None
         try:
             # Pre-load overlay icons BEFORE navigation so DefView has them
             # when it first renders (skip if already cached for this dir)

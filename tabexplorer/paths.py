@@ -96,12 +96,26 @@ _COMMON_PATH_PAIRS = [
 ]
 
 
+def is_slow_path(path):
+    """Classify potentially blocking paths without probing the filesystem."""
+    if not path:
+        return False
+    if path.startswith(('\\\\', '//')) or 'onedrive' in path.lower():
+        return True
+    if os.name == 'nt':
+        import ctypes
+        drive = os.path.splitdrive(path)[0]
+        if drive:
+            return ctypes.windll.kernel32.GetDriveTypeW(drive + '\\') == 4
+    return False
+
+
 def translate_common_path(path):
     """
     尝试将路径中的中英文常用目录名互相转换，递归尝试所有组合，返回第一个存在的路径。
     若找不到存在的路径，则返回原始 path。
     """
-    if not path or os.path.exists(path):
+    if not path or is_slow_path(path) or os.path.exists(path):
         return path
     # 只处理本地绝对路径
     norm_path = os.path.normpath(path)

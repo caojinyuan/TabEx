@@ -1,14 +1,11 @@
 """Configuration storage and session capture/restore ownership."""
 
-import json
-import os
 import time
 from . import search as _search
-from .paths import get_app_data_path
 from .i18n import _set_app_language
 from .debuglog import debug_print
 from .search import apply_runtime_performance_config
-from .bookmarks import _preserve_unreadable_file
+from .json_store import JsonFileStore
 from .theme import normalize_mode
 
 _CRYPTPROTECT_UI_FORBIDDEN = 0x01
@@ -40,13 +37,9 @@ def unprotect_secret(token):
         return None
 
 
-class ConfigStore:
+class ConfigStore(JsonFileStore):
     def __init__(self, path):
-        self.path = os.fspath(path)
-        self.last_written = None
-        self.recovered_backup = None
-        self.write_blocked = False
-        self.last_error = ''
+        super().__init__(path, dict)
         self.secret_unreadable = False
         # DPAPI 密文每次加密都不同；明文未变时复用上次密文，保持“内容未变不写盘”
         self._protected_key = ('', '')
@@ -62,6 +55,7 @@ class ConfigStore:
         if plain is None:
             self.secret_unreadable = True
             ai["api_key"] = ""
+            ai["api_key_protected"] = token
             return
         ai["api_key"] = plain
         self._protected_key = (plain, token)
@@ -75,7 +69,7 @@ class ConfigStore:
         cached_plain, cached_token = self._protected_key
         token = cached_token if cached_plain == key and cached_token else protect_secret(key)
         if not token:
-            return config
+            raise ValueError('API key encryption failed; configuration was not saved')
         self._protected_key = (key, token)
         disk_ai = {k: v for k, v in ai.items() if k != "api_key"}
         disk_ai["api_key_protected"] = token
@@ -166,102 +160,30 @@ class ConfigStore:
             "search_metadata_degrade_queue_ratio": _search.SEARCH_METADATA_DEGRADE_QUEUE_RATIO,
         }
 
-        try:
-            # 首先尝试加载指定路径的主配置文件
-            config_path = self.path
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-                    if not isinstance(config, dict):
-                        raise ValueError("config root is not an object")
-                    self._merge_defaults(config, default_config)
-                    # 合并默认配置
-                    for key, value in default_config.items():
-                        if key not in config:
-                            config[key] = value
-                    # 确保hotkeys存在所有键
-                    if "hotkeys" in config:
-                        for key, value in default_config["hotkeys"].items():
-                            if key not in config["hotkeys"]:
-                                config["hotkeys"][key] = value
-                    else:
-                        config["hotkeys"] = default_config["hotkeys"]
-
-                    # 确保 ai_chat 存在所有键
-                    if "ai_chat" in config and isinstance(config["ai_chat"], dict):
-                        for key, value in default_config["ai_chat"].items():
-                            if key not in config["ai_chat"]:
-                                config["ai_chat"][key] = value
-                    else:
-                        config["ai_chat"] = default_config["ai_chat"]
-
-                    # 确保 performance 存在所有键
-                    if "performance" in config and isinstance(config["performance"], dict):
-                        for key, value in default_config["performance"].items():
-                            if key not in config["performance"]:
-                                config["performance"][key] = value
-                    else:
-                        config["performance"] = default_config["performance"]
-
-                    # v3.76 曾把默认开启的自动检查写入配置，改为默认关闭后丢弃该旧键
-                    config.pop("auto_check_updates", None)
-                    # 资源快照日志已并入崩溃诊断，旧开关不再使用
-                    config.pop("resource_snapshot_logging", None)
-                    config.pop("resource_snapshot_interval_ms", None)
-                    config["theme"] = normalize_mode(config.get("theme"))
-                    self._decrypt_api_key(config)
-
-                    apply_runtime_performance_config(config.get("performance"))
-                    _set_app_language(config.get("language", "zh"))
-                    return config
-            else:
-                print("No config file found, starting with default config")
-                apply_runtime_performance_config(default_config.get("performance"))
-                return default_config
-        except Exception as e:
-            print(f"Failed to load config: {e}")
-            if isinstance(e, ValueError):
-                self.recovered_backup = _preserve_unreadable_file(self.path)
-            self.write_blocked = os.path.exists(self.path) and not self.recovered_backup
-            self.last_error = str(e)
+        config = self.read(None)
+        if config is None:
             apply_runtime_performance_config(default_config.get("performance"))
             return default_config
+        self._merge_defaults(config, default_config)
+        config.pop("auto_check_updates", None)
+        config.pop("resource_snapshot_logging", None)
+        config.pop("resource_snapshot_interval_ms", None)
+        config["theme"] = normalize_mode(config.get("theme"))
+        self._decrypt_api_key(config)
+        apply_runtime_performance_config(config.get("performance"))
+        _set_app_language(config.get("language", "zh"))
+        return config
 
     def save(self, config):
         """实际写入config.json（原子写入：先写临时文件再重命名；内容无变化时跳过写盘）"""
-        config_path = self.path
-        tmp_path = config_path + ".tmp"
+        if not isinstance(config, dict):
+            return self.report_error('Invalid JSON data structure')
         if self.write_blocked:
-            return False
+            return self.report_error(self.last_error)
         try:
-            new_content = json.dumps(self._disk_view(config), ensure_ascii=False, indent=2)
-            last_written = getattr(self, 'last_written', None)
-            if last_written is None and os.path.isfile(config_path):
-                # 仅首次落盘读取磁盘内容做比较，之后与内存中的上次写入内容比较
-                try:
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        last_written = f.read()
-                except Exception:
-                    last_written = None
-            if last_written == new_content:
-                self.last_written = new_content
-                return True
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, config_path)
-            self.last_written = new_content
-            self.last_error = ''
-            return True
-        except Exception as e:
-            print(f"Failed to save config: {e}")
-            self.last_error = str(e)
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-            return False
+            return super().save(self._disk_view(config))
+        except (TypeError, ValueError) as error:
+            return self.report_error(error)
 
 
 class SessionController:

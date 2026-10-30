@@ -11,6 +11,7 @@ from .paths import get_app_base_dir, get_app_config_path, get_app_data_path, tra
 from .i18n import tr
 from .constants import MAX_CHAT_HISTORY_MESSAGES, MAX_CHAT_MESSAGE_CHARS, MAX_CONTEXT_TOTAL_CHARS
 from .debuglog import debug_print
+from .json_store import JsonFileStore
 from .system import create_http_session, launch_detached, _retain_thread_until_finished
 from .widgets import show_toast
 from .fileops import _atomic_reviewed_write, _confirm_file_preview
@@ -348,35 +349,26 @@ class ChatPanel(QWidget):
             "version": 1,
             "workflows": templates,
         }
-        try:
-            with open(self.workflow_file, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            debug_print(f"[AI] Failed to write ai_workflows.json: {e}")
+        if not self._workflow_store.save(payload):
+            show_toast(self.main_window, tr("数据保存失败"), self._workflow_store.last_error, level="warning")
 
     def _load_workflow_templates(self):
         defaults = self._default_workflow_templates()
-        try:
-            if not os.path.exists(self.workflow_file):
+        store = self._workflow_store = JsonFileStore(self.workflow_file, dict)
+        data = store.read(None, validate=lambda value: isinstance(value.get('workflows'), dict))
+        if data is None:
+            if store.last_error:
+                detail = (tr("原文件已另存为 {}").format(os.path.basename(store.recovered_backup))
+                          if store.recovered_backup else store.last_error)
+                show_toast(self.main_window, tr("数据文件无法读取"), detail, level="warning")
+            else:
                 self._write_default_workflow_file(defaults)
-                return defaults
-
-            with open(self.workflow_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            workflows = data.get('workflows') if isinstance(data, dict) else None
-            if not isinstance(workflows, dict):
-                self._write_default_workflow_file(defaults)
-                return defaults
-
-            merged = dict(defaults)
-            for key, value in workflows.items():
-                if isinstance(key, str) and isinstance(value, str) and value.strip():
-                    merged[key] = value
-            return merged
-        except Exception as e:
-            debug_print(f"[AI] Failed to load ai_workflows.json, using defaults: {e}")
             return defaults
+        merged = dict(defaults)
+        for key, value in data['workflows'].items():
+            if isinstance(key, str) and isinstance(value, str) and value.strip():
+                merged[key] = value
+        return merged
 
     def _build_quick_workflow_prompt(self, workflow_key: str) -> str:
         target_dir = self._get_action_base_dir()
@@ -1249,49 +1241,41 @@ class ChatPanel(QWidget):
     # ── 聊天记录持久化 ──────────────────────────────────────────────────────────
     def _save_history(self):
         """保存聊天记录到 JSON 文件（原子替换）；失败时每次运行只提示一次。"""
-        import json
-        tmp_path = self.history_file + '.tmp'
-        try:
-            before_len = len(self.messages)
-            self._trim_chat_history()
-            if len(self.messages) != before_len:
-                self._rebuild_chat_display()
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(self.messages, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self.history_file)
+        store = getattr(self, '_history_store', None)
+        if store is None:
+            store = self._history_store = JsonFileStore(self.history_file, list)
+            store.read([])
+        before_len = len(self.messages)
+        self._trim_chat_history()
+        if len(self.messages) != before_len:
+            self._rebuild_chat_display()
+        if store.save(self.messages):
             self._history_save_warned = False
-        except Exception as e:
-            debug_print(f"[Chat] save history failed: {e}")
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            if not getattr(self, '_history_save_warned', False):
-                self._history_save_warned = True
-                show_toast(self.main_window, tr("聊天记录保存失败"), str(e), level="warning")
+            return True
+        if not getattr(self, '_history_save_warned', False):
+            self._history_save_warned = True
+            show_toast(self.main_window, tr("聊天记录保存失败"), store.last_error, level="warning")
+        return False
 
     def _load_history(self):
         """从 JSON 文件加载聊天记录；文件损坏时改名保留，避免被随后的保存覆盖。"""
-        import json
-        if os.path.exists(self.history_file):
-            try:
-                with open(self.history_file, 'r', encoding='utf-8') as f:
-                    loaded_messages = json.load(f)
-                self.messages = loaded_messages if isinstance(loaded_messages, list) else []
-                self._trim_chat_history()
-                # 重新显示所有消息
-                self._is_loading_history = True
-                self._rebuild_chat_display()
-                self._is_loading_history = False
-                self._save_history()
-            except Exception as e:
-                self._is_loading_history = False
-                self.messages = []
-                debug_print(f"[Chat] load history failed: {e}")
-                from .bookmarks import _preserve_unreadable_file
-                backup = _preserve_unreadable_file(self.history_file) if isinstance(e, ValueError) else ''
-                detail = tr("原文件已另存为 {}").format(os.path.basename(backup)) if backup else str(e)
+        store = self._history_store = JsonFileStore(self.history_file, list)
+        loaded = store.read(None)
+        if loaded is None:
+            self.messages = []
+            if store.last_error:
+                detail = (tr("原文件已另存为 {}").format(os.path.basename(store.recovered_backup))
+                          if store.recovered_backup else store.last_error)
                 show_toast(self.main_window, tr("聊天记录无法读取"), detail, level="warning")
+            return
+        self.messages = loaded
+        self._trim_chat_history()
+        self._is_loading_history = True
+        try:
+            self._rebuild_chat_display()
+        finally:
+            self._is_loading_history = False
+        self._save_history()
 
     def _delete_history(self):
         """删除保存的聊天记录文件。"""

@@ -690,7 +690,7 @@ class ConfigStoreTests(unittest.TestCase):
             path = Path(directory) / 'config.json'
             path.write_text('{broken', encoding='utf-8')
             store = ConfigStore(path)
-            with patch('tabexplorer.persistence._preserve_unreadable_file', return_value=None):
+            with patch('tabexplorer.json_store._preserve_unreadable_file', return_value=None):
                 config = store.load()
             self.assertFalse(store.save(config))
             self.assertEqual(path.read_text(encoding='utf-8'), '{broken')

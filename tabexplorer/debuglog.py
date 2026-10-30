@@ -8,7 +8,7 @@ import threading
 import time
 
 from .paths import get_app_data_path, get_app_log_path
-from .constants import APP_VERSION
+from .constants import APP_VERSION, DEBUG_LOG_BACKUP_COUNT, DEBUG_LOG_MAX_BYTES
 
 
 # 全局调试开关
@@ -17,6 +17,7 @@ _EXPLORER_MONITOR_DEBUG = False  # Explorer Monitor 单独的日志开关
 _DEBUG_LOG_PATH = get_app_log_path("TabEx_debug_latest.log")
 _DEBUG_LOG_LOCK = threading.Lock()
 _DEBUG_LOG_READY = False
+_DEBUG_LOG_ERROR = ''
 _diagnostics = None
 
 
@@ -66,30 +67,61 @@ def _diagnostic_event(kind, details):
 
 def _init_debug_log_file():
     """初始化调试日志文件（覆盖旧内容，仅保留本次运行日志）。"""
-    global _DEBUG_LOG_READY
+    global _DEBUG_LOG_READY, _DEBUG_LOG_ERROR
     try:
         with _DEBUG_LOG_LOCK:
             os.makedirs(os.path.dirname(_DEBUG_LOG_PATH), exist_ok=True)
-            with open(_DEBUG_LOG_PATH, "w", encoding="utf-8", errors="replace") as f:
-                f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + "[DebugLog] session started\n")
+            with open(_DEBUG_LOG_PATH, "wb") as f:
+                f.write((time.strftime("[%Y-%m-%d %H:%M:%S] ") + "[DebugLog] session started\n").encode('utf-8'))
         _DEBUG_LOG_READY = True
+        _DEBUG_LOG_ERROR = ''
     except OSError as error:
         _DEBUG_LOG_READY = False
-        print(f"[DebugLog] Cannot initialize log file {_DEBUG_LOG_PATH}: {error}", file=sys.stderr)
+        _report_debug_log_error(f"Cannot initialize log file {_DEBUG_LOG_PATH}: {error}")
+
+
+def _report_debug_log_error(error):
+    global _DEBUG_LOG_ERROR
+    if not _DEBUG_LOG_ERROR:
+        print(f"[DebugLog] Write failed: {error}", file=sys.stderr)
+        _diagnostic_event('debug_log_write_failed', str(error))
+    _DEBUG_LOG_ERROR = str(error)
+
+
+def _rotate_debug_log():
+    for index in range(DEBUG_LOG_BACKUP_COUNT - 1, 0, -1):
+        source = f'{_DEBUG_LOG_PATH}.{index}'
+        if os.path.exists(source):
+            os.replace(source, f'{_DEBUG_LOG_PATH}.{index + 1}')
+    if os.path.exists(_DEBUG_LOG_PATH):
+        os.replace(_DEBUG_LOG_PATH, f'{_DEBUG_LOG_PATH}.1')
 
 
 def _append_debug_log_line(message):
     """将一行调试信息追加到日志文件。"""
+    global _DEBUG_LOG_ERROR
     if not _DEBUG_LOG_READY:
-        return
+        return False
     try:
         ts = time.strftime("[%Y-%m-%d %H:%M:%S]")
-        line = f"{ts} {message}\n"
+        line = f"{ts} {message}\n".encode('utf-8', errors='replace')
+        if len(line) > DEBUG_LOG_MAX_BYTES:
+            marker = b'\n[DebugLog] oversized entry truncated\n'
+            line = line[:DEBUG_LOG_MAX_BYTES - len(marker)].decode('utf-8', errors='ignore').encode('utf-8') + marker
         with _DEBUG_LOG_LOCK:
-            with open(_DEBUG_LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+            try:
+                size = os.path.getsize(_DEBUG_LOG_PATH)
+            except FileNotFoundError:
+                size = 0
+            if size + len(line) > DEBUG_LOG_MAX_BYTES:
+                _rotate_debug_log()
+            with open(_DEBUG_LOG_PATH, "ab") as f:
                 f.write(line)
-    except Exception:
-        pass
+        _DEBUG_LOG_ERROR = ''
+        return True
+    except OSError as error:
+        _report_debug_log_error(error)
+        return False
 
 
 def debug_print(*args, **kwargs):

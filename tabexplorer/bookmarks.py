@@ -13,6 +13,7 @@ from . import theme as _theme
 from .paths import get_app_config_path, translate_common_path
 from .i18n import tr
 from .debuglog import debug_print
+from .json_store import JsonFileStore, _preserve_unreadable_file
 from .widgets import show_toast
 
 
@@ -173,17 +174,6 @@ def _builtin_key(node, specs):
     return None
 
 
-def _preserve_unreadable_file(path):
-    """把无法解析的数据文件改名保留，避免随后写入默认内容时覆盖用户数据；返回备份路径。"""
-    backup = f"{path}.broken-{time.strftime('%Y%m%d-%H%M%S')}"
-    try:
-        os.replace(path, backup)
-        return backup
-    except OSError as e:
-        debug_print(f"[Data] 无法保留损坏文件 {path}: {e}")
-        return ''
-
-
 def _bookmark_ids(nodes):
     ids, stack = set(), list(nodes)
     while stack:
@@ -210,53 +200,31 @@ def _assign_new_bookmark_ids(nodes, used_ids):
         stack.extend(node.get('children') or [])
 
 
-class BookmarkManager:
+class BookmarkManager(JsonFileStore):
     def __init__(self, config_file="bookmarks.json"):
         if os.path.isabs(config_file):
             self.config_file = config_file
         else:
             self.config_file = get_app_config_path(config_file)
+        super().__init__(self.config_file, dict)
         self.bookmark_tree = self.load_bookmarks()
         # 优化：延迟保存机制，避免频繁写入磁盘
         self._save_timer = None
         self._pending_save = False
 
     def load_bookmarks(self):
-        self.recovered_backup = ''
-        if not os.path.exists(self.config_file):
-            debug_print("No bookmark file found, starting with empty bookmarks")
-            return {}
-        try:
-            with open(self.config_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if isinstance(data, dict) and 'roots' in data:
-                data = data['roots']
-            if not isinstance(data, dict):
-                raise ValueError("bookmark root is not an object")
-            return data
-        except ValueError as e:
-            debug_print(f"Failed to load bookmarks: {e}")
-            self.recovered_backup = _preserve_unreadable_file(self.config_file)
-            return {}
-        except OSError as e:
-            debug_print(f"Failed to load bookmarks: {e}")
-            return {}
+        data = self.read({}, validate=lambda value: isinstance(value.get('roots', value), dict))
+        return data.get('roots', data)
 
     def save_bookmarks(self, immediate=False):
         # 优化：延迟保存，避免频繁操作时多次写入
+        if self.write_blocked:
+            return self.report_error(self.last_error)
         if immediate:
-            tmp_path = self.config_file + ".tmp"
-            try:
-                with open(tmp_path, 'w', encoding='utf-8') as f:
-                    json.dump({"roots": self.bookmark_tree}, f, ensure_ascii=False, indent=2)
-                os.replace(tmp_path, self.config_file)  # 原子替换，防止断电损坏
+            if super().save({"roots": self.bookmark_tree}):
                 self._pending_save = False
-            except Exception as e:
-                debug_print(f"Failed to save bookmarks: {e}")
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+                return True
+            return False
         else:
             self._pending_save = True
             if self._save_timer is None:
@@ -265,6 +233,7 @@ class BookmarkManager:
                 self._save_timer.setSingleShot(True)
                 self._save_timer.timeout.connect(lambda: self.save_bookmarks(immediate=True))
             self._save_timer.start(500)
+            return True
 
     def get_all_bookmarks(self):
         # 返回所有书签（递归）

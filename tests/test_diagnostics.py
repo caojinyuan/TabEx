@@ -507,6 +507,7 @@ class LogDirectoryTests(unittest.TestCase):
         self.stack.enter_context(patch.object(debuglog, '_diagnostics', None))
         self.stack.enter_context(patch.object(debuglog, '_DEBUG_LOG_PATH', str(self.root / 'logs' / 'TabEx_debug_latest.log')))
         self.stack.enter_context(patch.object(debuglog, '_DEBUG_LOG_READY', False))
+        self.stack.enter_context(patch.object(debuglog, '_DEBUG_LOG_ERROR', ''))
         self.addCleanup(self.close_diagnostics)
 
     def close_diagnostics(self):
