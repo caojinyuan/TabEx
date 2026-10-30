@@ -40,6 +40,7 @@ def validate(command, report, seconds=10, tabs=10, scenario='smoke', cycles=3, w
         (data / 'navigation' / 'nested').mkdir(parents=True)
         (data / 'fixture').mkdir()
         (data / 'fixture' / 'sample.bin').write_bytes(b'sample payload\n' * 65536)
+        (data / 'fixture' / 'match.txt').write_text('first line\nsample match\n', encoding='utf-8')
         (data / 'destination').mkdir()
         (data / '.tabex-validation').write_text('isolated', encoding='ascii')
         (data / 'config.json').write_text(json.dumps({

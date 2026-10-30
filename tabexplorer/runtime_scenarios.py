@@ -89,6 +89,30 @@ def lifecycle_steps(check):
                 raise AssertionError('Closed search dialog is still tracked')
 
         panel = w.get_file_task_panel()
+        from .search import _search_cache
+        _search_cache.clear()
+        w.show_search_dialog()
+        dialog = w.search_dialogs[-1]
+        dialog.path_input.setText(str(root / 'fixture'))
+        dialog.use_everything_cb.setChecked(False)
+        dialog.search_filename_cb.setChecked(False)
+        dialog.search_content_cb.setChecked(True)
+        dialog.file_type_input.setText('txt')
+        dialog.search_input.setEditText('sample')
+        dialog.start_search()
+        thread = dialog.search_thread
+        yield 'streamed content preview ready', lambda: (
+            not thread.is_alive() and dialog.current_result_count == 1
+            and dialog.open_match_button.isEnabled())
+        if (dialog.result_model.result_for_row(0).get('line') != 2
+                or 'sample match' not in dialog.match_preview.toPlainText()):
+            raise AssertionError('Content match line/preview is incorrect')
+        dialog.close()
+        w._rebuild_external_tools_menu()
+        actions = w.external_tools_menu.actions()
+        if not actions[0].isEnabled() or actions[3].isEnabled():
+            raise AssertionError('External tool context availability is incorrect')
+
         source, missing = root / 'fixture' / 'sample.bin', root / 'fixture' / 'missing.bin'
         destination = root / 'destination'
         panel.max_running_tasks = 0

@@ -360,6 +360,16 @@ class SettingsDialog(QDialog):
             w = shortcuts_layout.itemAt(i).widget()
             if w: compact_widget(w)
         tools_page_layout.addWidget(shortcuts_group)
+        from .context_tools import configured_tools
+        try:
+            self.external_tools = configured_tools(config)
+            self._external_tools_error = ''
+        except ValueError as error:
+            self.external_tools = None
+            self._external_tools_error = str(error)
+        external_tools_button = QPushButton(tr("配置外部工具..."), self)
+        external_tools_button.clicked.connect(self.edit_external_tools)
+        tools_page_layout.addWidget(external_tools_button)
 
         # 快捷键设置组
         hotkey_group = self._create_hotkey_group(config, compact_widget)
@@ -885,6 +895,17 @@ class SettingsDialog(QDialog):
         if owner is not None and hasattr(owner, 'check_for_updates'):
             owner.check_for_updates(manual=True)
 
+    def edit_external_tools(self):
+        from .context_tools import ContextToolsDialog
+        if self.external_tools is None:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, tr("外部工具"), self._external_tools_error)
+            return
+        dialog = ContextToolsDialog(self.external_tools, self)
+        if dialog.exec_():
+            self.external_tools = dialog.tools
+        dialog.deleteLater()
+
     def accept(self):
         """保存设置"""
         hotkey_bindings, hotkey_errors = self._collect_hotkey_bindings()
@@ -914,6 +935,8 @@ class SettingsDialog(QDialog):
             self.parent().config["enable_tortoisegit_buttons"] = self.tortoisegit_buttons_cb.isChecked()
             self.parent().config["preferred_terminal_tool"] = normalize_terminal_tool_name(self.preferred_terminal_combo.currentData())
             self.parent().config["quicklook_enabled"] = self.quicklook_cb.isChecked()
+            if self.external_tools is not None:
+                self.parent().config["external_tools"] = self.external_tools
             # 保存路径栏分隔符设置
             self.parent().config["breadcrumb_copy_separator"] = self.path_separator_combo.currentData()
             

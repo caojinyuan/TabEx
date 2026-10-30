@@ -1555,6 +1555,7 @@ class MainWindow(QMainWindow):
     def show_command_palette(self):
         from .commands import CommandPalette, menu_commands
         self._refresh_context_actions()
+        self._rebuild_external_tools_menu()
         dialog = CommandPalette(self)
         commands = [(label, action) for label, action in menu_commands(self.workspace_tools_menu)
                     if action is not self.command_palette_action]
@@ -3869,6 +3870,9 @@ class MainWindow(QMainWindow):
         workspace.addAction(tr('保存命名工作区...'), self.save_named_workspace)
         workspace.addAction(tr('打开命名工作区...'), self.open_named_workspace)
         workspace.addAction(tr('删除命名工作区...'), self.delete_named_workspace)
+        self.external_tools_menu = menu.addMenu(tr('外部工具'))
+        self.external_tools_menu.addAction(tr("配置外部工具..."), self.configure_external_tools)
+        self.external_tools_menu.aboutToShow.connect(self._rebuild_external_tools_menu)
         menu.addSection(tr('截图'))
         self.screenshot_action = menu.addAction(tr('屏幕截图'), lambda: self.start_screenshot(250))
         menu.addSection(tr('危险操作'))
@@ -3877,6 +3881,40 @@ class MainWindow(QMainWindow):
         menu.addSection(tr('诊断'))
         self.export_diagnostics_action = menu.addAction(tr('导出崩溃诊断包...'), self.export_diagnostics)
         menu.addAction(tr('检查更新...'), lambda: self.check_for_updates(manual=True))
+
+    def _external_tool_context(self):
+        from .context_tools import ToolContext
+        pane = self.get_active_pane()
+        left = self.get_current_tab_widget()
+        right = self._get_split_pane() if getattr(self, '_split_active', False) else None
+        selected = pane._get_selected_paths() if hasattr(pane, '_get_selected_paths') else []
+        return ToolContext(cwd=getattr(pane, 'current_path', ''), selected=tuple(selected),
+                           left=getattr(left, 'current_path', ''), right=getattr(right, 'current_path', ''))
+
+    def _rebuild_external_tools_menu(self):
+        from .context_tools import configured_tools, populate_tools_menu
+        try:
+            populate_tools_menu(self.external_tools_menu, configured_tools(self.config),
+                                self._external_tool_context(), self)
+        except ValueError as error:
+            self.external_tools_menu.clear()
+            action = self.external_tools_menu.addAction(str(error))
+            action.setEnabled(False)
+        self.external_tools_menu.addSeparator()
+        self.external_tools_menu.addAction(tr("配置外部工具..."), self.configure_external_tools)
+
+    def configure_external_tools(self):
+        from .context_tools import configured_tools, ContextToolsDialog
+        try:
+            tools = configured_tools(self.config)
+        except ValueError as error:
+            show_toast(self, tr("外部工具"), str(error), level='error')
+            return
+        dialog = ContextToolsDialog(tools, self)
+        if dialog.exec_():
+            self.config['external_tools'] = dialog.tools
+            self.save_config(immediate=True)
+        dialog.deleteLater()
 
     def _update_task_indicator(self):
         from PyQt5.QtWidgets import QStyle

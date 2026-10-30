@@ -91,24 +91,25 @@ def _compute_dir_snapshot(path, ignore_check=None):
 
 
 class _DirSnapshotSignals(QObject):
-    """后台目录快照计算完成信号：done(path, snapshot_or_None)。"""
-    done = pyqtSignal(str, object)
+    """后台目录快照计算完成信号，包含导航版本。"""
+    done = pyqtSignal(str, object, int)
 
 
 class _DirSnapshotRunnable(QRunnable):
     """在 QThreadPool 后台线程计算目录快照，完成后经信号回到 UI 线程比较。
 
     用于 FileExplorerTab 的 8 秒兜底轮询，避免在 UI 线程逐项 stat 造成周期性卡顿。"""
-    def __init__(self, path, ignore_check, signals):
+    def __init__(self, path, ignore_check, signals, generation=0):
         super().__init__()
         self._path = path
         self._ignore_check = ignore_check
         self._signals = signals
+        self._generation = generation
 
     def run(self):
         snap = _compute_dir_snapshot(self._path, self._ignore_check)
         try:
-            self._signals.done.emit(self._path, snap)
+            self._signals.done.emit(self._path, snap, self._generation)
         except RuntimeError:
             # 信号对象已随标签销毁：忽略
             pass
@@ -130,6 +131,8 @@ class FileExplorerTab(QWidget):
         self._current_path = value
         if old is None or old == value:
             return
+        self._snapshot_generation = getattr(self, '_snapshot_generation', 0) + 1
+        self._last_dir_snapshot = None
         hook = getattr(getattr(self, 'main_window', None), 'on_tab_path_changed', None)
         if callable(hook):
             try:
@@ -2991,6 +2994,8 @@ class FileExplorerTab(QWidget):
         # 后台目录快照（兜底轮询）：懒创建的信号对象 + in-flight 去重标志
         self._snapshot_signals = None
         self._snapshot_inflight = False
+        self._snapshot_generation = 0
+        self._snapshot_pending = False
         self._refresh_active = False
         self._refresh_pending = False
         self._refresh_pending_reason = None
@@ -3474,7 +3479,6 @@ class FileExplorerTab(QWidget):
                 else:
                     debug_print(f"[FileWatcher] Failed to watch: {path}")
                 self._refresh_file_watch_paths(path)
-                self._last_dir_snapshot = self._build_dir_snapshot(path)
                 debug_print(f"[FileWatcher] Now watching: {self.file_watcher.directories()}")
         elif path_is_slow:
             # 慢盘不注册 watcher，清空上次快照，避免下次轮询用旧快照误判
@@ -3768,30 +3772,46 @@ class FileExplorerTab(QWidget):
         # 上一次计算尚未返回时跳过本次，防止慢目录任务堆积。
         if getattr(self, '_snapshot_inflight', False):
             return
+        self._request_dir_snapshot(path)
+
+    def _request_dir_snapshot(self, path):
+        if getattr(self, '_is_cleaning_up', False):
+            return
+        if getattr(self, '_snapshot_inflight', False):
+            self._snapshot_pending = True
+            return
         try:
             if not hasattr(self, '_snapshot_signals') or self._snapshot_signals is None:
                 self._snapshot_signals = _DirSnapshotSignals(self)
                 self._snapshot_signals.done.connect(self._on_dir_snapshot_ready)
             self._snapshot_inflight = True
-            runnable = _DirSnapshotRunnable(path, self._should_ignore_internal_dir_entry, self._snapshot_signals)
+            runnable = _DirSnapshotRunnable(
+                path, self._should_ignore_internal_dir_entry, self._snapshot_signals,
+                getattr(self, '_snapshot_generation', 0))
             QThreadPool.globalInstance().start(runnable)
         except Exception as e:
             self._snapshot_inflight = False
             debug_print(f"[DirPoll] Failed to start snapshot worker: {e}")
 
-    def _on_dir_snapshot_ready(self, snap_path, current_snapshot):
+    def _on_dir_snapshot_ready(self, snap_path, current_snapshot, generation=0):
         """后台快照计算完成（回到 UI 线程）：与上次快照比较，变化则调度刷新。"""
         self._snapshot_inflight = False
         if getattr(self, '_is_cleaning_up', False):
             return
-        # 计算期间已切换目录：丢弃过期结果
-        if snap_path != getattr(self, 'current_path', None):
+        pending = getattr(self, '_snapshot_pending', False)
+        self._snapshot_pending = False
+        # A -> B -> A 也必须丢弃第一次 A 的结果，且每个标签至多有一个扫描任务。
+        if (snap_path != getattr(self, 'current_path', None)
+                or generation != getattr(self, '_snapshot_generation', 0)):
+            path = getattr(self, 'current_path', '')
+            if pending and path and not path.startswith(('shell:', '::')) and not self._is_slow_path(path):
+                self._request_dir_snapshot(path)
             return
         if current_snapshot is None:
+            debug_print(f"[DirPoll] Snapshot unavailable: {snap_path}")
             return
         if self._last_dir_snapshot is None:
             self._last_dir_snapshot = current_snapshot
-            self._request_refresh(reason="snapshot_ready")
             return
         if current_snapshot != self._last_dir_snapshot:
             debug_print(f"[DirPoll] Detected snapshot change for {snap_path}, scheduling refresh")
@@ -3802,26 +3822,20 @@ class FileExplorerTab(QWidget):
         """根据当前路径启动或停止兜底轮询"""
         if not hasattr(self, 'dir_poll_timer'):
             return
+        self._snapshot_generation = getattr(self, '_snapshot_generation', 0) + 1
+        self._last_dir_snapshot = None
+        self._snapshot_pending = False
+        self.dir_mtime = None
         # OneDrive/网络路径不做轮询，避免os.scandir()阻塞UI线程
-        if path and self._is_slow_path(path):
+        if not path or path.startswith(('shell:', '::')) or self._is_slow_path(path):
             if self.dir_poll_timer.isActive():
                 self.dir_poll_timer.stop()
                 debug_print(f"[DirPoll] Stopped polling for slow path: {path}")
             return
-        if path and os.path.isdir(path):
-            # 立即更新快照，避免刚导航时误判为变化
-            self.dir_mtime = self._get_dir_mtime(path)
-            self._last_dir_snapshot = self._build_dir_snapshot(path)
-            debug_print(f"[DirPoll] Updated mtime for {path}: {self.dir_mtime}")
-            if getattr(self, '_refresh_active', False) and not self.dir_poll_timer.isActive():
-                self.dir_poll_timer.start()
-                debug_print(f"[DirPoll] Started polling {path}")
-        else:
-            if self.dir_poll_timer.isActive():
-                self.dir_poll_timer.stop()
-                debug_print(f"[DirPoll] Stopped polling")
-            self.dir_mtime = None
-            self._last_dir_snapshot = None
+        self._request_dir_snapshot(path)
+        if getattr(self, '_refresh_active', False) and not self.dir_poll_timer.isActive():
+            self.dir_poll_timer.start()
+            debug_print(f"[DirPoll] Started polling {path}")
 
     def _get_dir_mtime(self, path):
         """安全获取目录修改时间"""

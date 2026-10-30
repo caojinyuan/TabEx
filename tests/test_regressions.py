@@ -1734,6 +1734,8 @@ class InterfaceTests(unittest.TestCase):
                             'insert_tab_group_marker', 'toggle_split_view', 'show_bookmark_manager_dialog',
                             'show_settings_menu', 'toggle_chat_panel', 'show_frequent_dirs', 'toggle_sync_browse'):
                         setattr(host, name, Mock())
+                    host.configure_external_tools = Mock()
+                    host._rebuild_external_tools_menu = Mock()
                     layout = QVBoxLayout(host)
                     host.create_custom_titlebar(layout)
                     host.resize(int(1000 * scale), int(80 * scale))
@@ -1803,7 +1805,8 @@ class InterfaceTests(unittest.TestCase):
         callbacks = {name: Mock() for name in (
             'show_file_tasks', 'show_directory_compare', 'preview_batch_rename', 'save_named_workspace',
             'open_named_workspace', 'delete_named_workspace', 'permanently_delete_selected', 'export_diagnostics',
-            'check_for_updates', 'start_screenshot', 'show_frequent_dirs', 'toggle_sync_browse')}
+            'check_for_updates', 'start_screenshot', 'show_frequent_dirs', 'toggle_sync_browse',
+            'configure_external_tools', '_rebuild_external_tools_menu')}
         owner = types.SimpleNamespace(style=self.app.style, config={}, **callbacks)
         menu = QMenu()
         self.addCleanup(menu.deleteLater)
@@ -1820,6 +1823,8 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(len(workspaces.actions()), 3)
         workspaces.actions()[1].trigger()
         callbacks['open_named_workspace'].assert_called_once()
+        owner.external_tools_menu.actions()[0].trigger()
+        callbacks['configure_external_tools'].assert_called_once()
         owner.export_diagnostics_action.trigger()
         callbacks['export_diagnostics'].assert_called_once()
         next(action for action in menu.actions() if action.text() == '检查更新...').trigger()
