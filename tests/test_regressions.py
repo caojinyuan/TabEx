@@ -1744,9 +1744,25 @@ class InterfaceTests(unittest.TestCase):
                     panel = None
                     try:
                         self.app.processEvents()
+                        host._refresh_titlebar_layout_now = Mock()
+                        for enabled in (False, True, False):
+                            host.config['enable_tortoisegit_buttons'] = enabled
+                            module.MainWindow.apply_tortoisegit_buttons_config(host)
+                            self.assertTrue(host.git_bash_button.isVisible())
+                            self.assertEqual(host.git_log_button.isVisible(), enabled)
+                            self.assertEqual(host.git_commit_button.isVisible(), enabled)
+                        host.config['enable_tortoisegit_buttons'] = True
+                        module.MainWindow.apply_tortoisegit_buttons_config(host)
+                        self.app.processEvents()
+                        host.git_bash_button.click()
+                        host.open_git_bash_current_tab.assert_called_once_with(False)
+                        host._get_current_tab_launch_dir = Mock(return_value=str(screenshot_dir))
+                        with patch_all('launch_shell_tool') as launch:
+                            module.MainWindow.open_git_bash_current_tab(host)
+                        launch.assert_called_once_with('git-bash', str(screenshot_dir))
                         buttons = [getattr(host, name) for name in (
-                            'git_log_button', 'git_commit_button', 'git_bash_button', 'cmd_button',
-                            'powershell_button', 'calculator_button', 'back_button', 'forward_button',
+                            'git_log_button', 'git_commit_button', 'cmd_button',
+                            'powershell_button', 'git_bash_button', 'calculator_button', 'back_button', 'forward_button',
                             'add_tab_button', 'reopen_tab_button', 'tab_list_button', 'search_button',
                             'workspace_tools_button', 'file_tasks_button', 'insert_group_btn', 'split_view_btn',
                             'bookmark_button', 'settings_button', 'ai_chat_btn')]

@@ -19,6 +19,23 @@ from tabexplorer.i18n import _set_app_language
 from tabexplorer.workers import QuickFindWorker
 
 
+class GitBashLaunchTests(unittest.TestCase):
+    def test_launch_uses_current_directory_with_spaces_and_unicode(self):
+        from tabexplorer.system import launch_shell_tool
+        with tempfile.TemporaryDirectory(prefix='TabEx Git Bash ') as temporary:
+            current_dir = Path(temporary) / '\u5f53\u524d\u76ee\u5f55 with spaces'
+            current_dir.mkdir()
+            git_root = Path(temporary) / 'Git'
+            git_root.mkdir()
+            executable = git_root / 'git-bash.exe'
+            executable.touch()
+            with patch('tabexplorer.system.find_git_install_root', return_value=str(git_root)), \
+                    patch('tabexplorer.system.launch_detached_async') as launch:
+                launch_shell_tool('git-bash', str(current_dir))
+            launch.assert_called_once_with(
+                [str(executable), f'--cd={current_dir}'], cwd=str(current_dir))
+
+
 class StartupTests(unittest.TestCase):
     def test_legacy_console_encoding_cannot_fail_on_status_symbols(self):
         """GBK 标准流在启动时配置为 UTF-8，状态符号不会产生未捕获异常。"""

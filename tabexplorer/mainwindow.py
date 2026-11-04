@@ -1685,8 +1685,6 @@ class MainWindow(QMainWindow):
             self.git_log_button.setVisible(enable)
         if hasattr(self, 'git_commit_button'):
             self.git_commit_button.setVisible(enable)
-        if hasattr(self, 'git_bash_button'):
-            self.git_bash_button.setVisible(enable)
         if hasattr(self, 'git_tools_separator'):
             self.git_tools_separator.setVisible(enable)
         # 快捷方式区与右侧工具组之间始终保留视觉间隔（与 Git 显示状态解耦）。
@@ -2504,14 +2502,6 @@ class MainWindow(QMainWindow):
                 }}
             """
 
-        # Git Bash 按钮
-        self.git_bash_button = QPushButton("GB")
-        self.git_bash_button.setToolTip(tr("在当前标签页路径打开 Git Bash"))
-        self.git_bash_button.setFixedSize(btn_size, btn_size)
-        self.git_bash_button.setStyleSheet(_tool_btn_style("#e44d26"))
-        self.git_bash_button.clicked.connect(self.open_git_bash_current_tab)
-        titlebar_layout.addWidget(self.git_bash_button)
-
         # Git 与终端/工具按钮组之间的分隔线
         self.git_tools_separator = QFrame()
         self.git_tools_separator.setFrameShape(QFrame.VLine)
@@ -2535,6 +2525,13 @@ class MainWindow(QMainWindow):
         self.powershell_button.setStyleSheet(_tool_btn_style("#2979ff"))
         self.powershell_button.clicked.connect(self.open_powershell_current_tab)
         titlebar_layout.addWidget(self.powershell_button)
+
+        self.git_bash_button = QPushButton("GB")
+        self.git_bash_button.setToolTip(tr("在当前标签页路径打开 Git Bash"))
+        self.git_bash_button.setFixedSize(btn_size, btn_size)
+        self.git_bash_button.setStyleSheet(_tool_btn_style("#e44d26"))
+        self.git_bash_button.clicked.connect(self.open_git_bash_current_tab)
+        titlebar_layout.addWidget(self.git_bash_button)
 
         self.calculator_button = QPushButton("CAL")
         self.calculator_button.setToolTip(tr("打开计算器"))
