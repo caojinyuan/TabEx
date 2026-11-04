@@ -2,9 +2,115 @@
 
 面向 **Windows x64** 的多标签页文件浏览器，类似 Clover。保留原生 Windows 文件视图，并提供标签管理、左右分屏、搜索和常用工具。
 
-**当前源码版本：v4.06**。修复长时间运行的内存与句柄累积（菜单、对话框、标签占位页、ctypes 类型缓存），最小化时暂停目录轮询，修正拖动标签时固定标签不再保持在最左侧的问题，详见[更新记录](docs/DESIGN.md#changes)。
+**当前源码版本：v4.07**。新增 11 项真实界面功能动图，覆盖标签、书签、程序启动区、文件夹拖入、截图、分屏与搜索；首页按基础上手、效率工具、进阶功能组织，并提供可重复生成的脚本和维护指南。本次不改变软件功能，详见[更新记录](docs/DESIGN.md#changes)。
 
-[下载发布版](https://github.com/caojinyuan/TabEx/releases/latest) · [快速开始](#quickstart) · [使用说明](#usage) · [快捷键](#shortcuts) · [设计文档](docs/DESIGN.md)
+[下载发布版](https://github.com/caojinyuan/TabEx/releases/latest) · [功能动图](#demos) · [快速开始](#quickstart) · [使用说明](#usage) · [快捷键](#shortcuts) · [设计文档](docs/DESIGN.md)
+
+<a id="demos"></a>
+
+## 功能动图
+
+真实 Windows 界面的演示，覆盖 **11 项功能**，每张约 10–18 秒，配有操作字幕；拖拽演示带鼠标位置高亮，系统导航树已遮挡以保护隐私。完整步骤及后续重录方法见[演示与维护指南](docs/FEATURE_DEMOS.md)。
+
+### 基础上手
+
+**多标签浏览**：`Ctrl+T` 新建标签，在不同标签打开目录，点击标签快速切换。
+
+![多标签浏览演示](docs/demos/tabs.gif)
+
+<details>
+<summary>标签基础操作：新建、拖动排序、固定、关闭与恢复</summary>
+
+拖动标签调整顺序；右键“固定”保留常用目录；`Ctrl+W` 关闭，`Ctrl+Shift+T` 恢复误关标签。
+
+![标签基础操作演示](docs/demos/tab-basics.gif)
+
+</details>
+
+<details>
+<summary>书签管理：添加目录、创建分类、保存后点击打开</summary>
+
+`Ctrl+D` 添加当前目录，可就地新建书签文件夹；从书签栏分类菜单打开已保存的目录。
+
+![书签管理演示](docs/demos/bookmarks.gif)
+
+</details>
+
+<details>
+<summary>标题栏启动区：拖入 EXE 或 LNK、启动程序、排序和移除</summary>
+
+将 `.exe` 或 `.lnk` 拖到标题栏“+ 拖入应用或快捷方式”；左键启动、拖动排序、右键移除，不删除原文件。
+
+![标题栏启动区演示](docs/demos/launcher.gif)
+
+</details>
+
+<details>
+<summary>文件夹拖入标签栏：松开即打开新标签</summary>
+
+将文件夹拖到标签栏（不是顶部的程序启动区），自动在新标签打开；原目录保持不变。
+
+![文件夹拖入标签栏演示](docs/demos/folder-drop.gif)
+
+</details>
+
+### 效率工具
+
+<details>
+<summary>屏幕截图：拖动选区、矩形与箭头标注、撤销、悬浮贴图</summary>
+
+`Ctrl+Alt+Z` 开始截图；选区后添加标注，可撤销并复制、保存或贴图。演示选择贴图，不修改系统剪贴板。
+
+![屏幕截图演示](docs/demos/screenshot.gif)
+
+</details>
+
+<details>
+<summary>文件内容搜索：筛选源码文件，查看匹配行</summary>
+
+`Ctrl+F` 打开搜索，关闭 Everything、勾选文件内容，输入关键词及文件类型；结果可预览匹配内容。
+
+![文件内容搜索演示](docs/demos/content-search.gif)
+
+</details>
+
+<details>
+<summary>功能搜索：输入关键词，不翻菜单也能执行功能</summary>
+
+`Ctrl+Shift+P` 打开功能搜索，输入“分屏”，选择“分屏对比”后回车执行。
+
+![功能搜索演示](docs/demos/command-palette.gif)
+
+</details>
+
+<details>
+<summary>文件收集篮：跨目录收集引用、去重，清空不删除原文件</summary>
+
+从“工具”添加选中项到收集篮，统一整理不同目录的文件；重复路径自动去重。
+
+![文件收集篮演示](docs/demos/file-basket.gif)
+
+</details>
+
+### 进阶功能
+
+<details>
+<summary>标签分组：F4 添加颜色分组，点击色块折叠或展开</summary>
+
+`F4` 将当前标签及左侧连续未分组标签组成一组；折叠只收起标签，不关闭目录。
+
+![标签分组演示](docs/demos/groups.gif)
+
+</details>
+
+<details>
+<summary>左右分屏与同步导航：两侧跟随进入对应子目录</summary>
+
+`F3` 将当前标签移到右侧；开启“同步导航”后，一侧进入 `src`，另一侧跟随进入对应目录。
+
+![左右分屏与同步导航演示](docs/demos/split.gif)
+
+</details>
 
 <a id="features"></a>
 
@@ -182,6 +288,7 @@
 
 ## 进阶与开发文档
 
+- [功能动图、操作步骤与重录维护](docs/FEATURE_DEMOS.md)
 - [高级选项与详细用法](docs/DESIGN.md#usage)
 - [设计与模块职责](docs/DESIGN.md#architecture)
 - [运行环境、配置迁移与调试](docs/DESIGN.md#runtime)
