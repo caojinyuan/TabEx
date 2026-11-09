@@ -6,8 +6,8 @@ import sys
 from PyQt5.QtCore import pyqtSignal, QMimeData, QSize, Qt, QTimer
 from PyQt5.QtGui import QDrag, QMouseEvent
 from PyQt5.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QSizePolicy, QSplitter, QSplitterHandle as _QSplitterHandle,
-    QToolButton, QVBoxLayout, QWidget,
+    QAbstractButton, QApplication, QHBoxLayout, QLabel, QSizePolicy, QSplitter,
+    QSplitterHandle as _QSplitterHandle, QToolButton, QVBoxLayout, QWidget,
 )
 
 from . import theme as _theme
@@ -569,7 +569,7 @@ class ClickableLabel(QLabel):
 
 
 class _ResizableSplitterHandle(_QSplitterHandle):
-    """分割条手柄：作为原生窗口并强制显示左右调整光标，并在中央绘制可见抓取条。
+    """分割条手柄：作为原生窗口并强制显示左右调整光标，平时是一条细线，悬停时加粗为强调色。
 
     内嵌的 IExplorerBrowser 是原生窗口（HWND），夹在两个原生面板之间的普通（alien）
     手柄常常收不到鼠标悬停、光标不会变成调整光标。将手柄本身设为原生窗口可与相邻的
@@ -594,28 +594,88 @@ class _ResizableSplitterHandle(_QSplitterHandle):
         super().leaveEvent(event)
 
     def paintEvent(self, event):
-        from PyQt5.QtGui import QPainter, QColor
+        from PyQt5.QtGui import QPainter
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(_theme.bg("#aab2c0" if self._hovered else "#d2d7e0")))
-        # 中央竖向抓取条（三段短竖线），提升可识别度
-        cx = self.width() // 2
-        cy = self.height() // 2
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(_theme.fg("#6b7686")))
+        p.fillRect(self.rect(), _theme.qcolor('editor-bg'))
+        # VS Code 风格分隔条：平时一条细线，悬停时加粗为强调色
+        width = 4 if self._hovered else 1
+        color = _theme.qcolor('sash-hover' if self._hovered else 'chrome-border')
         if self.orientation() == Qt.Horizontal:
-            for dy in (-12, 0, 12):
-                p.drawRect(cx - 1, cy + dy - 6, 2, 12)
+            p.fillRect((self.width() - width) // 2, 0, width, self.height(), color)
         else:
-            for dx in (-12, 0, 12):
-                p.drawRect(cx + dx - 6, cy - 1, 12, 2)
+            p.fillRect(0, (self.height() - width) // 2, self.width(), width, color)
         p.end()
 
 
 class ResizableSplitter(QSplitter):
-    """使用更宽、带原生窗口、明确光标与可见抓取条的手柄，便于在内嵌原生 Shell 窗口旁拖动调整宽度。"""
+    """使用更宽、带原生窗口、明确光标和悬停高亮的手柄，便于在内嵌原生 Shell 窗口旁拖动调整宽度。"""
 
     def createHandle(self):
         return _ResizableSplitterHandle(self.orientation(), self)
+
+
+class CommandCenter(QAbstractButton):
+    """VS Code 式命令中心：工具栏中部的搜索框样式按钮，显示当前目录名，点击打开快速打开。"""
+
+    def __init__(self, parent=None, scale=1.0):
+        super().__init__(parent)
+        from PyQt5.QtWidgets import QStyle
+        self._scale = scale
+        self._context = ''
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMinimumWidth(int(36 * scale))
+        self.setMaximumWidth(int(560 * scale))
+        self.setFixedHeight(int(24 * scale))
+        _set_tool_icon(self, 'edit-find', QStyle.SP_FileDialogContentsView, max(12, int(14 * scale)))
+        self.setAccessibleName(tr('命令中心'))
+
+    def set_context(self, text):
+        if text != self._context:
+            self._context = text
+            self.update()
+
+    def sizeHint(self):
+        return QSize(int(400 * self._scale), int(24 * self._scale))
+
+    def minimumSizeHint(self):
+        return QSize(int(36 * self._scale), int(24 * self._scale))
+
+    def enterEvent(self, event):
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        from PyQt5.QtCore import QRectF
+        from PyQt5.QtGui import QPainter, QPainterPath, QPen
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = 6.0 * self._scale
+        path = QPainterPath()
+        path.addRoundedRect(rect, radius, radius)
+        hot = self.underMouse() or self.isDown()
+        painter.fillPath(path, _theme.qcolor('cc-hover-bg' if hot else 'cc-bg'))
+        painter.setPen(QPen(_theme.qcolor('cc-border'), 1))
+        painter.drawPath(path)
+        icon_size = self.iconSize().width()
+        gap = int(6 * self._scale)
+        padding = int(10 * self._scale)
+        metrics = self.fontMetrics()
+        room = max(0, self.width() - padding * 2 - icon_size - gap)
+        text = metrics.elidedText(self._context or 'TabEx', Qt.ElideMiddle, room) if room > 0 else ''
+        content = icon_size + (gap + metrics.horizontalAdvance(text) if text else 0)
+        x = max(padding, (self.width() - content) // 2) if text else (self.width() - icon_size) // 2
+        self.icon().paint(painter, int(x), (self.height() - icon_size) // 2, icon_size, icon_size)
+        if text:
+            painter.setPen(_theme.qcolor('cc-fg'))
+            painter.drawText(QRectF(x + icon_size + gap, 0, room, self.height()), Qt.AlignLeft | Qt.AlignVCenter, text)
+        painter.end()
 
 
 def _build_te_icon():

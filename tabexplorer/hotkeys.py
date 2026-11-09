@@ -22,6 +22,8 @@ HOTKEY_COMMANDS = (
     ('prev_tab', 'switch_tab', 'Ctrl+Shift+Tab', '上一个标签'),
     ('search', 'search', 'Ctrl+F', '打开搜索对话框'),
     ('command_palette', 'command_palette', 'Ctrl+Shift+P', '查找功能'),
+    ('quick_open', 'quick_open', 'Ctrl+P', '快速打开（标签、书签、常用目录）'),
+    ('color_theme', 'color_theme', '', '选择颜色主题'),
     ('quick_find_current_dir', 'quick_find_current_dir', 'Ctrl+G', '检索当前目录文件夹/文件名'),
     ('frequent_dirs', 'frequent_dirs', 'Ctrl+J', '常用目录跳转'),
     ('go_back', 'navigate', 'Alt+Left', '后退'),
@@ -79,13 +81,19 @@ def _format_hotkey(ctrl, shift, alt, vk):
 
 
 def _hotkey_bindings(config):
-    """合并用户设置与默认值，返回 {命令: 按键文本}；空字符串表示未绑定。"""
+    """合并用户设置与默认值，返回 {命令: 按键文本}；空字符串表示未绑定。
+
+    未单独设置的命令（如新版本新增的命令），其默认键若已被用户分配给其他命令则让位。"""
     stored = config.get('hotkey_bindings') if isinstance(config, dict) else None
     stored = stored if isinstance(stored, dict) else {}
+    taken = {_parse_hotkey(value) for value in stored.values() if isinstance(value, str) and value} - {None}
     bindings = {}
     for command, _enable_key, default, _label in HOTKEY_COMMANDS:
         value = stored.get(command, default)
-        bindings[command] = value if isinstance(value, str) else default
+        value = value if isinstance(value, str) else default
+        if command not in stored and _parse_hotkey(value) in taken:
+            value = ''
+        bindings[command] = value
     return bindings
 
 

@@ -683,8 +683,9 @@ def _delete_quietly(widget):
 
 
 class _GrayTint(QWidget):
-    """灰色主题用的点击穿透半透明白色层。深色 Explorer 底为 #191919，叠 17% 白后约为 #404040。"""
-    ALPHA = 43
+    """主题色调用的点击穿透半透明层：原生视图底色固定（深色 #191919、浅色白），叠色后接近主题底色。
+
+    例如灰色主题叠 17% 白后约为 #404040。"""
 
     def __init__(self, owner):
         super().__init__(owner, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowTransparentForInput
@@ -692,10 +693,16 @@ class _GrayTint(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._color = QColor(255, 255, 255, 43)
+
+    def set_color(self, color):
+        if color != self._color:
+            self._color = QColor(color)
+            self.update()
 
     def paintEvent(self, _event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(255, 255, 255, self.ALPHA))
+        painter.fillRect(self.rect(), self._color)
 
 
 class IExplorerBrowserWidget(QWidget):
@@ -948,7 +955,6 @@ class IExplorerBrowserWidget(QWidget):
             self._init_ok  = True
             self._has_view = False
             self._created_dark = _theme.is_dark()
-            self._created_gray = _theme.is_gray()
             QTimer.singleShot(0, self.update_gray_tint)
             for delay in (300, 1200):
                 QTimer.singleShot(delay, self._sync_tree_colors)
@@ -1134,14 +1140,15 @@ class IExplorerBrowserWidget(QWidget):
         except Exception:
             dbg_exc("IExplorerBrowser._sync_tree_colors")
 
-    # ── 灰色主题：在原生视图上叠加半透明白色 ────────────────────────────────
+    # ── 主题色调：在原生视图上叠加半透明主题色 ──────────────────────────────
 
     def update_gray_tint(self):
-        """原生资源管理器的深色底固定为 #191919 且无法改色；灰色主题下在其上叠一层点击穿透的半透明白，
-        把底色提亮到与其余界面一致的灰。其他主题或视图未显示时隐藏。"""
+        """原生资源管理器的底色固定且无法改色；灰色、Monokai、Solarized 等主题在其上叠一层点击穿透的
+        半透明色，把底色调到与其余界面一致。视图按另一种深浅色创建（如主题预览中）或未显示时隐藏。"""
         window = self.window()
-        wanted = (_theme.is_gray() and self._init_ok and self.isVisible() and window is not None
-                  and not window.isMinimized())
+        color = _theme.view_tint()
+        wanted = (color is not None and self._init_ok and self.isVisible() and window is not None
+                  and not window.isMinimized() and getattr(self, '_created_dark', None) == _theme.is_dark())
         tint = getattr(self, '_gray_tint', None)
         if not wanted:
             if tint is not None:
@@ -1153,6 +1160,7 @@ class IExplorerBrowserWidget(QWidget):
             tint = self._gray_tint = _GrayTint(window)
             self.destroyed.connect(lambda _obj=None, t=tint: _delete_quietly(t))
             window.installEventFilter(self)
+        tint.set_color(color)
         tint.setGeometry(QRect(self.mapToGlobal(QPoint(0, 0)), self.size()))
         if not tint.isVisible():
             tint.show()

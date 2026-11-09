@@ -664,6 +664,13 @@ class CustomTabBar(QTabBar):
             prev.hide()
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MiddleButton:
+            # 与 VS Code、浏览器一致：中键点击标签即关闭
+            index = self.tabAt(event.pos())
+            if index >= 0 and self.main_window is not None and hasattr(self.main_window, 'close_tab'):
+                self.main_window.close_tab(index, target_tabwidget=self._owner_tw())
+            event.accept()
+            return
         was_dragging = self._dragging
         drag_button = self._drag_button
         press_content = self._press_content
@@ -836,16 +843,15 @@ class CustomTabBar(QTabBar):
             QToolButton {
                 border: none;
                 background: transparent;
-                color: #999;
-                font-size: 18px;
-                font-weight: bold;
                 padding: 0px;
                 margin: 0px;
+                border-radius: 4px;
             }
             QToolButton:hover {
-                background: #cccccc;
-                color: #333;
-                border-radius: 4px;
+                background: @toolbar-hover-bg;
+            }
+            QToolButton:pressed {
+                background: @toolbar-active-bg;
             }
         """)
         def _on_click(_checked=False, btn=close_btn, tabbar=self):

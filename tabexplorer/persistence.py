@@ -133,10 +133,13 @@ class ConfigStore(JsonFileStore):
                 "copy_filepath": True,     # Alt+X - 复制文件路径\文件名
                 "split_view": True,        # F3 - 左右分屏对比
                 "insert_group_bookmark": True,  # F4 - 插入标签分组（保留旧键名兼容已有配置）
+                "quick_open": True,        # Ctrl+P - 快速打开标签/书签/常用目录
+                "color_theme": True,       # 选择颜色主题（默认未绑定按键）
                 "screenshot": True         # Ctrl+Alt+Z - 屏幕截图（全局热键）
             },
             "language": "zh",              # 界面语言：zh / en
-            "theme": "system",             # 主题：system（跟随 Windows）/ light / dark / gray
+            "theme": "system",             # 主题：system（跟随 Windows）或 theme.THEME_MODES 中的颜色主题
+            "recent_commands": [],         # 功能搜索中最近执行的命令（按使用顺序）
         }
         default_config["ai_chat"] = {
             "enabled": False,

@@ -1,5 +1,6 @@
 """后台线程：Git 状态、目录大小检查与诊断包导出。"""
 
+import html
 import os
 import subprocess
 import time
@@ -121,14 +122,21 @@ class GitStatusWorker(QThread):
                     if y in ('M', 'D'):
                         modified += 1
             is_clean = (staged == 0 and modified == 0 and untracked == 0)
-            parts = []
+            repo_root = os.path.normpath(self.repo_root)
+            repo_name = os.path.basename(repo_root) or repo_root  # 仓库在盘符根目录时显示盘符
+            name_color = _theme.color('statusbar-emphasis-fg')
+
+            def _name(text):
+                return f'<span style="color:{name_color};font-weight:bold">{html.escape(text)}</span>'
+
+            parts = [tr("仓库: {}").format(_name(repo_name))]
             if branch:
-                parts.append(tr("分支: {}").format(branch))
+                parts.append(tr("分支: {}").format(_name(branch)))
             if is_clean:
-                parts.append(f'<span style="color:{_theme.fg("#2e7d32")};font-weight:bold">{tr("✔ 无更改")}</span>')
+                parts.append(f'<span style="color:{_theme.status_color("#2e7d32")};font-weight:bold">{tr("✔ 无更改")}</span>')
             else:
                 def _color(label, value, color_pos, color_zero='#2e7d32'):
-                    color = _theme.fg(color_pos if value > 0 else color_zero)
+                    color = _theme.status_color(color_pos if value > 0 else color_zero)
                     return f'<span style="color:{color}">{label} {value}</span>'
                 status_parts = [
                     _color(tr("暂存(Add)"), staged, "#d32f2f"),
@@ -136,7 +144,7 @@ class GitStatusWorker(QThread):
                     _color(tr("未跟踪(待Add)"), untracked, "#f9a825"),
                 ]
                 parts.append('  '.join(status_parts))
-            summary = ' | '.join(parts) if parts else None
+            summary = ' | '.join(parts)
             self.completed.emit(self.dir_path, self.repo_root, summary)
         except Exception:
             self.completed.emit(self.dir_path, self.repo_root, None)

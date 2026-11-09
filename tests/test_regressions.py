@@ -1982,6 +1982,43 @@ class InterfaceTests(unittest.TestCase):
         self.assertIs(bar.tabButton(0, bar.RightSide), button)
         bar.close()
 
+    def test_middle_click_closes_the_clicked_tab(self):
+        """中键点击标签时关闭该标签（作用于所属标签组），空白处中键不关闭任何标签。"""
+        from PyQt5.QtCore import QPoint
+        from PyQt5.QtTest import QTest
+        bar = self.module.CustomTabBar()
+        self.addCleanup(bar.deleteLater)
+        bar.main_window = Mock(dpi_scale=1.0, config={})
+        bar.owner_tabwidget = Mock()
+        for title in ('alpha', 'beta'):
+            bar.addTab(title)
+        bar.setExpanding(False)
+        bar.resize(400, 34)
+        bar.show()
+        self.app.processEvents()
+        QTest.mouseClick(bar, Qt.MiddleButton, Qt.NoModifier, bar.tabRect(1).center())
+        bar.main_window.close_tab.assert_called_once_with(1, target_tabwidget=bar.owner_tabwidget)
+        self.assertLess(bar.tabRect(1).right() + 10, bar.width())
+        QTest.mouseClick(bar, Qt.MiddleButton, Qt.NoModifier, QPoint(bar.tabRect(1).right() + 10, 15))
+        bar.main_window.close_tab.assert_called_once()
+        bar.close()
+
+    def test_git_summary_starts_with_repository_name(self):
+        """状态栏 Git 摘要以仓库文件夹名开头，再接分支与改动统计；仓库名和分支名加粗并用主题强调色，& 等字符按 HTML 转义。"""
+        import subprocess
+        output = types.SimpleNamespace(returncode=0, stdout='## main...origin/main\n M a.py\n?? b.txt\n')
+        worker = self.module.GitStatusWorker(r'C:\code\R&D\src', r'C:\code\R&D', 'git')
+        results = []
+        worker.completed.connect(lambda *values: results.append(values))
+        with patch.object(subprocess, 'run', return_value=output):
+            worker.run()
+        summary = results[0][2]
+        name = '<span style="color:' + self.module.color('statusbar-emphasis-fg') + ';font-weight:bold">{}</span>'
+        self.assertTrue(summary.startswith(
+            self.module.tr('仓库: {}').format(name.format('R&amp;D')) + ' | '
+            + self.module.tr('分支: {}').format(name.format('main'))))
+        self.assertIn(self.module.tr('未跟踪(待Add)'), summary)
+
     def test_split_indicator_tracks_active_side_without_resizing(self):
         """切换左右操作侧只切换标签与地址栏强调；关闭分屏后恢复单侧样式，尺寸不变。"""
         from PyQt5.QtWidgets import QWidget, QTabWidget, QStackedWidget
@@ -2007,9 +2044,9 @@ class InterfaceTests(unittest.TestCase):
         self.assertFalse(groups[0][0].tabBar().property('activePane'))
         self.assertTrue(groups[1][0].tabBar().property('activePane'))
         self.assertEqual([pane.path_bar._pane_active for pane in panes], [False, True])
-        for pane, color in zip(panes, ('#b7bcc4', '#2f6fdb')):
+        for pane, token in zip(panes, ('pane-inactive-border', 'focus-border')):
             image = pane.path_bar.grab().toImage()
-            self.assertEqual(image.pixelColor(5, image.height() - 1).name(), color)
+            self.assertEqual(image.pixelColor(5, image.height() - 1).name(), self.module.qcolor(token).name())
         owner.get_active_pane = lambda: panes[0]
         update(owner)
         self.assertEqual([pane.path_bar._pane_active for pane in panes], [True, False])
@@ -3522,7 +3559,7 @@ class PathParsingTests(unittest.TestCase):
 
 
 class ThemeTests(unittest.TestCase):
-    """深浅色主题：样式换色、图标重新着色、标题栏、跟随系统切换与 Shell 视图重建，共 6 个用例。
+    """颜色主题：样式换色、图标重新着色、标题栏、跟随系统切换、Shell 视图重建、全部主题的对比度与原生视图叠色，共 10 个用例。
 
     不调用未公开的 Win32 深色接口（已替换），每个用例结束恢复浅色。"""
 
@@ -3697,8 +3734,106 @@ class ThemeTests(unittest.TestCase):
         dialog = self.module.SettingsDialog({'theme': 'light'})
         self.addCleanup(dialog.deleteLater)
         self.assertEqual(dialog.theme_combo.currentData(), 'light')
-        self.assertEqual([dialog.theme_combo.itemData(i) for i in range(dialog.theme_combo.count())],
-                         ['system', 'light', 'dark', 'gray'])
+        choices = [dialog.theme_combo.itemData(i) for i in range(dialog.theme_combo.count())]
+        self.assertEqual([choice for choice in choices if choice], list(self.module.THEME_MODES))
+
+    @staticmethod
+    def contrast(first, second):
+        def luminance(color):
+            channels = [value / 12.92 if value <= 0.03928 else ((value + 0.055) / 1.055) ** 2.4
+                        for value in (color.redF(), color.greenF(), color.blueF())]
+            return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+        high, low = sorted((luminance(first), luminance(second)), reverse=True)
+        return (high + 0.05) / (low + 0.05)
+
+    def solid(self, token, under):
+        """令牌颜色叠在 under 令牌上的实际显示色（处理带透明度的 VS Code 颜色）。"""
+        from PyQt5.QtGui import QColor
+        top, base = self.module.qcolor(token), self.module.qcolor(under)
+        alpha = top.alphaF()
+        return QColor(*(round(getattr(top, name)() * alpha + getattr(base, name)() * (1 - alpha))
+                        for name in ('red', 'green', 'blue')))
+
+    def test_every_color_theme_switches_and_keeps_text_readable(self):
+        """每个颜色主题都能切换：@令牌填入样式表、深浅色与图标色正确；主要文字满足 WCAG AA 对比度。"""
+        from PyQt5.QtWidgets import QWidget
+        widget = QWidget()
+        self.addCleanup(widget.deleteLater)
+        self.module.bind_style(widget, 'QWidget { background: @editor-bg; color: @fg; border: 1px solid #d0d0d0; }')
+        pairs = (('fg', 'editor-bg', 4.5), ('tab-active-fg', 'tab-active-bg', 4.5),
+                 ('statusbar-fg', 'statusbar-bg', 4.5), ('statusbar-emphasis-fg', 'statusbar-bg', 4.5),
+                 ('titlebar-fg', 'titlebar-bg', 4.5),
+                 ('menu-fg', 'menu-bg', 4.5), ('menu-selection-fg', 'menu-selection-bg', 4.5),
+                 ('widget-fg', 'widget-bg', 4.5), ('list-active-fg', 'list-active-bg', 4.5),
+                 ('input-fg', 'input-bg', 4.5), ('tooltip-fg', 'tooltip-bg', 4.5),
+                 ('tab-inactive-fg', 'tab-inactive-bg', 3.0), ('fg-muted', 'editor-bg', 3.0),
+                 ('tab-separator', 'tab-inactive-bg', 1.8))
+        for theme_id in self.module.THEME_MODES[1:]:
+            with self.subTest(theme=theme_id):
+                self.module.set_theme(theme_id)
+                self.assertEqual(self.module.current_theme_id(), theme_id)
+                css = widget.styleSheet()
+                self.assertNotIn('@', css)
+                self.assertIn(self.module.color('editor-bg'), css)
+                theme = self.module._THEMES[theme_id]
+                self.assertEqual(self.module.is_dark(), theme.dark)
+                self.assertEqual(self.app.style().objectName() == 'fusion', not theme.native_style)
+                self.assertEqual(self.module.icon_color() is None, theme_id in ('light', 'light_plus'))
+                for text, background, minimum in pairs:
+                    shown = self.solid(background, 'widget-bg')
+                    self.assertGreaterEqual(self.contrast(self.module.qcolor(text), shown), minimum,
+                                            f'{text} on {background}')
+        self.module.set_theme('light')
+        self.assertEqual(widget.styleSheet(), 'QWidget { background: #ffffff; color: #3b3b3b; border: 1px solid #d0d0d0; }')
+
+    def test_literal_colors_follow_theme_tint_and_contrast(self):
+        """字面颜色按主题换算：带色调主题的白底变为主题底色，高对比度主题的边框改为对比色，Light+ 保持原样。"""
+        from PyQt5.QtGui import QColor
+        for theme_id in ('solarized_dark', 'solarized_light', 'monokai', 'one_dark_pro', 'github_dark', 'dark'):
+            with self.subTest(theme=theme_id):
+                self.module.set_theme(theme_id)
+                converted, editor = QColor(self.module.bg('#ffffff')), self.module.qcolor('editor-bg')
+                self.assertLessEqual(max(abs(converted.red() - editor.red()), abs(converted.green() - editor.green()),
+                                         abs(converted.blue() - editor.blue())), 3)
+        self.module.set_theme('hc_dark')
+        self.assertEqual(self.module.line('#d0d0d0'), '#6fc3df')
+        self.assertGreater(QColor(self.module.fg('#666666')).lightnessF(), 0.8)
+        self.module.set_theme('hc_light')
+        self.assertEqual(self.module.line('#e0e0e0'), '#0f4a85')
+        self.assertLess(QColor(self.module.fg('#666666')).lightnessF(), 0.25)
+        self.module.set_theme('light_plus')
+        self.assertEqual(self.module.qss('QLabel { color: #666; background: #f0f0f0; }'),
+                         'QLabel { color: #666; background: #f0f0f0; }')
+
+    def test_view_tint_matches_theme_background_over_native_view(self):
+        """原生视图的叠色：灰色仍为 17% 白；Monokai、One Dark Pro、Solarized 叠加后接近主题底色，其余主题不叠色。"""
+        native = {True: (25, 25, 25), False: (255, 255, 255)}
+        self.module.set_theme('gray')
+        self.assertEqual(self.module.view_tint().getRgb(), (255, 255, 255, 43))
+        for theme_id in self.module.THEME_MODES[1:]:
+            with self.subTest(theme=theme_id):
+                self.module.set_theme(theme_id)
+                tint = self.module.view_tint()
+                if theme_id not in ('gray', 'monokai', 'one_dark_pro', 'solarized_dark', 'solarized_light'):
+                    self.assertIsNone(tint)
+                    continue
+                alpha = tint.alphaF()
+                self.assertLessEqual(alpha, 0.33)
+                blended = [channel * alpha + base * (1 - alpha) for channel, base in
+                           zip((tint.red(), tint.green(), tint.blue()), native[self.module.is_dark()])]
+                editor = self.module.qcolor('editor-bg')
+                tolerance = 20 if theme_id == 'solarized_dark' else 3
+                for value, wanted in zip(blended, (editor.red(), editor.green(), editor.blue())):
+                    self.assertLessEqual(abs(value - wanted), tolerance)
+
+    def test_status_text_uses_statusbar_color_on_accent_bar(self):
+        """Dark+/Light+ 的状态栏是蓝底：Git 摘要等彩色文字改用状态栏前景色；其他主题仍按主题换算颜色。"""
+        self.module.set_theme('dark_plus')
+        self.assertEqual(self.module.status_color('#d32f2f'), self.module.color('statusbar-fg'))
+        self.module.set_theme('dark')
+        self.assertEqual(self.module.status_color('#d32f2f'), self.module.fg('#d32f2f'))
+        self.module.set_theme('light')
+        self.assertEqual(self.module.status_color('#d32f2f'), '#d32f2f')
 
 
 class NetworkBannerTests(unittest.TestCase):

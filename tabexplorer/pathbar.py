@@ -31,15 +31,13 @@ class SimplePathBar(QWidget):
     activated = pyqtSignal()
 
     _FONT   = "font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif; font-size: 11pt;"
-    _S_BAR  = ("SimplePathBar { background: #ffffff; border: none; }")
-    _S_EDIT = ("QLineEdit { background: white; border: 1px solid #ccc; border-radius: 3px;"
+    _S_BAR  = ("SimplePathBar { background: @editor-bg; border: none; }")
+    _S_EDIT = ("QLineEdit { background: @input-bg; border: 1px solid @focus-border; border-radius: 2px;"
                " font-family: 'Segoe UI', 'Microsoft YaHei UI', sans-serif; font-size: 10pt;"
-               " color: #202020; padding: 2px 6px; selection-background-color: #0078d4; }")
+               " color: @input-fg; padding: 2px 6px; selection-background-color: @selection-bg;"
+               " selection-color: @selection-fg; }")
 
-    # 绘制配色（与旧样式表一致）
-    _COL_SEG   = '#003d7a'   # 路径段文字
-    _COL_SEP   = '#888888'   # 分隔符 ›
-    _COL_HOVER = '#cce5ff'   # 悬停背景
+    # 绘制配色取主题令牌（VS Code 面包屑：普通段淡色，当前段与悬停段高亮）
     _CHEVRON   = '\u203a'    # ›
     _PAD       = 6           # 段内文字左右内边距
     _SEP_W     = 16          # 分隔符宽度
@@ -119,7 +117,7 @@ class SimplePathBar(QWidget):
         if state == (self._pane_active, self._split_indicator):
             return
         self._pane_active, self._split_indicator = state
-        border = '#2f6fdb' if active else '#a0a5ad'
+        border = '@focus-border' if active else '@pane-inactive-border'
         _theme.bind_style(self._edit, self._S_EDIT + (f'QLineEdit {{ border: 2px solid {border}; }}' if split else ''))
         self.update()
 
@@ -169,13 +167,13 @@ class SimplePathBar(QWidget):
     def paintEvent(self, event):
         if self._in_edit:
             return
-        from PyQt5.QtGui import QPainter, QColor, QFont
+        from PyQt5.QtGui import QPainter
         from PyQt5.QtCore import QRectF
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(_theme.bg('#ffffff')))
+        painter.fillRect(self.rect(), _theme.qcolor('editor-bg'))
         if self._split_indicator:
-            color = '#2f6fdb' if self._pane_active else '#b7bcc4'
-            painter.fillRect(0, self.height() - 2, self.width(), 2, QColor(_theme.line(color)))
+            token = 'focus-border' if self._pane_active else 'pane-inactive-border'
+            painter.fillRect(0, self.height() - 2, self.width(), 2, _theme.qcolor(token))
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.TextAntialiasing, True)
         painter.setFont(self._font)
@@ -190,9 +188,10 @@ class SimplePathBar(QWidget):
             return
         display_parts = self._choose_display_parts(parts)
         left_collapsed = len(display_parts) < len(parts)
-        col_seg = QColor(_theme.fg(self._COL_SEG))
-        col_sep = QColor(_theme.fg(self._COL_SEP))
-        col_hover = QColor(_theme.bg(self._COL_HOVER))
+        col_seg = _theme.qcolor('crumb-fg')
+        col_active = _theme.qcolor('crumb-active-fg')
+        col_sep = _theme.qcolor('crumb-fg')
+        col_hover = _theme.qcolor('crumb-hover-bg')
         pad = self._PAD
         sep_w = self._SEP_W
         chevron = self._CHEVRON
@@ -248,12 +247,8 @@ class SimplePathBar(QWidget):
             hovered = (self._hover_idx == idx)
             if hovered:
                 hover_bg(x, x + w)
-            f = QFont(self._font)
-            f.setUnderline(hovered)
-            painter.setFont(f)
-            painter.setPen(col_seg)
+            painter.setPen(col_active if (hovered or is_current) else col_seg)
             painter.drawText(x + pad, y, shown)
-            painter.setFont(self._font)
             regions.append({'kind': 'segment', 'x0': x, 'x1': x + w,
                             'payload': full, 'label': label, 'is_current': is_current})
             x += w

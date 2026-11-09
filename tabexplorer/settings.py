@@ -590,10 +590,12 @@ class SettingsDialog(QDialog):
         lang_row.addSpacing(16)
         lang_row.addWidget(QLabel(tr("主题:")))
         self.theme_combo = QComboBox(self)
-        self.theme_combo.addItem(tr("跟随系统"), "system")
-        self.theme_combo.addItem(tr("浅色"), "light")
-        self.theme_combo.addItem(tr("深色"), "dark")
-        self.theme_combo.addItem(tr("灰色"), "gray")
+        previous_group = None
+        for theme_id, label, group in _theme.theme_choices():
+            if previous_group is not None and group != previous_group:
+                self.theme_combo.insertSeparator(self.theme_combo.count())
+            self.theme_combo.addItem(label, theme_id)
+            previous_group = group
         self.theme_combo.setCurrentIndex(
             max(0, self.theme_combo.findData(_theme.normalize_mode(config.get("theme", "system")))))
         self.theme_combo.setToolTip(tr("跟随系统：随 Windows “应用模式”的浅色/深色设置自动切换"))

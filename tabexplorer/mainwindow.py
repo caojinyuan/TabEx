@@ -49,7 +49,7 @@ from .quicklook import (
     TYPING_GUARD_SECONDS,
 )
 from .widgets import (
-    _active_toasts, _build_te_icon, _pinned_tab_icon, ResizableSplitter, _set_tool_icon, show_toast,
+    _active_toasts, _build_te_icon, CommandCenter, _pinned_tab_icon, ResizableSplitter, _set_tool_icon, show_toast,
 )
 from .updates import (
     _open_release_page, UPDATE_CHECK_DELAY_MS, UPDATE_CHECK_INTERVAL_S, UPDATE_RELEASES_PAGE,
@@ -1547,10 +1547,18 @@ class MainWindow(QMainWindow):
             self.split_scope_label.setText(tr('当前操作：{}').format(side))
             self.split_scope_label.setToolTip(path)
         for attr, label, command in (('command_palette_action', '查找功能', 'command_palette'),
+                                     ('quick_open_action', '快速打开...', 'quick_open'),
+                                     ('color_theme_action', '颜色主题...', 'color_theme'),
                                      ('frequent_dirs_action', '常用目录...', 'frequent_dirs')):
             action = getattr(self, attr, None)
             if action is not None:
                 action.setText(_hotkey_hint(self.config, tr(label), command))
+        center = getattr(self, 'command_center', None)
+        if center is not None:
+            center.set_context(_tab_display_labels([path])[0] if path else 'TabEx')
+            center.setToolTip('\n'.join((
+                _hotkey_hint(self.config, tr('搜索标签、书签和常用目录'), 'quick_open'),
+                _hotkey_hint(self.config, tr('查找功能'), 'command_palette'))))
 
     def _resize_tools_button(self):
         button = getattr(self, 'workspace_tools_button', None)
@@ -1562,11 +1570,9 @@ class MainWindow(QMainWindow):
         width = max(int(32 * self.dpi_scale), button.sizeHint().width()) if expanded else int(32 * self.dpi_scale)
         button.setFixedWidth(width)
 
-    def show_command_palette(self):
-        from .commands import CommandPalette, menu_commands
-        self._refresh_context_actions()
-        self._rebuild_external_tools_menu()
-        dialog = CommandPalette(self)
+    def _palette_commands(self, owner):
+        """命令面板中的功能：工具菜单的所有动作，加上工具栏按钮（以临时动作代为点击）。"""
+        from .commands import menu_commands
         commands = [(label, action) for label, action in menu_commands(self.workspace_tools_menu)
                     if action is not self.command_palette_action]
         for name, label in (
@@ -1580,7 +1586,7 @@ class MainWindow(QMainWindow):
                 ('settings_button', '设置'), ('ai_chat_btn', 'AI 助手面板')):
             button = getattr(self, name)
             text = _toolbar_hotkey_tooltip(self, name) if name in _TOOLBAR_HOTKEY_TOOLTIPS else tr(label)
-            action = QAction(button.icon(), text, dialog)
+            action = QAction(button.icon(), text, owner)
             action.setToolTip(button.toolTip())
             available = button.isEnabled() and not button.isHidden()
             action.setEnabled(available)
@@ -1588,10 +1594,191 @@ class MainWindow(QMainWindow):
                 button.property('unavailable_reason') or tr('当前不可用，请检查设置或当前标签状态')))
             action.triggered.connect(button.click)
             commands.append((text, action))
-        dialog.set_commands(commands)
-        if dialog.exec_() == QDialog.Accepted and dialog.selected_action is not None:
-            dialog.selected_action.trigger()
-        dialog.deleteLater()
+        return commands
+
+    def _palette_anchor(self):
+        """快速输入浮层的定位区域：工具栏下方的整个窗口宽度（全局坐标）。"""
+        from PyQt5.QtCore import QPoint, QRect
+        origin = self.mapToGlobal(QPoint(0, 0))
+        bar = getattr(self, 'titlebar_widget', None)
+        top = bar.mapToGlobal(QPoint(0, bar.height())).y() if bar is not None and bar.isVisible() else origin.y()
+        return QRect(origin.x(), top, self.width(), max(0, origin.y() + self.height() - top))
+
+    def show_command_palette(self):
+        """VS Code Ctrl+Shift+P：以 > 前缀打开快速输入，删去 > 即可搜索标签、书签和常用目录。"""
+        self._show_quick_input('>')
+
+    def show_quick_open(self):
+        """VS Code Ctrl+P：在已开标签、书签、常用目录和最近关闭的标签之间跳转。"""
+        self._show_quick_input('')
+
+    def _show_quick_input(self, prefix):
+        from .commands import CommandPalette
+        if getattr(self, '_quick_input_open', False):
+            return
+        self._refresh_context_actions()
+        self._rebuild_external_tools_menu()
+        palette = CommandPalette(self, quick_open=self._quick_open_entries, open_path=self._open_typed_path)
+        palette.set_commands(self._palette_commands(palette), self.config.get('recent_commands', []))
+        palette.query.setText(prefix)
+        self._quick_input_open = True
+        try:
+            accepted = palette.run(self._palette_anchor())
+        finally:
+            self._quick_input_open = False
+            self._guard_shortcuts_after_modal()
+        if accepted and palette.selected_action is not None:
+            self._remember_command(palette.selected_label)
+            palette.selected_action.trigger()
+        elif accepted and palette.selected_entry is not None:
+            palette.selected_entry['run']()
+        palette.deleteLater()
+
+    def _remember_command(self, label):
+        from .commands import command_key, MAX_RECENT_COMMANDS
+        key = command_key(label)
+        if not key:
+            return
+        recent = [item for item in self.config.get('recent_commands', []) if isinstance(item, str) and item != key]
+        self.config['recent_commands'] = ([key] + recent)[:MAX_RECENT_COMMANDS]
+        self.save_config()
+
+    def show_color_theme_picker(self):
+        """VS Code 式颜色主题选择：上下键实时预览，Enter 保存，Esc 或点到别处还原。"""
+        from .commands import CommandPalette
+        if getattr(self, '_quick_input_open', False):
+            return
+        saved = _theme.normalize_mode(self.config.get('theme', 'system'))
+        system_hint = f"{_theme.theme_label('light')} / {_theme.theme_label('dark')}"
+        entries = [{'id': theme_id, 'label': label, 'group': _theme.theme_group_label(group),
+                    'description': system_hint if theme_id == 'system' else ''}
+                   for theme_id, label, group in _theme.theme_choices()]
+        palette = CommandPalette(self)
+        palette.set_theme_choices(entries, saved, self._preview_theme)
+        self._quick_input_open = True
+        self._theme_preview_active = True
+        try:
+            accepted = palette.run(self._palette_anchor())
+        finally:
+            self._quick_input_open = False
+            self._theme_preview_active = False
+            self._guard_shortcuts_after_modal()
+        chosen = palette.selected_entry['id'] if accepted and palette.selected_entry else None
+        palette.deleteLater()
+        if chosen is not None and chosen != saved:
+            self.config['theme'] = chosen
+            self.save_config()
+        self.apply_theme_config(force_refresh=chosen is not None)
+
+    def _preview_theme(self, theme_id):
+        """预览只换界面配色；Shell 视图等确定后再按需重建。"""
+        if _theme.set_theme(theme_id):
+            self._apply_window_palettes()
+            chat_panel = getattr(self, 'chat_panel', None)
+            if chat_panel is not None:
+                chat_panel.apply_theme()
+
+    def _quick_open_entries(self):
+        """快速打开的条目：已开标签、书签、常用目录、最近关闭，同一路径只保留最先出现的一项。"""
+        from PyQt5.QtCore import QUrl
+        from PyQt5.QtWidgets import QStyle
+        folder_icon = self.style().standardIcon(QStyle.SP_DirIcon)
+        entries, by_path = [], {}
+
+        def add(group, label, path, run, icon=None, aliases=''):
+            key = self._normalize_path_for_compare(path) if path else ''
+            if key and key in by_path:
+                by_path[key]['aliases'] += ' ' + ' '.join(filter(None, (label, aliases)))  # 书签名等别名仍可搜到已打开的标签
+                return
+            entry = {'group': group, 'label': label or path, 'description': path, 'run': run,
+                     'icon': icon if icon is not None and not icon.isNull() else folder_icon, 'aliases': aliases}
+            entries.append(entry)
+            if key:
+                by_path[key] = entry
+
+        self._refresh_tab_labels()
+        for side, (tabs, stack) in enumerate(self._all_groups()):
+            if tabs is None or stack is None:
+                continue
+            for index in range(min(tabs.count(), stack.count())):
+                pane = stack.widget(index)
+                add(tr('打开的标签'), tabs.tabText(index), str(getattr(pane, 'current_path', '') or ''),
+                    lambda pane=pane: self._activate_pane(pane), tabs.tabIcon(index), tr('右侧') if side else '')
+        for node, folders in self._iter_bookmark_nodes():
+            url = str(node.get('url', ''))
+            if url.lower().startswith('file:'):
+                path = os.path.normpath(QUrl(url).toLocalFile())
+            else:
+                path = url if url.lower().startswith('shell:') else os.path.normpath(url)
+            add(tr('书签'), str(node.get('name', '')), path, lambda node=node: self.open_bookmark_node(node),
+                aliases=folders)
+        for item in self._get_frequent_dirs().ranked(limit=200):
+            path = item['path']
+            add(tr('常用目录'), os.path.basename(path.rstrip('\\/')) or path, path,
+                lambda path=path: self._open_quick_path(path))
+        for info in list(self.closed_tabs_history):
+            path = str(info.get('path', ''))
+            add(tr('最近关闭'), str(info.get('title', '') or path), path,
+                lambda info=info: self._reopen_closed_entry(info))
+        return entries
+
+    def _iter_bookmark_nodes(self):
+        """按书签栏顺序列出可打开的书签节点及其所在文件夹名。"""
+        def walk(node, trail):
+            for child in node.get('children', []) or []:
+                if not isinstance(child, dict):
+                    continue
+                if child.get('type') == 'folder':
+                    yield from walk(child, f"{trail} {child.get('name', '')}".strip())
+                elif child.get('type') == 'url' and child.get('url') and not self._is_group_separator_node(child):
+                    yield child, trail
+
+        tree = self.bookmark_manager.get_tree()
+        for root in (tree.values() if isinstance(tree, dict) else ()):
+            if isinstance(root, dict):
+                yield from walk(root, '')
+
+    def _activate_pane(self, pane):
+        for tabs, stack in self._all_groups():
+            index = stack.indexOf(pane) if stack is not None else -1
+            if index >= 0:
+                tabs.setCurrentIndex(index)
+                self.set_active_pane_to_group(tabs)
+                return True
+        return False
+
+    def _open_quick_path(self, path):
+        """已在某个标签打开时切过去，否则在活动标签组新建标签。"""
+        key = self._normalize_path_for_compare(path)
+        for _tabs, stack in self._all_groups():
+            for index in range(stack.count() if stack is not None else 0):
+                pane = stack.widget(index)
+                if self._normalize_path_for_compare(getattr(pane, 'current_path', '') or '') == key:
+                    return self._activate_pane(pane)
+        if not _tab_target_available(path):
+            show_toast(self, tr("路径错误"), tr("路径不存在: {}").format(path), level="warning")
+            return False
+        self.add_new_tab(path, is_shell=path.startswith('shell:'), target_tabwidget=self.get_active_group_tabwidget())
+        return True
+
+    def _open_typed_path(self, text):
+        """快速打开中直接输入的路径：文件夹在标签中打开，文件则打开所在文件夹并选中它。"""
+        path = os.path.expandvars(text.strip().strip('"'))
+        if path.lower().startswith('shell:'):
+            return self._open_quick_path(path)
+        path = os.path.normpath(path)
+        if not is_network_path(path) and os.path.isfile(path):
+            return self.add_new_tab(os.path.dirname(path), select_file=path,
+                                    target_tabwidget=self.get_active_group_tabwidget()) >= 0
+        return self._open_quick_path(path)
+
+    def _reopen_closed_entry(self, info):
+        if info in self.closed_tabs_history:
+            self.closed_tabs_history.remove(info)
+        self.add_new_tab(info.get('path', ''), is_shell=info.get('is_shell', False),
+                         target_tabwidget=self.get_active_group_tabwidget())
+        if hasattr(self, 'reopen_tab_button'):
+            self.reopen_tab_button.setEnabled(bool(self.closed_tabs_history))
     
     def open_tortoisegit_log_current_tab(self):
         """打开当前标签页的 TortoiseGit 日志（作用于活动面板，分屏时跟随最近交互的一侧）"""
@@ -2410,15 +2597,23 @@ class MainWindow(QMainWindow):
     
     def create_custom_titlebar(self, main_layout):
         """创建工具栏（系统原生标题栏下方的功能按钮区域）"""
-        # 根据DPI调整工具栏高度
-        titlebar_height = int(32 * getattr(self, 'dpi_scale', 1.0))
+        # 根据DPI调整工具栏高度（多 1px 给底部分隔线）
+        titlebar_height = int(32 * getattr(self, 'dpi_scale', 1.0)) + 1
         titlebar = QWidget()
+        titlebar.setObjectName('tabexTitleBar')
         titlebar.setFixedHeight(titlebar_height)
-        _theme.bind_style(titlebar, "background-color: #f3f3f3;")
+        # Windows 11 下系统标题栏与工具栏同色（见 theme.apply_window_frame），合成 VS Code 式的标题区
+        _theme.bind_style(titlebar, "* { background-color: @titlebar-bg; }"
+                                    "QWidget#tabexTitleBar { border-bottom: 1px solid @titlebar-border; }")
         titlebar_layout = QHBoxLayout(titlebar)
         titlebar_layout.setContentsMargins(10, 0, 0, 0)
         titlebar_layout.setSpacing(0)
-        # 左侧使用弹性空白，所有功能按钮区域始终靠右紧凑排列。
+        # 命令中心居中，功能按钮区域始终靠右紧凑排列。
+        titlebar_layout.addStretch(1)
+        self.command_center = CommandCenter(titlebar, getattr(self, 'dpi_scale', 1.0))
+        self.command_center.setToolTip(_hotkey_hint(self.config, tr('搜索标签、书签和常用目录'), 'quick_open'))
+        self.command_center.clicked.connect(lambda: self.show_quick_open())
+        titlebar_layout.addWidget(self.command_center)
         titlebar_layout.addStretch(1)
         
         # 保存引用（兼容其他代码对 titlebar_widget 的引用）
@@ -2460,7 +2655,7 @@ class MainWindow(QMainWindow):
         self.shortcut_git_separator = QFrame()
         self.shortcut_git_separator.setFrameShape(QFrame.VLine)
         self.shortcut_git_separator.setFrameShadow(QFrame.Plain)
-        _theme.bind_style(self.shortcut_git_separator, "background-color: #d0d0d0; max-width: 1px;")
+        _theme.bind_style(self.shortcut_git_separator, "background-color: @chrome-border; max-width: 1px;")
         self.shortcut_git_separator.setFixedWidth(1)
         self.shortcut_git_separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
         titlebar_layout.addWidget(self.shortcut_git_separator)
@@ -2506,7 +2701,7 @@ class MainWindow(QMainWindow):
         self.git_tools_separator = QFrame()
         self.git_tools_separator.setFrameShape(QFrame.VLine)
         self.git_tools_separator.setFrameShadow(QFrame.Plain)
-        _theme.bind_style(self.git_tools_separator, "background-color: #d0d0d0; max-width: 1px;")
+        _theme.bind_style(self.git_tools_separator, "background-color: @chrome-border; max-width: 1px;")
         self.git_tools_separator.setFixedWidth(1)
         self.git_tools_separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
         titlebar_layout.addWidget(self.git_tools_separator)
@@ -2544,7 +2739,7 @@ class MainWindow(QMainWindow):
         separator = QFrame()
         separator.setFrameShape(QFrame.VLine)
         separator.setFrameShadow(QFrame.Plain)
-        _theme.bind_style(separator, "background-color: #d0d0d0; max-width: 1px;")
+        _theme.bind_style(separator, "background-color: @chrome-border; max-width: 1px;")
         separator.setFixedWidth(1)
         separator.setFixedHeight(int(20 * getattr(self, 'dpi_scale', 1.0)))
         titlebar_layout.addWidget(separator)
@@ -2706,6 +2901,7 @@ class MainWindow(QMainWindow):
         self.workspace_tools_button.setFixedSize(btn_size, btn_size)
         self.workspace_tools_button.setPopupMode(QToolButton.InstantPopup)
         tools_menu = QMenu(self.workspace_tools_button)
+        _theme.bind_style(tools_menu, _theme.GLOBAL_CSS)
         self._populate_workspace_tools_menu(tools_menu)
         self.workspace_tools_menu = tools_menu
         self.workspace_tools_button.setMenu(tools_menu)
@@ -2878,10 +3074,13 @@ class MainWindow(QMainWindow):
             (self.ai_chat_btn, 'help-contents', QStyle.SP_MessageBoxInformation),
         )
         toolbar_style = (
-            'QPushButton, QToolButton { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 0; }'
-            'QPushButton:hover:!disabled, QToolButton:hover:!disabled { background: #e5e9ee; }'
-            'QPushButton:checked, QToolButton:checked { background: #dceafa; border-color: #739bca; }'
-            'QPushButton:focus, QToolButton:focus { border-color: #2f6fdb; }'
+            'QPushButton, QToolButton { background: transparent; border: 1px solid transparent; border-radius: 5px;'
+            ' padding: 0; color: @titlebar-fg; }'
+            'QPushButton:hover:!disabled, QToolButton:hover:!disabled { background: @toolbar-hover-bg; }'
+            'QPushButton:pressed, QToolButton:pressed { background: @toolbar-active-bg; }'
+            'QPushButton:checked, QToolButton:checked { background: @toolbar-checked-bg;'
+            ' border-color: @toolbar-checked-border; }'
+            'QPushButton:focus, QToolButton:focus { border-color: @focus-border; }'
         )
         for button, theme, fallback in icons:
             button.setText('')
@@ -3062,16 +3261,18 @@ class MainWindow(QMainWindow):
 
     def _apply_window_palettes(self):
         """主窗口与主容器的窗口底色（填充边框与内容之间的缝隙）随主题变化。"""
-        from PyQt5.QtGui import QColor, QPalette
+        from PyQt5.QtGui import QPalette
         for widget in (self, getattr(self, '_main_container', None)):
             if widget is not None:
                 palette = widget.palette()
-                palette.setColor(QPalette.Window, QColor(_theme.bg('#ffffff')))
+                palette.setColor(QPalette.Window, _theme.qcolor('editor-bg'))
                 widget.setPalette(palette)
 
     def _schedule_system_theme_check(self):
         if _theme.normalize_mode(self.config.get("theme")) != 'system':
             return
+        if getattr(self, '_theme_preview_active', False):
+            return  # 预览主题时的配色广播来自本进程，不能把预览切回系统主题
         timer = getattr(self, '_system_theme_timer', None)
         if timer is None:
             timer = self._system_theme_timer = QTimer(self)
@@ -3079,10 +3280,11 @@ class MainWindow(QMainWindow):
             timer.timeout.connect(self.apply_theme_config)
         timer.start(400)
 
-    def apply_theme_config(self):
-        """按配置（跟随系统/浅色/深色）应用主题；与当前一致时不做任何事。"""
-        if not _theme.set_dark(_theme.resolve_dark(self.config.get("theme", "system")),
-                               _theme.resolve_gray(self.config.get("theme", "system"))):
+    def apply_theme_config(self, force_refresh=False):
+        """按配置应用颜色主题（跟随系统时按 Windows 应用模式）；与当前一致且不强制刷新时不做任何事。
+
+        force_refresh：主题已在预览中切好时，仍补做重建 Shell 视图等收尾。"""
+        if not _theme.set_theme(self.config.get("theme", "system")) and not force_refresh:
             return False
         self._apply_window_palettes()
         self.apply_tab_group_markers_config()
@@ -3565,6 +3767,8 @@ class MainWindow(QMainWindow):
             'switch_tab_number': lambda: self._select_tab_by_number(vk - 0x30),
             'search': self.show_search_dialog,
             'command_palette': lambda: self.show_command_palette(),
+            'quick_open': lambda: self.show_quick_open(),
+            'color_theme': lambda: self.show_color_theme_picker(),
             'quick_find_current_dir': self.quick_find_in_current_directory,
             'frequent_dirs': self.show_frequent_dirs,
             'go_back': self.go_back_current_tab,
@@ -3896,6 +4100,10 @@ class MainWindow(QMainWindow):
         from PyQt5.QtWidgets import QStyle
         self.command_palette_action = menu.addAction(
             _hotkey_hint(self.config, tr('查找功能'), 'command_palette'), lambda: self.show_command_palette())
+        self.quick_open_action = menu.addAction(
+            _hotkey_hint(self.config, tr('快速打开...'), 'quick_open'), lambda: self.show_quick_open())
+        self.color_theme_action = menu.addAction(
+            _hotkey_hint(self.config, tr('颜色主题...'), 'color_theme'), lambda: self.show_color_theme_picker())
         menu.addSection(tr('文件操作'))
         self.file_tasks_action = menu.addAction(tr('文件任务'), self.show_file_tasks)
         self.directory_compare_action = menu.addAction(tr('目录差异比较...'), self.show_directory_compare)
@@ -4225,6 +4433,10 @@ class MainWindow(QMainWindow):
             self.config["hotkeys"]["split_view"] = dlg.hotkey_split_view.isChecked()
             self.config["hotkeys"]["insert_group_bookmark"] = dlg.hotkey_insert_group_bookmark.isChecked()
             self.config["hotkeys"]["screenshot"] = dlg.hotkey_screenshot.isChecked()
+            for enable_key in {key for key in _HOTKEY_ENABLE_KEYS.values() if key}:
+                switch = getattr(dlg, 'hotkey_' + enable_key, None)
+                if switch is not None:
+                    self.config["hotkeys"][enable_key] = switch.isChecked()
             self._apply_hotkey_bindings()
             
             self.save_config()
@@ -4796,8 +5008,7 @@ class MainWindow(QMainWindow):
         set_debug_mode(self.config.get("debug_mode", False))
         set_explorer_monitor_debug(self.config.get("explorer_monitor_debug", False))
         # 须在创建任何 Shell 视图之前应用：原生视图只在新建时完整采用深色
-        _theme.set_dark(_theme.resolve_dark(self.config.get("theme", "system")),
-                        _theme.resolve_gray(self.config.get("theme", "system")))
+        _theme.set_theme(self.config.get("theme", "system"))
         
         # 初始化书签管理器
         self.bookmark_manager = BookmarkManager()
@@ -5076,15 +5287,15 @@ class MainWindow(QMainWindow):
 
         def _color(pct):
             if pct >= RESOURCE_CRIT_PERCENT:
-                return _theme.fg("#d32f2f")  # 红：危急
+                return _theme.status_color("#d32f2f")  # 红：危急
             if pct >= RESOURCE_WARN_PERCENT:
-                return _theme.fg("#e67700")  # 橙：偏高
-            return _theme.fg("#666")          # 常态
+                return _theme.status_color("#e67700")  # 橙：偏高
+            return _theme.color('statusbar-fg')       # 常态
 
         cpu = get_system_cpu_percent()
         mem = get_system_memory_status()
         cpu_html = (f"<span style='color:{_color(cpu)}'>CPU {cpu:.0f}%</span>"
-                    if cpu is not None else f"<span style='color:{_theme.fg('#666')}'>CPU --</span>")
+                    if cpu is not None else f"<span style='color:{_color(0)}'>CPU --</span>")
         if mem is not None:
             used_mb, total_mb, pct = mem
             mem_html = (f"<span style='color:{_color(pct)}'>{tr('内存')} "
@@ -5262,14 +5473,15 @@ class MainWindow(QMainWindow):
 
         # 填充窗口背景，避免边框与内容之间出现半透明缝隙
         self.setAutoFillBackground(True)
-        # 再次用样式表确保非客户区也以白色填充
-        _theme.bind_style(self, "QMainWindow { background: white; }")
+        # 再次用样式表确保非客户区以主题底色填充；菜单、提示、滚动条统一为 VS Code 风格
+        _theme.bind_style(self, "QMainWindow { background: @editor-bg; }" + _theme.GLOBAL_CSS)
         
         
-        # 创建主容器，无边距，纯白填充
+        # 创建主容器，无边距，主题底色填充
         main_container = QWidget()
         main_container.setAutoFillBackground(True)
-        _theme.bind_style(main_container, "QWidget { background: white; margin: 0px; padding: 0px; border: none; }")
+        _theme.bind_style(main_container, "QWidget { background: @editor-bg; margin: 0px; padding: 0px; border: none; }"
+                          + _theme.GLOBAL_CSS)
         container_layout = QVBoxLayout(main_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(0)
@@ -5301,22 +5513,21 @@ class MainWindow(QMainWindow):
         tabbar = self.tab_widget.tabBar()
         tabbar.setAcceptDrops(True)
         
-        # 根据DPI缩放标签栏尺寸
-        tab_height = int(24 * self.dpi_scale)
+        # 根据DPI缩放标签栏尺寸：VS Code 式扁平标签填满标签栏，活动标签与下方内容同色并带顶部强调线
+        tab_bar_height = int(32 * getattr(self, 'dpi_scale', 1.0))
         tab_width = int(120 * self.dpi_scale)
         tab_padding_v = int(2 * self.dpi_scale)
-        tab_padding_h = int(4 * self.dpi_scale)
-        tab_radius = int(6 * self.dpi_scale)
+        tab_padding_h = int(6 * self.dpi_scale)
+        tab_height = tab_bar_height - 2 - 2 * tab_padding_v
         tab_font_size = int(12 * self.dpi_scale)
-        tab_margin = int(2 * self.dpi_scale)
         
         tab_css = f"""
             QTabBar::tab {{
-                background: #f5f5f5;
-                border: 1px solid #d0d0d0;
-                border-bottom: none;
-                border-top-left-radius: {tab_radius}px;
-                border-top-right-radius: {tab_radius}px;
+                background: @tab-inactive-bg;
+                color: @tab-inactive-fg;
+                border: none;
+                border-right: 1px solid @tab-separator;
+                border-top: 2px solid transparent;
                 padding: {tab_padding_v}px {tab_padding_h}px;
                 height: {tab_height}px;
                 width: {tab_width}px;
@@ -5324,31 +5535,20 @@ class MainWindow(QMainWindow):
                 max-width: {tab_width}px;
                 font-family: 'Microsoft YaHei UI', 'Segoe UI', Arial, sans-serif;
                 font-size: {tab_font_size}px;
-                margin-top: {tab_margin}px;
-                margin-right: 0px;
+                margin: 0px;
                 text-align: center;
-                color: #505050;
             }}
             QTabBar::tab:hover:!selected {{
-                background: #e8e8e8;
-                border-color: #c0c0c0;
+                background: @tab-hover-bg;
             }}
             QTabBar::tab:selected {{
-                background: #f5f5f5;
-                border: 1px solid #2F6FDB;
-                border-bottom: none;
-                margin-top: 0px;
-                padding-top: {tab_padding_v + 1}px;
-                color: #2F6FDB;
-                font-weight: bold;
-            }}
-            QTabBar::tab:!selected {{
-                font-weight: normal;
-                margin-top: {tab_margin + 1}px;
+                background: @tab-active-bg;
+                color: @tab-active-fg;
+                border-top: 2px solid @tab-active-border-top;
             }}
             QTabBar[activePane="false"]::tab:selected {{
-                border-color: #a0a5ad;
-                color: #505050;
+                border-top-color: @tab-unfocused-border-top;
+                color: @tab-unfocused-active-fg;
             }}
         """
         _theme.bind_style(tabbar, tab_css)
@@ -5357,9 +5557,8 @@ class MainWindow(QMainWindow):
 
         # 创建标签栏容器（只显示标签和按钮，不显示内容）
         tab_bar_container = QWidget()
-        tab_bar_height = int(32 * getattr(self, 'dpi_scale', 1.0))
         tab_bar_container.setFixedHeight(tab_bar_height)  # 固定高度，只显示标签栏
-        _theme.bind_style(tab_bar_container, "background-color: #f3f3f3;")
+        _theme.bind_style(tab_bar_container, "background-color: @tab-bar-bg;")
         tab_bar_layout = QHBoxLayout(tab_bar_container)
         tab_bar_layout.setContentsMargins(0, 0, 0, 0)
         tab_bar_layout.setSpacing(0)
@@ -5405,54 +5604,25 @@ class MainWindow(QMainWindow):
         self.menu_bar.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         _theme.bind_style(self.menu_bar, """
             QMenuBar {
-                background-color: #f3f3f3;
-                border-top: 1px solid #d0d0d0;
-                border-bottom: 1px solid #e0e0e0;
-                padding: 2px;
+                background-color: @editor-bg;
+                border: none;
+                border-bottom: 1px solid @chrome-border;
+                padding: 2px 4px;
             }
             QMenuBar::item {
                 padding: 4px 10px;
                 background: transparent;
                 border-radius: 4px;
                 min-width: 0px;
-                color: #303030;
+                color: @fg;
             }
             QMenuBar::item:selected {
-                background: #e5e5e5;
-                color: #000000;
+                background: @toolbar-hover-bg;
             }
             QMenuBar::item:pressed {
-                background: #d5d5d5;
-                color: #000000;
+                background: @toolbar-active-bg;
             }
-            QMenu {
-                background-color: #ffffff;
-                border: 1px solid #d0d0d0;
-                border-radius: 6px;
-                padding: 4px;
-                color: #000000;
-            }
-            QMenu::item {
-                padding: 6px 24px 6px 12px;
-                background: transparent;
-                border-radius: 4px;
-                color: #303030;
-                margin: 2px 4px;
-            }
-            QMenu::item:selected {
-                background: #e3f2fd;
-                color: #000000;
-            }
-            QMenu::item:pressed {
-                background: #bbdefb;
-                color: #000000;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: #e5e5e5;
-                margin: 4px 8px;
-            }
-        """)
+        """ + _theme.GLOBAL_CSS)
         self.populate_bookmark_bar_menu()
         # 将菜单栏添加到主布局
         main_layout.addWidget(self.menu_bar)
@@ -5473,8 +5643,12 @@ class MainWindow(QMainWindow):
         split_controls_layout.addWidget(self.sync_browse_button)
         split_controls_layout.addWidget(self.compare_directories_button)
         split_controls_layout.addWidget(self.split_scope_label, 1)
-        _theme.bind_style(self.split_controls, 'QToolButton { padding: 4px; border: 1px solid #d0d0d0; }'
-                          'QToolButton:checked { background: #dceafa; border-color: #739bca; }')
+        _theme.bind_style(self.split_controls, 'QToolButton { padding: 4px; border: 1px solid @chrome-border;'
+                          ' border-radius: 4px; color: @fg; background: transparent; }'
+                          'QToolButton:hover { background: @toolbar-hover-bg; }'
+                          'QToolButton:checked { background: @toolbar-checked-bg;'
+                          ' border-color: @toolbar-checked-border; }'
+                          'QLabel { color: @fg-muted; }')
         self.split_controls.hide()
         main_layout.addWidget(self.split_controls)
 
@@ -5489,7 +5663,7 @@ class MainWindow(QMainWindow):
         # 右侧标签页内容区域（使用 StackedWidget 独立显示，不依赖 tab_widget）
         from PyQt5.QtWidgets import QStackedWidget
         self.content_stack = QStackedWidget()
-        _theme.bind_style(self.content_stack, "background: white;")
+        _theme.bind_style(self.content_stack, "background: @editor-bg;")
         self.content_stack.setAutoFillBackground(True)
         # 允许右侧内容在窗口缩小时被压缩，避免阻止左侧目录树向左拖动
         self.content_stack.setMinimumWidth(0)
@@ -5500,7 +5674,7 @@ class MainWindow(QMainWindow):
 
         # 右侧分屏内容栈（默认不加入分割器，F3 时插入到索引 1）
         self.split_content_stack = QStackedWidget()
-        _theme.bind_style(self.split_content_stack, "background: white;")
+        _theme.bind_style(self.split_content_stack, "background: @editor-bg;")
         self.split_content_stack.setAutoFillBackground(True)
         self.split_content_stack.setMinimumWidth(0)
         self.split_content_stack.setVisible(False)

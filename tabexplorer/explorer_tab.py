@@ -876,7 +876,7 @@ class FileExplorerTab(QWidget, NavigationMixin):
     def setup_ui(self):
         from PyQt5.QtWidgets import QLabel
         # 设置FileExplorerTab背景为白色
-        _theme.bind_style(self, "background: white;")
+        _theme.bind_style(self, "background: @editor-bg;")
         self.setAutoFillBackground(True)
         
         layout = QVBoxLayout(self)
@@ -940,7 +940,8 @@ class FileExplorerTab(QWidget, NavigationMixin):
         self.status_bar.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         _theme.bind_style(
             self.status_bar,
-            "QLabel { padding: 2px 8px; background: white; border-top: 1px solid #e0e0e0; font-size: 12px; color: #444; }"
+            "QLabel { padding: 0px 8px; background: @statusbar-bg; border-top: 1px solid @statusbar-border;"
+            " font-size: 12px; color: @statusbar-fg; }"
         )
         # 支持在状态栏上按住拖动整个软件窗口
         self._status_drag_pos = None
@@ -955,7 +956,8 @@ class FileExplorerTab(QWidget, NavigationMixin):
         self.resource_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         _theme.bind_style(
             self.resource_label,
-            "QLabel { padding: 2px 10px; background: white; border-top: 1px solid #e0e0e0; font-size: 12px; }"
+            "QLabel { padding: 0px 10px; background: @statusbar-bg; border-top: 1px solid @statusbar-border;"
+            " font-size: 12px; color: @statusbar-fg; }"
         )
         self.resource_label.mouseDoubleClickEvent = self._status_bar_mouse_double_click
         self.resource_label.hide()
@@ -964,11 +966,11 @@ class FileExplorerTab(QWidget, NavigationMixin):
         self.cancel_file_op_btn.setFixedWidth(52)
         _theme.bind_style(
             self.cancel_file_op_btn,
-            "QPushButton { background: #f8f8f8; border: 1px solid #dddddd; border-top: 1px solid #e0e0e0;"
-            " color: #444; font-size: 11px; padding: 0 6px; }"
-            "QPushButton:hover { background: #efefef; }"
-            "QPushButton:pressed { background: #e5e5e5; }"
-            "QPushButton:disabled { color: #9a9a9a; background: #f4f4f4; }"
+            "QPushButton { background: @statusbar-bg; border: none; border-top: 1px solid @statusbar-border;"
+            " color: @statusbar-fg; font-size: 11px; padding: 0 6px; }"
+            "QPushButton:hover { background: @statusbar-hover-bg; }"
+            "QPushButton:pressed { background: @statusbar-hover-bg; }"
+            "QPushButton:disabled { color: @fg-disabled; }"
         )
         self.cancel_file_op_btn.setToolTip(_hotkey_hint(getattr(getattr(self, 'main_window', None), 'config', {}),
                                                         tr("取消当前后台复制/删除"), 'cancel_file_op'))
@@ -2733,13 +2735,14 @@ class FileExplorerTab(QWidget, NavigationMixin):
                 debug_print(f"[navigate_to] Deferred navigation failed: {e}")
 
     def rebuild_shell_view(self):
-        """切换深浅色后重建 Shell 视图（原生视图只在新建时完整应用配色）。不可见的标签延迟到下次显示。"""
+        """切换深浅色后重建 Shell 视图（原生视图只在新建时完整应用配色）。不可见的标签延迟到下次显示。
+
+        同为深色或同为浅色的主题之间切换不重建，色调由视图上的叠色层调整。"""
         explorer = getattr(self, 'explorer', None)
         path = getattr(self, 'current_path', '')
         if not isinstance(explorer, IExplorerBrowserWidget) or not explorer._init_ok or not path:
             return False
-        if (getattr(explorer, '_created_dark', None) == _theme.is_dark()
-                and getattr(explorer, '_created_gray', False) == _theme.is_gray()):
+        if getattr(explorer, '_created_dark', None) == _theme.is_dark():
             return False
         if not explorer.hibernate(path):
             return False

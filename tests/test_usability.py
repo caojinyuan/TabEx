@@ -66,6 +66,95 @@ class CommandPaletteTests(unittest.TestCase):
         self.assertEqual(dialog.results.topLevelItemCount(), 0)
         self.assertTrue(dialog.explanation.text())
 
+    def test_new_default_hotkey_yields_to_existing_user_binding(self):
+        """新增命令的默认键（Ctrl+P）若已被用户分配给其他功能则让位；用户显式设置的按键保持不变。"""
+        from tabexplorer.hotkeys import _hotkey_bindings
+        self.assertEqual(_hotkey_bindings({})['quick_open'], 'Ctrl+P')
+        bindings = _hotkey_bindings({'hotkey_bindings': {'frequent_dirs': 'Ctrl+P'}})
+        self.assertEqual((bindings['frequent_dirs'], bindings['quick_open']), ('Ctrl+P', ''))
+        bindings = _hotkey_bindings({'hotkey_bindings': {'quick_open': 'Ctrl+Alt+O'}})
+        self.assertEqual(bindings['quick_open'], 'Ctrl+Alt+O')
+
+    def test_fuzzy_match_highlights_words_and_prefers_contiguous_text(self):
+        """连续子串优先于分散字符，词首加分；只在路径等附加文本中命中时可用但不高亮；任一词不中即排除。"""
+        from tabexplorer.commands import fuzzy_match, split_hotkey
+        self.assertEqual(fuzzy_match('sw', 'Save Workspace')[1], [0, 5])
+        self.assertGreater(fuzzy_match('work', 'Save Workspace')[0], fuzzy_match('wsp', 'Save Workspace')[0])
+        self.assertGreater(fuzzy_match('space', 'Space bar')[0], fuzzy_match('space', 'Workspace')[0])
+        self.assertEqual(fuzzy_match('分屏 比较', '分屏对比与目录比较')[1], [0, 1, 7, 8])
+        self.assertEqual(fuzzy_match('src', 'project', r'C:\work\src')[1], [])
+        self.assertIsNone(fuzzy_match('xyz', 'Save Workspace'))
+        self.assertEqual(split_hotkey('查找功能 (Ctrl+Shift+P)'), ('查找功能', 'Ctrl+Shift+P'))
+        self.assertEqual(split_hotkey('目录差异比较...'), ('目录差异比较...', ''))
+
+    def test_recent_commands_come_first_with_group_labels(self):
+        """最近使用的命令排在最前并标出分组，其余命令保持原顺序；右侧显示从标签拆出的快捷键。"""
+        from tabexplorer.commands import _ROLE_GROUP, _ROLE_KEYS
+        dialog = CommandPalette()
+        self.addCleanup(dialog.deleteLater)
+        actions = [QAction(text, dialog) for text in ('Alpha', 'Beta (Ctrl+B)', 'Gamma')]
+        dialog.set_commands([(action.text(), action) for action in actions], recent=['Gamma', 'Beta'])
+        rows = [dialog.results.topLevelItem(index) for index in range(dialog.results.topLevelItemCount())]
+        self.assertEqual([row.text(0) for row in rows], ['Gamma', 'Beta', 'Alpha'])
+        groups = [row.data(0, _ROLE_GROUP) for row in rows]
+        self.assertEqual(groups, [app.tr('最近使用'), None, app.tr('其他命令')])
+        self.assertEqual(rows[1].data(0, _ROLE_KEYS), 'Ctrl+B')
+        dialog.query.setText('gam')
+        self.assertEqual(dialog.results.topLevelItem(0).text(0), 'Gamma')
+        self.assertEqual(dialog.results.topLevelItemCount(), 1)
+
+    def test_quick_open_prefixes_switch_between_files_commands_and_help(self):
+        """快速打开：不带前缀查找标签/书签/目录，> 切到命令，? 显示用法并可一键切换；输入路径时首项为直接打开。"""
+        opened = []
+        entries = [{'group': 'tabs', 'label': 'src', 'description': r'C:\work\src', 'run': lambda: opened.append('src')},
+                   {'group': 'bookmarks', 'label': 'Docs', 'description': r'D:\docs', 'run': lambda: opened.append('docs')}]
+        dialog = CommandPalette(quick_open=lambda: entries, open_path=opened.append)
+        self.addCleanup(dialog.deleteLater)
+        command = QAction('Compare folders', dialog)
+        dialog.set_commands([('Compare folders', command)])
+        self.assertEqual(dialog.mode, 'files')
+        self.assertEqual(dialog.results.topLevelItemCount(), 2)
+        dialog.query.setText('docs')
+        self.assertEqual(dialog.results.topLevelItem(0).text(0), 'Docs')
+        dialog.choose_current()
+        self.assertIs(dialog.selected_entry, entries[1])
+        dialog.query.setText('>comp')
+        self.assertEqual(dialog.mode, 'commands')
+        self.assertEqual(dialog.results.topLevelItem(0).text(0), 'Compare folders')
+        dialog.query.setText('?')
+        self.assertEqual(dialog.mode, 'help')
+        dialog.results.setCurrentItem(dialog.results.topLevelItem(1))
+        dialog.choose_current()
+        self.assertEqual(dialog.query.text(), '>')
+        self.assertEqual(dialog.mode, 'commands')
+        QTest.keyClick(dialog.query, Qt.Key_P, Qt.ControlModifier)
+        self.assertEqual(dialog.mode, 'files')
+        dialog.query.setText(r'C:\Windows')
+        self.assertEqual(dialog.results.topLevelItem(0).text(0), app.tr('打开路径'))
+        dialog.choose_current()
+        dialog.selected_entry['run']()
+        self.assertEqual(opened, [r'C:\Windows'])
+
+    def test_theme_choices_preview_on_move_and_start_at_current_theme(self):
+        """主题选择从当前主题开始；上下移动后预览所选主题，筛选只按主题名称。"""
+        previewed = []
+        dialog = CommandPalette()
+        self.addCleanup(dialog.deleteLater)
+        entries = [{'id': 'light', 'label': 'Light Modern', 'group': 'light'},
+                   {'id': 'dark', 'label': 'Dark Modern', 'group': 'dark'},
+                   {'id': 'monokai', 'label': 'Monokai', 'group': 'dark'}]
+        dialog.set_theme_choices(entries, 'dark', previewed.append)
+        dialog.show()
+        self.assertEqual(dialog.mode, 'themes')
+        self.assertEqual(dialog.results.currentItem().text(0), 'Dark Modern')
+        QTest.keyClick(dialog.query, Qt.Key_Down)
+        dialog._preview_current()
+        self.assertEqual(previewed[-1], 'monokai')
+        dialog.query.setText('light')
+        self.assertEqual(dialog.results.topLevelItemCount(), 1)
+        dialog.choose_current()
+        self.assertEqual(dialog.selected_entry['id'], 'light')
+
 
 class ContextControlsTests(unittest.TestCase):
     @classmethod
@@ -164,14 +253,72 @@ class ContextControlsTests(unittest.TestCase):
         action.triggered.connect(callback)
 
         def choose():
-            dialog = QApplication.activeModalWidget()
-            self.assertIsInstance(dialog, CommandPalette)
-            dialog.query.setText(app.tr('目录差异比较...'))
+            dialog = next(widget for widget in QApplication.topLevelWidgets()
+                          if isinstance(widget, CommandPalette) and widget.isVisible())
+            dialog.query.setText('>' + app.tr('目录差异比较...'))
             dialog.choose_current()
 
         QTimer.singleShot(0, choose)
         self.window.show_command_palette()
         callback.assert_called_once()
+        self.assertEqual(self.window.config['recent_commands'][0], app.tr('目录差异比较...'))
+
+    def test_command_center_shows_folder_and_opens_quick_open(self):
+        """命令中心显示活动标签的文件夹名，提示中带快捷键，点击打开快速打开。"""
+        w = self.window
+        w._refresh_context_actions()
+        self.assertEqual(w.command_center._context, os.path.basename(self.panes[0].current_path))
+        self.assertIn('Ctrl+P', w.command_center.toolTip())
+        self.assertFalse(w.command_center.icon().isNull())
+        with patch.object(w, 'show_quick_open') as show:
+            w.command_center.click()
+        show.assert_called_once_with()
+        self.assertIn('Ctrl+P', w.quick_open_action.text())
+
+    def test_quick_open_lists_each_path_once_and_activates_its_tab(self):
+        """快速打开：同一路径只列一次（右侧标签成为别名），选中后切到该标签；最近关闭的标签可直接恢复。"""
+        w = self.window
+        w.closed_tabs_history = [{'path': r'C:\gone', 'title': 'gone', 'is_shell': False}]
+        entries = w._quick_open_entries()
+        tabs = [entry for entry in entries if entry['group'] == app.tr('打开的标签')]
+        self.assertEqual(len(tabs), 1)
+        self.assertIn(app.tr('右侧'), tabs[0]['aliases'])
+        with patch.object(w, 'set_active_pane_to_group') as activate:
+            tabs[0]['run']()
+        activate.assert_called_once_with(w.tab_widget)
+        closed = next(entry for entry in entries if entry['group'] == app.tr('最近关闭'))
+        closed['run']()
+        w.add_new_tab.assert_called_with(r'C:\gone', is_shell=False, target_tabwidget=w.get_active_group_tabwidget())
+        self.assertEqual(w.closed_tabs_history, [])
+
+    def test_color_theme_picker_previews_then_reverts_or_saves(self):
+        """主题选择：上下键即时预览；Esc 恢复原主题且不保存，Enter 保存并保持所选主题。"""
+        w = self.window
+        native = patch_all('_set_native_app_mode')
+        native.start()
+        self.addCleanup(native.stop)
+        self.addCleanup(app.set_theme, 'light')
+        self.config['theme'] = 'light'
+        w.apply_theme_config()
+        previewed = []
+
+        def step(final_key):
+            palette = next(widget for widget in QApplication.topLevelWidgets()
+                           if isinstance(widget, CommandPalette) and widget.isVisible())
+            QTest.keyClick(palette.query, Qt.Key_Down)
+            palette._preview_current()
+            previewed.append(app.current_theme_id())
+            QTest.keyClick(palette.query, final_key)
+
+        QTimer.singleShot(0, lambda: step(Qt.Key_Escape))
+        w.show_color_theme_picker()
+        self.assertNotEqual(previewed[-1], 'light')
+        self.assertEqual(app.current_theme_id(), 'light')
+        self.assertEqual(self.config['theme'], 'light')
+        QTimer.singleShot(0, lambda: step(Qt.Key_Return))
+        w.show_color_theme_picker()
+        self.assertEqual(self.config['theme'], previewed[-1])
+        self.assertEqual(app.current_theme_id(), previewed[-1])
 
     def test_split_controls_fit_languages_and_font_scales(self):
         old_language, old_font = app._app_language, self.qt.font()
