@@ -2,7 +2,7 @@
 
 面向 **Windows x64** 的多标签页文件浏览器，类似 Clover。保留原生 Windows 文件视图，并提供标签管理、左右分屏、搜索和常用工具。
 
-**当前源码版本：v4.11**。修复分组收起动画方向：组首保持不动，展开向右伸展、收起向左收拢，不再先向右拉伸再跳回，保留约 500ms 平滑动画。继续支持中英文截图离线文字识别，详见[截图使用说明](#屏幕截图)和[更新记录](docs/DESIGN.md#changes)。
+**当前版本：v4.12**。修复打包 EXE 的 OCR 启动报错：统一 Qt 与 ONNX Runtime 使用的 C++ 运行库，并将 EXE 子进程实际中英文识别加入发布验收，检查失败不替换旧 EXE。详见[打包说明](#打包-exe)、[截图使用说明](#屏幕截图)和[更新记录](docs/DESIGN.md#changes)。
 
 [下载发布版](https://github.com/caojinyuan/TabEx/releases/latest) · [功能动图](#demos) · [快速开始](#quickstart) · [使用说明](#usage) · [快捷键](#shortcuts) · [设计文档](docs/DESIGN.md)
 
@@ -175,6 +175,12 @@
 3. 运行 [1_run_TabEx.bat](1_run_TabEx.bat) 启动。
 
 首次安装需要联网；Python 和依赖保存在项目内，无需预装 Python，也不用手动激活环境。
+
+### 打包 EXE
+
+运行 [2_build_exe.bat](2_build_exe.bat)。构建机需要安装 **Microsoft Visual C++ 2015–2022 Redistributable x64（14.42 或更新版本）**。打包会把新版 C++ 运行库同时放入 EXE 根目录和 Qt 目录，避免 Qt 自带旧库导致 ONNX Runtime DLL 初始化失败；缺失或版本过旧会明确中止。
+
+只有单元测试、EXE 主窗口检查和 **EXE 子进程实际中英文 OCR 识别**全部通过后，才替换 `TabExplorer.exe`。验收结果（含 `ocr` 字段）写入 `artifacts/release-runtime.json`；失败保留旧 EXE。发布的 EXE 已携带运行库和模型，用户不需要安装 Python。
 
 ### 第一次打开后
 

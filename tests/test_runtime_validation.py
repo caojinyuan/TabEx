@@ -50,6 +50,7 @@ class RuntimeBudgetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             host = types.SimpleNamespace(
                 _finishing=False, timer=Mock(), samples=[], sample=lambda: {},
+                _ocr_worker=None, ocr_result={'ok': True},
                 latencies=metrics, scenario='lifecycle', baseline={}, violations=[],
                 limits=DEFAULT_LIMITS, actions=2, restored=True, phase='resource checkpoint',
                 cycles=3, warmup_cycles=2, expected_path='', window=Mock(),
@@ -63,6 +64,21 @@ class RuntimeBudgetTests(unittest.TestCase):
             self.assertEqual(report['error'], 'Responsiveness budget exceeded')
             self.assertTrue(any('heartbeat_max_ms' in error for error in report['violations']))
             self.assertEqual(report['measured_cycles'], 1)
+
+    def test_ocr_requires_real_chinese_and_english_output(self):
+        for text, error, expected in (
+                ('\u79bb\u7ebf\u6587\u5b57\u8bc6\u522b \u4e2d\u6587\u6d4b\u8bd5\nHello World 12345', '', True),
+                ('Hello World 12345', '', False),
+                ('', 'DLL initialization failed', False)):
+            with self.subTest(text=text, error=error):
+                host = types.SimpleNamespace(finish=Mock())
+                RuntimeValidation.ocr_completed(host, text, error)
+                self.assertEqual(host.ocr_result['ok'], expected)
+                if expected:
+                    host.finish.assert_not_called()
+                else:
+                    host.finish.assert_called_once()
+                    self.assertIn('OCR validation failed', host.finish.call_args.args[0])
 
     def test_invalid_budget_configuration_rejected_before_launch(self):
         from tools.validate_runtime import validate

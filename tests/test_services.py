@@ -445,6 +445,30 @@ class BundledToolTests(unittest.TestCase):
 
 
 class BuildPipelineTests(unittest.TestCase):
+    def test_runtime_collection_overrides_both_root_and_qt_dlls(self):
+        from tools.build_release import collect_msvc_runtime, MSVC_DLLS
+        image = Mock()
+        image.FILE_HEADER.Machine = 0x8664
+        image.VS_FIXEDFILEINFO = [types.SimpleNamespace(FileVersionMS=(14 << 16) | 42)]
+        image.__enter__ = Mock(return_value=image)
+        image.__exit__ = Mock(return_value=False)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in MSVC_DLLS:
+                (root / name).touch()
+            with patch('pefile.PE', return_value=image):
+                binaries = collect_msvc_runtime(root)
+                self.assertEqual(binaries, [(root / name, destination) for name in MSVC_DLLS
+                                            for destination in ('.', r'PyQt5\Qt5\bin')])
+                for machine, version in ((0x14c, 42), (0x8664, 26)):
+                    image.FILE_HEADER.Machine = machine
+                    image.VS_FIXEDFILEINFO[0].FileVersionMS = (14 << 16) | version
+                    with self.assertRaisesRegex(RuntimeError, '14.42'):
+                        collect_msvc_runtime(root)
+            (root / MSVC_DLLS[0]).unlink()
+            with self.assertRaisesRegex(RuntimeError, 'Missing'):
+                collect_msvc_runtime(root)
+
     def test_build_installs_from_requirements_directory_before_building(self):
         from tools.build_release import build
         root = Path(__file__).resolve().parents[1]
@@ -479,10 +503,11 @@ class BuildPipelineTests(unittest.TestCase):
                         destination.mkdir()
                         (destination / 'TabExplorer.exe').write_bytes(b'candidate')
 
-                verify = Mock(return_value={'ok': True, 'frozen': True})
+                verify = Mock(return_value={'ok': True, 'frozen': True, 'ocr': {'ok': True}})
                 if failure == 'validation':
                     verify.side_effect = RuntimeError('native failed')
                 with ExitStack() as stack:
+                    stack.enter_context(patch('tools.build_release.collect_msvc_runtime', return_value=[]))
                     if failure == 'replace':
                         stack.enter_context(patch('os.replace', side_effect=PermissionError('in use')))
                     with self.assertRaises((RuntimeError, OSError, subprocess.CalledProcessError)):
@@ -511,9 +536,12 @@ class BuildPipelineTests(unittest.TestCase):
 
             def verify(*arguments, **keywords):
                 self.assertEqual(executable.read_bytes(), b'old')
-                return {'ok': True, 'frozen': True}
+                return {'ok': True, 'frozen': True, 'ocr': {'ok': True}}
 
-            self.assertEqual(build(root, install=False, run=run, verify=verify), executable)
+            runtime = root / 'msvcp140.dll'
+            with patch('tools.build_release.collect_msvc_runtime',
+                       return_value=[(runtime, '.'), (runtime, r'PyQt5\Qt5\bin')]):
+                self.assertEqual(build(root, install=False, run=run, verify=verify), executable)
             self.assertIn('unittest', commands[0])
             command = commands[1]
             self.assertEqual(command[command.index('--collect-data') + 1], 'rapidocr')
@@ -524,7 +552,33 @@ class BuildPipelineTests(unittest.TestCase):
             bundled_data = [command[index + 1] for index, value in enumerate(command) if value == '--add-data']
             self.assertEqual(bundled_data, [str(root / 'icons') + ';icons'] +
                              [str(root / 'tools' / tool) + ';tools' for tool in ('es.exe', 'rg.exe', '7zr.exe')])
+            bundled_binaries = [command[index + 1] for index, value in enumerate(command)
+                                if value == '--add-binary']
+            self.assertEqual(bundled_binaries, [str(runtime) + ';.', str(runtime) + r';PyQt5\Qt5\bin'])
             self.assertEqual(executable.read_bytes(), b'new')
+
+    def test_missing_or_failed_packaged_ocr_never_promotes_executable(self):
+        from tools.build_release import build
+        for result in ({'ok': True, 'frozen': True},
+                       {'ok': True, 'frozen': True, 'ocr': {'ok': False}}):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'tools').mkdir()
+                for name in ('es.exe', 'rg.exe', '7zr.exe'):
+                    (root / 'tools' / name).touch()
+                executable = root / 'TabExplorer.exe'
+                executable.write_bytes(b'old')
+
+                def run(command, **keywords):
+                    if 'PyInstaller' in command:
+                        destination = Path(command[command.index('--distpath') + 1])
+                        destination.mkdir()
+                        (destination / 'TabExplorer.exe').write_bytes(b'candidate')
+
+                with patch('tools.build_release.collect_msvc_runtime', return_value=[]):
+                    with self.assertRaisesRegex(RuntimeError, 'OCR validation'):
+                        build(root, install=False, run=run, verify=Mock(return_value=result))
+                self.assertEqual(executable.read_bytes(), b'old')
 
 
 class QuickLookTests(unittest.TestCase):

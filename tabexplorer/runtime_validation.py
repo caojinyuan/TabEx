@@ -80,6 +80,8 @@ class RuntimeValidation(QObject):
         self.phase = 'startup'
         self._in_tick = False
         self._finishing = False
+        self.ocr_result = None
+        self._ocr_worker = None
         self._step = None
         if self.scenario == 'lifecycle':
             from .runtime_scenarios import lifecycle_steps
@@ -132,6 +134,8 @@ class RuntimeValidation(QObject):
             if now > self.deadline:
                 self.finish(f'Validation timeout: {self.phase}')
                 return
+            if self.ready_at is not None and self.ocr_result is None:
+                return
             if self.scenario == 'lifecycle' and self.ready_at is not None:
                 self.tick_lifecycle(now)
                 return
@@ -142,8 +146,8 @@ class RuntimeValidation(QObject):
                 self.first_ready_seconds = time.time() - self.started_at
                 self.samples.append(self.sample())
                 self.report.with_suffix('.ready').write_text('ready', encoding='ascii')
-                if self.scenario == 'lifecycle':
-                    return
+                self.start_ocr()
+                return
             if now - self.last_action < 0.2:
                 return
             self.last_action = now
@@ -176,6 +180,31 @@ class RuntimeValidation(QObject):
             self.finish(f'{type(error).__name__}: {error}')
         finally:
             self._in_tick = False
+
+    def start_ocr(self):
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtGui import QFont, QImage, QPainter
+        from .ocr import OcrWorker
+
+        self.phase = 'ocr'
+        image = QImage(1100, 220, QImage.Format_RGB888)
+        image.fill(Qt.white)
+        painter = QPainter(image)
+        painter.setFont(QFont('Microsoft YaHei', 28))
+        painter.drawText(30, 75, '\u79bb\u7ebf\u6587\u5b57\u8bc6\u522b \u4e2d\u6587\u6d4b\u8bd5')
+        painter.drawText(30, 155, 'Hello World 12345')
+        painter.end()
+        self._ocr_worker = OcrWorker(image, 'auto', self)
+        self._ocr_worker.completed.connect(self.ocr_completed)
+        self._ocr_worker.start()
+
+    def ocr_completed(self, text, error):
+        expected = ('\u79bb\u7ebf\u6587\u5b57\u8bc6\u522b', '\u4e2d\u6587\u6d4b\u8bd5', 'Hello World 12345')
+        if not error and not all(value in text for value in expected):
+            error = f'OCR output mismatch: {text!r}'
+        self.ocr_result = {'ok': not error, 'text': text, 'error': error}
+        if error:
+            self.finish(f'OCR validation failed: {error}')
 
     def tick_lifecycle(self, now):
         if self._step is not None:
@@ -212,6 +241,11 @@ class RuntimeValidation(QObject):
             return
         self._finishing = True
         self.timer.stop()
+        if self._ocr_worker is not None:
+            self._ocr_worker.requestInterruption()
+            self._ocr_worker.wait()
+        if not error and not (self.ocr_result and self.ocr_result['ok']):
+            error = 'OCR validation did not pass'
         self.samples.append(self.sample())
         latencies = self.latencies.summary()
         if self.scenario == 'lifecycle' and self.baseline is not None:
@@ -221,6 +255,7 @@ class RuntimeValidation(QObject):
                 error = 'Responsiveness budget exceeded'
         report = {
             'ok': not error, 'error': error, 'frozen': bool(getattr(__import__('sys'), 'frozen', False)),
+            'ocr': self.ocr_result,
             'first_ready_s': round(getattr(self, 'first_ready_seconds', 0), 3),
             'actions': self.actions, 'minimize_restore': self.restored,
             **latencies, 'samples': self.samples, 'scenario': self.scenario, 'phase': self.phase,
