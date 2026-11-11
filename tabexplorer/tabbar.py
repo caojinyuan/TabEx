@@ -395,6 +395,9 @@ class CustomTabBar(QTabBar):
         return super().minimumTabSizeHint(index)
 
     def animate_group_change(self, change):
+        # QTabWidget resets expanding when installing its bar; disable it here
+        # so freed space cannot stretch the leader and cause a final snap.
+        self.setExpanding(False)
         before = [self.tabRect(i).width() if self.isTabVisible(i) else 0
                   for i in range(self.count())]
         self._finish_group_animation()

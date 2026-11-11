@@ -2,7 +2,7 @@
 
 面向 **Windows x64** 的多标签页文件浏览器，类似 Clover。保留原生 Windows 文件视图，并提供标签管理、左右分屏、搜索和常用工具。
 
-**当前源码版本：v4.10**。新增截图离线文字识别：使用 RapidOCR 本地模型自动识别中英文，按行整理多列文字，支持编辑、重试和复制；模型随新版 EXE 提供，无需 Windows OCR 语言包，识别不联网、不上传截图。详见[截图使用说明](#屏幕截图)和[更新记录](docs/DESIGN.md#changes)。
+**当前源码版本：v4.11**。修复分组收起动画方向：组首保持不动，展开向右伸展、收起向左收拢，不再先向右拉伸再跳回，保留约 500ms 平滑动画。继续支持中英文截图离线文字识别，详见[截图使用说明](#屏幕截图)和[更新记录](docs/DESIGN.md#changes)。
 
 [下载发布版](https://github.com/caojinyuan/TabEx/releases/latest) · [功能动图](#demos) · [快速开始](#quickstart) · [使用说明](#usage) · [快捷键](#shortcuts) · [设计文档](docs/DESIGN.md)
 

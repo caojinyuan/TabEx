@@ -258,6 +258,31 @@ class TabFeatureTests(unittest.TestCase):
         self.assertFalse(bar._group_widths)
         self.assertTrue(all(bar.isTabVisible(i) for i in range(bar.count())))
 
+    def test_group_collapse_moves_left_without_stretching_or_final_jump(self):
+        host, tabs, bar = self.animated_host()
+        head = bar.tabRect(0)
+        following_width = bar.tabRect(2).width()
+        previous_left = bar.tabRect(2).left()
+        previous_right = bar.tabRect(1).right()
+        host.set_tab_group_collapsed(tabs[0], host.tab_widget, True)
+        bar._group_animation.pause()
+        for milliseconds in (0, 100, 200, 300, 400, 499, 500):
+            bar._group_animation.setCurrentTime(milliseconds)
+            self.app.processEvents()
+            self.assertEqual(bar.tabRect(0), head)
+            self.assertEqual(bar.tabRect(2).width(), following_width)
+            left = bar.tabRect(2).left()
+            self.assertLessEqual(left, previous_left)
+            if milliseconds == 500:
+                self.assertLessEqual(previous_left - left, 1)
+            else:
+                self.assertEqual(bar.tabRect(1).left(), head.right() + 1)
+                self.assertLessEqual(bar.tabRect(1).right(), previous_right)
+                previous_right = bar.tabRect(1).right()
+            previous_left = left
+        self.assertFalse(bar.isTabVisible(1))
+        self.assertEqual(bar.tabRect(2).left(), head.right() + 1)
+
 
 class FrequentDirsTests(unittest.TestCase):
     def test_ranking_filter_remove_and_persistence(self):
