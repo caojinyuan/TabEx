@@ -2,7 +2,8 @@
 
 样式表与自绘颜色一律按浅色主题书写：
 - `@令牌`（如 `background: @statusbar-bg`）取当前主题的界面配色，用于标题栏、标签、状态栏等主框架；
-- 其余字面颜色由 qss()/fg()/bg()/line() 按用途换算到当前主题（Light Modern、Light+ 保持原样）。
+- 其余字面颜色由 qss()/fg()/bg()/line() 按用途换算到当前主题（Light Modern、Light+ 保持原样）；
+  带强调色板的深色主题（如 Monokai Black）把彩色文字换成色板里色相最近的颜色，红绿蓝等含义不变。
 bind_style() 记录原文，切换主题时由 set_theme() 统一重新换算。"""
 
 import ctypes
@@ -11,9 +12,10 @@ import re
 import sys
 from functools import lru_cache
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QColor, QPalette
-from PyQt5.QtWidgets import QApplication, QToolTip
+from PyQt5.QtCore import QPointF, QRectF, Qt
+from PyQt5.QtGui import QColor, QPainter, QPalette
+from PyQt5.QtWidgets import (QApplication, QPlainTextEdit, QProxyStyle, QStyle, QStyleOptionButton, QTextEdit,
+                             QToolTip)
 
 from .debuglog import debug_print
 from .i18n import tr
@@ -85,11 +87,13 @@ def _neutral_offset(editor):
 
 
 def _dark_remap(editor, **params):
-    """深色主题的字面颜色换算参数：浅色背景按亮度反转到以 editor 为底的深色区间。"""
+    """深色主题的字面颜色换算参数：浅色背景按亮度反转到以 editor 为底的深色区间。
+
+    accents 为强调色板时，彩色文字不再按亮度换算，而是取色板中色相最近的颜色。"""
     base = _lightness(editor)
     remap = dict(mode='dark', base=base, offset=_neutral_offset(editor), bg_gain=1.05, bg_cap=0.45,
                  line_gain=1.25, line_floor=base + 0.12, line_cap=0.5, fg_top=0.95, fg_gain=0.8,
-                 fg_tint=0.35, contrast_line=None)
+                 fg_tint=0.35, contrast_line=None, accents=())
     remap.update(params)
     return remap
 
@@ -113,6 +117,7 @@ def _complete_colors(dark, prominent, colors):
     put('titlebar-bg', tokens['chrome-bg'])
     put('titlebar-fg', tokens['chrome-fg'])
     put('titlebar-border', tokens['chrome-border'])
+    put('window-border', None)  # Windows 11 系统窗口边框色；None 为系统默认
     put('toolbar-hover-bg', '#5A5D5E50' if dark else '#B8B8B850')
     put('toolbar-active-bg', '#63666780' if dark else '#A6A6A680')
     put('toolbar-checked-bg', _alpha(tokens['focus-border'], 0x40))
@@ -134,6 +139,7 @@ def _complete_colors(dark, prominent, colors):
     put('tab-unfocused-border-top', _mix(tokens['fg-muted'], tokens['tab-active-bg'], 0.4))
     put('tab-unfocused-active-fg', _mix(tokens['tab-active-fg'], tokens['tab-active-bg'], 0.3))
     put('crumb-fg', tokens['fg-muted'])
+    put('crumb-separator-fg', tokens['crumb-fg'])
     put('crumb-active-fg', tokens['fg'])
     put('crumb-hover-bg', tokens['toolbar-hover-bg'])
     put('pane-inactive-border', _mix(tokens['fg-muted'], tokens['editor-bg'], 0.45))
@@ -146,6 +152,8 @@ def _complete_colors(dark, prominent, colors):
     put('input-bg', _mix(tokens['editor-bg'], '#FFFFFF', 0.08) if dark else '#FFFFFF')
     put('input-fg', tokens['fg'])
     put('input-border', tokens['chrome-border'])
+    # 输入框、按钮、勾选框的外框（Fusion 绘制的控件）；浅色主题沿用 Fusion 自己的外框（None）
+    put('control-border', tokens['input-border'] if dark else None)
     put('input-placeholder', tokens['fg-muted'])
     put('button-bg', tokens['focus-border'])
     put('button-fg', '#FFFFFF')
@@ -225,6 +233,11 @@ class ColorTheme:
         channels = [(wanted - (1.0 - alpha) * base) / alpha for wanted, base in zip(target, native)]
         return tuple(max(0, min(255, int(round(value)))) for value in channels) + (int(round(alpha * 255)),)
 
+
+# Monokai 原色：粉（关键字）、橙（参数）、黄（字符串）、绿（函数名）、青（类型）、紫（常量）
+_MONOKAI_ACCENTS = ('#F92672', '#FD971F', '#E6DB74', '#A6E22E', '#66D9EF', '#AE81FF')
+# Monokai 注释色：Monokai Black 的输入框、按钮、勾选框及样式表里的浅灰边框统一用它，黑底和深灰底上对比度都 ≥3:1
+_MONOKAI_COMMENT = '#75715E'
 
 _THEMES = {theme.id: theme for theme in (
     ColorTheme('light', 'Light Modern', 'light', {
@@ -319,6 +332,26 @@ _THEMES = {theme.id: theme for theme in (
         'palette-alt-base': '#2D2E27', 'palette-button': '#414339', 'selection-bg': '#75715E',
         'selection-fg': '#F8F8F2',
     }, remap=_dark_remap('#272822'), tint_view=True),
+    # 纯黑底配 Monokai 原色，色彩按代码里的角色使用：粉色是结构标记（活动标签顶线、路径分隔符），
+    # 绿色是当前名称（活动标签、当前文件夹），青色是焦点、链接与分组，橙色是匹配高亮，深蓝是选区；
+    # 黑底上窗口边框（Windows 11）和标签之间的分隔线用橙色，浅色或深色背景前都看得清；
+    # 输入框、按钮、勾选框和样式表里的浅灰边框统一为 Monokai 注释色，看得见又不抢眼。
+    # 大面积文字保持中性白/灰，彩色只落在小元素和细线上。原生视图保持系统深色底，不叠色。
+    ColorTheme('monokai_black', 'Monokai Black', 'dark', {
+        'editor-bg': '#000000', 'fg': '#F8F8F2', 'fg-muted': '#A6A6A0', 'focus-border': '#66D9EF',
+        'chrome-bg': '#000000', 'chrome-border': '#242524', 'window-border': '#FD971F', 'link-fg': '#66D9EF',
+        'tab-active-fg': '#A6E22E', 'tab-active-border-top': '#F92672', 'tab-separator': '#FD971F',
+        'tab-hover-bg': '#161616', 'crumb-active-fg': '#A6E22E', 'crumb-separator-fg': '#F92672',
+        'statusbar-fg': '#CFCFC2', 'statusbar-emphasis-fg': '#66D9EF',
+        'input-bg': '#161616', 'input-border': _MONOKAI_COMMENT, 'input-placeholder': '#8F8F89',
+        'menu-bg': '#121212', 'menu-border': '#333333', 'menu-selection-bg': '#203561',
+        'menu-selection-fg': '#FFFFFF', 'menu-separator': '#2E2E2E', 'list-hover-bg': '#FFFFFF14',
+        'list-active-bg': '#203561', 'list-active-fg': '#FFFFFF', 'list-highlight-fg': '#FD971F',
+        'list-active-highlight-fg': '#FD971F', 'widget-bg': '#121212', 'widget-border': '#333333',
+        'picker-group-fg': '#66D9EF', 'tooltip-bg': '#121212', 'tooltip-border': '#3A3A3A',
+        'palette-window': '#121212', 'palette-base': '#000000', 'palette-alt-base': '#0D0D0D',
+        'palette-button': '#1E1E1E', 'selection-bg': '#203561', 'selection-fg': '#FFFFFF',
+    }, remap=_dark_remap('#000000', accents=_MONOKAI_ACCENTS, contrast_line=_MONOKAI_COMMENT)),
     ColorTheme('solarized_dark', 'Solarized Dark', 'dark', {
         'editor-bg': '#002B36', 'fg': '#93A1A1', 'fg-muted': '#6F8A90', 'focus-border': '#2AA198',
         'chrome-bg': '#00212B', 'chrome-border': '#0A3F4C', 'titlebar-bg': '#002C39', 'link-fg': '#268BD2',
@@ -510,6 +543,14 @@ def _from_hsl(hue, sat, light):
     return result.red(), result.green(), result.blue()
 
 
+def _nearest_accent(hue, accents):
+    """强调色板中色相最近的颜色 (r, g, b)：红色提示仍是红，绿色成功仍是绿，只是换成主题的那一种。"""
+    def distance(accent):
+        gap = abs(hue - QColor(accent).hslHueF()) % 1.0
+        return min(gap, 1.0 - gap)
+    return _rgba(min(accents, key=distance))[:3]
+
+
 def _convert_dark(role, hue, sat, light, gray, remap):
     if role == 'fg':
         # 浅色文字本就用于深色/彩色底（如强调按钮上的白字），保持不变
@@ -517,6 +558,8 @@ def _convert_dark(role, hue, sat, light, gray, remap):
             return None
         if gray:
             return _shift(remap['fg_top'] - light * remap['fg_gain'], remap['offset'], remap['fg_tint'])
+        if remap['accents']:
+            return _nearest_accent(hue, remap['accents'])
         return _from_hsl(hue, sat, max(0.62, remap['fg_top'] - light * remap['fg_gain']))
     if role == 'bg':
         # 深色或强调色背景（L<0.55）保持不变，浅色背景按亮度反转到深色区间
@@ -584,6 +627,26 @@ def line(value):
 def status_color(value):
     """状态栏里的彩色文字：强调色底的状态栏（Light+/Dark+）统一用状态栏前景色，否则按主题换算。"""
     return color('statusbar-fg') if _current.prominent_statusbar else fg(value)
+
+
+def group_tab_fill_alpha(group_color, active):
+    """标签分组底色的不透明度（0–255）。
+
+    浅色主题保持 72/52。深色底上同样的透明度只剩一层暗红/暗蓝，看不出是同一组：在不低于原值的前提下逐步加深，
+    直到标签文字对比度将低于 4.5（当前标签）/ 3.0（其他标签）或达到上限。"""
+    base = 72 if active else 52
+    if not _dark:
+        return base
+    tokens = _current.colors
+    text = tokens['tab-active-fg' if active else 'tab-inactive-fg'][:7]
+    under = tokens['tab-active-bg' if active else 'tab-inactive-bg'][:7]
+    minimum, ceiling = (4.5, 112) if active else (3.0, 84)
+    best = base
+    for alpha in range(base + 4, ceiling + 1, 4):
+        if _contrast(text, _mix(under, group_color, alpha / 255.0)) < minimum:
+            break
+        best = alpha
+    return best
 
 
 _DECLARATION = re.compile(r'([A-Za-z-]+)(\s*:\s*)([^;{}]*)')
@@ -699,13 +762,28 @@ def _set_dwm_dark(hwnd, dark):
         return False
 
 
-def _set_dwm_caption(hwnd, caption, text):
-    """Windows 11 起可设置标题栏底色和文字色，让系统标题栏与下方工具栏连成一体。"""
+def _colorref(value):
+    red, green, blue, _alpha_value = _rgba(value)
+    return red | (green << 8) | (blue << 16)
+
+
+def _dwm_frame_colors():
+    """Windows 11 系统窗口框架的颜色 [(DWM 属性, COLORREF)]：标题栏底色、标题文字色和窗口边框色。
+
+    主题未指定 window-border 时边框恢复系统默认（DWMWA_COLOR_DEFAULT），从带边框色的主题切走后不残留。"""
+    tokens = _current.colors
+    border = tokens.get('window-border')
+    return [(35, _colorref(tokens['titlebar-bg'])),  # DWMWA_CAPTION_COLOR
+            (36, _colorref(tokens['titlebar-fg'])),  # DWMWA_TEXT_COLOR
+            (34, _colorref(border) if border else 0xFFFFFFFF)]  # DWMWA_BORDER_COLOR
+
+
+def _set_dwm_caption(hwnd, colors):
+    """Windows 11 起可设置标题栏底色、文字色和边框色，让系统标题栏与下方工具栏连成一体。"""
     if _windows_build() < 22000:
         return False
-    for attribute, value in ((35, caption), (36, text)):  # DWMWA_CAPTION_COLOR / DWMWA_TEXT_COLOR
-        red, green, blue, _alpha_value = _rgba(value)
-        colorref = ctypes.c_uint32(red | (green << 8) | (blue << 16))
+    for attribute, value in colors:
+        colorref = ctypes.c_uint32(value)
         try:
             if ctypes.windll.dwmapi.DwmSetWindowAttribute(
                     ctypes.wintypes.HWND(hwnd), attribute, ctypes.byref(colorref), ctypes.sizeof(colorref)) != 0:
@@ -716,7 +794,7 @@ def _set_dwm_caption(hwnd, caption, text):
 
 
 def apply_window_frame(widget, force=False):
-    """按当前主题设置顶层窗口系统标题栏：深浅色，Windows 11 上同时设置标题栏底色与文字色。"""
+    """按当前主题设置顶层窗口系统标题栏：深浅色，Windows 11 上同时设置标题栏底色、文字色与窗口边框色。"""
     try:
         if not widget.isWindow() or widget.windowFlags() & Qt.FramelessWindowHint:
             return
@@ -733,7 +811,7 @@ def apply_window_frame(widget, force=False):
         if dark_stale and _set_dwm_dark(hwnd, _dark):
             widget.setProperty(_FRAME_PROPERTY, _dark)
             changed = True
-        if caption_stale and _set_dwm_caption(hwnd, _current.colors['titlebar-bg'], _current.colors['titlebar-fg']):
+        if caption_stale and _set_dwm_caption(hwnd, _dwm_frame_colors()):
             widget.setProperty(_CAPTION_PROPERTY, _current.id)
             changed = True
         if changed and widget.isVisible():
@@ -775,6 +853,79 @@ def _build_palette(theme):
     return palette
 
 
+def _control_outline(option, focused):
+    """输入框、按钮、勾选框的外框色：获得焦点（或默认按钮）用 focus-border，禁用时 control-border 变淡。"""
+    enabled = bool(option.state & QStyle.State_Enabled)
+    if focused and enabled:
+        return qcolor('focus-border')
+    color = qcolor('control-border')
+    if not enabled:
+        color.setAlphaF(color.alphaF() * 0.45)
+    return color
+
+
+def _stroke(painter, color, draw, dx=0.5, dy=0.5):
+    """按 Fusion 的几何（半像素平移、抗锯齿、1px）在它画的外框上重描，正好盖住原来的颜色。"""
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.translate(dx, dy)
+    painter.setPen(color)
+    painter.setBrush(Qt.NoBrush)
+    draw(painter)
+    painter.restore()
+
+
+class _ControlBorderStyle(QProxyStyle):
+    """非系统风格主题使用的 Fusion。
+
+    Fusion 的输入框、按钮、勾选框外框由窗口底色加深得到，深色底上几乎看不见。主题定义了 control-border 时，
+    在 Fusion 绘制后按相同几何重描外框：常态用 control-border，获得焦点的输入框、键盘焦点所在的按钮/勾选框
+    以及默认按钮用 focus-border，禁用时变淡。样式表自己写了边框的控件不经过这里。"""
+
+    def __init__(self):
+        super().__init__('Fusion')
+        self.setObjectName('fusion')
+
+    def drawPrimitive(self, element, option, painter, widget=None):
+        super().drawPrimitive(element, option, painter, widget)
+        if not _current.colors.get('control-border'):
+            return
+        state = option.state
+        has_focus = bool(state & QStyle.State_HasFocus)
+        keyboard_focus = has_focus and bool(state & QStyle.State_KeyboardFocusChange)
+        rect = QRectF(option.rect)
+        if element == QStyle.PE_FrameLineEdit:
+            _stroke(painter, _control_outline(option, has_focus),
+                    lambda p: p.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 2, 2))
+        elif element == QStyle.PE_PanelButtonCommand:
+            features = int(option.features) if isinstance(option, QStyleOptionButton) else 0
+            if features & int(QStyleOptionButton.Flat) and not state & (QStyle.State_Sunken | QStyle.State_On):
+                return  # Fusion 不给平面按钮画底框
+            default = bool(features & int(QStyleOptionButton.DefaultButton))
+            _stroke(painter, _control_outline(option, keyboard_focus or default),
+                    lambda p: p.drawRoundedRect(rect.adjusted(0, 1, -1, 0), 2, 2), dy=-0.5)
+        elif element == QStyle.PE_IndicatorCheckBox:
+            _stroke(painter, _control_outline(option, keyboard_focus),
+                    lambda p: p.drawRect(rect.adjusted(0, 0, -1, -1)))
+        elif element == QStyle.PE_IndicatorRadioButton:
+            width = option.rect.width()
+            center = QPointF(option.rect.center()) + QPointF(1, 1)
+            radius = (width + (width + 1) % 2) / 2.0 - 1
+            _stroke(painter, _control_outline(option, keyboard_focus),
+                    lambda p: p.drawEllipse(center, radius, radius), dx=0, dy=0)
+        elif element == QStyle.PE_Frame and isinstance(widget, (QTextEdit, QPlainTextEdit)):
+            _stroke(painter, _control_outline(option, widget.hasFocus()),
+                    lambda p: p.drawRect(rect.adjusted(0, 0, -1, -1)))
+
+    def drawComplexControl(self, control, option, painter, widget=None):
+        super().drawComplexControl(control, option, painter, widget)
+        # 下拉框由 Fusion 内部调用上面的 PE_FrameLineEdit / PE_PanelButtonCommand，这里只需补数字框
+        if control == QStyle.CC_SpinBox and getattr(option, 'frame', True) and _current.colors.get('control-border'):
+            rect = QRectF(option.rect)
+            _stroke(painter, _control_outline(option, bool(option.state & QStyle.State_HasFocus)),
+                    lambda p: p.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 2, 2))
+
+
 def set_theme(theme_id):
     """切换到指定主题（可传配置值，system 按 Windows 设置解析）；返回是否发生变化。
 
@@ -791,9 +942,11 @@ def set_theme(theme_id):
     _current, _applied, _dark, _gray = theme, True, theme.dark, theme.id == 'gray'
     if native_changed:
         _set_native_app_mode(theme.dark)
-    style = _original_style if theme.native_style else 'Fusion'
-    if app.style().objectName().lower() != style.lower():
-        app.setStyle(style)
+    if theme.native_style:
+        if app.style().objectName().lower() != _original_style.lower():
+            app.setStyle(_original_style)
+    elif not isinstance(app.style(), _ControlBorderStyle):
+        app.setStyle(_ControlBorderStyle())
     palette = QPalette(_original_palette) if theme.native_style else _build_palette(theme)
     app.setPalette(palette)
     QToolTip.setPalette(palette)

@@ -596,8 +596,6 @@ _LANG_EN = {
     "留空则使用内置提示词（支持 [OPEN_DIR:] 和 [RUN_SCRIPT:] 指令）": "Leave empty to use built-in prompt",
     "面板宽度 (px):": "Panel Width (px):",
     "点击链接在浏览器中打开 GitHub Releases 页面": "Click to open GitHub Releases in browser",
-    '检查更新: <a href="https://github.com/caojinyuan/TabEx/releases">https://github.com/caojinyuan/TabEx/releases</a>':
-        'Check for updates: <a href="https://github.com/caojinyuan/TabEx/releases">https://github.com/caojinyuan/TabEx/releases</a>',
     "语言 / Language:": "语言 / Language:",
     "主题:": "Theme:",
     "跟随系统": "Follow system",

@@ -2,7 +2,7 @@
 
 import os
 
-from PyQt5.QtCore import QEvent, QPoint, Qt
+from PyQt5.QtCore import QEasingCurve, QEvent, QPoint, Qt, QVariantAnimation
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 from PyQt5.QtWidgets import (
     QDialog, QHeaderView, QLineEdit, QMenuBar, QTabBar, QTabWidget, QToolButton, QTreeWidget,
@@ -154,6 +154,11 @@ def tab_group_runs(panes):
         runs.append((index, end, color))
         index = end + 1
     return runs
+
+
+def tab_is_available(bar, index):
+    """Navigation uses the target visibility while collapsing tabs still occupy space."""
+    return getattr(bar, '_group_target_visibility', {}).get(index, bar.isTabVisible(index))
 
 
 class _GroupChip(QToolButton):
@@ -365,11 +370,82 @@ class CustomTabBar(QTabBar):
         self._suppress_context_menu_once = False
         self._drop_indicator_active = False
         self._drop_indicator_index = -1
+        self._group_widths = {}
+        self._group_target_visibility = {}
+        self._group_animation = QVariantAnimation(self)
+        self._group_animation.setDuration(500)
+        self._group_animation.setEasingCurve(QEasingCurve.InOutCubic)
+        self._group_animation.valueChanged.connect(self._animate_group_widths)
+        self._group_animation.finished.connect(self._finish_group_animation)
         from PyQt5.QtCore import QTimer
         self._drag_end_timer = QTimer(self)
         self._drag_end_timer.setSingleShot(True)
         self._drag_end_timer.setInterval(150)
         self._drag_end_timer.timeout.connect(self._on_drag_end_timeout)
+
+    def tabSizeHint(self, index):
+        size = super().tabSizeHint(index)
+        if index in self._group_widths:
+            size.setWidth(self._group_widths[index])
+        return size
+
+    def minimumTabSizeHint(self, index):
+        if index in self._group_widths:
+            return self.tabSizeHint(index)
+        return super().minimumTabSizeHint(index)
+
+    def animate_group_change(self, change):
+        before = [self.tabRect(i).width() if self.isTabVisible(i) else 0
+                  for i in range(self.count())]
+        self._finish_group_animation()
+        change()
+        if not self.isVisible():
+            return
+        after = [self.tabRect(i).width() if self.isTabVisible(i) else 0 for i in range(self.count())]
+        self._group_width_ranges = {i: (start, end) for i, (start, end) in enumerate(zip(before, after))
+                                    if start != end}
+        if not self._group_width_ranges:
+            return
+        self._group_target_visibility = {i: self.isTabVisible(i) for i in self._group_width_ranges}
+        self._group_widths = {i: max(1, start) for i, (start, _end) in self._group_width_ranges.items()}
+        for i in self._group_widths:
+            self.setTabVisible(i, True)
+        self._animate_group_widths(0.0)
+        self._group_animation.setStartValue(0.0)
+        self._group_animation.setEndValue(1.0)
+        self._group_animation.start()
+
+    def _animate_group_widths(self, progress):
+        for index, (start, end) in self._group_width_ranges.items():
+            self._group_widths[index] = max(1, round(start + (end - start) * progress))
+        if self._group_widths:
+            # Reinstalling a button invalidates Qt's cached tab size hints.
+            index = next(iter(self._group_widths))
+            self.setTabButton(index, QTabBar.RightSide, self.tabButton(index, QTabBar.RightSide))
+            for index in self._group_widths:
+                button = self.tabButton(index, QTabBar.RightSide)
+                if button is not None:
+                    button.hide()
+        self.updateGeometry()
+        self.update()
+
+    def _finish_group_animation(self, apply_visibility=True):
+        self._group_animation.stop()
+        visibility = self._group_target_visibility
+        had_widths = bool(self._group_widths)
+        self._group_target_visibility = {}
+        self._group_widths = {}
+        for index, visible in visibility.items():
+            if apply_visibility and index < self.count():
+                self.setTabVisible(index, visible)
+        if had_widths:
+            for index in range(self.count()):
+                button = self.tabButton(index, QTabBar.RightSide)
+                self.setTabButton(index, QTabBar.RightSide, button)
+                if button is not None:
+                    button.setVisible(self.isTabVisible(index))
+        self.updateGeometry()
+        self.update()
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -402,10 +478,11 @@ class CustomTabBar(QTabBar):
                 if not rect.isValid() or rect.width() <= 4:
                     continue
 
-                # 分组使用圆角背景高亮，并内缩到标签内部，避免出现“比标签更大/尖角”的视觉问题。
+                # 分组使用圆角背景高亮，并内缩到标签内部，避免出现“比标签更大/尖角”的视觉问题；
+                # 深色主题加深底色，黑底上也能一眼看出同组。
                 base = QColor(color_hex)
                 fill = QColor(base)
-                fill.setAlpha(72 if i == self.currentIndex() else 52)
+                fill.setAlpha(_theme.group_tab_fill_alpha(color_hex, i == self.currentIndex()))
                 inner = rect.adjusted(2, 2, -2, -1)
                 if inner.width() <= 4 or inner.height() <= 4:
                     continue
@@ -476,6 +553,7 @@ class CustomTabBar(QTabBar):
 
     def refresh_group_decorations(self):
         """按分组首个标签同步组名与折叠状态，隐藏折叠组的其余标签，并在组首显示名称标签。"""
+        self._finish_group_animation(apply_visibility=False)
         mw = getattr(self, 'main_window', None)
         cs = mw._content_stack_for(self._owner_tw()) if mw is not None and hasattr(mw, '_content_stack_for') else None
         if cs is None:
@@ -866,13 +944,18 @@ class CustomTabBar(QTabBar):
 
     def tabInserted(self, index):
         """标签添加时自动附加关闭按钮"""
+        self._group_target_visibility = {}
+        self._finish_group_animation()
         super().tabInserted(index)
         close_btn = self._make_close_btn(index)
         self.setTabButton(index, QTabBar.RightSide, close_btn)
         self._schedule_labels()
 
     def tabRemoved(self, index):
+        self._group_target_visibility = {}
+        self._finish_group_animation()
         super().tabRemoved(index)
+        self.refresh_group_decorations()
         self._schedule_labels()
 
     def _schedule_labels(self):
@@ -894,6 +977,8 @@ class CustomTabBar(QTabBar):
     
     def on_tab_moved(self, from_index, to_index):
         """标签页移动后的处理，同步所属组的 content_stack；固定标签逻辑仅适用于左侧组。"""
+        self._group_target_visibility = {}
+        self._finish_group_animation()
         if getattr(self, '_sorting_pinned_tabs', False):
             return
         if not self.main_window:

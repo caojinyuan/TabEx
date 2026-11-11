@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from PyQt5.QtWidgets import QApplication, QStackedWidget, QTabWidget, QWidget
+from PyQt5.QtTest import QTest
 
 from app_modules import MODULE_FILES, ROOT, app, patch_all
 
@@ -200,6 +201,62 @@ class TabFeatureTests(unittest.TestCase):
         self.assertTrue(all(bar.isTabVisible(index) for index in range(4)))
         self.assertFalse(any(tab.tab_group_collapsed for tab in tabs))
         self.assertEqual(app.tab_group_runs(tabs), [(0, 2, '#64B5F6')])
+
+    def animated_host(self):
+        tabs = [self.make_tab('A', color='#64B5F6', name='Work'),
+                self.make_tab('B', color='#64B5F6'), self.make_tab('C')]
+        host = self.host(tabs)
+        host.resize(800, 100)
+        host.tab_widget.resize(800, 80)
+        host.tab_widget.tabBar().setStyleSheet(
+            'QTabBar::tab { width: 120px; min-width: 120px; max-width: 120px; padding: 2px 6px; }')
+        host.show()
+        self.addCleanup(host.close)
+        self.app.processEvents()
+        return host, tabs, host.tab_widget.tabBar()
+
+    def test_group_animation_progress_completion_and_reverse(self):
+        from tabexplorer.tabbar import tab_is_available
+        host, tabs, bar = self.animated_host()
+        width = bar.tabRect(1).width()
+        host.set_tab_group_collapsed(tabs[0], host.tab_widget, True)
+        self.assertEqual(bar._group_animation.duration(), 500)
+        self.assertFalse(tab_is_available(bar, 1))
+        self.assertTrue(bar.isTabVisible(1))
+        bar._group_animation.setCurrentTime(250)
+        halfway = bar.tabRect(1).width()
+        self.assertGreater(halfway, 1)
+        self.assertLess(halfway, width)
+        host.set_tab_group_collapsed(tabs[0], host.tab_widget, False)
+        self.assertAlmostEqual(bar.tabRect(1).width(), halfway, delta=1)
+        bar._group_animation.setCurrentTime(500)
+        self.assertTrue(bar.isTabVisible(1))
+        self.assertEqual(bar.tabRect(1).width(), width)
+        self.assertFalse(bar._group_widths)
+        host.set_tab_group_collapsed(tabs[0], host.tab_widget, True)
+        QTest.qWait(600)
+        self.assertFalse(bar.isTabVisible(1))
+        self.assertTrue(bar.isTabVisible(2))
+        self.assertTrue(tabs[0].tab_group_collapsed)
+        host.set_tab_group_collapsed(tabs[0], host.tab_widget, False)
+        bar._group_animation.setCurrentTime(250)
+        self.assertGreater(bar.tabRect(1).width(), 1)
+        self.assertLess(bar.tabRect(1).width(), width)
+        bar._group_animation.setCurrentTime(500)
+        self.assertEqual(bar.tabRect(1).width(), width)
+
+    def test_group_animation_selection_and_removal_interrupt_safely(self):
+        host, tabs, bar = self.animated_host()
+        host.set_tab_group_collapsed(tabs[0], host.tab_widget, True)
+        host.tab_widget.setCurrentIndex(1)
+        host._reveal_hidden_current_tab(host.tab_widget, 1)
+        self.assertFalse(tabs[0].tab_group_collapsed)
+        self.assertFalse(bar._group_widths)
+        self.assertTrue(bar.isTabVisible(1))
+        host.set_tab_group_collapsed(tabs[0], host.tab_widget, True)
+        host.close_tab(1, target_tabwidget=host.tab_widget)
+        self.assertFalse(bar._group_widths)
+        self.assertTrue(all(bar.isTabVisible(i) for i in range(bar.count())))
 
 
 class FrequentDirsTests(unittest.TestCase):

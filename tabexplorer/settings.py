@@ -14,6 +14,7 @@ from .hotkeys import (
     _format_hotkey, _hotkey_bindings, HOTKEY_COMMANDS, _parse_hotkey, _validate_hotkey_bindings,
 )
 from .widgets import show_toast
+from .updates import UPDATE_RELEASES_PAGE
 
 
 def parse_model_names(payload):
@@ -603,9 +604,9 @@ class SettingsDialog(QDialog):
         lang_row.addStretch(1)
         bottom_layout.addLayout(lang_row)
         
-        # 检查更新链接
+        # 检查更新链接：只显示“打开发布页”，不显示含作者账号的仓库地址
         update_link = QLabel()
-        update_link.setText(tr('检查更新: <a href="https://github.com/caojinyuan/TabEx/releases">https://github.com/caojinyuan/TabEx/releases</a>'))
+        update_link.setText('{}: <a href="{}">{}</a>'.format(tr("检查更新"), UPDATE_RELEASES_PAGE, tr("打开发布页")))
         update_link.setOpenExternalLinks(True)
         update_link.setStyleSheet("QLabel { padding: 10px; font-size: 10pt; }")
         update_link.setTextFormat(Qt.RichText)

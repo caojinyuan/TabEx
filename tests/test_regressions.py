@@ -2516,7 +2516,7 @@ class OptimizationTests(unittest.TestCase):
 
 
 class HotkeyAndUpdateTests(unittest.TestCase):
-    """自定义快捷键与检查更新，共 12 个用例。网络请求全部模拟，不访问 GitHub。"""
+    """自定义快捷键与检查更新（含设置窗口不显示仓库地址），共 15 个用例。网络请求全部模拟，不访问 GitHub。"""
 
     @classmethod
     def setUpClass(cls):
@@ -2719,6 +2719,40 @@ class HotkeyAndUpdateTests(unittest.TestCase):
                 config = self.module.MainWindow.load_config(types.SimpleNamespace())
         self.assertNotIn('auto_check_updates', config)
         self.assertIs(config['auto_update_check'], False)
+
+    def test_settings_update_link_hides_repository_address(self):
+        """设置窗口的“检查更新”只显示“打开发布页”链接文字，链接仍指向发布页；窗口内任何文字和提示都不出现仓库地址或作者账号。
+
+        场景：中英文界面各打开一次设置窗口，把富文本转成实际显示的文字后检查。
+        """
+        from PyQt5.QtGui import QTextDocument
+        from PyQt5.QtWidgets import QAbstractButton, QGroupBox, QLabel, QWidget
+        page = self.module.UPDATE_RELEASES_PAGE
+        account = page.split('/')[3]
+        self.addCleanup(self.module._set_app_language, self.module._app_language)
+
+        def shown(text):
+            document = QTextDocument()
+            document.setHtml(text)
+            return document.toPlainText()
+
+        for language, link_text in (('zh', '检查更新: 打开发布页'), ('en', 'Check for Updates: Open Releases')):
+            with self.subTest(language=language):
+                self.module._set_app_language(language)
+                dialog = self.module.SettingsDialog({})
+                self.addCleanup(dialog.deleteLater)
+                links = [label for label in dialog.findChildren(QLabel) if f'href="{page}"' in label.text()]
+                self.assertEqual([shown(label.text()) for label in links], [link_text])
+                self.assertTrue(links[0].openExternalLinks())
+                for widget in dialog.findChildren(QWidget):
+                    texts = [widget.toolTip()]
+                    if isinstance(widget, (QLabel, QAbstractButton)):
+                        texts.append(shown(widget.text()) if isinstance(widget, QLabel) else widget.text())
+                    elif isinstance(widget, QGroupBox):
+                        texts.append(widget.title())
+                    for text in texts:
+                        self.assertNotIn('github.com', text)
+                        self.assertNotIn(account, text)
 
 
 
@@ -3559,7 +3593,8 @@ class PathParsingTests(unittest.TestCase):
 
 
 class ThemeTests(unittest.TestCase):
-    """颜色主题：样式换色、图标重新着色、标题栏、跟随系统切换、Shell 视图重建、全部主题的对比度与原生视图叠色，共 10 个用例。
+    """颜色主题：样式换色、图标重新着色、标题栏、跟随系统切换、Shell 视图重建、全部主题的对比度与原生视图叠色、
+    强调色板换算、面包屑分隔符颜色、Windows 11 窗口边框色、输入控件外框色与深色底上的标签分组色，共 16 个用例。
 
     不调用未公开的 Win32 深色接口（已替换），每个用例结束恢复浅色。"""
 
@@ -3789,7 +3824,8 @@ class ThemeTests(unittest.TestCase):
     def test_literal_colors_follow_theme_tint_and_contrast(self):
         """字面颜色按主题换算：带色调主题的白底变为主题底色，高对比度主题的边框改为对比色，Light+ 保持原样。"""
         from PyQt5.QtGui import QColor
-        for theme_id in ('solarized_dark', 'solarized_light', 'monokai', 'one_dark_pro', 'github_dark', 'dark'):
+        for theme_id in ('solarized_dark', 'solarized_light', 'monokai', 'monokai_black', 'one_dark_pro',
+                         'github_dark', 'dark'):
             with self.subTest(theme=theme_id):
                 self.module.set_theme(theme_id)
                 converted, editor = QColor(self.module.bg('#ffffff')), self.module.qcolor('editor-bg')
@@ -3834,6 +3870,180 @@ class ThemeTests(unittest.TestCase):
         self.assertEqual(self.module.status_color('#d32f2f'), self.module.fg('#d32f2f'))
         self.module.set_theme('light')
         self.assertEqual(self.module.status_color('#d32f2f'), '#d32f2f')
+
+    def test_monokai_black_uses_monokai_accents_on_black(self):
+        """Monokai Black：纯黑底配 Monokai 原色，彩色文字（Git 摘要、提示）换成色板中色相最近的颜色。
+
+        场景：切换到 Monokai Black 后检查界面令牌与字面颜色换算；灰色和浅色文字、其他主题不受色板影响。
+        """
+        from PyQt5.QtGui import QColor
+        self.module.set_theme('monokai_black')
+        tokens = {'editor-bg': '#000000', 'chrome-border': '#242524', 'tab-active-fg': '#a6e22e',
+                  'tab-active-border-top': '#f92672', 'tab-separator': '#fd971f', 'window-border': '#fd971f',
+                  'crumb-active-fg': '#a6e22e', 'crumb-separator-fg': '#f92672',
+                  'statusbar-emphasis-fg': '#66d9ef', 'picker-group-fg': '#66d9ef', 'list-highlight-fg': '#fd971f',
+                  'selection-bg': '#203561', 'list-active-bg': '#203561', 'menu-selection-bg': '#203561'}
+        for token, expected in tokens.items():
+            self.assertEqual(self.module.color(token), expected, token)
+        self.assertIsNone(self.module.view_tint())
+        snapped = {'#2e7d32': '#a6e22e', '#d32f2f': '#f92672', '#f9a825': '#fd971f', '#e67700': '#fd971f',
+                   '#1976D2': '#66d9ef', '#7b1fa2': '#ae81ff'}
+        for literal, expected in snapped.items():
+            self.assertEqual(self.module.fg(literal), expected, literal)
+        self.assertEqual(self.module.status_color('#2e7d32'), '#a6e22e')
+        self.assertEqual(self.module.qss('QLabel { color: #d32f2f; }'), 'QLabel { color: #f92672; }')
+        gray = QColor(self.module.fg('#666666'))
+        self.assertTrue(gray.red() == gray.green() == gray.blue())
+        self.assertEqual(self.module.fg('#ffcdd2'), '#ffcdd2')
+        for theme_id in self.module.THEME_MODES[1:]:
+            if theme_id == 'monokai_black':
+                continue
+            with self.subTest(theme=theme_id):
+                self.module.set_theme(theme_id)
+                self.assertNotIn(self.module.fg('#2e7d32'), snapped.values())
+                self.assertEqual(self.module.color('crumb-separator-fg'), self.module.color('crumb-fg'))
+
+    def test_window_border_follows_theme_on_windows_11(self):
+        """Windows 11 系统窗口边框：Monokai Black 设为橙色，切到其他主题恢复系统默认；Windows 10 不设置边框色。
+
+        场景：替换 DwmSetWindowAttribute 记录写入的属性与颜色（34 为 DWMWA_BORDER_COLOR）。
+        """
+        import ctypes
+        from PyQt5.QtWidgets import QDialog
+        dialog = QDialog()
+        dialog.winId()
+        self.addCleanup(dialog.deleteLater)
+        calls = []
+
+        def record(_hwnd, attribute, value, _size):
+            calls.append((attribute, value._obj.value))
+            return 0
+
+        with patch.object(ctypes.windll.dwmapi, 'DwmSetWindowAttribute', side_effect=record):
+            with patch_all('_windows_build', return_value=22631):
+                self.module.set_theme('monokai_black')
+                self.assertEqual(dict(self.module._dwm_frame_colors())[34], 0x001F97FD)
+                self.module.apply_window_frame(dialog)
+                self.assertIn((34, 0x001F97FD), calls)
+                calls.clear()
+                self.module.set_theme('dark')
+                self.module.apply_window_frame(dialog)
+                self.assertIn((34, 0xFFFFFFFF), calls)
+                self.assertNotIn((34, 0x001F97FD), calls)
+            calls.clear()
+            with patch_all('_windows_build', return_value=19045):
+                self.module.set_theme('monokai_black')
+                self.module.apply_window_frame(dialog, force=True)
+                self.assertNotIn(34, [attribute for attribute, _value in calls])
+
+    def test_fusion_controls_draw_theme_border_color(self):
+        """深色主题下 Fusion 绘制的输入框、按钮、勾选框、数字框、下拉框和多行输入框都按 control-border 描外框。
+
+        Monokai Black 为 Monokai 注释色，在对话框各种底色上对比度 ≥3:1，样式表里的浅灰边框也换成它；
+        获得焦点用 focus-border，禁用变淡；深色主题用各自的 input-border，浅色 Fusion 主题保留 Fusion 自己的外框。
+        """
+        from PyQt5.QtGui import QColor
+        from PyQt5.QtWidgets import (QCheckBox, QComboBox, QLineEdit, QPlainTextEdit, QPushButton, QSpinBox,
+                                     QStyle, QStyleOption)
+        self.module.set_theme('monokai_black')
+        self.assertEqual(self.app.style().objectName(), 'fusion')
+        self.assertIsInstance(self.app.style(), self.module._ControlBorderStyle)
+        border = self.module.color('control-border')
+        self.assertEqual(border, '#75715e')
+        for background in ('palette-window', 'palette-base', 'palette-button', 'input-bg', 'widget-bg'):
+            self.assertGreaterEqual(self.module._contrast(border, self.module.color(background)), 3.0, background)
+        self.assertEqual(self.module.line('#d0d0d0'), border)
+        self.assertEqual(self.module.qss('QFrame { border: 1px solid #c0c0c0; }'), f'QFrame {{ border: 1px solid {border}; }}')
+
+        def border_pixels(widget, color=border):
+            target = QColor(color)
+            image = widget.grab().toImage()
+            return sum(1 for y_pos in range(image.height()) for x_pos in range(image.width())
+                       if sum(abs(a - b) for a, b in zip(image.pixelColor(x_pos, y_pos).getRgb()[:3],
+                                                          target.getRgb()[:3])) <= 12)
+
+        editable = QComboBox()
+        editable.setEditable(True)
+        widgets = {'checkbox': QCheckBox('option'), 'line edit': QLineEdit('text'), 'button': QPushButton('Apply'),
+                   'spin box': QSpinBox(), 'combo box': QComboBox(), 'editable combo box': editable,
+                   'plain text edit': QPlainTextEdit()}
+        for name, widget in widgets.items():
+            self.addCleanup(widget.deleteLater)
+            widget.resize(widget.sizeHint())
+            with self.subTest(widget=name):
+                self.assertGreater(border_pixels(widget), 12)
+
+        option = QStyleOption()
+        option.state = QStyle.State_Enabled | QStyle.State_HasFocus
+        self.assertEqual(self.module._control_outline(option, True), self.module.qcolor('focus-border'))
+        option.state = QStyle.State_None
+        dimmed = self.module._control_outline(option, True)
+        self.assertEqual(dimmed.rgb(), self.module.qcolor('control-border').rgb())
+        self.assertLess(dimmed.alphaF(), 0.5)
+
+        self.module.set_theme('dark')
+        self.assertEqual(self.module.color('control-border'), self.module.color('input-border'))
+        self.assertGreater(border_pixels(widgets['checkbox'], self.module.color('control-border')), 12)
+        self.module.set_theme('solarized_light')
+        self.assertEqual(self.module.color('control-border'), '')
+        self.module.set_theme('light')
+        self.assertNotIsInstance(self.app.style(), self.module._ControlBorderStyle)
+
+    def test_group_tab_tint_is_visible_on_dark_backgrounds(self):
+        """标签分组色：深色主题加深底色（不低于原值，文字对比度当前标签 ≥4.5、其他 ≥3）；浅色主题保持 72/52。"""
+        palette = ["#E57373", "#64B5F6", "#81C784", "#FFB74D", "#BA68C8",
+                   "#4DB6AC", "#F06292", "#7986CB", "#AED581", "#FFD54F"]
+        self.module.set_theme('light')
+        self.assertEqual((self.module.group_tab_fill_alpha('#E57373', True),
+                          self.module.group_tab_fill_alpha('#E57373', False)), (72, 52))
+        for theme_id in [theme_id for theme_id in self.module.THEME_MODES[1:] if self.module._THEMES[theme_id].dark]:
+            with self.subTest(theme=theme_id):
+                self.module.set_theme(theme_id)
+                colors = self.module._THEMES[theme_id].colors
+                for active, base, minimum in ((True, 72, 4.5), (False, 52, 3.0)):
+                    text = colors['tab-active-fg' if active else 'tab-inactive-fg'][:7]
+                    under = colors['tab-active-bg' if active else 'tab-inactive-bg'][:7]
+                    for group in palette:
+                        alpha = self.module.group_tab_fill_alpha(group, active)
+                        self.assertGreaterEqual(alpha, base)
+                        if alpha > base:
+                            shown = self.module._mix(under, group, alpha / 255.0)
+                            self.assertGreaterEqual(self.module._contrast(text, shown), minimum, (group, active))
+        self.module.set_theme('monokai_black')
+        self.assertTrue(all(self.module.group_tab_fill_alpha(group, False) >= 76 for group in palette))
+
+    def test_breadcrumb_separators_use_separator_color(self):
+        """面包屑：分隔符用 crumb-separator-fg（Monokai Black 为粉色），当前段为绿色，其余段不带粉色；其他主题分隔符同普通段。
+
+        场景：真实绘制地址栏 C:\\work\\project 并按命中区读取像素。
+        """
+        from PyQt5.QtGui import QColor
+        bar = self.module.SimplePathBar()
+        self.addCleanup(bar.deleteLater)
+        bar.resize(480, 30)
+        bar.set_path(r'C:\work\project')
+
+        def count(theme_id):
+            self.module.set_theme(theme_id)
+            image = bar.grab().toImage()
+            hits = {}
+            for region in bar._display_regions:
+                key = 'separator' if region['kind'] == 'separator' else (
+                    'current' if region['is_current'] else 'segment')
+                for x_pos in range(region['x0'], min(region['x1'], image.width())):
+                    for y_pos in range(image.height()):
+                        hue, sat, value, _alpha = QColor(image.pixel(x_pos, y_pos)).getHsvF()
+                        if sat > 0.5 and value > 0.35:
+                            color_name = 'pink' if hue >= 0.88 else 'green' if 0.18 <= hue <= 0.27 else 'other'
+                            hits[(key, color_name)] = hits.get((key, color_name), 0) + 1
+            return hits
+
+        hits = count('monokai_black')
+        self.assertGreater(hits.get(('separator', 'pink'), 0), 0)
+        self.assertGreater(hits.get(('current', 'green'), 0), 0)
+        self.assertEqual(hits.get(('segment', 'pink'), 0) + hits.get(('current', 'pink'), 0), 0)
+        self.assertEqual(hits.get(('separator', 'green'), 0), 0)
+        self.assertEqual(count('dark').get(('separator', 'pink'), 0), 0)
 
 
 class NetworkBannerTests(unittest.TestCase):

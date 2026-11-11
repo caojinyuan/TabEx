@@ -67,7 +67,9 @@ from .shellview import (
 )
 from .netstatus import is_network_path
 from .explorer_tab import FileExplorerTab
-from .tabbar import CustomMenuBar, CustomTabBar, DragDropTabWidget, _tab_display_labels, tab_group_runs, TabListDialog
+from .tabbar import (
+    CustomMenuBar, CustomTabBar, DragDropTabWidget, _tab_display_labels, tab_group_runs, tab_is_available, TabListDialog,
+)
 from .chat import ChatPanel
 from .settings import SettingsDialog
 from .persistence import ConfigStore, SessionController
@@ -778,7 +780,7 @@ class MainWindow(QMainWindow):
             return min(max(idx, 0), count)
         slot = idx if local.x() < rect.center().x() else idx + 1
         # 落在折叠分组的组首之后时，插到整个折叠组后面
-        while slot < count and hasattr(bar, 'isTabVisible') and not bar.isTabVisible(slot):
+        while slot < count and hasattr(bar, 'isTabVisible') and not tab_is_available(bar, slot):
             slot += 1
         return slot
 
@@ -3734,7 +3736,7 @@ class MainWindow(QMainWindow):
         index = self.tab_widget.currentIndex()
         for _attempt in range(count):
             index = (index + step) % count
-            if bar.isTabVisible(index):
+            if tab_is_available(bar, index):
                 break
         self.tab_widget.setCurrentIndex(index)
 
@@ -3742,7 +3744,7 @@ class MainWindow(QMainWindow):
         """Ctrl+1..8 切到活动标签组第 N 个可见标签（折叠分组只算组首），Ctrl+9 切到最后一个。"""
         tabs = self.get_active_group_tabwidget()
         bar = tabs.tabBar()
-        visible = [index for index in range(tabs.count()) if bar.isTabVisible(index)]
+        visible = [index for index in range(tabs.count()) if tab_is_available(bar, index)]
         position = len(visible) - 1 if number == 9 else number - 1
         if 0 <= position < len(visible):
             tabs.setCurrentIndex(visible[position])
@@ -4657,7 +4659,7 @@ class MainWindow(QMainWindow):
     def _reveal_hidden_current_tab(self, tab_widget, index):
         """选中了折叠分组中被隐藏的标签时展开该分组。"""
         bar = tab_widget.tabBar() if tab_widget is not None else None
-        if bar is not None and 0 <= index < bar.count() and not bar.isTabVisible(index):
+        if bar is not None and 0 <= index < bar.count() and not tab_is_available(bar, index):
             self._apply_tab_grouping_for_pane(tab_widget)
 
     def copy_tab_path(self, tab):
@@ -4779,7 +4781,7 @@ class MainWindow(QMainWindow):
             tw.setCurrentIndex(cs.indexOf(members[0]))
         for member in members:
             member.tab_group_collapsed = bool(collapsed)
-        self._after_tab_group_change(tw)
+        tw.tabBar().animate_group_change(lambda: self._after_tab_group_change(tw))
         return True
 
     def toggle_tab_group_collapsed(self, index, target_tabwidget=None):

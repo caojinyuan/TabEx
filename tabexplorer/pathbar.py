@@ -190,7 +190,7 @@ class SimplePathBar(QWidget):
         left_collapsed = len(display_parts) < len(parts)
         col_seg = _theme.qcolor('crumb-fg')
         col_active = _theme.qcolor('crumb-active-fg')
-        col_sep = _theme.qcolor('crumb-fg')
+        col_sep = _theme.qcolor('crumb-separator-fg')
         col_hover = _theme.qcolor('crumb-hover-bg')
         pad = self._PAD
         sep_w = self._SEP_W
@@ -211,7 +211,7 @@ class SimplePathBar(QWidget):
             w = fm.horizontalAdvance(ell) + pad * 2
             if self._hover_idx == idx:
                 hover_bg(x, x + w)
-            painter.setPen(col_sep)
+            painter.setPen(col_seg)
             painter.drawText(x + pad, y, ell)
             regions.append({'kind': 'ellipsis', 'x0': x, 'x1': x + w,
                             'payload': None, 'label': self._current_path, 'is_current': False})
