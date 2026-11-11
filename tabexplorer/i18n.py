@@ -216,6 +216,28 @@ _LANG_EN = {
     "取消 (Esc)": "Cancel (Esc)",
     "复制到剪贴板 (Enter)": "Copy to clipboard (Enter)",
     "截图已复制到剪贴板": "Screenshot copied to clipboard",
+    "离线文字识别 (Ctrl+T)": "Offline OCR (Ctrl+T)",
+    "离线文字识别": "Offline OCR",
+    "中英文自动识别": "Chinese and English (automatic)",
+    "使用 RapidOCR 本地模型，中英文自动识别，不上传截图。结果可编辑，复制前请核对。":
+        "Uses local RapidOCR models for Chinese and English. Screenshots are not uploaded. Review before copying.",
+    "重新识别": "Recognize Again",
+    "复制文字": "Copy Text",
+    "正在本地识别…": "Recognizing locally...",
+    "识别完成，可编辑或复制。": "Recognition complete. You can edit or copy the text.",
+    "未识别到文字，请放大文字或重新截图。":
+        "No text recognized. Enlarge the text or capture a new screenshot.",
+    "文字已复制到剪贴板": "Text copied to clipboard",
+    "缺少 RapidOCR 组件，请重新运行依赖安装脚本；EXE 用户请重新安装完整版本。":
+        "RapidOCR is missing. Run the dependency installer again, or reinstall the complete EXE release.",
+    "无法识别空图片。": "Cannot recognize an empty image.",
+    "不支持的识别语言：{}": "Unsupported OCR language: {}",
+    "缺少离线 OCR 模型：{}。请重新安装完整版本，不会自动联网下载。":
+        "Offline OCR model missing: {}. Reinstall the complete release. Models will not be downloaded automatically.",
+    "无法编码 OCR 图片。": "Could not encode the OCR image.",
+    "OCR 进程异常退出，请重试。": "The OCR process exited unexpectedly. Please retry.",
+    "文字识别超时，请缩小选区后重试。": "OCR timed out. Select a smaller area and retry.",
+    "文字识别失败：{}": "OCR failed: {}",
     "截图已保存：{}": "Screenshot saved: {}",
     "截图失败：无法抓取屏幕": "Screenshot failed: cannot capture the screen",
     "截图失败：{}": "Screenshot failed: {}",

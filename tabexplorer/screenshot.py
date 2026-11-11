@@ -13,11 +13,15 @@ from PyQt5.QtGui import (
     QColor, QCursor, QFont, QFontMetrics, QFontMetricsF, QGuiApplication, QImage, QPainter, QPainterPath,
     QPainterPathStroker, QPen, QPixmap, QPolygonF,
 )
-from PyQt5.QtWidgets import QApplication, QFileDialog, QFrame, QHBoxLayout, QLineEdit, QMenu, QToolButton, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import (
+    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QMenu, QPlainTextEdit, QPushButton, QToolButton, QVBoxLayout, QWidget,
+)
 
 from .debuglog import debug_print
 from .i18n import tr
 from .menus import exec_menu
+from .ocr import LANGUAGES, OcrWorker
 
 
 MIN_SELECTION = 2
@@ -35,6 +39,7 @@ TOOLS = (
 )
 ACTIONS = (
     ('undo', '↶', '撤销 (Ctrl+Z)'), ('pin', '📌', '贴图 (F3)'), ('save', '💾', '保存 (Ctrl+S)'),
+    ('ocr', 'OCR', '离线文字识别 (Ctrl+T)'),
     ('cancel', '✕', '取消 (Esc)'), ('copy', '✓', '复制到剪贴板 (Enter)'),
 )
 MOSAIC_BLOCK = 10
@@ -286,6 +291,8 @@ class _Toolbar(QFrame):
         self._action_buttons = {}
         for name, glyph, label in ACTIONS:
             button = self._button(glyph, label)
+            if name == 'ocr':
+                button.setFixedWidth(42)
             button.clicked.connect(lambda _checked, n=name: self.actionTriggered.emit(n))
             self._action_buttons[name] = button
             row.addWidget(button)
@@ -674,6 +681,8 @@ class ScreenshotOverlay(QWidget):
             self._perform('copy')
         elif ctrl and key == Qt.Key_S and self._sel is not None:
             self._perform('save')
+        elif ctrl and key == Qt.Key_T and self._sel is not None:
+            self._perform('ocr')
         elif key == Qt.Key_F3 and self._sel is not None:
             self._perform('pin')
         elif self._sel is None and key == Qt.Key_Shift:
@@ -877,6 +886,10 @@ class ScreenshotOverlay(QWidget):
             origin = self._map.geometry.topLeft()
             self._controller.pin(pixmap, origin + self._sel.topLeft())
             self.close()
+        elif action == 'ocr':
+            image = pixmap.toImage()
+            self.close()
+            self._controller.recognize(image)
 
     def closeEvent(self, event):
         self._finish_text(False)
@@ -980,6 +993,103 @@ def close_all_pins():
         pin.close()
 
 
+class OcrDialog(QDialog):
+    def __init__(self, image, parent=None):
+        super().__init__(parent, Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setWindowTitle(tr("离线文字识别"))
+        self.setAttribute(Qt.WA_QuitOnClose, False)
+        self.resize(640, 420)
+        self._image = image.copy()
+        self._worker = None
+        self._closing = False
+        layout = QVBoxLayout(self)
+        hint = QLabel(tr("使用 RapidOCR 本地模型，中英文自动识别，不上传截图。结果可编辑，复制前请核对。"), self)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        controls = QHBoxLayout()
+        self.language = QComboBox(self)
+        for code, label in LANGUAGES:
+            self.language.addItem(tr(label), code)
+        controls.addWidget(self.language)
+        self.recognize_button = QPushButton(tr("重新识别"), self)
+        self.recognize_button.clicked.connect(self.recognize)
+        controls.addWidget(self.recognize_button)
+        controls.addStretch()
+        layout.addLayout(controls)
+        self.status = QLabel(self)
+        self.status.setWordWrap(True)
+        self.status.setTextFormat(Qt.PlainText)
+        layout.addWidget(self.status)
+        self.text = QPlainTextEdit(self)
+        layout.addWidget(self.text)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.copy_button = QPushButton(tr("复制文字"), self)
+        self.copy_button.setEnabled(False)
+        self.copy_button.clicked.connect(self.copy_text)
+        self.text.textChanged.connect(
+            lambda: self.copy_button.setEnabled(self._worker is None and bool(self.text.toPlainText().strip())))
+        buttons.addWidget(self.copy_button)
+        close_button = QPushButton(tr("关闭"), self)
+        close_button.clicked.connect(self.reject)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        QTimer.singleShot(0, self.recognize)
+
+    def recognize(self):
+        if self._worker is not None or self._closing:
+            return
+        self.text.clear()
+        self.text.setReadOnly(True)
+        self.status.setText(tr("正在本地识别…"))
+        self.language.setEnabled(False)
+        self.recognize_button.setEnabled(False)
+        worker = OcrWorker(self._image, self.language.currentData(), self)
+        self._worker = worker
+        worker.completed.connect(self._completed)
+        worker.finished.connect(self._finished)
+        worker.start()
+
+    def _completed(self, text, error):
+        if self._closing:
+            return
+        self.text.setPlainText(text)
+        self.status.setText(error or (tr("识别完成，可编辑或复制。") if text
+                                     else tr("未识别到文字，请放大文字或重新截图。")))
+
+    def _finished(self):
+        self._worker.deleteLater()
+        self._worker = None
+        if self._closing:
+            super().done(QDialog.Rejected)
+            return
+        self.text.setReadOnly(False)
+        self.language.setEnabled(True)
+        self.recognize_button.setEnabled(True)
+        self.copy_button.setEnabled(bool(self.text.toPlainText().strip()))
+
+    def copy_text(self):
+        text = self.text.toPlainText()
+        if self._worker is None and text.strip():
+            QApplication.clipboard().setText(text)
+            self.status.setText(tr("文字已复制到剪贴板"))
+
+    def done(self, result):
+        self._closing = True
+        if self._worker is not None:
+            self._worker.requestInterruption()
+            self.hide()
+        else:
+            super().done(result)
+
+    def shutdown(self):
+        self._closing = True
+        if self._worker is not None:
+            self._worker.requestInterruption()
+            self._worker.wait()
+        self.hide()
+
+
 # ---------------------------------------------------------------- 全局热键与入口
 
 class _GlobalHotkey(QAbstractNativeEventFilter):
@@ -1030,6 +1140,7 @@ class ScreenshotController(QObject):
         super().__init__(parent)
         self._notify = notify
         self._overlay = None
+        self._ocr_dialog = None
         self._pending = False
         self._hotkey = _GlobalHotkey(self.start)
 
@@ -1082,8 +1193,29 @@ class ScreenshotController(QObject):
         window.show()
         window.raise_()
 
+    def recognize(self, image):
+        if self._ocr_dialog is not None:
+            self._ocr_dialog.shutdown()
+            self._ocr_dialog.deleteLater()
+        dialog = OcrDialog(image, self.parent())
+        self._ocr_dialog = dialog
+        dialog.finished.connect(self._on_ocr_closed)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_ocr_closed(self):
+        dialog = self.sender()
+        if self._ocr_dialog is dialog:
+            self._ocr_dialog = None
+        dialog.deleteLater()
+
     def shutdown(self):
         self._hotkey.unregister()
         if self._overlay is not None:
             self._overlay.close()
+        if self._ocr_dialog is not None:
+            self._ocr_dialog.shutdown()
+            self._ocr_dialog.deleteLater()
+            self._ocr_dialog = None
         close_all_pins()

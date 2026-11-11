@@ -38,6 +38,9 @@ def build(root=ROOT, install=True, output=None, run=None, verify=None):
             '--name', 'TabExplorer', '--distpath', str(stage / 'dist'),
             '--workpath', str(stage / 'work'), '--specpath', str(stage),
             '--add-data', str(root / 'icons') + ';icons',
+            '--collect-data', 'rapidocr',
+            '--collect-submodules', 'rapidocr.inference_engine.onnxruntime',
+            '--runtime-hook', str(root / 'tools' / 'pyi_rth_ocr.py'),
         ]
         command.extend(arg for tool in bundled_tools for arg in ('--add-data', str(tool) + ';tools'))
         icon = root / 'icons' / 'TabExplorer.ico'

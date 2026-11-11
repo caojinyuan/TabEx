@@ -516,6 +516,11 @@ class BuildPipelineTests(unittest.TestCase):
             self.assertEqual(build(root, install=False, run=run, verify=verify), executable)
             self.assertIn('unittest', commands[0])
             command = commands[1]
+            self.assertEqual(command[command.index('--collect-data') + 1], 'rapidocr')
+            self.assertEqual(command[command.index('--collect-submodules') + 1],
+                             'rapidocr.inference_engine.onnxruntime')
+            self.assertEqual(command[command.index('--runtime-hook') + 1],
+                             str(root / 'tools' / 'pyi_rth_ocr.py'))
             bundled_data = [command[index + 1] for index, value in enumerate(command) if value == '--add-data']
             self.assertEqual(bundled_data, [str(root / 'icons') + ';icons'] +
                              [str(root / 'tools' / tool) + ';tools' for tool in ('es.exe', 'rg.exe', '7zr.exe')])
