@@ -1816,19 +1816,26 @@ class InterfaceTests(unittest.TestCase):
             self.app.setFont(saved_font)
 
     def test_tools_menu_groups_danger_and_preserves_actions(self):
-        """工具菜单区分文件、导航、工作区、截图、危险操作和诊断，保留原操作连接。"""
+        """工具菜单按功能分组，并保留原操作连接。"""
         from PyQt5.QtWidgets import QMenu, QToolButton
+        from tabexplorer.commands import menu_commands
         callbacks = {name: Mock() for name in (
             'show_file_tasks', 'show_directory_compare', 'preview_batch_rename', 'save_named_workspace',
             'open_named_workspace', 'delete_named_workspace', 'permanently_delete_selected', 'export_diagnostics',
             'check_for_updates', 'start_screenshot', 'show_frequent_dirs', 'toggle_sync_browse',
-            'configure_external_tools', '_rebuild_external_tools_menu')}
+            'configure_external_tools', '_rebuild_external_tools_menu', '_open_windows_tool')}
         owner = types.SimpleNamespace(style=self.app.style, config={}, **callbacks)
         menu = QMenu()
         self.addCleanup(menu.deleteLater)
         self.module.MainWindow._populate_workspace_tools_menu(owner, menu)
         sections = [action.text() for action in menu.actions() if action.isSeparator()]
-        self.assertEqual(sections, ['文件操作', '导航', '截图', '危险操作', '诊断'])
+        self.assertEqual(sections, ['文件操作', '导航', '系统', '截图', '危险操作', '诊断'])
+        for label, target, name in (
+                ('打开设备管理器', 'devmgmt.msc', '设备管理器'),
+                ('打开高级系统设置', 'SystemPropertiesAdvanced.exe', '高级系统设置')):
+            next(action for action in menu.actions() if action.text() == label).trigger()
+            callbacks['_open_windows_tool'].assert_called_with(target, name)
+            self.assertIn(label, [text for text, _action in menu_commands(menu)])
         owner.frequent_dirs_action.trigger()
         callbacks['show_frequent_dirs'].assert_called_once()
         self.assertIn('Ctrl+J', owner.frequent_dirs_action.text())
@@ -1852,6 +1859,23 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(owner.file_tasks_button.text(), '2')
         self.assertIn('运行 2，失败 1', owner.file_tasks_button.toolTip())
         self.assertIn('运行 2，失败 1', owner.file_tasks_action.text())
+
+    def test_windows_tools_launch_and_report_errors(self):
+        import tabexplorer.mainwindow as mainwindow
+        owner = object()
+        for target, name in (('devmgmt.msc', '设备管理器'),
+                             ('SystemPropertiesAdvanced.exe', '高级系统设置')):
+            with self.subTest(target=target), \
+                    patch.object(mainwindow.os, 'startfile') as startfile, \
+                    patch.object(mainwindow, 'show_toast') as toast:
+                mainwindow.MainWindow._open_windows_tool(owner, target, name)
+                startfile.assert_called_once_with(target)
+                toast.assert_not_called()
+                startfile.side_effect = OSError('launch failed')
+                mainwindow.MainWindow._open_windows_tool(owner, target, name)
+                toast.assert_called_once_with(owner, mainwindow.tr('错误'),
+                                              mainwindow.tr('无法打开 {}: {}').format(name, 'launch failed'),
+                                              level='error')
 
     def test_tab_labels_disambiguate_paths_duplicates_and_roots_without_io(self):
         """同名目录使用最短父路径区分，重复路径编号，根目录和特殊目录可读；不访问磁盘。"""

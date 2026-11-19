@@ -1866,6 +1866,12 @@ class MainWindow(QMainWindow):
             show_toast(self, tr("提示"), str(e), level="warning")
         except Exception as e:
             show_toast(self, tr("错误"), tr("无法打开计算器: {}").format(e), level="error")
+
+    def _open_windows_tool(self, target, name):
+        try:
+            os.startfile(target)
+        except OSError as error:
+            show_toast(self, tr("错误"), tr("无法打开 {}: {}").format(name, error), level="error")
     
     def apply_tortoisegit_buttons_config(self):
         """根据配置显示/隐藏 TortoiseGit 按钮"""
@@ -4126,6 +4132,11 @@ class MainWindow(QMainWindow):
         self.external_tools_menu = menu.addMenu(tr('外部工具'))
         self.external_tools_menu.addAction(tr("配置外部工具..."), self.configure_external_tools)
         self.external_tools_menu.aboutToShow.connect(self._rebuild_external_tools_menu)
+        menu.addSection(tr('系统'))
+        menu.addAction(tr('打开设备管理器'),
+                       lambda: self._open_windows_tool('devmgmt.msc', tr('设备管理器')))
+        menu.addAction(tr('打开高级系统设置'),
+                       lambda: self._open_windows_tool('SystemPropertiesAdvanced.exe', tr('高级系统设置')))
         menu.addSection(tr('截图'))
         self.screenshot_action = menu.addAction(tr('屏幕截图'), lambda: self.start_screenshot(250))
         menu.addSection(tr('危险操作'))
