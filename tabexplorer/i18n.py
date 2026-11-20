@@ -253,6 +253,11 @@ _LANG_EN = {
     "上一张": "Previous",
     "下一张": "Next",
     "复制到剪贴板": "Copy to Clipboard",
+    "清空": "Clear All",
+    "确认清空": "Confirm Clear",
+    "清空全部 {} 张历史截图？此操作不可撤销。":
+        "Clear all {} historical screenshots? This cannot be undone.",
+    "清空截图历史失败：{}": "Could not clear screenshot history: {}",
     "历史截图已复制到剪贴板": "Historical screenshot copied to clipboard",
     "只能删除图库内的截图": "Only screenshots within the gallery can be deleted",
     "删除这张历史截图？此操作不可撤销。\n{}": "Delete this historical screenshot? This cannot be undone.\n{}",

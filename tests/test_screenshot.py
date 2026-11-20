@@ -170,6 +170,43 @@ class ScreenshotTests(unittest.TestCase):
             self.assertEqual(dialog.list.count(), 1)
             self.assertIn('access denied', dialog.status.text())
 
+    def test_history_clear_requires_confirmation_and_removes_all_images(self):
+        with TemporaryDirectory() as directory:
+            store = screenshot.ScreenshotHistoryStore(directory)
+            image = QPixmap(24, 16)
+            image.fill(QColor('#ff0000'))
+            paths = {store.add(image), store.add(image)}
+            dialog = screenshot.ScreenshotHistoryDialog(store)
+            self.addCleanup(dialog.deleteLater)
+
+            with patch.object(screenshot.QMessageBox, 'question', return_value=screenshot.QMessageBox.No):
+                dialog.clear_button.click()
+            self.assertEqual({path for path, _stamp in store.entries()}, paths)
+
+            with patch.object(screenshot.QMessageBox, 'question', return_value=screenshot.QMessageBox.Yes):
+                dialog.clear_button.click()
+            self.assertEqual(store.entries(), [])
+            self.assertTrue(all(not os.path.exists(path) for path in paths))
+            self.assertEqual(dialog.list.count(), 0)
+            self.assertFalse(dialog.clear_button.isEnabled())
+            self.assertFalse(dialog.copy_button.isEnabled())
+            self.assertFalse(dialog.delete_button.isEnabled())
+
+    def test_history_clear_failure_keeps_image_and_shows_error(self):
+        with TemporaryDirectory() as directory:
+            store = screenshot.ScreenshotHistoryStore(directory)
+            image = QPixmap(24, 16)
+            image.fill(QColor('#ff0000'))
+            path = store.add(image)
+            dialog = screenshot.ScreenshotHistoryDialog(store)
+            self.addCleanup(dialog.deleteLater)
+            with patch.object(screenshot.QMessageBox, 'question', return_value=screenshot.QMessageBox.Yes), \
+                    patch.object(store, 'remove', side_effect=PermissionError('access denied')):
+                dialog.clear_button.click()
+            self.assertTrue(os.path.isfile(path))
+            self.assertEqual(dialog.list.count(), 1)
+            self.assertIn('access denied', dialog.status.text())
+
     def test_screenshot_toolbar_opens_history_gallery(self):
         """截图工具栏的历史入口打开图库，且不结束当前截图会话。"""
         controller = Mock()

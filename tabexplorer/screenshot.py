@@ -996,17 +996,20 @@ class ScreenshotHistoryDialog(QDialog):
         self.next_button = QPushButton(tr("下一张"), self)
         self.copy_button = QPushButton(tr("复制到剪贴板"), self)
         self.delete_button = QPushButton(tr("删除"), self)
+        self.clear_button = QPushButton(tr("清空"), self)
         self.close_button = QPushButton(tr("关闭"), self)
         self.previous_button.clicked.connect(lambda: self._move_selection(-1))
         self.next_button.clicked.connect(lambda: self._move_selection(1))
         self.copy_button.clicked.connect(self.copy_selected)
         self.delete_button.clicked.connect(self.delete_selected)
+        self.clear_button.clicked.connect(self.clear_history)
         self.close_button.clicked.connect(self.reject)
         buttons.addWidget(self.previous_button)
         buttons.addWidget(self.next_button)
         buttons.addStretch(1)
         buttons.addWidget(self.copy_button)
         buttons.addWidget(self.delete_button)
+        buttons.addWidget(self.clear_button)
         buttons.addWidget(self.close_button)
         layout.addLayout(buttons)
         self.refresh()
@@ -1055,6 +1058,7 @@ class ScreenshotHistoryDialog(QDialog):
         self.next_button.setEnabled(count > 1 and 0 <= row < count - 1)
         self.copy_button.setEnabled(row >= 0)
         self.delete_button.setEnabled(row >= 0)
+        self.clear_button.setEnabled(count > 0)
 
     def _move_selection(self, step):
         row = self.list.currentRow() + step
@@ -1094,6 +1098,30 @@ class ScreenshotHistoryDialog(QDialog):
         self.refresh()
         if self.list.count():
             self.list.setCurrentRow(min(row, self.list.count() - 1))
+
+    def clear_history(self):
+        try:
+            entries = self.store.entries()
+        except OSError as error:
+            debug_print(f"[Screenshot] history listing failed: {error}")
+            self.status.setText(tr("无法读取截图历史：{}").format(error))
+            return
+        if not entries:
+            return
+        if QMessageBox.question(
+                self, tr("确认清空"),
+                tr("清空全部 {} 张历史截图？此操作不可撤销。").format(len(entries)),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            for path, _modified in entries:
+                self.store.remove(path)
+        except (OSError, ValueError) as error:
+            debug_print(f"[Screenshot] history clearing failed: {error}")
+            self.refresh()
+            self.status.setText(tr("清空截图历史失败：{}").format(error))
+            return
+        self.refresh()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
