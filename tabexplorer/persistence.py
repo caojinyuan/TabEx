@@ -127,7 +127,7 @@ class ConfigStore(JsonFileStore):
                 "add_bookmark": True,      # Ctrl+D
                 "quick_copy": True,        # Alt+C - 快速复制选中项
                 "quick_paste": True,       # Alt+V - 快速粘贴到当前目录
-                "quick_delete": True,      # Alt+Delete - 快速删除
+                "quick_delete": True,      # Alt+Delete - 确认后永久删除
                 "cancel_file_op": True,    # Alt+Q - 取消后台复制/删除
                 "copy_filename": True,     # Alt+Z - 复制选中文件名
                 "copy_filepath": True,     # Alt+X - 复制文件路径\文件名

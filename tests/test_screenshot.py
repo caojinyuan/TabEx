@@ -1,7 +1,9 @@
 """Screenshot overlay: selection geometry, annotation rendering and session guards."""
 
 import unittest
-from unittest.mock import patch
+import os
+from tempfile import TemporaryDirectory
+from unittest.mock import Mock, patch
 
 from PyQt5.QtCore import QEvent, QPoint, QPointF, QRect, Qt
 from PyQt5.QtGui import QColor, QMouseEvent, QPixmap
@@ -92,6 +94,91 @@ class ScreenshotTests(unittest.TestCase):
         self.assertEqual(image.pixelColor(125, 80), QColor('#ffffff'))
         edge = image.pixelColor(round(20 * 1.25), 50)
         self.assertEqual((edge.red(), edge.green(), edge.blue()), (255, 0, 0))
+
+    def test_screenshot_history_is_persistent_and_copyable(self):
+        """历史图库保留多张截图，并可将选中历史重新复制到剪贴板。"""
+        with TemporaryDirectory() as directory:
+            store = screenshot.ScreenshotHistoryStore(directory)
+            first = QPixmap(24, 16)
+            first.fill(QColor('#ff0000'))
+            second = QPixmap(24, 16)
+            second.fill(QColor('#00ff00'))
+            first_path, second_path = store.add(first), store.add(second)
+            os.utime(first_path, (1, 1))
+            os.utime(second_path, (1, 1))
+
+            entries = store.entries()
+            self.assertEqual(len(entries), 2)
+            self.assertTrue(all(os.path.isfile(path) for path, _stamp in entries))
+            self.assertEqual({path for path, _stamp in entries}, {first_path, second_path})
+
+            dialog = screenshot.ScreenshotHistoryDialog(store)
+            clipboard = Mock()
+            with patch.object(screenshot.QApplication, 'clipboard', return_value=clipboard):
+                dialog.copy_selected()
+            copied = clipboard.setPixmap.call_args.args[0]
+            self.assertEqual(copied.toImage().pixelColor(0, 0), QColor('#00ff00'))
+            self.assertEqual(len(store.entries()), 2)
+            dialog.close()
+
+    def test_overlay_records_screenshot_when_copied(self):
+        """完成截图复制时自动写入历史图库。"""
+        controller = Mock()
+        overlay = self.make_overlay()
+        overlay._controller = controller
+        overlay._sel = QRect(20, 20, 80, 60)
+        with patch.object(screenshot.QApplication, 'clipboard') as clipboard:
+            overlay._perform('copy')
+        controller.remember.assert_called_once()
+        clipboard.return_value.setPixmap.assert_called_once()
+
+    def test_history_delete_requires_confirmation_and_preserves_other_images(self):
+        with TemporaryDirectory() as directory:
+            store = screenshot.ScreenshotHistoryStore(directory)
+            image = QPixmap(24, 16)
+            image.fill(QColor('#ff0000'))
+            paths = {store.add(image), store.add(image)}
+            dialog = screenshot.ScreenshotHistoryDialog(store)
+            self.addCleanup(dialog.deleteLater)
+            selected = dialog.list.currentItem().data(Qt.UserRole)
+            with patch.object(screenshot.QMessageBox, 'question', return_value=screenshot.QMessageBox.No):
+                dialog.delete_button.click()
+            self.assertEqual({path for path, _stamp in store.entries()}, paths)
+            with patch.object(screenshot.QMessageBox, 'question', return_value=screenshot.QMessageBox.Yes):
+                dialog.delete_button.click()
+                self.assertFalse(os.path.exists(selected))
+                self.assertEqual({path for path, _stamp in store.entries()}, paths - {selected})
+                self.assertEqual(dialog.list.count(), 1)
+                dialog.delete_button.click()
+            self.assertEqual(store.entries(), [])
+            self.assertTrue(dialog.preview.pixmap() is None or dialog.preview.pixmap().isNull())
+            self.assertFalse(dialog.copy_button.isEnabled())
+            self.assertFalse(dialog.delete_button.isEnabled())
+
+    def test_history_delete_failure_keeps_image_and_shows_error(self):
+        with TemporaryDirectory() as directory:
+            store = screenshot.ScreenshotHistoryStore(directory)
+            image = QPixmap(24, 16)
+            image.fill(QColor('#ff0000'))
+            path = store.add(image)
+            dialog = screenshot.ScreenshotHistoryDialog(store)
+            self.addCleanup(dialog.deleteLater)
+            with patch.object(screenshot.QMessageBox, 'question', return_value=screenshot.QMessageBox.Yes), \
+                    patch.object(store, 'remove', side_effect=PermissionError('access denied')):
+                dialog.delete_button.click()
+            self.assertTrue(os.path.isfile(path))
+            self.assertEqual(dialog.list.count(), 1)
+            self.assertIn('access denied', dialog.status.text())
+
+    def test_screenshot_toolbar_opens_history_gallery(self):
+        """截图工具栏的历史入口打开图库，且不结束当前截图会话。"""
+        controller = Mock()
+        overlay = self.make_overlay()
+        overlay._controller = controller
+        overlay.show()
+        overlay._perform('history')
+        controller.show_history.assert_called_once_with(overlay)
+        self.assertTrue(overlay.isVisible())
 
     def test_undo_removes_last_annotation_and_numbers_stay_sequential(self):
         """序号标注依次编号；撤销后下一个序号顺延回收的编号。"""

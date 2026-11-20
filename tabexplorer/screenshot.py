@@ -4,18 +4,19 @@ import ctypes
 import ctypes.wintypes as wt
 import math
 import os
+import uuid
 from datetime import datetime
 
 from PyQt5.QtCore import (
     QAbstractNativeEventFilter, QObject, QPoint, QPointF, QRect, QRectF, QStandardPaths, Qt, QTimer, pyqtSignal,
 )
 from PyQt5.QtGui import (
-    QColor, QCursor, QFont, QFontMetrics, QFontMetricsF, QGuiApplication, QImage, QPainter, QPainterPath,
+    QColor, QCursor, QFont, QFontMetrics, QFontMetricsF, QGuiApplication, QIcon, QImage, QPainter, QPainterPath,
     QPainterPathStroker, QPen, QPixmap, QPolygonF,
 )
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMenu, QPlainTextEdit, QPushButton, QToolButton, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .debuglog import debug_print
@@ -40,7 +41,7 @@ TOOLS = (
 ACTIONS = (
     ('undo', '↶', '撤销 (Ctrl+Z)'), ('pin', '📌', '贴图 (F3)'), ('save', '💾', '保存 (Ctrl+S)'),
     ('ocr', 'OCR', '离线文字识别 (Ctrl+T)'),
-    ('cancel', '✕', '取消 (Esc)'), ('copy', '✓', '复制到剪贴板 (Enter)'),
+    ('history', '▤', '截图历史图库'), ('cancel', '✕', '取消 (Esc)'), ('copy', '✓', '复制到剪贴板 (Enter)'),
 )
 MOSAIC_BLOCK = 10
 MAGNIFIER_GRID = 15
@@ -860,6 +861,9 @@ class ScreenshotOverlay(QWidget):
         if action == 'undo':
             self._undo()
             return
+        if action == 'history':
+            self._controller.show_history(self)
+            return
         if action == 'cancel':
             self.close()
             return
@@ -867,6 +871,7 @@ class ScreenshotOverlay(QWidget):
             return
         pixmap = self.render_result()
         if action == 'copy':
+            self._remember(pixmap)
             QApplication.clipboard().setPixmap(pixmap)
             self._controller.notify(tr("截图已复制到剪贴板"))
             self.close()
@@ -879,17 +884,27 @@ class ScreenshotOverlay(QWidget):
                 self.setFocus()
                 return
             if path:
+                self._remember(pixmap)
                 self._controller.notify(tr("截图已保存：{}").format(path), 'info' if os.path.exists(path) else 'warning')
             self.close()
         elif action == 'pin':
+            self._remember(pixmap)
             pixmap.setDevicePixelRatio(self._map.dpr)
             origin = self._map.geometry.topLeft()
             self._controller.pin(pixmap, origin + self._sel.topLeft())
             self.close()
         elif action == 'ocr':
+            self._remember(pixmap)
             image = pixmap.toImage()
             self.close()
             self._controller.recognize(image)
+
+    def _remember(self, pixmap):
+        try:
+            self._controller.remember(pixmap)
+        except OSError as error:
+            debug_print(f"[Screenshot] history save failed: {error}")
+            self._controller.notify(tr("截图历史保存失败：{}").format(error), 'warning')
 
     def closeEvent(self, event):
         self._finish_text(False)
@@ -910,6 +925,181 @@ def save_pixmap_dialog(pixmap, parent=None):
         path += '.png'
     _last_save_dir = os.path.dirname(path)
     return path if pixmap.save(path) else ''
+
+
+class ScreenshotHistoryStore:
+    """持久保存已完成的截图，不自动清理历史记录。"""
+
+    def __init__(self, directory=None):
+        if directory is None:
+            from .paths import get_app_config_path
+            directory = os.path.join(get_app_config_path(), 'screenshot_history')
+        self.directory = os.path.abspath(directory)
+
+    def add(self, pixmap):
+        os.makedirs(self.directory, exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        path = os.path.join(self.directory, f'TabEx_{stamp}_{uuid.uuid4().hex[:8]}.png')
+        if not pixmap.save(path, 'PNG'):
+            raise OSError(tr("无法保存截图历史：{}").format(path))
+        return path
+
+    def entries(self):
+        os.makedirs(self.directory, exist_ok=True)
+        entries = []
+        with os.scandir(self.directory) as children:
+            for child in children:
+                if child.is_file() and child.name.lower().endswith('.png'):
+                    try:
+                        entries.append((child.path, child.stat().st_mtime))
+                    except FileNotFoundError:
+                        continue
+        entries.sort(key=lambda entry: (entry[1], os.path.basename(entry[0])), reverse=True)
+        return entries
+
+    def remove(self, path):
+        path = os.path.abspath(path)
+        if (os.path.normcase(os.path.dirname(path)) != os.path.normcase(self.directory)
+                or not path.lower().endswith('.png')):
+            raise ValueError(tr("只能删除图库内的截图"))
+        os.remove(path)
+
+
+class ScreenshotHistoryDialog(QDialog):
+    """截图历史浏览器：浏览、复制和手动删除截图，不自动清理。"""
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.setWindowTitle(tr("截图历史图库"))
+        self.resize(820, 540)
+        layout = QVBoxLayout(self)
+
+        self.status = QLabel(self)
+        layout.addWidget(self.status)
+        body = QHBoxLayout()
+        self.list = QListWidget(self)
+        self.list.setMinimumWidth(270)
+        self.list.currentItemChanged.connect(self._selection_changed)
+        self.list.itemDoubleClicked.connect(lambda _item: self.copy_selected())
+        body.addWidget(self.list)
+
+        self.preview = QLabel(self)
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumSize(400, 300)
+        self.preview.setFrameShape(QFrame.StyledPanel)
+        body.addWidget(self.preview, 1)
+        layout.addLayout(body, 1)
+
+        buttons = QHBoxLayout()
+        self.previous_button = QPushButton(tr("上一张"), self)
+        self.next_button = QPushButton(tr("下一张"), self)
+        self.copy_button = QPushButton(tr("复制到剪贴板"), self)
+        self.delete_button = QPushButton(tr("删除"), self)
+        self.close_button = QPushButton(tr("关闭"), self)
+        self.previous_button.clicked.connect(lambda: self._move_selection(-1))
+        self.next_button.clicked.connect(lambda: self._move_selection(1))
+        self.copy_button.clicked.connect(self.copy_selected)
+        self.delete_button.clicked.connect(self.delete_selected)
+        self.close_button.clicked.connect(self.reject)
+        buttons.addWidget(self.previous_button)
+        buttons.addWidget(self.next_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.copy_button)
+        buttons.addWidget(self.delete_button)
+        buttons.addWidget(self.close_button)
+        layout.addLayout(buttons)
+        self.refresh()
+
+    def refresh(self):
+        self.list.clear()
+        try:
+            entries = self.store.entries()
+        except OSError as error:
+            self.status.setText(tr("无法读取截图历史：{}").format(error))
+            self._update_controls()
+            return
+        for path, modified in entries:
+            label = datetime.fromtimestamp(modified).strftime('%Y-%m-%d %H:%M:%S')
+            pixmap = QPixmap(path)
+            item = QListWidgetItem(QIcon(pixmap.scaled(
+                96, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)), label)
+            item.setData(Qt.UserRole, path)
+            item.setToolTip(path)
+            self.list.addItem(item)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+            self.status.setText(tr("共 {} 张截图，历史记录不会自动删除").format(self.list.count()))
+        else:
+            self.status.setText(tr("暂无截图历史"))
+        self._update_controls()
+
+    def _selection_changed(self, current, _previous):
+        path = current.data(Qt.UserRole) if current is not None else ''
+        pixmap = QPixmap(path) if path else QPixmap()
+        if pixmap.isNull():
+            self.preview.clear()
+            self.preview.setToolTip('')
+            if path:
+                self.status.setText(tr("无法读取截图：{}").format(path))
+        else:
+            self.preview.setPixmap(pixmap.scaled(
+                self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.preview.setToolTip(path)
+        self._update_controls()
+
+    def _update_controls(self):
+        count = self.list.count()
+        row = self.list.currentRow()
+        self.previous_button.setEnabled(count > 1 and row > 0)
+        self.next_button.setEnabled(count > 1 and 0 <= row < count - 1)
+        self.copy_button.setEnabled(row >= 0)
+        self.delete_button.setEnabled(row >= 0)
+
+    def _move_selection(self, step):
+        row = self.list.currentRow() + step
+        if 0 <= row < self.list.count():
+            self.list.setCurrentRow(row)
+
+    def copy_selected(self):
+        item = self.list.currentItem()
+        if item is None:
+            return
+        path = item.data(Qt.UserRole)
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            self.status.setText(tr("无法读取截图：{}").format(path))
+            return
+        pixmap.setDevicePixelRatio(1.0)
+        QApplication.clipboard().setPixmap(pixmap)
+        self.status.setText(tr("历史截图已复制到剪贴板"))
+
+    def delete_selected(self):
+        item = self.list.currentItem()
+        if item is None:
+            return
+        path = item.data(Qt.UserRole)
+        if QMessageBox.question(
+                self, tr("确认删除"),
+                tr("删除这张历史截图？此操作不可撤销。\n{}").format(path),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        row = self.list.currentRow()
+        try:
+            self.store.remove(path)
+        except (OSError, ValueError) as error:
+            debug_print(f"[Screenshot] history deletion failed: {error}")
+            self.status.setText(tr("删除截图失败：{}").format(error))
+            return
+        self.refresh()
+        if self.list.count():
+            self.list.setCurrentRow(min(row, self.list.count() - 1))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        item = self.list.currentItem()
+        if item is not None:
+            self._selection_changed(item, None)
 
 
 # ---------------------------------------------------------------- 贴图
@@ -1142,6 +1332,7 @@ class ScreenshotController(QObject):
         self._overlay = None
         self._ocr_dialog = None
         self._pending = False
+        self._history_store = ScreenshotHistoryStore()
         self._hotkey = _GlobalHotkey(self.start)
 
     def notify(self, message, level='info'):
@@ -1186,6 +1377,14 @@ class ScreenshotController(QObject):
 
     def _on_closed(self):
         self._overlay = None
+
+    def remember(self, pixmap):
+        return self._history_store.add(pixmap)
+
+    def show_history(self, parent=None):
+        dialog = ScreenshotHistoryDialog(self._history_store, parent or self.parent())
+        dialog.exec_()
+        dialog.deleteLater()
 
     def pin(self, pixmap, position):
         window = PinWindow(pixmap, position)

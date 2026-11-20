@@ -3500,18 +3500,8 @@ class MainWindow(QMainWindow):
         current_tab._run_file_batch_op('copy', alive_paths, dst_dir, conflict_actions=conflict_actions)
 
     def quick_delete_selected_items(self):
-        """Alt+Delete：将选中项移入回收站。"""
-        current_tab = self.get_active_pane()
-        if not current_tab or not hasattr(current_tab, '_get_selected_paths'):
-            show_toast(self, tr("提示"), tr("当前标签不支持快速删除"), level="warning")
-            return
-        selected_paths = current_tab._get_selected_paths()
-        selected_paths = [p for p in (selected_paths or []) if p]
-        if not selected_paths:
-            show_toast(self, tr("提示"), tr("请先选择要删除的文件或文件夹"), level="warning")
-            return
-        if hasattr(current_tab, '_run_file_batch_op'):
-            current_tab._run_file_batch_op('delete', selected_paths)
+        """Alt+Delete：确认后永久删除选中项。"""
+        self.permanently_delete_selected()
 
     def quick_cancel_background_file_operation(self):
         """Alt+Q：取消当前标签页正在执行的后台复制/删除任务。"""
@@ -3823,6 +3813,11 @@ class MainWindow(QMainWindow):
         if controller is not None:
             controller.start(delay_ms)
 
+    def show_screenshot_history(self):
+        controller = getattr(self, 'screenshot', None)
+        if controller is not None:
+            controller.show_history()
+
     def _screenshot_notify(self, message, level='info'):
         show_toast(self, tr("提示"), message, level=level, duration=3000)
 
@@ -4032,15 +4027,22 @@ class MainWindow(QMainWindow):
         name, accepted = QInputDialog.getText(self, tr("保存工作区"), tr("名称"))
         name = name.strip()
         if not accepted or not name:
-            return
+            return None
         workspaces = self.config.setdefault('named_workspaces', {})
         if name in workspaces and QMessageBox.question(
                 self, tr("覆盖工作区"), name, QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No) != QMessageBox.Yes:
-            return
-        workspaces[name] = self._capture_named_workspace()
+            return None
+        workspaces[name] = dict(self._capture_named_workspace(), saved_at=time.time())
         self.save_config(immediate=True)
         show_toast(self, tr("工作区"), tr("已保存"), level="success")
+        return name
+
+    def manage_named_workspaces(self):
+        from .workspace import WorkspaceManagerDialog
+        dialog = WorkspaceManagerDialog(self, self)
+        dialog.exec_()
+        dialog.deleteLater()
 
     def _choose_named_workspace(self):
         workspaces = self.config.get('named_workspaces', {})
@@ -4050,8 +4052,9 @@ class MainWindow(QMainWindow):
         name, accepted = QInputDialog.getItem(self, tr("工作区"), tr("名称"), sorted(workspaces), 0, False)
         return name if accepted else None
 
-    def open_named_workspace(self):
-        name = self._choose_named_workspace()
+    def open_named_workspace(self, name=None):
+        if name is None:
+            name = self._choose_named_workspace()
         if name is None:
             return
         state = self.config['named_workspaces'][name]
@@ -4095,9 +4098,47 @@ class MainWindow(QMainWindow):
         if failures:
             show_toast(self, tr("工作区"), tr("部分目录无法打开") + ': ' + '\n'.join(failures), level="warning")
 
-    def delete_named_workspace(self):
+    def _clear_tabs_for_workspace_switch(self):
+        for tab_widget, content_stack in self._all_groups():
+            for index in range(content_stack.count() - 1, -1, -1):
+                tab = content_stack.widget(index)
+                if tab is not None and hasattr(tab, 'cleanup'):
+                    try:
+                        tab.cleanup()
+                    except Exception as error:
+                        debug_print(f"[Workspace] Tab cleanup failed during switch: {error}")
+                if tab is not None and hasattr(tab, 'set_refresh_active'):
+                    try:
+                        tab.set_refresh_active(False)
+                    except Exception as error:
+                        debug_print(f"[Workspace] Refresh shutdown failed during switch: {error}")
+                if tab is not None:
+                    content_stack.removeWidget(tab)
+                    tab.deleteLater()
+                _remove_tab_and_page(tab_widget, index)
+        if getattr(self, '_split_active', False):
+            self._teardown_split_group()
+        self._active_pane = None
+        self.update_navigation_buttons()
+
+    def switch_named_workspace(self, name):
+        state = self.config.get('named_workspaces', {}).get(name)
+        if not isinstance(state, dict) or not isinstance(state.get('groups', []), list):
+            show_toast(self, tr("工作区"), tr("工作区数据无效"), level="warning")
+            return False
+        self._clear_tabs_for_workspace_switch()
+        self.open_named_workspace(name)
+        if self.tab_widget.count() == 0:
+            self.add_new_tab()
+        if not state.get('groups'):
+            self.save_pinned_tabs()
+        self._schedule_session_snapshot()
+        return True
+
+    def delete_named_workspace(self, name=None):
         from PyQt5.QtWidgets import QMessageBox
-        name = self._choose_named_workspace()
+        if name is None:
+            name = self._choose_named_workspace()
         if name is not None and QMessageBox.question(
                 self, tr("删除工作区记录"), name, QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No) == QMessageBox.Yes:
@@ -4124,11 +4165,7 @@ class MainWindow(QMainWindow):
         self.sync_browse_action = menu.addAction(tr('分屏同步浏览'), self.toggle_sync_browse)
         self.sync_browse_action.setCheckable(True)
         self.sync_browse_action.setChecked(bool(getattr(self, '_sync_browse', False)))
-        workspace = menu.addMenu(tr('工作区'))
-        workspace.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
-        workspace.addAction(tr('保存命名工作区...'), self.save_named_workspace)
-        workspace.addAction(tr('打开命名工作区...'), self.open_named_workspace)
-        workspace.addAction(tr('删除命名工作区...'), self.delete_named_workspace)
+        menu.addAction(tr('工作区'), self.manage_named_workspaces)
         self.external_tools_menu = menu.addMenu(tr('外部工具'))
         self.external_tools_menu.addAction(tr("配置外部工具..."), self.configure_external_tools)
         self.external_tools_menu.aboutToShow.connect(self._rebuild_external_tools_menu)
@@ -4139,6 +4176,7 @@ class MainWindow(QMainWindow):
                        lambda: self._open_windows_tool('SystemPropertiesAdvanced.exe', tr('高级系统设置')))
         menu.addSection(tr('截图'))
         self.screenshot_action = menu.addAction(tr('屏幕截图'), lambda: self.start_screenshot(250))
+        menu.addAction(tr('截图历史图库'), self.show_screenshot_history)
         menu.addSection(tr('危险操作'))
         danger = menu.addAction(tr('永久删除选中项...'), self.permanently_delete_selected)
         danger.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxWarning))

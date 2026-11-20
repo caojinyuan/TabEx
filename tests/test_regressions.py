@@ -681,6 +681,211 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(right.items[0].current_path, 'right-one')
         self.assertTrue(owner._split_active)
 
+    def test_workspace_manager_separates_open_and_switch(self):
+        """管理器中的打开保留当前操作，切换调用替换式恢复。"""
+        owner = types.SimpleNamespace(
+            config={'named_workspaces': {'demo': {'groups': []}}},
+            open_named_workspace=Mock(),
+            switch_named_workspace=Mock(),
+        )
+        dialog = self.module.WorkspaceManagerDialog(owner)
+        dialog.open_selected()
+        owner.open_named_workspace.assert_called_once_with('demo')
+        owner.switch_named_workspace.assert_not_called()
+        dialog.close()
+
+        dialog = self.module.WorkspaceManagerDialog(owner)
+        dialog.switch_selected()
+        owner.switch_named_workspace.assert_called_once_with('demo')
+        dialog.close()
+
+    def test_switch_workspace_clears_tabs_and_split_before_restore(self):
+        """切换工作区先清理当前标签与分屏，再恢复目标工作区。"""
+        sequence = []
+        owner = types.SimpleNamespace(
+            config={'named_workspaces': {'target': {'groups': [{'tabs': []}]}}},
+            _clear_tabs_for_workspace_switch=lambda: sequence.append('clear'),
+            open_named_workspace=lambda name: sequence.append(('open', name)),
+            tab_widget=types.SimpleNamespace(count=lambda: 1),
+            save_pinned_tabs=Mock(),
+            _schedule_session_snapshot=Mock(),
+        )
+        result = self.module.MainWindow.switch_named_workspace(owner, 'target')
+        self.assertTrue(result)
+        self.assertEqual(sequence, ['clear', ('open', 'target')])
+
+    def test_clear_tabs_for_workspace_switch_releases_both_widgets(self):
+        """清理切换前的标签时关闭 Explorer 内容并释放占位页。"""
+        class Content:
+            def __init__(self):
+                self.cleanup_called = False
+                self.refresh_active = True
+                self.deleted = False
+
+            def cleanup(self):
+                self.cleanup_called = True
+
+            def set_refresh_active(self, active):
+                self.refresh_active = active
+
+            def deleteLater(self):
+                self.deleted = True
+
+        class Placeholder:
+            def __init__(self):
+                self.deleted = False
+
+            def deleteLater(self):
+                self.deleted = True
+
+        content, placeholder = Content(), Placeholder()
+
+        class Stack:
+            def __init__(self, value):
+                self.items = [value]
+
+            def count(self):
+                return len(self.items)
+
+            def widget(self, index):
+                return self.items[index]
+
+            def removeWidget(self, value):
+                self.items.remove(value)
+
+        class Tabs:
+            def __init__(self, value):
+                self.items = [value]
+
+            def count(self):
+                return len(self.items)
+
+            def widget(self, index):
+                return self.items[index]
+
+            def removeTab(self, index):
+                self.items.pop(index)
+
+        stack, tabs = Stack(content), Tabs(placeholder)
+        owner = types.SimpleNamespace(
+            _all_groups=lambda: [(tabs, stack)],
+            _split_active=False,
+            _active_pane=content,
+            update_navigation_buttons=Mock(),
+        )
+        self.module.MainWindow._clear_tabs_for_workspace_switch(owner)
+        self.assertTrue(content.cleanup_called)
+        self.assertFalse(content.refresh_active)
+        self.assertTrue(content.deleted)
+        self.assertTrue(placeholder.deleted)
+        self.assertEqual(stack.count(), 0)
+        self.assertEqual(tabs.count(), 0)
+
+    def test_workspace_manager_shows_nested_groups_and_tabs(self):
+        """工作区管理器按工作区、分组和标签展示快照内容。
+
+        场景：提供带分组标签、未分组标签及右侧分屏标签的工作区，还有旧格式记录。
+        预期：工作区为根节点，分组下显示其标签，保存时间及旧记录兼容显示正确。
+        """
+        owner = types.SimpleNamespace(config={'named_workspaces': {
+            'Zulu': {'saved_at': 123.0},
+            'Alpha': {'groups': [
+                {'tabs': [
+                    {'path': r'C:\one', 'bookmark_group_color': 'red', 'tab_group_name': 'Project'},
+                    {'path': r'C:\two', 'bookmark_group_color': 'red'},
+                    {'path': r'C:\three'},
+                ]},
+                {'tabs': [{'path': r'D:\right'}]},
+            ]},
+        }})
+        dialog = self.module.WorkspaceManagerDialog(owner)
+        self.assertEqual(dialog.tree.topLevelItemCount(), 2)
+        self.assertEqual(dialog.tree.topLevelItem(0).text(0), 'Alpha')
+        self.assertEqual(dialog.tree.topLevelItem(0).text(1), '未知')
+        self.assertEqual(dialog.tree.topLevelItem(0).childCount(), 3)
+        group_item = dialog.tree.topLevelItem(0).child(0)
+        self.assertIn('Project (2)', group_item.text(0))
+        self.assertEqual(group_item.childCount(), 2)
+        self.assertIn(r'C:\two', group_item.child(1).text(0))
+        self.assertIn(r'D:\right', dialog.tree.topLevelItem(0).child(2).text(0))
+        self.assertEqual(
+            dialog.tree.topLevelItem(1).text(1),
+            time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(123.0)))
+        self.assertEqual(dialog.tree.headerItem().text(1), '保存时间')
+        dialog.close()
+
+    def test_workspace_manager_can_remove_tab_and_ungroup(self):
+        """工作区管理器可删除单个标签并取消分组而保留其他标签。
+
+        场景：分组含两个标签，另有一个未分组标签且当前选中最后一个。
+        预期：删除标签后活动索引调整，取消分组只清除分组元数据。
+        """
+        state = {'saved_at': 1.0, 'groups': [{'tabs': [
+            {'path': 'one', 'bookmark_group_color': 'red', 'tab_group_name': 'Group'},
+            {'path': 'two', 'bookmark_group_color': 'red', 'tab_group_name': 'Group'},
+            {'path': 'three'},
+        ], 'active_index': 2}]}
+        owner = types.SimpleNamespace(
+            config={'named_workspaces': {'demo': state}},
+            save_config=Mock(),
+        )
+        dialog = self.module.WorkspaceManagerDialog(owner)
+        root = dialog.tree.topLevelItem(0)
+        group_item = root.child(0)
+        from PyQt5.QtWidgets import QMessageBox
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.Yes):
+            dialog.tree.setCurrentItem(group_item.child(1))
+            dialog.delete_selected()
+        pane = state['groups'][0]
+        self.assertEqual([entry['path'] for entry in pane['tabs']], ['one', 'three'])
+        self.assertEqual(pane['active_index'], 1)
+
+        dialog.tree.setCurrentItem(dialog.tree.topLevelItem(0).child(0))
+        dialog.ungroup_selected()
+        self.assertEqual(state['groups'][0]['tabs'][0]['bookmark_group_color'], '')
+        self.assertEqual(state['groups'][0]['tabs'][0]['tab_group_name'], '')
+        owner.save_config.assert_called_with(immediate=True)
+        dialog.close()
+
+    def test_workspace_manager_can_delete_a_group(self):
+        """删除分组会移除该分组的全部标签并修正活动索引。"""
+        state = {'groups': [{'tabs': [
+            {'path': 'one', 'bookmark_group_color': 'red'},
+            {'path': 'two', 'bookmark_group_color': 'red'},
+            {'path': 'three'},
+        ], 'active_index': 1}]}
+        owner = types.SimpleNamespace(
+            config={'named_workspaces': {'demo': state}},
+            save_config=Mock(),
+        )
+        dialog = self.module.WorkspaceManagerDialog(owner)
+        dialog.tree.setCurrentItem(dialog.tree.topLevelItem(0).child(0))
+        from PyQt5.QtWidgets import QMessageBox
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.Yes):
+            dialog.delete_selected()
+        self.assertEqual([entry['path'] for entry in state['groups'][0]['tabs']], ['three'])
+        self.assertEqual(state['groups'][0]['active_index'], 0)
+        dialog.close()
+
+    def test_saving_named_workspace_records_saved_time(self):
+        """保存或覆盖工作区时记录当前时间。
+
+        场景：以固定时钟保存一个命名工作区。
+        预期：快照内容保留，并附上可用于列表显示的保存时间。
+        """
+        owner = types.SimpleNamespace(
+            config={},
+            _capture_named_workspace=lambda: {'version': 1, 'groups': []},
+            save_config=Mock(),
+        )
+        with patch.object(self.module.QInputDialog, 'getText', return_value=('demo', True)), \
+                patch.object(self.module.time, 'time', return_value=123.0), \
+                patch_all('show_toast'):
+            self.module.MainWindow.save_named_workspace(owner)
+        self.assertEqual(owner.config['named_workspaces']['demo']['saved_at'], 123.0)
+        self.assertEqual(owner.config['named_workspaces']['demo']['groups'], [])
+        owner.save_config.assert_called_once_with(immediate=True)
+
     def test_slow_tab_activation_does_not_stat_or_scan(self):
         """激活慢路径标签时，不同步调用目录存在性检查。
 
@@ -1730,9 +1935,11 @@ class InterfaceTests(unittest.TestCase):
                             'go_back_current_tab', 'go_forward_current_tab', 'add_new_tab', 'reopen_closed_tab',
                             'show_tab_list', 'show_search_dialog', 'show_file_tasks', 'show_directory_compare',
                             'preview_batch_rename', 'save_named_workspace', 'open_named_workspace',
-                            'delete_named_workspace', 'permanently_delete_selected', 'export_diagnostics',
+                            'delete_named_workspace', 'manage_named_workspaces',
+                            'permanently_delete_selected', 'export_diagnostics',
                             'insert_tab_group_marker', 'toggle_split_view', 'show_bookmark_manager_dialog',
-                            'show_settings_menu', 'toggle_chat_panel', 'show_frequent_dirs', 'toggle_sync_browse'):
+                            'show_settings_menu', 'toggle_chat_panel', 'show_screenshot_history',
+                            'show_frequent_dirs', 'toggle_sync_browse'):
                         setattr(host, name, Mock())
                     host.configure_external_tools = Mock()
                     host._rebuild_external_tools_menu = Mock()
@@ -1821,8 +2028,10 @@ class InterfaceTests(unittest.TestCase):
         from tabexplorer.commands import menu_commands
         callbacks = {name: Mock() for name in (
             'show_file_tasks', 'show_directory_compare', 'preview_batch_rename', 'save_named_workspace',
-            'open_named_workspace', 'delete_named_workspace', 'permanently_delete_selected', 'export_diagnostics',
-            'check_for_updates', 'start_screenshot', 'show_frequent_dirs', 'toggle_sync_browse',
+            'open_named_workspace', 'delete_named_workspace', 'manage_named_workspaces',
+            'permanently_delete_selected', 'export_diagnostics',
+            'check_for_updates', 'start_screenshot', 'show_screenshot_history', 'show_frequent_dirs',
+            'toggle_sync_browse',
             'configure_external_tools', '_rebuild_external_tools_menu', '_open_windows_tool')}
         owner = types.SimpleNamespace(style=self.app.style, config={}, **callbacks)
         menu = QMenu()
@@ -1842,10 +2051,12 @@ class InterfaceTests(unittest.TestCase):
         self.assertTrue(owner.sync_browse_action.isCheckable())
         owner.screenshot_action.trigger()
         callbacks['start_screenshot'].assert_called_once_with(250)
-        workspaces = next(action.menu() for action in menu.actions() if action.menu())
-        self.assertEqual(len(workspaces.actions()), 3)
-        workspaces.actions()[1].trigger()
-        callbacks['open_named_workspace'].assert_called_once()
+        next(action for action in menu.actions() if action.text() == '截图历史图库').trigger()
+        callbacks['show_screenshot_history'].assert_called_once()
+        workspace_action = next(action for action in menu.actions() if action.text() == '工作区')
+        self.assertIsNone(workspace_action.menu())
+        workspace_action.trigger()
+        callbacks['manage_named_workspaces'].assert_called_once()
         owner.external_tools_menu.actions()[0].trigger()
         callbacks['configure_external_tools'].assert_called_once()
         owner.export_diagnostics_action.trigger()
@@ -2563,6 +2774,12 @@ class HotkeyAndUpdateTests(unittest.TestCase):
         self.assertEqual(self.module._validate_hotkey_bindings(bindings), [])
         self.assertEqual(bindings['reopen_tab'], 'Ctrl+Shift+T')
         self.assertEqual(bindings['quick_delete'], 'Alt+Del')
+
+    def test_alt_delete_uses_confirmed_permanent_delete(self):
+        """Alt+Delete 使用永久删除确认流程，而不是移入回收站。"""
+        owner = types.SimpleNamespace(permanently_delete_selected=Mock())
+        self.module.MainWindow.quick_delete_selected_items(owner)
+        owner.permanently_delete_selected.assert_called_once_with()
 
     def test_validation_reports_unsafe_and_duplicate_bindings(self):
         """缺少修饰键、占用 Explorer 文件快捷键、与 Ctrl+数字冲突或重复分配时报错。"""
