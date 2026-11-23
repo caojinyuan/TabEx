@@ -106,6 +106,7 @@ class ConfigStore(JsonFileStore):
             "enable_mouse_gestures": True,  # 默认启用鼠标手势（右键画线导航）
             "show_tab_group_markers": True,  # 默认显示标签分组颜色
             "tab_hibernate_minutes": 30,  # 后台标签闲置多久后释放 Shell 视图：0=关闭
+            "screenshot_history_retention_days": 3,  # 截图历史保留天数：0=不自动删除
             "hotkey_bindings": {},  # 自定义按键 {命令: "Ctrl+T"}；未列出的命令使用默认按键
             "search_presets": [],  # 常用搜索条件（不含搜索路径）
             "auto_update_check": False,  # 默认关闭；开启后每天最多查询一次 GitHub 最新发布，只提示不下载

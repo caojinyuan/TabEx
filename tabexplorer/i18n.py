@@ -248,7 +248,9 @@ _LANG_EN = {
     "无法保存截图历史：{}": "Could not save screenshot history: {}",
     "无法读取截图历史：{}": "Could not read screenshot history: {}",
     "无法读取截图：{}": "Could not read screenshot: {}",
-    "共 {} 张截图，历史记录不会自动删除": "{} screenshots; history is never removed automatically",
+    "共 {} 张截图": "{} screenshots",
+    "自动清理截图历史失败：{}": "Could not automatically clean screenshot history: {}",
+    "截图历史保存天数无效：{}": "Invalid screenshot history retention period: {}",
     "暂无截图历史": "No screenshot history",
     "上一张": "Previous",
     "下一张": "Next",
@@ -565,6 +567,11 @@ _LANG_EN = {
     "切换到同级文件夹": "Switch to sibling folder",
     "无子文件夹": "No subfolders",
     # ── SettingsDialog ────────────────────────────────────────────────────
+    "截图历史设置": "Screenshot History",
+    "截图历史保存天数:": "Screenshot retention (days):",
+    "不自动删除": "Never delete automatically",
+    "按文件修改时间清理过期截图；0 表示不自动删除。清理后无法撤销。":
+        "Delete expired screenshots based on file modification time; 0 disables automatic deletion. Deletion cannot be undone.",
     "路径栏分隔符设置": "Path Bar Separator",
     "路径栏拷贝分隔符:": "Copy Separator:",
     "设置从路径栏拷贝时使用的分隔符": "Separator used when copying from path bar",

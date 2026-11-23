@@ -242,6 +242,20 @@ class SettingsDialog(QDialog):
             if w: compact_widget(w)
         general_layout.addWidget(tabs_group)
 
+        screenshot_group = QGroupBox(tr("截图历史设置"))
+        screenshot_layout = QHBoxLayout()
+        screenshot_layout.addWidget(QLabel(tr("截图历史保存天数:")))
+        self.screenshot_retention_spin = QSpinBox(self)
+        self.screenshot_retention_spin.setRange(0, 36500)
+        self.screenshot_retention_spin.setSpecialValueText(tr("不自动删除"))
+        self.screenshot_retention_spin.setValue(config.get("screenshot_history_retention_days", 3))
+        self.screenshot_retention_spin.setToolTip(tr("按文件修改时间清理过期截图；0 表示不自动删除。清理后无法撤销。"))
+        screenshot_layout.addWidget(self.screenshot_retention_spin)
+        screenshot_layout.addStretch(1)
+        screenshot_group.setLayout(screenshot_layout)
+        compact_groupbox(screenshot_group)
+        general_layout.addWidget(screenshot_group)
+
         # 鼠标手势设置组
         gesture_group = QGroupBox(tr("鼠标手势设置"))
         gesture_layout = QVBoxLayout()
@@ -930,6 +944,7 @@ class SettingsDialog(QDialog):
             self.parent().config["enable_explorer_monitor"] = self.monitor_cb.isChecked()
             self.parent().config["explorer_monitor_interval"] = self.interval_spinbox.value()
             self.parent().config["tab_hibernate_minutes"] = self.tab_hibernate_spin.value()
+            self.parent().config["screenshot_history_retention_days"] = self.screenshot_retention_spin.value()
             self.parent().config["debug_mode"] = self.debug_mode_cb.isChecked()
             self.parent().config["explorer_monitor_debug"] = self.explorer_monitor_debug_cb.isChecked()
             self.parent().config["file_op_max_workers"] = self.file_op_workers_spin.value()

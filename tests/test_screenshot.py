@@ -121,6 +121,109 @@ class ScreenshotTests(unittest.TestCase):
             self.assertEqual(len(store.entries()), 2)
             dialog.close()
 
+    def test_history_cleanup_respects_default_custom_and_never_retention(self):
+        with TemporaryDirectory() as directory:
+            config = {}
+            store = screenshot.ScreenshotHistoryStore(directory, config)
+            image = QPixmap(2, 2)
+            image.fill(QColor('#ff0000'))
+            old, boundary, recent = (store.add(image) for _ in range(3))
+            unrelated = os.path.join(directory, 'other.png')
+            self.assertTrue(image.save(unrelated))
+            now = 1700000000
+            for path, age in ((old, 4), (boundary, 3), (recent, 2), (unrelated, 10)):
+                os.utime(path, (now - age * 86400, now - age * 86400))
+            with patch.object(screenshot.time, 'time', return_value=now):
+                store.cleanup()
+                self.assertFalse(os.path.exists(old))
+                self.assertTrue(os.path.exists(boundary))
+                self.assertTrue(os.path.exists(recent))
+                self.assertTrue(os.path.exists(unrelated))
+                config['screenshot_history_retention_days'] = 0
+                store.cleanup()
+                self.assertTrue(os.path.exists(boundary))
+                config['screenshot_history_retention_days'] = 1
+                store.cleanup()
+                self.assertFalse(os.path.exists(boundary))
+                self.assertFalse(os.path.exists(recent))
+                self.assertTrue(os.path.exists(unrelated))
+
+    def test_history_cleanup_failure_is_reported_without_losing_new_screenshot(self):
+        with TemporaryDirectory() as directory:
+            controller = screenshot.ScreenshotController(self.notify)
+            self.addCleanup(controller.shutdown)
+            controller._history_store = screenshot.ScreenshotHistoryStore(directory)
+            image = QPixmap(2, 2)
+            image.fill(QColor('#ff0000'))
+            with patch.object(controller._history_store, 'cleanup', side_effect=PermissionError('denied')):
+                path = controller.remember(image)
+            self.assertTrue(os.path.isfile(path))
+            self.assertTrue(any('denied' in message for message in self.messages))
+
+    def test_controller_cleans_on_startup_and_periodically_using_current_settings(self):
+        with TemporaryDirectory() as directory:
+            config = {'screenshot_history_retention_days': 3}
+            store = screenshot.ScreenshotHistoryStore(directory, config)
+            image = QPixmap(2, 2)
+            image.fill(QColor('#ff0000'))
+            path = store.add(image)
+            os.utime(path, (1, 1))
+            with patch.object(screenshot, 'ScreenshotHistoryStore', return_value=store):
+                controller = screenshot.ScreenshotController(self.notify)
+            self.addCleanup(controller.shutdown)
+            self.app.processEvents()
+            self.assertFalse(os.path.exists(path))
+            path = store.add(image)
+            os.utime(path, (1, 1))
+            config['screenshot_history_retention_days'] = 0
+            controller._history_cleanup_timer.timeout.emit()
+            self.assertTrue(os.path.exists(path))
+            config['screenshot_history_retention_days'] = 3
+            controller._history_cleanup_timer.timeout.emit()
+            self.assertFalse(os.path.exists(path))
+
+    def test_invalid_retention_does_not_delete_history(self):
+        with TemporaryDirectory() as directory:
+            store = screenshot.ScreenshotHistoryStore(directory, {'screenshot_history_retention_days': -1})
+            image = QPixmap(2, 2)
+            image.fill(QColor('#ff0000'))
+            path = store.add(image)
+            os.utime(path, (1, 1))
+            with self.assertRaises(ValueError):
+                store.cleanup()
+            self.assertTrue(os.path.exists(path))
+
+    def test_retention_settings_are_saved_and_used_by_existing_store(self):
+        from PyQt5.QtWidgets import QWidget
+        from tabexplorer.persistence import ConfigStore
+        from tabexplorer.settings import SettingsDialog
+
+        with TemporaryDirectory() as directory, patch.dict(os.environ, TABEX_DATA_DIR=directory):
+            config_store = ConfigStore(os.path.join(directory, 'settings.json'))
+            owner = QWidget()
+            owner.config = config_store.load()
+            owner.save_config = lambda: config_store.save(owner.config)
+            owner.apply_tortoisegit_buttons_config = Mock()
+            owner.setup_shortcuts = Mock()
+            store = screenshot.ScreenshotHistoryStore(directory, owner.config)
+            with patch.object(SettingsDialog, '_is_auto_startup_enabled', return_value=False), \
+                    patch.object(SettingsDialog, '_startup_target_mismatch', return_value=''):
+                dialog = SettingsDialog(owner.config, owner)
+                self.assertEqual(dialog.screenshot_retention_spin.value(), 3)
+                dialog.screenshot_retention_spin.setValue(0)
+                dialog.accept()
+                self.assertEqual(store.retention_days(), 0)
+                self.assertEqual(config_store.load()['screenshot_history_retention_days'], 0)
+                dialog.deleteLater()
+                dialog = SettingsDialog(owner.config, owner)
+                self.assertEqual(dialog.screenshot_retention_spin.value(), 0)
+                dialog.screenshot_retention_spin.setValue(14)
+                dialog.accept()
+                self.assertEqual(store.retention_days(), 14)
+                self.assertEqual(config_store.load()['screenshot_history_retention_days'], 14)
+                dialog.deleteLater()
+            owner.deleteLater()
+
     def test_overlay_records_screenshot_when_copied(self):
         """完成截图复制时自动写入历史图库。"""
         controller = Mock()

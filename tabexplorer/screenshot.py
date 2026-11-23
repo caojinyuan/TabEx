@@ -4,6 +4,8 @@ import ctypes
 import ctypes.wintypes as wt
 import math
 import os
+import re
+import time
 import uuid
 from datetime import datetime
 
@@ -928,13 +930,39 @@ def save_pixmap_dialog(pixmap, parent=None):
 
 
 class ScreenshotHistoryStore:
-    """持久保存已完成的截图，不自动清理历史记录。"""
+    """持久保存已完成的截图。"""
 
-    def __init__(self, directory=None):
+    def __init__(self, directory=None, config=None):
         if directory is None:
             from .paths import get_app_config_path
             directory = os.path.join(get_app_config_path(), 'screenshot_history')
         self.directory = os.path.abspath(directory)
+        self.config = config if config is not None else {}
+
+    def retention_days(self):
+        days = self.config.get('screenshot_history_retention_days', 3)
+        if type(days) is not int or not 0 <= days <= 36500:
+            raise ValueError(tr("截图历史保存天数无效：{}").format(days))
+        return days
+
+    def cleanup(self):
+        days = self.retention_days()
+        if days == 0:
+            return
+        cutoff = time.time() - days * 86400
+        try:
+            children = os.scandir(self.directory)
+        except FileNotFoundError:
+            return
+        with children:
+            for child in children:
+                if not re.fullmatch(r'TabEx_\d{8}_\d{6}_\d{6}_[0-9a-f]{8}\.png', child.name):
+                    continue
+                try:
+                    if child.is_file(follow_symlinks=False) and child.stat(follow_symlinks=False).st_mtime < cutoff:
+                        self.remove(child.path)
+                except FileNotFoundError:
+                    continue
 
     def add(self, pixmap):
         os.makedirs(self.directory, exist_ok=True)
@@ -966,7 +994,7 @@ class ScreenshotHistoryStore:
 
 
 class ScreenshotHistoryDialog(QDialog):
-    """截图历史浏览器：浏览、复制和手动删除截图，不自动清理。"""
+    """截图历史浏览器：浏览、复制和手动删除截图。"""
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
@@ -1032,7 +1060,7 @@ class ScreenshotHistoryDialog(QDialog):
             self.list.addItem(item)
         if self.list.count():
             self.list.setCurrentRow(0)
-            self.status.setText(tr("共 {} 张截图，历史记录不会自动删除").format(self.list.count()))
+            self.status.setText(tr("共 {} 张截图").format(self.list.count()))
         else:
             self.status.setText(tr("暂无截图历史"))
         self._update_controls()
@@ -1360,7 +1388,11 @@ class ScreenshotController(QObject):
         self._overlay = None
         self._ocr_dialog = None
         self._pending = False
-        self._history_store = ScreenshotHistoryStore()
+        self._history_store = ScreenshotHistoryStore(config=getattr(parent, 'config', None))
+        self._history_cleanup_timer = QTimer(self)
+        self._history_cleanup_timer.timeout.connect(self._cleanup_history)
+        self._history_cleanup_timer.start(60 * 60 * 1000)
+        QTimer.singleShot(0, self._cleanup_history)
         self._hotkey = _GlobalHotkey(self.start)
 
     def notify(self, message, level='info'):
@@ -1407,9 +1439,19 @@ class ScreenshotController(QObject):
         self._overlay = None
 
     def remember(self, pixmap):
-        return self._history_store.add(pixmap)
+        path = self._history_store.add(pixmap)
+        self._cleanup_history()
+        return path
+
+    def _cleanup_history(self):
+        try:
+            self._history_store.cleanup()
+        except (OSError, ValueError) as error:
+            debug_print(f"[Screenshot] history cleanup failed: {error}")
+            self.notify(tr("自动清理截图历史失败：{}").format(error), 'warning')
 
     def show_history(self, parent=None):
+        self._cleanup_history()
         dialog = ScreenshotHistoryDialog(self._history_store, parent or self.parent())
         dialog.exec_()
         dialog.deleteLater()
@@ -1438,6 +1480,7 @@ class ScreenshotController(QObject):
         dialog.deleteLater()
 
     def shutdown(self):
+        self._history_cleanup_timer.stop()
         self._hotkey.unregister()
         if self._overlay is not None:
             self._overlay.close()
