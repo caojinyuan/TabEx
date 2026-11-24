@@ -34,6 +34,7 @@ HOTKEY_COMMANDS = (
     ('quick_copy', 'quick_copy', 'Alt+C', '快速复制选中项（后台）'),
     ('quick_paste', 'quick_paste', 'Alt+V', '快速粘贴到当前目录（后台）'),
     ('quick_delete', 'quick_delete', 'Alt+Del', '永久删除选中项'),
+    ('swap_filenames', None, 'Alt+A', '互换两个文件的名称（保留扩展名）'),
     ('cancel_file_op', 'cancel_file_op', 'Alt+Q', '取消后台复制/删除'),
     ('copy_filename', 'copy_filename', 'Alt+Z', '复制选中文件名（含后缀）'),
     ('copy_filepath', 'copy_filepath', 'Alt+X', '复制文件路径\\文件名'),

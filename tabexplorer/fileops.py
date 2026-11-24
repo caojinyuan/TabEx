@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 
 from PyQt5.QtCore import pyqtSignal, Qt, QThread, QTimer
 from PyQt5.QtWidgets import (
@@ -876,6 +877,53 @@ def _plan_batch_rename(paths, find_text, replacement):
         targets.add(normalized)
         plan[source] = target
     return plan
+
+
+def _plan_swap_filenames(paths):
+    if len(paths) != 2 or any(not os.path.isfile(path) for path in paths):
+        raise ValueError(tr("请选择两个文件（不能选择文件夹）"))
+    sources = [os.path.abspath(path) for path in paths]
+    normalized = [os.path.normcase(path) for path in sources]
+    if normalized[0] == normalized[1]:
+        raise ValueError(tr("请选择两个不同的文件"))
+    names = [os.path.splitext(os.path.basename(path)) for path in sources]
+    targets = [os.path.join(os.path.dirname(sources[index]), names[1 - index][0] + names[index][1])
+               for index in range(2)]
+    if all(os.path.normcase(target) == source for target, source in zip(targets, normalized)):
+        return {}
+    for target in targets:
+        if os.path.lexists(target) and os.path.normcase(target) not in normalized:
+            raise FileExistsError(tr("重命名目标冲突: ") + target)
+    return dict(zip(sources, targets))
+
+
+def _swap_filenames(paths):
+    plan = _plan_swap_filenames(paths)
+    if not plan:
+        return
+    sources = list(plan)
+    temporary = os.path.join(os.path.dirname(sources[0]), '.tabex-swap-' + uuid.uuid4().hex)
+    moves = [(sources[0], temporary), (sources[1], plan[sources[1]]), (temporary, plan[sources[0]])]
+    completed = []
+    try:
+        for source, target in moves:
+            if os.path.lexists(target):
+                raise FileExistsError(tr("重命名目标冲突: ") + target)
+            os.rename(source, target)
+            completed.append((source, target))
+    except OSError as error:
+        rollback_errors = []
+        for source, target in reversed(completed):
+            try:
+                if os.path.lexists(source):
+                    raise FileExistsError(source)
+                os.rename(target, source)
+            except OSError as rollback_error:
+                rollback_errors.append(f"{target} -> {source}: {rollback_error}")
+        if rollback_errors:
+            raise OSError(tr("交换失败：{}；恢复失败，请手动恢复：{}").format(
+                error, '; '.join(rollback_errors))) from error
+        raise
 
 
 def _compare_directories(left_root, right_root, cancel_event, emit):

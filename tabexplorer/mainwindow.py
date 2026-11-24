@@ -56,7 +56,7 @@ from .workers import DiagnosticExportWorker, QuickFindWorker, OpenPathWorker
 from .search import apply_runtime_performance_config, QuickFindResultsDialog, _search_cache, SearchDialog
 from .fileops import (
     _confirm_file_preview, CopyConflictDialog, DirectoryCompareDialog, FileTaskPanel, _find_copy_conflicts,
-    _plan_batch_rename,
+    _plan_batch_rename, _plan_swap_filenames, _swap_filenames,
 )
 from .bookmarks import BookmarkDialog, BookmarkManager, BookmarkManagerDialog, _preserve_unreadable_file, is_builtin_bookmark
 from .shellview import (
@@ -3500,6 +3500,28 @@ class MainWindow(QMainWindow):
         """Alt+Delete：确认后永久删除选中项。"""
         self.permanently_delete_selected()
 
+    def swap_selected_filenames(self):
+        from PyQt5.QtWidgets import QMessageBox
+        tab = self.get_active_pane()
+        paths = tab._get_selected_paths() if tab and hasattr(tab, '_get_selected_paths') else []
+        try:
+            plan = _plan_swap_filenames(paths)
+            if not plan:
+                show_toast(self, tr("提示"), tr("无变化"), level="info")
+                return
+            message = '\n\n'.join(f"{source}\n→ {target}" for source, target in plan.items())
+            try:
+                confirmed = QMessageBox.question(
+                    self, tr("互换文件名"), tr("确认互换以下文件名，保留各自的扩展名？") + '\n\n' + message,
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+            finally:
+                self._guard_shortcuts_after_modal()
+            if confirmed:
+                _swap_filenames(list(plan))
+                show_toast(self, tr("互换文件名"), tr("文件名已互换"), level="info")
+        except (OSError, ValueError) as error:
+            show_toast(self, tr("重命名失败"), str(error), level="error")
+
     def quick_cancel_background_file_operation(self):
         """Alt+Q：取消当前标签页正在执行的后台复制/删除任务。"""
         current_tab = self.get_active_pane()
@@ -3775,6 +3797,7 @@ class MainWindow(QMainWindow):
             'quick_copy': self.quick_copy_selected_items_for_background_paste,
             'quick_paste': self.quick_paste_to_current_directory,
             'quick_delete': self.quick_delete_selected_items,
+            'swap_filenames': self.swap_selected_filenames,
             'cancel_file_op': self.quick_cancel_background_file_operation,
             'copy_filename': lambda: self.copy_selected_filename(mode="filename"),
             'copy_filepath': lambda: self.copy_selected_filename(mode="path"),

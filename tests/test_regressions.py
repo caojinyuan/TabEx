@@ -2810,6 +2810,99 @@ class HotkeyAndUpdateTests(unittest.TestCase):
         self.module.MainWindow.quick_delete_selected_items(owner)
         owner.permanently_delete_selected.assert_called_once_with()
 
+    def test_swap_filenames_preserves_extensions_and_contents(self):
+        for suffixes in (('.txt', '.txt'), ('.txt', '.jpg'), ('', '.txt')):
+            with self.subTest(suffixes=suffixes), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                first, second = root / ('first' + suffixes[0]), root / ('second' + suffixes[1])
+                first.write_text('first content', encoding='utf-8')
+                second.write_text('second content', encoding='utf-8')
+                self.module._swap_filenames([str(first), str(second)])
+                self.assertEqual((root / ('second' + suffixes[0])).read_text(encoding='utf-8'), 'first content')
+                self.assertEqual((root / ('first' + suffixes[1])).read_text(encoding='utf-8'), 'second content')
+                self.assertEqual(len(list(root.iterdir())), 2)
+
+    def test_swap_filenames_rejects_conflict_and_invalid_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second, conflict = root / 'first.txt', root / 'second.jpg', root / 'second.txt'
+            for path in (first, second, conflict):
+                path.write_text(path.name, encoding='utf-8')
+            for paths in ([str(first)], [str(first), str(root)], [str(first), str(first)]):
+                with self.subTest(paths=paths), self.assertRaises(ValueError):
+                    self.module._plan_swap_filenames(paths)
+            with self.assertRaises(FileExistsError):
+                self.module._swap_filenames([str(first), str(second)])
+            self.assertEqual(conflict.read_text(encoding='utf-8'), 'second.txt')
+            self.assertEqual(first.read_text(encoding='utf-8'), 'first.txt')
+            self.assertEqual(second.read_text(encoding='utf-8'), 'second.jpg')
+
+    def test_swap_filenames_rolls_back_after_final_move_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / 'first.txt', root / 'second.txt'
+            first.write_text('first', encoding='utf-8')
+            second.write_text('second', encoding='utf-8')
+            rename = os.rename
+            calls = []
+
+            def failing_rename(source, target):
+                calls.append((source, target))
+                if len(calls) == 3:
+                    raise PermissionError('locked')
+                return rename(source, target)
+
+            with patch('tabexplorer.fileops.os.rename', side_effect=failing_rename):
+                with self.assertRaises(PermissionError):
+                    self.module._swap_filenames([str(first), str(second)])
+            self.assertEqual(first.read_text(encoding='utf-8'), 'first')
+            self.assertEqual(second.read_text(encoding='utf-8'), 'second')
+            self.assertEqual(len(list(root.iterdir())), 2)
+
+    def test_swap_filenames_reports_failed_rollback_location(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / 'first.txt', root / 'second.txt'
+            first.write_text('first', encoding='utf-8')
+            second.write_text('second', encoding='utf-8')
+            rename = os.rename
+            calls = []
+
+            def failing_rename(source, target):
+                calls.append((source, target))
+                if len(calls) >= 3:
+                    raise PermissionError('locked')
+                return rename(source, target)
+
+            with patch('tabexplorer.fileops.os.rename', side_effect=failing_rename):
+                with self.assertRaises(OSError) as caught:
+                    self.module._swap_filenames([str(first), str(second)])
+            self.assertIn('.tabex-swap-', str(caught.exception))
+            self.assertIn('locked', str(caught.exception))
+            self.assertEqual(sorted(path.read_text(encoding='utf-8') for path in root.iterdir()), ['first', 'second'])
+
+    def test_swap_shortcut_requires_confirmation(self):
+        from PyQt5.QtWidgets import QMessageBox
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = Path(directory) / 'first.txt', Path(directory) / 'second.txt'
+            first.write_text('first', encoding='utf-8')
+            second.write_text('second', encoding='utf-8')
+            owner = Mock()
+            owner.config = {}
+            owner.get_active_pane.return_value._get_selected_paths.return_value = [str(first), str(second)]
+            owner.swap_selected_filenames.side_effect = lambda: self.module.MainWindow.swap_selected_filenames(owner)
+            with patch.object(QMessageBox, 'question', return_value=QMessageBox.No) as question, \
+                    patch_all('show_toast'):
+                self.assertTrue(self.module.MainWindow._run_shortcut(owner, 0x41, False, False, True))
+                self.assertIn(str(first), question.call_args.args[2])
+            self.assertEqual(first.read_text(encoding='utf-8'), 'first')
+            self.assertEqual(second.read_text(encoding='utf-8'), 'second')
+            owner._guard_shortcuts_after_modal.assert_called_once_with()
+            with patch.object(QMessageBox, 'question', return_value=QMessageBox.Yes), patch_all('show_toast'):
+                self.assertTrue(self.module.MainWindow._run_shortcut(owner, 0x41, False, False, True))
+            self.assertEqual(first.read_text(encoding='utf-8'), 'second')
+            self.assertEqual(second.read_text(encoding='utf-8'), 'first')
+
     def test_validation_reports_unsafe_and_duplicate_bindings(self):
         """缺少修饰键、占用 Explorer 文件快捷键、与 Ctrl+数字冲突或重复分配时报错。"""
         validate = self.module._validate_hotkey_bindings
