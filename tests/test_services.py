@@ -234,7 +234,7 @@ class ConfigPathTests(unittest.TestCase):
                 self.assertEqual(get_app_config_path(name), str(target))
         self.assertEqual(get_app_data_path('chat_history.json'), str(self.root / 'chat_history.json'))
         self.assertEqual(get_app_log_path('TabEx_debug_latest.log'), str(self.root / 'logs' / 'TabEx_debug_latest.log'))
-        self.assertEqual(get_app_data_path('QuickLook'), str(self.root / 'QuickLook'))
+        self.assertEqual(get_app_data_path('example'), str(self.root / 'example'))
 
     def test_existing_config_takes_priority_without_overwriting_either_file(self):
         from tabexplorer.paths import get_app_config_path
@@ -408,8 +408,8 @@ class BundledToolTests(unittest.TestCase):
         from tabexplorer import paths, search
         self.assertEqual(search.detect_everything(), str(root / 'tools' / 'es.exe'))
         self.assertEqual(search.detect_ripgrep(), str(root / 'tools' / 'rg.exe'))
-        self.assertEqual(paths.get_bundled_path(os.path.join('tools', '7zr.exe')),
-                         str(root / 'tools' / '7zr.exe'))
+        self.assertEqual(paths.get_bundled_path(os.path.join('tools', 'rg.exe')),
+                         str(root / 'tools' / 'rg.exe'))
 
     def test_source_tools_are_independent_of_working_and_data_directories(self):
         root = Path(__file__).resolve().parents[1]
@@ -419,7 +419,7 @@ class BundledToolTests(unittest.TestCase):
                 patch('os.getcwd', return_value=directory), \
                 patch('shutil.which', side_effect=AssertionError('Bundled tools must take priority')):
             self.assert_tools_found(root)
-            for name in ('es.exe', 'rg.exe', '7zr.exe'):
+            for name in ('es.exe', 'rg.exe'):
                 self.assertFalse((root / name).exists())
                 self.assertTrue((root / 'tools' / name).is_file())
 
@@ -427,7 +427,7 @@ class BundledToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'tools').mkdir()
-            for name in ('es.exe', 'rg.exe', '7zr.exe'):
+            for name in ('es.exe', 'rg.exe'):
                 (root / 'tools' / name).write_bytes(b'tool')
             with patch.object(sys, '_MEIPASS', directory, create=True), \
                     patch('shutil.which', side_effect=AssertionError('Bundled tools must take priority')):
@@ -441,7 +441,7 @@ class BundledToolTests(unittest.TestCase):
                 patch('shutil.which', side_effect=lambda name: str(Path(directory) / 'path' / name)):
             self.assertEqual(search.detect_everything(), str(Path(directory) / 'path' / 'es.exe'))
             self.assertEqual(search.detect_ripgrep(), str(Path(directory) / 'path' / 'rg.exe'))
-            self.assertIsNone(paths.get_bundled_path(os.path.join('tools', '7zr.exe')))
+            self.assertIsNone(paths.get_bundled_path(os.path.join('tools', 'rg.exe')))
 
 
 class BuildPipelineTests(unittest.TestCase):
@@ -492,7 +492,7 @@ class BuildPipelineTests(unittest.TestCase):
                 executable = root / 'TabExplorer.exe'
                 executable.write_bytes(b'old working executable')
                 (root / 'tools').mkdir()
-                for tool in ('es.exe', 'rg.exe', '7zr.exe'):
+                for tool in ('es.exe', 'rg.exe'):
                     (root / 'tools' / tool).write_bytes(b'tool')
 
                 def run(command, **keywords):
@@ -523,7 +523,7 @@ class BuildPipelineTests(unittest.TestCase):
             executable = root / 'TabExplorer.exe'
             executable.write_bytes(b'old')
             (root / 'tools').mkdir()
-            for tool in ('es.exe', 'rg.exe', '7zr.exe'):
+            for tool in ('es.exe', 'rg.exe'):
                 (root / 'tools' / tool).write_bytes(b'tool')
             commands = []
 
@@ -547,11 +547,15 @@ class BuildPipelineTests(unittest.TestCase):
             self.assertEqual(command[command.index('--collect-data') + 1], 'rapidocr')
             self.assertEqual(command[command.index('--collect-submodules') + 1],
                              'rapidocr.inference_engine.onnxruntime')
+            self.assertIn('pygments.lexers',
+                          [command[index + 1] for index, value in enumerate(command) if value == '--collect-submodules'])
+            self.assertIn('pypdfium2',
+                          [command[index + 1] for index, value in enumerate(command) if value == '--copy-metadata'])
             self.assertEqual(command[command.index('--runtime-hook') + 1],
                              str(root / 'tools' / 'pyi_rth_ocr.py'))
             bundled_data = [command[index + 1] for index, value in enumerate(command) if value == '--add-data']
             self.assertEqual(bundled_data, [str(root / 'icons') + ';icons'] +
-                             [str(root / 'tools' / tool) + ';tools' for tool in ('es.exe', 'rg.exe', '7zr.exe')])
+                             [str(root / 'tools' / tool) + ';tools' for tool in ('es.exe', 'rg.exe')])
             bundled_binaries = [command[index + 1] for index, value in enumerate(command)
                                 if value == '--add-binary']
             self.assertEqual(bundled_binaries, [str(runtime) + ';.', str(runtime) + r';PyQt5\Qt5\bin'])
@@ -564,7 +568,7 @@ class BuildPipelineTests(unittest.TestCase):
             with self.subTest(result=result), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / 'tools').mkdir()
-                for name in ('es.exe', 'rg.exe', '7zr.exe'):
+                for name in ('es.exe', 'rg.exe'):
                     (root / 'tools' / name).touch()
                 executable = root / 'TabExplorer.exe'
                 executable.write_bytes(b'old')
@@ -579,153 +583,6 @@ class BuildPipelineTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, 'OCR validation'):
                         build(root, install=False, run=run, verify=Mock(return_value=result))
                 self.assertEqual(executable.read_bytes(), b'old')
-
-
-class QuickLookTests(unittest.TestCase):
-    """QuickLook 集成：焦点判断、断点续传、校验与解压；用 7zr 现场生成的小压缩包代替真实下载。"""
-
-    def setUp(self):
-        from tabexplorer import quicklook
-        self.quicklook = quicklook
-        self.root = tempfile.TemporaryDirectory()
-        self.addCleanup(self.root.cleanup)
-        environment = patch.dict(os.environ, {'TABEX_DATA_DIR': self.root.name})
-        environment.start()
-        self.addCleanup(environment.stop)
-        source = Path(self.root.name) / 'source'
-        source.mkdir()
-        (source / 'QuickLook.exe').write_bytes(b'fake quicklook')
-        archive = Path(self.root.name) / 'fixture.7z'
-        seven_zip = Path(__file__).resolve().parents[1] / 'tools' / '7zr.exe'
-        subprocess.run([str(seven_zip), 'a', str(archive), str(source / '*'), '-bso0', '-bsp0'], check=True)
-        self.payload = archive.read_bytes()
-        import hashlib
-        self.digest = hashlib.sha256(self.payload).hexdigest()
-
-    def opener(self, payload=None, record=None):
-        payload = self.payload if payload is None else payload
-
-        def open_url(request, timeout=None):
-            start = int(request.get_header('Range', 'bytes=0-').split('=')[1].rstrip('-'))
-            if record is not None:
-                record.append(start)
-            import io
-            response = io.BytesIO(payload[start:])
-            response.status = 206 if start else 200
-            return response
-        return open_url
-
-    def install(self, **keywords):
-        return self.quicklook.install_quicklook(
-            url='https://example.invalid/QuickLook.7z', sha256=self.digest, size=len(self.payload),
-            opener=keywords.pop('opener', self.opener()), **keywords)
-
-    def test_default_is_off_and_not_found_until_downloaded(self):
-        """没有下载时找不到 QuickLook；配置默认关闭该功能。"""
-        from tabexplorer.persistence import ConfigStore
-        with patch.dict(os.environ, {'LOCALAPPDATA': '', 'ProgramFiles': '', 'ProgramFiles(x86)': ''}):
-            self.assertIsNone(self.quicklook.find_quicklook())
-        store = ConfigStore(Path(self.root.name) / 'config.json')
-        self.assertIs(store.load()['quicklook_enabled'], False)
-
-    def test_install_extracts_verified_archive(self):
-        """校验通过后解压到数据目录，并清理压缩包和临时目录。"""
-        executable = self.install()
-        self.assertEqual(Path(executable).read_bytes(), b'fake quicklook')
-        self.assertEqual(self.quicklook.find_quicklook(), executable)
-        self.assertEqual(sorted(path.name for path in Path(self.root.name).glob('QuickLook*')), ['QuickLook'])
-
-    def test_checksum_mismatch_discards_download(self):
-        """内容与固定哈希不符时拒绝安装并删除已下载文件。"""
-        with self.assertRaises(self.quicklook.QuickLookInstallError):
-            self.install(opener=self.opener(self.payload + b'tampered'))
-        self.assertFalse((Path(self.root.name) / 'QuickLook.7z.part').exists())
-        self.assertFalse((Path(self.root.name) / 'QuickLook').exists())
-
-    def test_cancelled_download_keeps_partial_file(self):
-        """取消下载抛出取消异常，保留 .part 供下次继续，不产生安装目录。"""
-        with self.assertRaises(self.quicklook.QuickLookCancelled):
-            self.install(cancelled=lambda: True)
-        self.assertFalse((Path(self.root.name) / 'QuickLook').exists())
-        Path(self.root.name, 'QuickLook.7z.part').write_bytes(self.payload[:10])
-        with self.assertRaises(self.quicklook.QuickLookCancelled):
-            self.install(cancelled=lambda: True)
-        self.assertEqual(Path(self.root.name, 'QuickLook.7z.part').read_bytes(), self.payload[:10])
-
-    def test_download_resumes_from_partial_file(self):
-        """已有部分下载时发送 Range 请求，只补齐剩余字节，最终哈希校验通过。"""
-        half = len(self.payload) // 2
-        Path(self.root.name, 'QuickLook.7z.part').write_bytes(self.payload[:half])
-        calls = []
-        self.install(opener=self.opener(record=calls))
-        self.assertEqual(calls, [half])
-        self.assertTrue((Path(self.root.name) / 'QuickLook' / 'QuickLook.exe').is_file())
-
-    def test_space_only_previews_in_file_list(self):
-        """只有文件列表控件持有焦点才预览；重命名框、目录树、Qt 控件和刚输入过字符时不触发。"""
-        for name in ('DirectUIHWND', 'SysListView32', 'SHELLDLL_DefView'):
-            self.assertTrue(self.quicklook.is_file_view_focus_class(name), name)
-        for name in ('', 'Edit', 'ATL:Edit', 'SysTreeView32', 'Qt5152QWindowIcon', 'ComboBox'):
-            self.assertFalse(self.quicklook.is_file_view_focus_class(name), name)
-        self.assertTrue(self.quicklook.is_typing_key(0x41, False, False))
-        self.assertTrue(self.quicklook.is_typing_key(0x31, False, False))
-        for vk, ctrl, alt in ((0x41, True, False), (0x41, False, True), (0x28, False, False), (0x20, False, False)):
-            self.assertFalse(self.quicklook.is_typing_key(vk, ctrl, alt))
-
-    def test_only_first_launched_instance_is_stopped_on_exit(self):
-        """本程序启动的 QuickLook 退出时结束；之后只转交路径的进程不会替换它。"""
-        first, forwarder = Mock(), Mock()
-        first.poll.return_value = None
-        forwarder.poll.return_value = 0
-        self.quicklook._owned_process = None
-        with patch('subprocess.Popen', side_effect=[first, forwarder]):
-            self.assertTrue(self.quicklook.preview(r'C:\a.txt', r'C:\ql\QuickLook.exe'))
-            self.assertTrue(self.quicklook.preview(r'C:\b.txt', r'C:\ql\QuickLook.exe'))
-        self.quicklook.stop_owned_process()
-        first.terminate.assert_called_once()
-        forwarder.terminate.assert_not_called()
-
-    def test_only_visible_quicklook_window_gets_taskbar_button(self):
-        """只处理可见的 QuickLook 顶层窗口；隐藏的消息窗口和其他程序的窗口不受影响。"""
-        cls = 'HwndWrapper[QuickLook.exe;;1d018446-ab1d-44f4-9144-1db0b71f72b0]'
-        self.assertTrue(self.quicklook.is_preview_window(cls, True))
-        self.assertFalse(self.quicklook.is_preview_window(cls, False))
-        self.assertFalse(self.quicklook.is_preview_window('HwndWrapper[Other.exe;;x]', True))
-        self.assertFalse(self.quicklook.is_preview_window('', True))
-        self.assertEqual(len(self.quicklook.show_preview_in_taskbar()), 2)
-
-    def test_taskbar_watcher_waits_for_slow_window_then_stops(self):
-        """窗口迟迟不出现时持续等待至超时；窗口出现后持续监视，关闭后且超时才停止。"""
-        from PyQt5.QtWidgets import QApplication
-        QApplication.instance() or QApplication([])
-        watcher = self.quicklook.QuickLookTaskbarWatcher()
-        self.addCleanup(watcher.deleteLater)
-        results = iter([(0, 0), (1, 1), (1, 0), (0, 0)])
-        with patch.object(self.quicklook, 'show_preview_in_taskbar', side_effect=lambda: next(results)):
-            watcher.watch()
-            self.assertTrue(watcher._timer.isActive())
-            watcher._tick()   # 窗口出现并加上样式
-            watcher._tick()   # 窗口仍在，继续监视
-            self.assertTrue(watcher._timer.isActive())
-            watcher._deadline = 0
-            watcher._tick()   # 窗口已关闭且超过监视时限
-        self.assertFalse(watcher._timer.isActive())
-
-    def test_idle_quicklook_is_stopped_but_recent_one_is_kept(self):
-        """空闲超时才结束本程序启动的 QuickLook；刚用过的保留，结束后可再次启动。"""
-        process = Mock()
-        process.poll.return_value = None
-        process.pid = 4321
-        self.quicklook._owned_process = None
-        with patch('subprocess.Popen', return_value=process):
-            self.assertTrue(self.quicklook.preview(r'C:\a.txt', r'C:\ql\QuickLook.exe'))
-        self.assertEqual(self.quicklook.owned_process_id(), 4321)
-        self.assertFalse(self.quicklook.stop_owned_process_if_idle(timeout_s=3600))
-        process.terminate.assert_not_called()
-        self.assertTrue(self.quicklook.stop_owned_process_if_idle(timeout_s=0))
-        process.terminate.assert_called_once()
-        self.assertIsNone(self.quicklook.owned_process_id())
-        self.assertFalse(self.quicklook.stop_owned_process_if_idle(timeout_s=0))
 
 
 class ConfigStoreTests(unittest.TestCase):

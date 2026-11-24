@@ -4,6 +4,8 @@ import ctypes.wintypes
 import json
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 
@@ -42,12 +44,7 @@ from .hotkeys import (
     _TOOLBAR_HOTKEY_TOOLTIPS,
 )
 from .title_shortcuts import TitleShortcutBar
-from .quicklook import (
-    find_quicklook, foreground_focus_class_name, is_file_view_focus_class, is_typing_key, owned_process_id as quicklook_pid,
-    preview as quicklook_preview, QuickLookTaskbarWatcher,
-    stop_owned_process as stop_quicklook, stop_owned_process_if_idle as stop_quicklook_if_idle,
-    TYPING_GUARD_SECONDS,
-)
+from .preview import file_view_has_focus, is_typing_key, TYPING_GUARD_SECONDS
 from .widgets import (
     _active_toasts, _build_te_icon, CommandCenter, _pinned_tab_icon, ResizableSplitter, _set_tool_icon, show_toast,
 )
@@ -3669,36 +3666,31 @@ class MainWindow(QMainWindow):
             if blocked:
                 return
             if vk == 0x20 and not (ctrl or shift or alt):
-                self._quicklook_preview_selection()
+                self._preview_selection()
                 return
             self._run_shortcut(vk, ctrl, shift, alt)
         except Exception as e:
             debug_print(f"[ShortcutHook] dispatch error: {e}")
 
-    def _quicklook_preview_selection(self):
-        """空格键：用 QuickLook 预览文件列表中选中的第一项；未启用或未下载时不做任何事。"""
-        if not self.config.get("quicklook_enabled", False):
-            return
+    def _preview_selection(self):
         if time.monotonic() - getattr(self, '_last_typing_key_at', 0) < TYPING_GUARD_SECONDS:
             return
-        focus_class = foreground_focus_class_name()
-        if not is_file_view_focus_class(focus_class):
-            debug_print(f"[QuickLook] skipped, focus class={focus_class!r}")
-            return
-        executable = find_quicklook()
-        if executable is None:
-            show_toast(self, tr("提示"), tr("尚未下载 QuickLook，请在 设置 → 工具集成 中下载"), level="info")
+        if not file_view_has_focus():
             return
         tab = self.get_active_pane()
         paths = tab._get_selected_paths() if tab is not None and hasattr(tab, '_get_selected_paths') else []
         path = next((item for item in (paths or []) if item), None)
-        if path:
-            debug_print(f"[QuickLook] preview {path} (focus class={focus_class!r})")
-            if quicklook_preview(path, executable):
-                watcher = getattr(self, '_quicklook_taskbar_watcher', None)
-                if watcher is None:
-                    watcher = self._quicklook_taskbar_watcher = QuickLookTaskbarWatcher(self)
-                watcher.watch()
+        if not path:
+            return
+        command = [sys.executable]
+        if not getattr(sys, 'frozen', False):
+            command.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'TabEx.py'))
+        command.extend(['--preview', path, self.config.get('language', 'zh'), self.config.get('theme', 'system')])
+        try:
+            subprocess.Popen(command, close_fds=True)
+        except OSError as error:
+            debug_print(f"[Preview] launch failed: {error}")
+            show_toast(self, tr("错误"), tr("无法启动预览：{}").format(error), level="error")
 
     def _check_shortcuts(self):
         """轮询兜底：仅在键盘钩子安装失败时运行。"""
@@ -3719,6 +3711,12 @@ class MainWindow(QMainWindow):
                     pressed.append(vk)
                 self._last_keys_state[vk] = down
             for vk in pressed:
+                if is_typing_key(vk, ctrl, alt):
+                    self._last_typing_key_at = time.monotonic()
+            for vk in pressed:
+                if vk == 0x20 and not (ctrl or shift or alt):
+                    self._preview_selection()
+                    continue
                 if self._run_shortcut(vk, ctrl, shift, alt):
                     return
         except Exception:
@@ -3825,6 +3823,7 @@ class MainWindow(QMainWindow):
         """按当前配置更新轮询兜底的键位、Shell 键盘过滤器和界面上的按键提示。"""
         table = _hotkey_table(self.config)
         poll_vks = {vk for _ctrl, _shift, _alt, vk in table}
+        poll_vks.update((0x20, *range(0x30, 0x5B), *range(0xBA, 0xC1), *range(0xDB, 0xE0)))
         if self.config.get("hotkeys", {}).get("switch_tab_number", True):
             poll_vks.update(range(0x31, 0x3A))
         self._shortcut_poll_vks = tuple(sorted(poll_vks))
@@ -4304,8 +4303,6 @@ class MainWindow(QMainWindow):
                                   for index in range(stack.count()))
             rss_mb = get_process_memory_usage_mb()
             resources = get_process_resources() or {}
-            quicklook_process = quicklook_pid()
-            quicklook = get_process_resources(quicklook_process) if quicklook_process else None
             _debuglog._diagnostics.snapshot({
                 'qt': QT_VERSION_STR, 'pyqt': PYQT_VERSION_STR,
                 'tabs_per_group': groups, 'split': bool(getattr(self, '_split_active', False)),
@@ -4318,8 +4315,6 @@ class MainWindow(QMainWindow):
                 self._last_resource_sample = now
                 _debuglog._diagnostics.sample({
                     'rss_mb': rss_mb, **resources,
-                    'quicklook_commit_mb': quicklook['commit_mb'] if quicklook else None,
-                    'quicklook_handles': quicklook['handles'] if quicklook else None,
                     'python_threads': threading.active_count(),
                     'thread_names': _thread_name_summary(),
                     'tabs': sum(groups), 'hibernated_tabs': hibernated,
@@ -4450,7 +4445,6 @@ class MainWindow(QMainWindow):
             self.config["enable_cache_tabs"] = dlg.cache_tabs_cb.isChecked()
             self.config["enable_tortoisegit_buttons"] = dlg.tortoisegit_buttons_cb.isChecked()
             self.config["preferred_terminal_tool"] = normalize_terminal_tool_name(dlg.preferred_terminal_combo.currentData())
-            self.config["quicklook_enabled"] = dlg.quicklook_cb.isChecked()
             self.config["enable_title_shortcuts"] = dlg.title_shortcuts_cb.isChecked()
             self.config["enable_mouse_gestures"] = dlg.mouse_gestures_cb.isChecked()
             self.config["file_op_max_workers"] = dlg.file_op_workers_spin.value()
@@ -5277,7 +5271,6 @@ class MainWindow(QMainWindow):
         self._housekeeping_runs += 1
         removed_dialogs = self._prune_search_dialog_refs()
         removed_toasts = self._prune_toast_refs()
-        stop_quicklook_if_idle()
         if not self.isActiveWindow():
             self._last_keys_state.clear()
 
@@ -6409,7 +6402,6 @@ class MainWindow(QMainWindow):
             self._stop_shortcut_listener()
         except Exception as e:
             print(f"Error stopping shortcut hook: {e}")
-        stop_quicklook()
 
         for timer_name in (
             '_shortcut_timer',

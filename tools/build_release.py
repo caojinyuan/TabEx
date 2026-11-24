@@ -54,7 +54,7 @@ def build(root=ROOT, install=True, output=None, run=None, verify=None):
             cwd=root, check=True)
     run(python + ['-W', 'ignore::DeprecationWarning', '-m', 'unittest', 'discover', '-s', 'tests'],
         cwd=root, check=True)
-    bundled_tools = [root / 'tools' / name for name in ('es.exe', 'rg.exe', '7zr.exe')]
+    bundled_tools = [root / 'tools' / name for name in ('es.exe', 'rg.exe')]
     for tool in bundled_tools:
         if not tool.is_file():
             raise FileNotFoundError(f'Bundled tool not found: {tool}')
@@ -68,8 +68,11 @@ def build(root=ROOT, install=True, output=None, run=None, verify=None):
             '--add-data', str(root / 'icons') + ';icons',
             '--collect-data', 'rapidocr',
             '--collect-submodules', 'rapidocr.inference_engine.onnxruntime',
+            '--collect-submodules', 'pygments.lexers',
             '--runtime-hook', str(root / 'tools' / 'pyi_rth_ocr.py'),
         ]
+        command.extend(arg for package in ('pypdfium2', 'pypdf', 'openpyxl', 'et-xmlfile', 'xlrd', 'pygments', 'mammoth', 'cobble')
+                       for arg in ('--copy-metadata', package))
         command.extend(arg for source, destination in runtime_binaries
                        for arg in ('--add-binary', str(source) + ';' + destination))
         command.extend(arg for tool in bundled_tools for arg in ('--add-data', str(tool) + ';tools'))

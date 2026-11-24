@@ -1,6 +1,12 @@
 PyQt5==5.15.11
 pywin32==312
 comtypes==1.4.8
+pypdf==7.0.0
+pypdfium2==5.15.2
+openpyxl==3.1.5
+xlrd==2.0.2
+Pygments==2.21.0
+mammoth==1.13.0
 requests==2.32.5
 Send2Trash==2.1.0
 rapidocr==3.10.0

@@ -2587,6 +2587,23 @@ class OptimizationTests(unittest.TestCase):
     def run_shortcut(self, host, vk, ctrl=False, shift=False, alt=False):
         return self.module.MainWindow._run_shortcut(host, vk, ctrl, shift, alt)
 
+    def test_space_dispatches_to_preview_with_legacy_configuration(self):
+        host = types.SimpleNamespace(
+            config={'quicklook_enabled': True},
+            _shortcut_gate=Mock(return_value=(False, True)),
+            _run_shortcut=Mock(),
+            _preview_selection=Mock(),
+        )
+        self.module.MainWindow._on_shortcut_key(host, 0x20, False, False, False)
+        host._preview_selection.assert_called_once_with()
+        host._run_shortcut.assert_not_called()
+
+    def test_settings_hide_preview_for_legacy_configuration(self):
+        from PyQt5.QtWidgets import QGroupBox
+        dialog = self.module.SettingsDialog({'quicklook_enabled': True})
+        self.addCleanup(dialog.deleteLater)
+        self.assertNotIn('QuickLook 预览', [group.title() for group in dialog.findChildren(QGroupBox)])
+
     def test_ctrl_number_switches_tab_in_active_group(self):
         """Ctrl+数字切换活动标签组的标签，Ctrl+9 到最后一个。
 
