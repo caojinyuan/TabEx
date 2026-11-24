@@ -22,6 +22,15 @@ def tr(zh_text):
 
 _LANG_EN = {
     "文件预览": "File Preview",
+    "文件路径": "File Path",
+    "修改时间": "Modified",
+    "文件说明": "Description",
+    "公司名称": "Company",
+    "文件版本": "File Version",
+    "产品版本": "Product Version",
+    "仅显示文件信息，不会执行程序。": "File information only; the program will not be executed.",
+    "该文件没有可用的版本信息。": "No version information is available for this file.",
+    "无法读取版本信息：{}": "Could not read version information: {}",
     "搜索文本": "Search text",
     "上一个": "Previous",
     "下一个": "Next",

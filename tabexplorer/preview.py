@@ -10,19 +10,22 @@ import sys
 import tarfile
 import threading
 import zipfile
+from datetime import datetime
 from xml.etree import ElementTree
 
-from PyQt5.QtCore import QByteArray, QBuffer, QEvent, QIODevice, QObject, QSize, Qt, QUrl, pyqtSignal
+from PyQt5.QtCore import QByteArray, QBuffer, QEvent, QFileInfo, QIODevice, QObject, QSize, Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QFontDatabase, QImage, QImageReader, QKeySequence, QPixmap, QTextDocument
 from PyQt5.QtWidgets import (
-    QAbstractButton, QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-    QPushButton, QScrollArea, QShortcut, QSlider, QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
+    QAbstractButton, QApplication, QComboBox, QDialog, QFileIconProvider, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
+    QPlainTextEdit, QPushButton, QScrollArea, QShortcut, QSlider, QTableWidget, QTableWidgetItem, QTextBrowser,
+    QVBoxLayout, QWidget,
 )
 
 from .debuglog import debug_print
 from . import theme
 from .i18n import _set_app_language, tr
 from .syntax_preview import CodeHighlighter, HIGHLIGHT_LIMIT, PreviewTextEdit, highlight_spans
+from .system import format_file_size
 
 TEXT_LIMIT = 5 * 1024 * 1024
 DOCUMENT_LIMIT = 32 * 1024 * 1024
@@ -300,6 +303,47 @@ def _decode_text(data, truncated=False):
     raise PreviewError(tr("无法识别文本编码。"))
 
 
+def _exe_information(path):
+    import pywintypes
+    import win32api
+
+    details = os.stat(path)
+    fields = [
+        (tr("文件名"), os.path.basename(path)),
+        (tr("文件路径"), os.path.abspath(path)),
+        (tr("大小"), format_file_size(details.st_size)),
+        (tr("修改时间"), datetime.fromtimestamp(details.st_mtime).strftime('%Y-%m-%d %H:%M:%S')),
+    ]
+    notice = tr("仅显示文件信息，不会执行程序。")
+    try:
+        translations = win32api.GetFileVersionInfo(path, '\\VarFileInfo\\Translation') or ()
+        found = set()
+        names = (
+            ('FileDescription', tr("文件说明")),
+            ('CompanyName', tr("公司名称")),
+            ('FileVersion', tr("文件版本")),
+            ('ProductVersion', tr("产品版本")),
+        )
+        for language, codepage in translations:
+            for name, label in names:
+                if name in found:
+                    continue
+                subblock = f'\\StringFileInfo\\{language:04x}{codepage:04x}\\{name}'
+                value = win32api.GetFileVersionInfo(path, subblock)
+                if value:
+                    fields.append((label, str(value)[:1024]))
+                    found.add(name)
+        if not found:
+            notice += ' ' + tr("该文件没有可用的版本信息。")
+    except pywintypes.error as error:
+        debug_print(f"[Preview] executable version information unavailable: {error}")
+        if error.winerror in (1812, 1813, 1814, 1815):
+            notice += ' ' + tr("该文件没有可用的版本信息。")
+        else:
+            notice += ' ' + tr("无法读取版本信息：{}").format(error.strerror)
+    return fields, notice
+
+
 def load_preview(path):
     """Return (kind, content, notice); never execute or modify the selected file."""
     if os.path.isdir(path):
@@ -311,6 +355,9 @@ def load_preview(path):
                     break
         return 'text', '\n'.join(names[:ITEM_LIMIT]), tr("内容已截断。") if len(names) > ITEM_LIMIT else ''
     ext = os.path.splitext(path)[1].lower()
+    if ext == '.exe':
+        fields, notice = _exe_information(path)
+        return 'exe', fields, notice
     if ext in VIDEO_EXTENSIONS | AUDIO_EXTENSIONS:
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
@@ -455,6 +502,10 @@ class _PdfPageLoader(QObject):
 class PreviewDialog(QDialog):
     def __init__(self, path):
         super().__init__()
+        self.setWindowFlags(
+            Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint |
+            Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowSystemMenuHint
+        )
         self._path = path
         self._kind = ''
         self._pdf_index, self._pdf_zoom, self._pdf_count = 0, 1.5, 0
@@ -463,7 +514,12 @@ class PreviewDialog(QDialog):
         self._pdf_text_loaded = False
         self._pdf_text_mode = False
         self._sheets = []
-        self.setWindowTitle(tr("文件预览") + ' - ' + os.path.basename(path))
+        filename_text = os.path.basename(os.path.normpath(path)) or path
+        self.setWindowTitle(filename_text)
+        icon = QFileIconProvider().icon(QFileInfo(path))
+        if icon.isNull():
+            debug_print(f"[Preview] file icon unavailable: {path}")
+        self.setWindowIcon(icon)
         self.resize(900, 650)
         theme.bind_style(self, """
             QDialog { background: @editor-bg; color: @fg; }
@@ -481,7 +537,7 @@ class PreviewDialog(QDialog):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
         heading = QHBoxLayout()
-        filename = QLabel(os.path.basename(path) or path, self)
+        filename = QLabel(filename_text, self)
         filename.setToolTip(path)
         title_font = filename.font()
         title_font.setBold(True)
@@ -540,6 +596,17 @@ class PreviewDialog(QDialog):
         self.text = PreviewTextEdit(self)
         self.text.setReadOnly(True)
         layout.addWidget(self.text)
+        self.exe_info = QWidget(self)
+        exe_layout = QVBoxLayout(self.exe_info)
+        exe_layout.addStretch()
+        self.exe_icon = QLabel(self.exe_info)
+        self.exe_icon.setAlignment(Qt.AlignCenter)
+        exe_layout.addWidget(self.exe_icon)
+        self.exe_fields = QFormLayout()
+        exe_layout.addLayout(self.exe_fields)
+        exe_layout.addStretch()
+        self.exe_info.hide()
+        layout.addWidget(self.exe_info)
         self.image = QLabel(self)
         self.image.setAlignment(Qt.AlignCenter)
         self.image_scroll = QScrollArea(self)
@@ -637,6 +704,17 @@ class PreviewDialog(QDialog):
             self.word.show()
         elif kind == 'media':
             self._setup_media(content)
+        elif kind == 'exe':
+            self.text.hide()
+            self.search.setEnabled(False)
+            self.exe_icon.setPixmap(self.windowIcon().pixmap(96, 96))
+            for label, value in content:
+                field = QLabel(value, self.exe_info)
+                field.setTextFormat(Qt.PlainText)
+                field.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                field.setWordWrap(True)
+                self.exe_fields.addRow(label + ':', field)
+            self.exe_info.show()
         else:
             self.text.setPlainText(content)
 

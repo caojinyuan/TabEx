@@ -2604,6 +2604,18 @@ class OptimizationTests(unittest.TestCase):
         self.addCleanup(dialog.deleteLater)
         self.assertNotIn('QuickLook 预览', [group.title() for group in dialog.findChildren(QGroupBox)])
 
+    def test_settings_auto_height_survives_dialog_deletion(self):
+        from PyQt5 import sip
+        from PyQt5.QtTest import QTest
+
+        live = self.module.SettingsDialog({})
+        self.addCleanup(live.deleteLater)
+        doomed = self.module.SettingsDialog({})
+        sip.delete(doomed)
+        QTest.qWait(20)
+        self.assertEqual(live.minimumHeight(), live.maximumHeight())
+        self.assertLessEqual(live.height(), int(self.app.primaryScreen().availableGeometry().height() * 0.9))
+
     def test_ctrl_number_switches_tab_in_active_group(self):
         """Ctrl+数字切换活动标签组的标签，Ctrl+9 到最后一个。
 

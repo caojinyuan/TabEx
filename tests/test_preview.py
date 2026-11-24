@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 import types
@@ -7,10 +8,10 @@ import unittest
 from unittest.mock import Mock, patch
 import zipfile
 
-from PyQt5.QtCore import Qt, QUrl
+from PyQt5.QtCore import QFileInfo, Qt, QUrl
 from PyQt5.QtGui import QImage, QTextDocument
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QFileIconProvider
 
 from tabexplorer import preview
 from tabexplorer.mainwindow import MainWindow
@@ -53,6 +54,48 @@ class PreviewTests(unittest.TestCase):
             stream.writestr('folder/example.txt', 'not extracted')
         self.assertIn('folder/example.txt', preview.load_preview(str(archive))[1])
         self.assertFalse((self.root / 'folder').exists())
+
+    def test_exe_preview_shows_metadata_without_reading_or_running_content(self):
+        path = self.root / 'sample.EXE'
+        path.write_bytes(b'This is not executable content to display')
+        with patch('builtins.open', side_effect=AssertionError('unexpected content read')), \
+                patch('tabexplorer.preview.debug_print'):
+            kind, fields, notice = preview.load_preview(str(path))
+        self.assertEqual(kind, 'exe')
+        values = dict(fields)
+        self.assertEqual(values[preview.tr("文件名")], 'sample.EXE')
+        self.assertEqual(values[preview.tr("文件路径")], str(path))
+        self.assertEqual(values[preview.tr("大小")], f'{path.stat().st_size} B')
+        self.assertIn(preview.tr("该文件没有可用的版本信息。"), notice)
+
+        dialog = preview.PreviewDialog(str(path))
+        dialog.show()
+        self.addCleanup(dialog.close)
+        for _ in range(200):
+            self.app.processEvents()
+            if dialog._kind:
+                break
+            QTest.qWait(10)
+        self.assertEqual(dialog._kind, 'exe')
+        self.assertFalse(dialog.exe_info.isHidden())
+        self.assertFalse(dialog.search.isEnabled())
+        self.assertIsNotNone(dialog.exe_icon.pixmap())
+        self.assertEqual(dialog.text.toPlainText(), '')
+
+    def test_exe_preview_uses_version_resources_and_reports_errors(self):
+        import pywintypes
+        import win32api
+        kind, fields, _ = preview.load_preview(sys.executable)
+        language, codepage = win32api.GetFileVersionInfo(sys.executable, '\\VarFileInfo\\Translation')[0]
+        version = win32api.GetFileVersionInfo(
+            sys.executable, f'\\StringFileInfo\\{language:04x}{codepage:04x}\\FileVersion')
+        self.assertEqual(kind, 'exe')
+        self.assertEqual(dict(fields)[preview.tr("文件版本")], version)
+
+        with patch('win32api.GetFileVersionInfo', side_effect=pywintypes.error(5, 'GetFileVersionInfo', 'denied')):
+            _, fields, notice = preview.load_preview(sys.executable)
+        self.assertTrue(fields)
+        self.assertIn('denied', notice)
 
     def test_office_text(self):
         from docx import Document
@@ -182,6 +225,56 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(dialog.status.text(), 'truncated')
         QTest.keyClick(dialog.search, Qt.Key_Escape)
         self.assertFalse(dialog.isVisible())
+
+    def test_window_title_and_icon_match_file_or_folder(self):
+        path = self.root / 'example.txt'
+        path.write_text('preview', encoding='utf-8')
+        folder = self.root / 'example folder'
+        folder.mkdir()
+        provider = QFileIconProvider()
+        for selected in (str(path), str(folder) + os.sep):
+            with self.subTest(path=selected):
+                dialog = preview.PreviewDialog(selected)
+                self.addCleanup(dialog.close)
+                self.assertEqual(dialog.windowTitle(), os.path.basename(os.path.normpath(selected)))
+                expected = provider.icon(QFileInfo(selected))
+                self.assertFalse(expected.isNull())
+                self.assertEqual(dialog.windowIcon().pixmap(32, 32).toImage(),
+                                 expected.pixmap(32, 32).toImage())
+                for _ in range(100):
+                    self.app.processEvents()
+                    if dialog._kind:
+                        break
+                    QTest.qWait(10)
+                self.assertTrue(dialog._kind)
+
+    def test_preview_window_has_working_minimize_and_maximize_buttons(self):
+        import ctypes
+
+        path = self.root / 'window.txt'
+        path.write_text('preview', encoding='utf-8')
+        dialog = preview.PreviewDialog(str(path))
+        dialog.show()
+        self.addCleanup(dialog.close)
+        QTest.qWait(20)
+        if os.name == 'nt':
+            get_window_long = ctypes.windll.user32.GetWindowLongW
+            get_window_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            get_window_long.restype = ctypes.c_long
+            style = get_window_long(int(dialog.winId()), -16)
+            self.assertTrue(style & 0x00020000)
+            self.assertTrue(style & 0x00010000)
+        dialog.showMaximized()
+        QTest.qWait(20)
+        self.assertTrue(dialog.isMaximized())
+        dialog.showMinimized()
+        QTest.qWait(20)
+        self.assertTrue(dialog.isMinimized())
+        dialog.showNormal()
+        QTest.qWait(20)
+        self.assertFalse(dialog.isMinimized())
+        self.assertFalse(dialog.isMaximized())
+        self.assertTrue(dialog.isVisible())
 
     def test_code_highlighting_handles_preprocessor_multiline_and_unicode(self):
         from tabexplorer.syntax_preview import highlight_spans

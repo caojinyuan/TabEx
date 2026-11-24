@@ -2,7 +2,7 @@
 
 import os
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QCheckBox, QDialog, QLabel, QPushButton, QVBoxLayout
 
 from . import theme as _theme
@@ -621,23 +621,18 @@ class SettingsDialog(QDialog):
         # 主布局拼接
         main_layout.addLayout(main_vertical_layout)
 
-        # 高度根据内容自适应，并限制不超过屏幕可用高度
-        try:
-            from PyQt5.QtWidgets import QApplication
-            from PyQt5.QtCore import QTimer
+        self._auto_height_timer = QTimer(self)
+        self._auto_height_timer.setSingleShot(True)
+        self._auto_height_timer.timeout.connect(self._apply_auto_height)
+        self._auto_height_timer.start(0)
 
-            def _apply_auto_height():
-                self.adjustSize()
-                target_h = self.sizeHint().height()
-                screen_geo = QApplication.primaryScreen().availableGeometry()
-                max_h = int(screen_geo.height() * 0.9)
-                self.setFixedHeight(min(target_h, max_h))
-
-            # 延迟到布局稳定后计算，避免初次 sizeHint 偏差
-            QTimer.singleShot(0, _apply_auto_height)
-        except Exception:
-            # 兜底：给一个较合理默认高度
-            self.resize(600, 620)
+    def _apply_auto_height(self):
+        from PyQt5.QtWidgets import QApplication
+        self.adjustSize()
+        target_h = self.sizeHint().height()
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        max_h = int(screen_geo.height() * 0.9)
+        self.setFixedHeight(min(target_h, max_h))
     
     def _is_auto_startup_enabled(self):
         """检查是否已启用开机启动"""
