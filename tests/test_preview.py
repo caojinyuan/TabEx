@@ -11,7 +11,7 @@ import zipfile
 from PyQt5.QtCore import QFileInfo, Qt, QUrl
 from PyQt5.QtGui import QImage, QTextDocument
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QFileIconProvider
+from PyQt5.QtWidgets import QApplication, QFileIconProvider, QPushButton
 
 from tabexplorer import preview
 from tabexplorer.mainwindow import MainWindow
@@ -225,6 +225,143 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(dialog.status.text(), 'truncated')
         QTest.keyClick(dialog.search, Qt.Key_Escape)
         self.assertFalse(dialog.isVisible())
+
+    def test_text_search_starts_at_first_match_and_wraps_in_both_directions(self):
+        path = self.root / 'text.txt'
+        path.write_text('one two one two one', encoding='utf-8')
+        with patch.object(preview._Loader, 'run'):
+            dialog = preview.PreviewDialog(str(path))
+        self.addCleanup(dialog.close)
+        dialog._loaded(('text', 'one two one two one', ''))
+        cursor = dialog.text.textCursor()
+        cursor.setPosition(5)
+        dialog.text.setTextCursor(cursor)
+        dialog.search.setText('one')
+        for expected in (0, 8, 16, 0):
+            dialog.find_next()
+            self.assertEqual(dialog.text.textCursor().selectionStart(), expected)
+        dialog.find_next(backward=True)
+        self.assertEqual(dialog.text.textCursor().selectionStart(), 16)
+        dialog.search.setText('two')
+        dialog.find_next()
+        self.assertEqual(dialog.text.textCursor().selectionStart(), 4)
+        dialog.search.setText('missing')
+        dialog.find_next()
+        self.assertIn(preview.tr("未找到匹配内容。"), dialog.status.text())
+        dialog.search.setText('one')
+        dialog.find_next()
+        self.assertEqual(dialog.text.textCursor().selectionStart(), 0)
+
+    def test_enter_searches_once_and_buttons_keep_their_direction(self):
+        with patch.object(preview._Loader, 'run'):
+            dialog = preview.PreviewDialog(str(self.root / 'text.txt'))
+        self.addCleanup(dialog.close)
+        dialog._loaded(('text', 'match one\nmatch two\nmatch three', ''))
+        dialog.show()
+        dialog.search.setFocus()
+        self.app.processEvents()
+        QTest.keyClicks(dialog.search, 'match')
+        for expected in (0, 10, 20, 0):
+            QTest.keyClick(dialog.search, Qt.Key_Return)
+            self.assertEqual(dialog.text.textCursor().selectionStart(), expected)
+        buttons = {button.text(): button for button in dialog.findChildren(QPushButton)}
+        QTest.mouseClick(buttons[preview.tr("上一个")], Qt.LeftButton)
+        self.assertEqual(dialog.text.textCursor().selectionStart(), 20)
+        QTest.mouseClick(buttons[preview.tr("下一个")], Qt.LeftButton)
+        self.assertEqual(dialog.text.textCursor().selectionStart(), 0)
+        dialog.search.setFocus()
+        QTest.keyClick(dialog.search, Qt.Key_Enter)
+        self.assertEqual(dialog.text.textCursor().selectionStart(), 10)
+
+    def test_enter_searches_once_in_sheet_and_pdf_previews(self):
+        with patch.object(preview._Loader, 'run'), patch.object(preview._Loader, 'run_pdf_text'):
+            sheet = preview.PreviewDialog(str(self.root / 'sheet.xlsx'))
+            self.addCleanup(sheet.close)
+            sheet._loaded(('sheet', [('sheet', 2, 1, [(0, 0, 'match'), (1, 0, 'match')])], ''))
+            sheet.show()
+            sheet.search.setFocus()
+            sheet.search.setText('match')
+            self.app.processEvents()
+            QTest.keyClick(sheet.search, Qt.Key_Return)
+            self.assertEqual(sheet.table.currentRow(), 0)
+            QTest.keyClick(sheet.search, Qt.Key_Return)
+            self.assertEqual(sheet.table.currentRow(), 1)
+
+            pdf = preview.PreviewDialog(str(self.root / 'document.pdf'))
+            self.addCleanup(pdf.close)
+            pdf._loaded(('pdf', (QImage(2, 2, QImage.Format_RGB32), 1, 1.0), ''))
+            pdf.show()
+            pdf.search.setFocus()
+            pdf.search.setText('match')
+            self.app.processEvents()
+            QTest.keyClick(pdf.search, Qt.Key_Return)
+            pdf._pdf_text_ready(('text', 'match one\nmatch two', ''))
+            self.assertEqual(pdf.text.textCursor().selectionStart(), 0)
+            QTest.keyClick(pdf.search, Qt.Key_Return)
+            self.assertEqual(pdf.text.textCursor().selectionStart(), 10)
+
+    def test_sheet_search_starts_at_first_match_and_resets_on_sheet_change(self):
+        path = self.root / 'sheet.xlsx'
+        with patch.object(preview._Loader, 'run'):
+            dialog = preview.PreviewDialog(str(path))
+        self.addCleanup(dialog.close)
+        sheets = [('one', 2, 2, [(0, 0, 'match'), (1, 1, 'match')]),
+                  ('two', 2, 2, [(0, 0, 'match'), (1, 1, 'match')])]
+        dialog._loaded(('sheet', sheets, ''))
+        dialog.table.setCurrentCell(0, 0)
+        dialog.search.setText('match')
+        for expected in ((0, 0), (1, 1), (0, 0)):
+            dialog.find_next()
+            self.assertEqual((dialog.table.currentRow(), dialog.table.currentColumn()), expected)
+        dialog.find_next(backward=True)
+        self.assertEqual((dialog.table.currentRow(), dialog.table.currentColumn()), (1, 1))
+        dialog.sheets.setCurrentIndex(1)
+        dialog.find_next()
+        self.assertEqual((dialog.table.currentRow(), dialog.table.currentColumn()), (0, 0))
+
+    def test_rich_text_search_starts_at_first_match(self):
+        for kind, content, target_name in (
+                ('markdown', 'one two one', 'markdown'),
+                ('word', ('<p>one two one</p>', {}), 'word')):
+            with self.subTest(kind=kind), patch.object(preview._Loader, 'run'):
+                dialog = preview.PreviewDialog(str(self.root / 'document'))
+                self.addCleanup(dialog.close)
+                dialog._loaded((kind, content, ''))
+                target = getattr(dialog, target_name)
+                cursor = target.textCursor()
+                cursor.setPosition(5)
+                target.setTextCursor(cursor)
+                dialog.search.setText('one')
+                for expected in (0, 8, 0):
+                    dialog.find_next()
+                    self.assertEqual(target.textCursor().selectionStart(), expected)
+
+    def test_pdf_search_respects_direction_and_searches_cached_text_immediately(self):
+        with patch.object(preview._Loader, 'run'), patch.object(preview._Loader, 'run_pdf_text'):
+            dialog = preview.PreviewDialog(str(self.root / 'document.pdf'))
+            self.addCleanup(dialog.close)
+            image = QImage(2, 2, QImage.Format_RGB32)
+            dialog._loaded(('pdf', (image, 1, 1.0), ''))
+            dialog.search.setText('one')
+            dialog.find_next(backward=True)
+            dialog._pdf_text_ready(('text', 'one two one', ''))
+            self.assertEqual(dialog.text.textCursor().selectionStart(), 8)
+            dialog._toggle_pdf_text()
+            dialog.find_next()
+            self.assertEqual(dialog.text.textCursor().selectionStart(), 0)
+
+    def test_preview_window_stays_above_other_windows(self):
+        path = self.root / 'window.txt'
+        with patch.object(preview._Loader, 'run'):
+            dialog = preview.PreviewDialog(str(path))
+        self.addCleanup(dialog.close)
+        dialog.show()
+        self.assertTrue(dialog.windowFlags() & Qt.WindowStaysOnTopHint)
+        dialog.showMinimized()
+        self.assertTrue(dialog.isMinimized())
+        dialog.showMaximized()
+        self.assertTrue(dialog.isMaximized())
+        self.assertTrue(dialog.windowFlags() & Qt.WindowStaysOnTopHint)
 
     def test_window_title_and_icon_match_file_or_folder(self):
         path = self.root / 'example.txt'

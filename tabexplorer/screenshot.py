@@ -42,6 +42,7 @@ TOOLS = (
 )
 ACTIONS = (
     ('undo', '↶', '撤销 (Ctrl+Z)'), ('pin', '📌', '贴图 (F3)'), ('save', '💾', '保存 (Ctrl+S)'),
+    ('save_default', '📥', '默认保存并复制文件路径'),
     ('ocr', 'OCR', '离线文字识别 (Ctrl+T)'),
     ('history', '▤', '截图历史图库'), ('cancel', '✕', '取消 (Esc)'), ('copy', '✓', '复制到剪贴板 (Enter)'),
 )
@@ -889,6 +890,12 @@ class ScreenshotOverlay(QWidget):
                 self._remember(pixmap)
                 self._controller.notify(tr("截图已保存：{}").format(path), 'info' if os.path.exists(path) else 'warning')
             self.close()
+        elif action == 'save_default':
+            path = self._remember(pixmap)
+            if path:
+                QApplication.clipboard().setText(path)
+                self._controller.notify(tr("截图已保存，文件路径已复制：{}").format(path))
+                self.close()
         elif action == 'pin':
             self._remember(pixmap)
             pixmap.setDevicePixelRatio(self._map.dpr)
@@ -903,10 +910,11 @@ class ScreenshotOverlay(QWidget):
 
     def _remember(self, pixmap):
         try:
-            self._controller.remember(pixmap)
+            return self._controller.remember(pixmap)
         except OSError as error:
             debug_print(f"[Screenshot] history save failed: {error}")
             self._controller.notify(tr("截图历史保存失败：{}").format(error), 'warning')
+            return None
 
     def closeEvent(self, event):
         self._finish_text(False)

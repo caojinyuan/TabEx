@@ -235,6 +235,45 @@ class ScreenshotTests(unittest.TestCase):
         controller.remember.assert_called_once()
         clipboard.return_value.setPixmap.assert_called_once()
 
+    def test_default_save_button_writes_history_and_copies_path(self):
+        with TemporaryDirectory() as directory:
+            controller = screenshot.ScreenshotController(self.notify)
+            self.addCleanup(controller.shutdown)
+            controller._history_store = screenshot.ScreenshotHistoryStore(directory)
+            overlay = self.make_overlay()
+            overlay._controller = controller
+            _drag(overlay, QPoint(20, 20), QPoint(100, 80))
+            overlay._tool, overlay._color, overlay._width = 'rect', QColor('#ff0000'), 4
+            _drag(overlay, QPoint(30, 30), QPoint(60, 60))
+            with patch.object(screenshot.QApplication, 'clipboard') as clipboard, \
+                    patch.object(screenshot, 'save_pixmap_dialog') as dialog:
+                overlay._toolbar._action_buttons['save_default'].click()
+            entries = controller._history_store.entries()
+            self.assertEqual(len(entries), 1)
+            path = entries[0][0]
+            self.assertTrue(os.path.isabs(path))
+            clipboard.return_value.setText.assert_called_once_with(path)
+            clipboard.return_value.setPixmap.assert_not_called()
+            dialog.assert_not_called()
+            self.assertEqual(QPixmap(path).toImage().pixelColor(10, 20), QColor('#ff0000'))
+            self.assertIn(path, self.messages[-1])
+
+    def test_default_save_failure_keeps_selection_and_clipboard(self):
+        controller = Mock()
+        controller.remember.side_effect = PermissionError('denied')
+        overlay = self.make_overlay()
+        overlay._controller = controller
+        overlay._sel = QRect(20, 20, 80, 60)
+        overlay.show()
+        with patch.object(screenshot.QApplication, 'clipboard') as clipboard:
+            overlay._perform('save_default')
+        clipboard.assert_not_called()
+        self.assertTrue(overlay.isVisible())
+        self.assertEqual(overlay._sel, QRect(20, 20, 80, 60))
+        controller.notify.assert_called_once()
+        self.assertIn('denied', controller.notify.call_args.args[0])
+        self.assertEqual(controller.notify.call_args.args[1], 'warning')
+
     def test_history_delete_requires_confirmation_and_preserves_other_images(self):
         with TemporaryDirectory() as directory:
             store = screenshot.ScreenshotHistoryStore(directory)

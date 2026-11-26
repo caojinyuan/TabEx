@@ -504,7 +504,8 @@ class PreviewDialog(QDialog):
         super().__init__()
         self.setWindowFlags(
             Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint |
-            Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowSystemMenuHint
+            Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowSystemMenuHint |
+            Qt.WindowStaysOnTopHint
         )
         self._path = path
         self._kind = ''
@@ -513,6 +514,8 @@ class PreviewDialog(QDialog):
         self._pdf_rendering = False
         self._pdf_text_loaded = False
         self._pdf_text_mode = False
+        self._pdf_search_backward = False
+        self._search_fresh = True
         self._sheets = []
         filename_text = os.path.basename(os.path.normpath(path)) or path
         self.setWindowTitle(filename_text)
@@ -626,6 +629,7 @@ class PreviewDialog(QDialog):
         self.word.hide()
         layout.addWidget(self.word)
         self.search.returnPressed.connect(self.find_next)
+        self.search.textChanged.connect(self._reset_search)
         following.clicked.connect(self.find_next)
         previous.clicked.connect(lambda: self.find_next(backward=True))
         shortcut = QShortcut(QKeySequence.Find, self)
@@ -649,6 +653,12 @@ class PreviewDialog(QDialog):
                 return True
         return super().eventFilter(obj, event)
 
+    def keyPressEvent(self, event):
+        if self.search.hasFocus() and event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def closeEvent(self, event):
         QApplication.instance().removeEventFilter(self)
         player = getattr(self, '_media_player', None)
@@ -659,6 +669,7 @@ class PreviewDialog(QDialog):
     def _loaded(self, result):
         kind, content, notice = result
         self._kind = kind
+        self._reset_search()
         self._notice = notice
         self.status.setText(notice)
         if kind in ('image', 'pdf'):
@@ -780,6 +791,7 @@ class PreviewDialog(QDialog):
     def _show_sheet(self, index):
         if not 0 <= index < len(self._sheets):
             return
+        self._reset_search()
         from openpyxl.utils import get_column_letter
         _name, rows, columns, cells = self._sheets[index]
         self.table.clear()
@@ -871,7 +883,8 @@ class PreviewDialog(QDialog):
         self.pdf_text_button.setEnabled(True)
         self._show_pdf_text()
         if self.search.text():
-            self.find_next()
+            self.find_next(backward=self._pdf_search_backward)
+        self._pdf_search_backward = False
 
     def _pdf_text_failed(self, error):
         self.pdf_text_button.setEnabled(True)
@@ -889,6 +902,9 @@ class PreviewDialog(QDialog):
         self.status.setText(tr("预览失败：{}").format(message))
         self.search.setEnabled(False)
 
+    def _reset_search(self):
+        self._search_fresh = True
+
     def find_next(self, backward=False):
         query = self.search.text()
         if not query:
@@ -899,14 +915,24 @@ class PreviewDialog(QDialog):
                 self.status.setText(' '.join(filter(None, (self._notice, tr("未找到匹配内容。")))))
                 return
             current = self.table.currentItem()
-            position = matches.index(current) if current in matches else (-1 if not backward else 0)
+            position = (matches.index(current) if not self._search_fresh and current in matches
+                        else (-1 if not backward else 0))
             self.table.setCurrentItem(matches[(position + (-1 if backward else 1)) % len(matches)])
+            self._search_fresh = False
             self.status.setText(self._notice)
             return
         if self._kind == 'pdf' and not self._pdf_text_mode:
-            self._toggle_pdf_text()
-            return
+            self._pdf_search_backward = backward
+            if self.pdf_text_button.isEnabled():
+                self._toggle_pdf_text()
+            if not self._pdf_text_mode:
+                return
         target = self.markdown if self._kind == 'markdown' else self.word if self._kind == 'word' else self.text
+        if self._search_fresh:
+            cursor = target.textCursor()
+            cursor.movePosition(cursor.End if backward else cursor.Start)
+            target.setTextCursor(cursor)
+            self._search_fresh = False
         flags = QTextDocument.FindBackward if backward else QTextDocument.FindFlags()
         if not target.find(query, flags):
             cursor = target.textCursor()
@@ -932,4 +958,6 @@ def main():
     dialog = PreviewDialog(sys.argv[2])
     dialog.show()
     theme.apply_window_frame(dialog)
+    dialog.raise_()
+    dialog.activateWindow()
     sys.exit(app.exec_())
