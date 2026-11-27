@@ -14,6 +14,7 @@ from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QFileIconProvider, QPushButton
 
 from tabexplorer import preview
+from tabexplorer import firmware_preview as firmware
 from tabexplorer.mainwindow import MainWindow
 
 
@@ -26,6 +27,12 @@ class PreviewTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+
+    def wait_for(self, condition):
+        deadline = time.monotonic() + 5
+        while not condition() and time.monotonic() < deadline:
+            QTest.qWait(10)
+        self.assertTrue(condition())
 
     def test_text_encodings_binary_and_truncated_character(self):
         path = self.root / 'text.txt'
@@ -77,9 +84,9 @@ class PreviewTests(unittest.TestCase):
                 break
             QTest.qWait(10)
         self.assertEqual(dialog._kind, 'exe')
-        self.assertFalse(dialog.exe_info.isHidden())
+        self.assertFalse(dialog.info_panel.isHidden())
         self.assertFalse(dialog.search.isEnabled())
-        self.assertIsNotNone(dialog.exe_icon.pixmap())
+        self.assertIsNotNone(dialog.info_icon.pixmap())
         self.assertEqual(dialog.text.toPlainText(), '')
 
     def test_exe_preview_uses_version_resources_and_reports_errors(self):
@@ -490,26 +497,126 @@ class PreviewTests(unittest.TestCase):
         sheet_dialog.find_next()
         self.assertEqual((sheet_dialog.table.currentRow(), sheet_dialog.table.currentColumn()), (2, 2))
 
-    def test_audio_preview_does_not_play_automatically(self):
+    def test_audio_and_video_are_information_only_even_when_metadata_is_missing(self):
+        import builtins
         import wave
-        from PyQt5.QtMultimedia import QMediaPlayer
         path = self.root / 'audio.wav'
         with wave.open(str(path), 'wb') as audio:
             audio.setnchannels(1)
             audio.setsampwidth(2)
             audio.setframerate(8000)
             audio.writeframes(b'\x00\x00' * 800)
+        video = self.root / 'video.MP4'
+        video.write_bytes(b'no media properties')
+        original = builtins.__import__
+
+        def no_player(name, *args, **kwargs):
+            if name.startswith('PyQt5.QtMultimedia'):
+                raise AssertionError('Preview must not initialize a player or decoder')
+            return original(name, *args, **kwargs)
+
+        with patch('builtins.__import__', side_effect=no_player), \
+                patch('subprocess.Popen', side_effect=AssertionError('unexpected launch')), \
+                patch('os.startfile', side_effect=AssertionError('unexpected launch')):
+            for sample in (path, video):
+                with self.subTest(extension=sample.suffix):
+                    dialog = preview.PreviewDialog(str(sample))
+                    dialog.show()
+                    self.addCleanup(dialog.close)
+                    self.wait_for(lambda: dialog._kind == 'media')
+                    self.assertTrue(dialog.info_panel.isVisible())
+                    self.assertFalse(dialog.search_bar.isVisible())
+                    self.assertFalse(dialog.controls.isVisible())
+                    with patch.object(QApplication, 'clipboard') as clipboard:
+                        dialog.copy_info.click()
+                        details = clipboard.return_value.setText.call_args.args[0]
+                        self.assertIn(str(sample), details)
+                        if sample == path:
+                            self.assertIn('8000 Hz', details)
+                            self.assertIn('00:00:00.100', details)
+                    dialog.close()
+
+    def test_binary_pages_jump_search_and_empty_input(self):
+        path = self.root / 'image.BIN'
+        path.touch()
+        self.assertEqual(preview.load_preview(str(path))[1].data, b'')
+        with path.open('wb') as stream:
+            stream.write(bytes(range(32)))
+            stream.seek(0x2020)
+            stream.write(b'\x00HELLO\xff')
         dialog = preview.PreviewDialog(str(path))
-        dialog.show()
         self.addCleanup(dialog.close)
-        for _ in range(200):
-            self.app.processEvents()
-            if dialog._kind == 'media':
-                break
-            QTest.qWait(10)
-        self.assertEqual(dialog._kind, 'media')
-        self.assertEqual(dialog._media_player.state(), QMediaPlayer.StoppedState)
-        self.assertFalse(dialog.media_play.isHidden())
+        dialog.show()
+        self.wait_for(lambda: dialog._kind == 'hex')
+        self.assertEqual(len(dialog._hex_page.data), 4096)
+        self.assertNotIn('HELLO', dialog.text.toPlainText())
+        self.assertFalse(dialog.hex_previous.isEnabled())
+        dialog.hex_offset.setText('0x2021')
+        QTest.keyClick(dialog.hex_offset, Qt.Key_Return)
+        self.wait_for(lambda: dialog._hex_page.start == 0x2000)
+        self.assertIn('00002020  00 48 45 4C 4C 4F FF', dialog.text.textCursor().selectedText())
+        self.assertFalse(dialog.hex_next.isEnabled())
+        self.assertEqual(dialog.hex_page_label.text(), '3 / 3')
+        dialog.search.setText('HELLO')
+        dialog.find_next()
+        self.assertEqual(dialog.text.textCursor().selectedText(), 'HELLO')
+        dialog.hex_offset.setText('0x3000')
+        QTest.keyClick(dialog.hex_offset, Qt.Key_Return)
+        self.assertEqual(dialog.status.text(), preview.tr("偏移超出文件范围。"))
+        dialog.hex_previous.click()
+        self.wait_for(lambda: dialog._hex_page.start == 4096)
+        dialog.hex_next.click()
+        self.wait_for(lambda: dialog._hex_page.start == 8192)
+
+    def test_srecords_decode_address_widths_and_keep_good_rows_after_errors(self):
+        path = self.root / 'example.S19'
+        path.write_bytes(b'S1051000414267\nS1051000414200\nS2ZZ\nS1081000FF\n'
+                         b'S205123456AAB4\nS30612345678AA3B\nS9031000EC\n')
+        kind, rows, notice = preview.load_preview(str(path))
+        self.assertEqual(kind, 'records')
+        self.assertEqual(rows[0], ('1', 'S1', '0x00001000', '2', '41 42', 'OK'))
+        self.assertEqual([r[-1] for r in rows[1:4]], [preview.tr("校验和不符"), preview.tr("十六进制字符无效"),
+                                                        preview.tr("记录长度不符")])
+        self.assertEqual(rows[4][2], '0x00123456')
+        self.assertEqual(rows[5][2], '0x12345678')
+        self.assertIn(preview.tr("预览范围：{} 条记录 · {} 个数据字节 · {} 条错误").format(7, 4, 3), notice)
+        with patch.object(firmware, 'RECORD_BYTE_LIMIT', 21):
+            _, limited, notice = preview.load_preview(str(path))
+        self.assertEqual(limited, rows[:1])
+        self.assertIn(preview.tr("内容已截断。"), notice)
+
+    def test_ihex_extended_addresses_and_searchable_records(self):
+        path = self.root / 'example.ihx'
+        path.write_bytes(b':020000040001F9\n:02001000AABB89\n:02000004000200\n:02001000AABB89\n:00000001FF')
+        dialog = preview.PreviewDialog(str(path))
+        self.addCleanup(dialog.close)
+        dialog.show()
+        self.wait_for(lambda: dialog._kind == 'records')
+        self.assertTrue(dialog.table.isVisible())
+        self.assertEqual(dialog.table.item(1, 2).text(), '0x00010010')
+        self.assertEqual(dialog.table.item(3, 2).text(), '?')
+        dialog.search.setText('AA BB')
+        for row in (1, 3, 1):
+            dialog.find_next()
+            self.assertEqual(dialog.table.currentRow(), row)
+        dialog.errors_only.click()
+        self.assertFalse(dialog.table.isRowHidden(2))
+        self.assertTrue(dialog.table.isRowHidden(1))
+        dialog.find_next()
+        self.assertIn(preview.tr("未找到匹配内容。"), dialog.status.text())
+        dialog.errors_only.click()
+        dialog.find_next()
+        self.assertEqual(dialog.table.currentRow(), 1)
+
+    def test_unknown_binary_falls_back_to_file_information_but_unknown_text_is_readable(self):
+        path = self.root / 'sample.unknown'
+        path.write_bytes(b'\x00\x01other')
+        kind, fields, notice = preview.load_preview(str(path))
+        self.assertEqual(kind, 'info')
+        self.assertEqual(dict(fields)[preview.tr("文件路径")], str(path))
+        self.assertTrue(notice)
+        path.write_text('plain text', encoding='utf-8')
+        self.assertEqual(preview.load_preview(str(path))[:2], ('text', 'plain text'))
 
     def test_markdown_is_rendered_and_external_images_are_blocked(self):
         image = QImage(3, 2, QImage.Format_RGB32)
