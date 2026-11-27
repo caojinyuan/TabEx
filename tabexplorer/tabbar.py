@@ -236,9 +236,14 @@ class CustomMenuBar(QMenuBar):
 def _tab_display_labels(paths):
     from collections import Counter
     from pathlib import PureWindowsPath
-    normalized = [str(PureWindowsPath(path)).casefold() for path in paths]
-    parts = [PureWindowsPath(path).parts for path in paths]
+    parsed = [PureWindowsPath(path) for path in paths]
+    normalized = [str(path).casefold() for path in parsed]
+    parts = [path.parts for path in parsed]
     totals = Counter(normalized)
+    suffix_counts = Counter()
+    for key in totals:
+        segments = PureWindowsPath(key).parts
+        suffix_counts.update(segments[-depth:] for depth in range(1, len(segments) + 1))
     seen = Counter()
     labels = []
     special = {'shell:RecycleBinFolder': tr('回收站'), 'shell:MyComputerFolder': tr('此电脑'),
@@ -250,10 +255,7 @@ def _tab_display_labels(paths):
             for depth in range(1, len(parts[index]) + 1):
                 suffix = parts[index][-depth:]
                 label = str(PureWindowsPath(*suffix))
-                if not any(normalized[other] != normalized[index]
-                           and tuple(part.casefold() for part in parts[other][-depth:])
-                           == tuple(part.casefold() for part in suffix)
-                           for other in range(len(paths))):
+                if suffix_counts[tuple(part.casefold() for part in suffix)] == 1:
                     break
         seen[normalized[index]] += 1
         if totals[normalized[index]] > 1:

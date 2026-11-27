@@ -33,9 +33,22 @@ class SnapshotTests(unittest.TestCase):
             _snapshot_signals=Mock(), _snapshot_generation=0, _snapshot_inflight=False,
             _snapshot_pending=False, _refresh_active=True, _last_dir_snapshot=None,
             _is_slow_path=lambda path: path.startswith('\\\\'),
-            _should_ignore_internal_dir_entry=lambda path, name: False, _request_refresh=Mock())
+            _request_refresh=Mock())
         host._request_dir_snapshot = lambda path: explorer.FileExplorerTab._request_dir_snapshot(host, path)
         return host
+
+    def test_snapshots_classify_directory_once_and_filter_internal_names_only_at_app_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            child = base / 'work'
+            child.mkdir()
+            for root in (base, child):
+                for name in ('keep', 'config.json', 'config.json.previous', 'TabEx_debug_latest.log'):
+                    (root / name).touch()
+            with patch.object(explorer, 'get_app_base_dir', return_value=str(base)) as lookup:
+                self.assertEqual(explorer._compute_dir_snapshot(str(base))[0], 2)
+                self.assertEqual(explorer._compute_dir_snapshot(str(child))[0], 4)
+                self.assertEqual(lookup.call_count, 2)
 
     def test_initial_snapshot_is_one_background_scan_without_ui_filesystem_calls(self):
         host = self.host()

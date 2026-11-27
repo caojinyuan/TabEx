@@ -62,6 +62,32 @@ class PreviewTests(unittest.TestCase):
         self.assertIn('folder/example.txt', preview.load_preview(str(archive))[1])
         self.assertFalse((self.root / 'folder').exists())
 
+    def test_image_fits_viewport_and_double_click_restores_original_pixels(self):
+        for width, height in ((1920, 1080), (4096, 512)):
+            with self.subTest(size=(width, height)):
+                image = QImage(width, height, QImage.Format_RGB32)
+                image.fill(Qt.red)
+                path = self.root / 'diagram.png'
+                self.assertTrue(image.save(str(path)))
+                dialog = preview.PreviewDialog(str(path))
+                self.addCleanup(dialog.close)
+                dialog.resize(900, 650)
+                dialog.show()
+                self.wait_for(lambda: dialog._kind == 'image')
+                def fits():
+                    size = dialog.image_scroll.viewport().size()
+                    return dialog.image.width() <= size.width() and dialog.image.height() <= size.height()
+                self.wait_for(fits)
+                self.assertAlmostEqual(dialog.image.width() / dialog.image.height(), width / height, delta=0.1)
+                QTest.mouseDClick(dialog.image, Qt.LeftButton)
+                self.wait_for(lambda: dialog.image.width() == width)
+                self.assertEqual(dialog.image.height(), height)
+                self.assertGreater(dialog.image_scroll.horizontalScrollBar().maximum(), 0)
+                dialog.image_zoom.click()
+                dialog.resize(640, 420)
+                self.wait_for(fits)
+                dialog.close()
+
     def test_exe_preview_shows_metadata_without_reading_or_running_content(self):
         path = self.root / 'sample.EXE'
         path.write_bytes(b'This is not executable content to display')

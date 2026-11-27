@@ -390,6 +390,67 @@ class SessionRestoreWorkTests(unittest.TestCase):
         self.assertEqual(self.browsed(), [self.paths[2], self.paths[6]])
         self.assertEqual((w.tab_widget.count(), w.split_tab_widget.count()), (5, 3))
 
+    def test_close_and_reopen_preserves_duplicate_instances_pin_order_active_side_and_lazy_views(self):
+        w = self.window
+        w.show()
+        w._delayed_initialization()
+        a, b, c = self.paths[:3]
+        w.config['named_workspaces']['duplicates'] = {'groups': [
+            {'active_index': 3, 'tabs': [{'path': a, 'is_pinned': True}, {'path': b},
+                                          {'path': a}, {'path': b, 'bookmark_group_color': '#64B5F6'}]},
+            {'active_index': 1, 'tabs': [{'path': b, 'is_pinned': True}, {'path': c}, {'path': b}]}],
+            'active_group': 1}
+        with patch('tabexplorer.mainwindow.show_toast'):
+            self.assertTrue(w.switch_named_workspace('duplicates'))
+        expected = w._capture_named_workspace()
+        self.assertEqual([g['active_index'] for g in expected['groups']], [3, 1])
+        self.assertEqual(expected['active_group'], 1)
+        self.dispose()
+        with patch.object(MainWindow, '_delayed_initialization', lambda self: None):
+            self.window = MainWindow()
+        self.window.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.window.show()
+        self.browse.reset_mock()
+        self.window._delayed_initialization()
+        self.assertEqual(self.window._capture_named_workspace(), expected)
+        self.assertEqual(self.browsed(), [b, c])
+
+    def test_workspace_switch_undo_restores_split_and_append_does_not_replace_undo(self):
+        w = self.window
+        w.show()
+        w._delayed_initialization()
+        before = w._capture_named_workspace()
+        w.config['named_workspaces']['one'] = {'groups': [{'tabs': [{'path': self.paths[4]}], 'active_index': 0}]}
+        with patch('tabexplorer.mainwindow.show_toast') as toast:
+            w.switch_named_workspace('one')
+            undo_click = toast.call_args.kwargs['action']
+            self.assertTrue(w.undo_workspace_action.isEnabled())
+            self.assertFalse(w._split_active)
+            w.open_named_workspace('one')
+            self.assertEqual(w.tab_widget.count(), 2)
+            self.assertTrue(undo_click())
+            self.assertEqual(w._capture_named_workspace(), before)
+            self.assertFalse(w.undo_workspace_action.isEnabled())
+            self.assertFalse(undo_click())
+
+    def test_restored_missing_local_folder_keeps_tab_and_can_retry(self):
+        missing = Path(self.paths[0]) / 'restored-later'
+        w = self.window
+        w.config['tab_session'] = {'groups': [{'tabs': [{'path': str(missing)}]}]}
+        w.show()
+        w._delayed_initialization()
+        tab = w.get_current_tab_widget()
+        self.assertEqual(tab.current_path, str(missing))
+        self.assertTrue(tab.net_banner.isVisible())
+        self.assertTrue(tab.explorer.isHidden())
+        self.assertTrue(tab.net_banner.reconnect_button.isHidden())
+        tab.net_banner.retry_button.click()
+        self.assertTrue(tab.net_banner.retry_button.isEnabled())
+        self.browse.assert_not_called()
+        missing.mkdir()
+        tab.net_banner.retry_button.click()
+        self.assertEqual(self.browsed(), [str(missing)])
+
 
 class DebugLogRotationTests(unittest.TestCase):
     def setUp(self):

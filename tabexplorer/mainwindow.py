@@ -4108,11 +4108,13 @@ class MainWindow(QMainWindow):
         if name is None:
             return
         state = self.config['named_workspaces'][name]
-        groups = state.get('groups', [])
-        if not isinstance(groups, list) or not groups:
+        if not SessionController.valid_workspace(state):
+            show_toast(self, tr("工作区"), tr("工作区数据无效"), level="warning")
             return
         with self._batch_tab_restore():
-            failures = self._append_workspace_groups(groups)
+            failures = self._append_workspace_groups(state['groups'])
+        if 'active_group' in state:
+            self._restore_workspace_side(state)
         self.save_pinned_tabs()
         self._schedule_session_snapshot()
         if failures:
@@ -4121,6 +4123,8 @@ class MainWindow(QMainWindow):
     def _append_workspace_groups(self, groups):
         failures = []
         for group_index, group in enumerate(groups[:2]):
+            if not group['tabs']:
+                continue
             if group_index == 1 and not getattr(self, '_split_active', False):
                 self._activate_split_layout()
             target = self.tab_widget if group_index == 0 else self.split_tab_widget
@@ -4176,17 +4180,45 @@ class MainWindow(QMainWindow):
 
     def switch_named_workspace(self, name):
         state = self.config.get('named_workspaces', {}).get(name)
-        if not isinstance(state, dict) or not isinstance(state.get('groups', []), list):
+        if not SessionController.valid_workspace(state):
             show_toast(self, tr("工作区"), tr("工作区数据无效"), level="warning")
             return False
+        previous = self._capture_named_workspace()
+        self._workspace_undo = previous
+        self.undo_workspace_action.setEnabled(bool(previous['groups']))
+        if not self._replace_workspace(state):
+            return False
+        show_toast(self, tr("工作区"), tr("已切换到 {}").format(name), action_text=tr("撤销"),
+                   action=lambda: self.undo_workspace_switch(previous))
+        return True
+
+    def _replace_workspace(self, state):
         with self._batch_tab_restore():
             self._clear_tabs_for_workspace_switch()
-            self.open_named_workspace(name)
+            failures = self._append_workspace_groups(state['groups'])
             if self.tab_widget.count() == 0:
                 self.add_new_tab()
-        if not state.get('groups'):
-            self.save_pinned_tabs()
-        self._schedule_session_snapshot()
+        self._restore_workspace_side(state)
+        self.save_pinned_tabs()
+        self.save_session_snapshot(immediate=True)
+        if failures:
+            show_toast(self, tr("工作区"), tr("部分目录无法打开") + ': ' + '\n'.join(failures), level="warning")
+            return False
+        return True
+
+    def _restore_workspace_side(self, state):
+        right = state.get('active_group', 0) == 1 and self._split_active
+        self.set_active_pane_to_group(self.split_tab_widget if right else self.tab_widget)
+
+    def undo_workspace_switch(self, expected=None):
+        previous = getattr(self, '_workspace_undo', None)
+        if not previous or (expected is not None and expected is not previous):
+            return False
+        if not self._replace_workspace(previous):
+            return False
+        self._workspace_undo = None
+        self.undo_workspace_action.setEnabled(False)
+        show_toast(self, tr("工作区"), tr("已恢复切换前的标签布局"), level="success")
         return True
 
     def delete_named_workspace(self, name=None):
@@ -4220,6 +4252,8 @@ class MainWindow(QMainWindow):
         self.sync_browse_action.setCheckable(True)
         self.sync_browse_action.setChecked(bool(getattr(self, '_sync_browse', False)))
         menu.addAction(tr('工作区'), self.manage_named_workspaces)
+        self.undo_workspace_action = menu.addAction(tr('撤销工作区切换'), lambda: self.undo_workspace_switch())
+        self.undo_workspace_action.setEnabled(False)
         self.external_tools_menu = menu.addMenu(tr('外部工具'))
         self.external_tools_menu.addAction(tr("配置外部工具..."), self.configure_external_tools)
         self.external_tools_menu.aboutToShow.connect(self._rebuild_external_tools_menu)
@@ -5072,6 +5106,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._startup_session_pending = True
         self._app_started_at = time.time()
 
         self.server_socket = None
@@ -5224,12 +5259,6 @@ class MainWindow(QMainWindow):
 
     def _get_pinned_paths_from_config(self):
         return SessionController(self)._get_pinned_paths_from_config()
-
-    def _collect_cached_tabs(self):
-        return SessionController(self)._collect_cached_tabs()
-
-    def _collect_split_session(self):
-        return SessionController(self)._collect_split_session()
 
     def _get_last_active_tab_path(self):
         return SessionController(self)._get_last_active_tab_path()
@@ -5785,7 +5814,8 @@ class MainWindow(QMainWindow):
         # 先检查是否有固定标签或缓存标签，如果没有才添加默认标签页
         has_content = bool(
             self.config.get("pinned_tabs", []) or 
-            self.config.get("cached_tabs", [])
+            (self.config.get("enable_cache_tabs", True)
+             and (self.config.get("cached_tabs", []) or self.config.get("tab_session", {}).get('groups')))
         )
         if not has_content:
             # 没有固定标签也没有缓存标签，才添加默认的主目录标签
@@ -5870,6 +5900,15 @@ class MainWindow(QMainWindow):
         self._bring_to_front()
     
     def _restore_startup_tabs(self):
+        session = self.config.get('tab_session')
+        if self.config.get('enable_cache_tabs', True) and session:
+            if SessionController.valid_workspace(session):
+                failures = self._append_workspace_groups(session['groups'])
+                self._restore_workspace_side(session)
+                if failures:
+                    show_toast(self, tr("工作区"), tr("部分目录无法打开") + ': ' + '\n'.join(failures), level="warning")
+                return
+            debug_print("[Session] Invalid saved layout; using legacy session fields")
         debug_print(f"[App] 启动时标签页数: {self.tab_widget.count()}")
         
         # 延迟加载固定标签页
@@ -5887,19 +5926,10 @@ class MainWindow(QMainWindow):
                 cached_tabs = self.config.get("cached_tabs", [])
                 debug_print(f"[App] 待恢复的缓存标签页数: {len(cached_tabs)}")
                 if cached_tabs:
-                    pinned_paths = self._get_pinned_paths_from_config()
-                    pinned_norm = {
-                        self._normalize_path_for_compare(p)
-                        for p in pinned_paths if p
-                    }
                     debug_print(f"[App] 恢复 {len(cached_tabs)} 个缓存标签页")
                     for tab_info in cached_tabs:
                         path = tab_info.get('path', '')
                         if path:
-                            norm = self._normalize_path_for_compare(path)
-                            if norm in pinned_norm:
-                                debug_print(tr("[App] 跳过缓存标签（已固定）: {}").format(path))
-                                continue
                             # 懒加载：恢复的缓存标签不逐个激活，后台标签首次可见时才导航
                             self.add_new_tab(
                                 path,
@@ -5943,6 +5973,7 @@ class MainWindow(QMainWindow):
         self._update_window_title()
         with self._batch_tab_restore():
             self._restore_startup_tabs()
+        self._startup_session_pending = False
 
         # 延迟启动实例服务器
         try:
@@ -6314,6 +6345,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭时停止服务器和监听"""
+        basket = getattr(self, '_file_basket', None)
+        if basket is not None and basket.cancel_checksum():
+            event.ignore()
+            show_toast(self, tr("文件收集篮"), tr("正在取消校验，请稍后退出。"), level="warning")
+            return
         chat = getattr(self, 'chat_panel', None)
         if chat is not None and chat.has_running_actions():
             chat.cancel_actions()
@@ -6364,7 +6400,6 @@ class MainWindow(QMainWindow):
         if screenshot is not None:
             screenshot.shutdown()
 
-        self._active_pane = None
         self._save_frequent_dirs()
 
         # 先保存会话快照（此时分屏仍处于激活态，确保 split_session 被正确持久化）；

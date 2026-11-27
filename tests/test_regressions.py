@@ -701,21 +701,16 @@ class IntegrationTests(unittest.TestCase):
         owner.switch_named_workspace.assert_called_once_with('demo')
         dialog.close()
 
-    def test_switch_workspace_clears_tabs_and_split_before_restore(self):
-        """切换工作区先清理当前标签与分屏，再恢复目标工作区。"""
-        sequence = []
+    def test_invalid_workspace_does_not_replace_current_tabs(self):
+        """无标签或损坏的工作区不能先清掉当前布局。"""
         owner = types.SimpleNamespace(
             config={'named_workspaces': {'target': {'groups': [{'tabs': []}]}}},
-            _batch_tab_restore=nullcontext,
-            _clear_tabs_for_workspace_switch=lambda: sequence.append('clear'),
-            open_named_workspace=lambda name: sequence.append(('open', name)),
-            tab_widget=types.SimpleNamespace(count=lambda: 1),
-            save_pinned_tabs=Mock(),
-            _schedule_session_snapshot=Mock(),
+            _replace_workspace=Mock(),
         )
-        result = self.module.MainWindow.switch_named_workspace(owner, 'target')
-        self.assertTrue(result)
-        self.assertEqual(sequence, ['clear', ('open', 'target')])
+        with patch_all('show_toast') as warning:
+            self.assertFalse(self.module.MainWindow.switch_named_workspace(owner, 'target'))
+        owner._replace_workspace.assert_not_called()
+        warning.assert_called_once()
 
     def test_clear_tabs_for_workspace_switch_releases_both_widgets(self):
         """清理切换前的标签时关闭 Explorer 内容并释放占位页。"""
@@ -1182,9 +1177,9 @@ class FunctionalBoundaryTests(unittest.TestCase):
             (left / 'kind').mkdir()
             (right / 'kind').write_bytes(b'file')
             (left / 'locked').write_bytes(b'left')
-            (right / 'locked').write_bytes(b'right')
+            (right / 'locked').write_bytes(b'test')
             results = []
-            with patch('filecmp.cmp', side_effect=PermissionError('test-locked')):
+            with patch('builtins.open', side_effect=PermissionError('test-locked')):
                 self.module._compare_directories(str(left), str(right), threading.Event(), results.append)
             states = {row[0]: row[1] for row in results}
             self.assertEqual(states['kind'], self.module.tr('类型不同'))
@@ -1872,25 +1867,26 @@ class InterfaceTests(unittest.TestCase):
             self.app.setFont(original_font)
             self.module._set_app_language(original_language)
 
-    def test_search_options_share_one_row_and_fit_narrow_window(self):
-        """所有勾选项在同一行显示；窄窗口中搜索、停止按钮互不重叠。"""
+    def test_search_options_fit_narrow_window_and_expose_active_filters(self):
+        """常用选项保留在主界面，高级选项按需展开，收起后仍有摘要。"""
         with patch_all('detect_everything', return_value=None):
             dialog = self.module.SearchDialog(str(ROOT))
         try:
             dialog.resize(640, 520)
             dialog.show()
             self.app.processEvents()
-            checkboxes = (dialog.search_filename_cb, dialog.search_content_cb, dialog.match_case_cb,
-                          dialog.match_whole_word_cb, dialog.use_everything_cb)
-            for checkbox in checkboxes:
+            self.assertFalse(dialog.match_case_cb.isVisible())
+            dialog.more_filters.click()
+            for checkbox in (dialog.search_filename_cb, dialog.search_content_cb, dialog.match_case_cb,
+                             dialog.match_whole_word_cb, dialog.use_regex_cb, dialog.use_everything_cb):
                 self.assertTrue(checkbox.isVisible())
-                self.assertEqual(checkbox.geometry().center().y(), checkboxes[0].geometry().center().y())
-            for left, right in zip(checkboxes, checkboxes[1:]):
-                self.assertLess(left.geometry().right(), right.geometry().left())
+                self.assertGreaterEqual(checkbox.width(), checkbox.sizeHint().width())
             dialog.match_case_cb.setChecked(True)
             dialog.match_whole_word_cb.setChecked(True)
             self.assertTrue(dialog.match_case_cb.isChecked())
             self.assertTrue(dialog.match_whole_word_cb.isChecked())
+            dialog.more_filters.click()
+            self.assertIn(dialog.match_case_cb.text(), dialog.filter_summary.text())
             self.app.processEvents()
             self.assertLess(dialog.search_input.geometry().right(), dialog.search_btn.geometry().left())
             self.assertLess(dialog.search_btn.geometry().right(), dialog.stop_btn.geometry().left())
@@ -1898,7 +1894,11 @@ class InterfaceTests(unittest.TestCase):
                 self.assertTrue(dialog.rect().contains(button.geometry()))
             self.assertFalse(dialog.search_btn.icon().isNull())
             self.assertFalse(dialog.stop_btn.icon().isNull())
+            self.assertEqual(dialog.file_type_input.text(), '')
+            dialog._rebuild_presets_menu()
+            next(a for a in dialog.presets_menu.actions() if a.text() == self.module.tr("工程源码（文件类型）")).trigger()
             self.assertEqual(dialog.file_type_input.text(), '*.c,*.h,*.xdm,*.arxml,*.xml')
+            self.assertIn('*.arxml', dialog.filter_summary.text())
         finally:
             dialog.close()
 
@@ -3536,45 +3536,52 @@ class SessionPersistenceTests(unittest.TestCase):
 
     def host(self, left, right=(), pinned=(), split_active=False, split_current=0):
         window = self.module.MainWindow
-        names = ('_collect_cached_tabs', '_collect_split_session', '_get_pinned_paths_from_config',
+        names = ('_get_pinned_paths_from_config',
                  '_normalize_path_for_compare', 'save_session_snapshot', '_get_last_active_tab_path',
                  '_restore_split_session')
         host = type('SessionHost', (), {name: getattr(window, name) for name in names})()
         host.config = {'pinned_tabs': list(pinned), 'enable_cache_tabs': True}
         host.tab_widget = Mock()
         host.tab_widget.count.return_value = len(left)
+        host.tab_widget.currentIndex.return_value = 0
         host.content_stack = self.stack(list(left))
         host._split_active = split_active
         host.split_tab_widget = Mock()
         host.split_tab_widget.count.return_value = len(right)
         host.split_tab_widget.currentIndex.return_value = split_current
         host.split_content_stack = self.stack(list(right))
+        host._all_groups = lambda: [(host.tab_widget, host.content_stack)] + (
+            [(host.split_tab_widget, host.split_content_stack)] if host._split_active else [])
         host.get_current_tab_widget = lambda: left[0] if left else None
         host.save_config = Mock()
         return host
 
     def test_cached_tabs_skip_pinned_and_keep_group_fields(self):
-        """会话只记录左侧非固定标签：按标记或配置路径（不区分大小写/尾部斜杠）排除固定标签，保留重复标签及分组信息。"""
+        """旧版缓存投影仅按固定标记排除，同路径的普通标签必须保留。"""
         tabs = [self.tab('C:\\Pinned', pinned=True), self.tab('C:\\Work', color='#E57373'), self.tab('c:\\pinned\\'),
                 self.tab('C:\\Work', color='#E57373'), self.tab(''), self.tab('shell:RecycleBinFolder')]
-        cached = self.host(tabs, pinned=[{'path': 'C:\\PINNED'}])._collect_cached_tabs()
-        self.assertEqual([item['path'] for item in cached], ['C:\\Work', 'C:\\Work', 'shell:RecycleBinFolder'])
+        host = self.host(tabs, pinned=[{'path': 'C:\\PINNED'}])
+        host.save_session_snapshot()
+        cached = host.config['cached_tabs']
+        self.assertEqual([item['path'] for item in cached], ['C:\\Work', 'c:\\pinned\\', 'C:\\Work', 'shell:RecycleBinFolder'])
         self.assertEqual(cached[0], {
             'path': 'C:\\Work', 'is_shell': False, 'bookmark_group_color': '#E57373',
             'tab_group_separator_after': True, 'tab_group_separator_color': '#E57373', 'tab_group_separator_name': 'G',
             'tab_group_name': '', 'tab_group_collapsed': False})
-        self.assertTrue(cached[2]['is_shell'])
+        self.assertTrue(cached[-1]['is_shell'])
 
     def test_split_session_only_when_active_and_index_clamped(self):
         """右侧分屏仅在开启时记录非固定标签，当前索引越界时收敛到有效范围。"""
         right = [self.tab('C:\\R1'), self.tab('C:\\R2', pinned=True)]
         host = self.host([self.tab('C:\\L')], right, split_active=True, split_current=5)
-        state = host._collect_split_session()
+        host.save_session_snapshot()
+        state = host.config['split_session']
         self.assertTrue(state['active'])
         self.assertEqual([item['path'] for item in state['tabs']], ['C:\\R1'])
         self.assertEqual(state['active_index'], 0)
         host._split_active = False
-        self.assertEqual(host._collect_split_session(), {'active': False, 'tabs': [], 'active_index': 0})
+        host.save_session_snapshot()
+        self.assertEqual(host.config['split_session'], {'active': False, 'tabs': [], 'active_index': 0})
 
     def test_snapshot_skips_unchanged_writes_except_immediate(self):
         """会话内容未变化时不重复写盘；关闭/启动时的立即保存始终写入；关闭标签缓存后不记录普通标签。"""

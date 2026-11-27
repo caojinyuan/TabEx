@@ -928,20 +928,40 @@ class SearchDialog(QDialog):
         self.search_content_cb.setChecked(True)  # 默认也选中
         type_options.addWidget(self.search_content_cb)
 
+        type_options.addStretch(1)
+        self.more_filters = QToolButton(self)
+        self.more_filters.setText(tr("更多筛选"))
+        self.more_filters.setCheckable(True)
+        type_options.addWidget(self.more_filters)
+        layout.addLayout(type_options)
+        self.filter_summary = QLabel(self)
+        self.filter_summary.setTextFormat(Qt.PlainText)
+        self.filter_summary.setWordWrap(True)
+        self.filter_summary.setMinimumWidth(0)
+        self.filter_summary.setMaximumHeight(2 * self.fontMetrics().lineSpacing() + 4)
+        layout.addWidget(self.filter_summary)
+        self.advanced_filters = QWidget(self)
+        advanced = QVBoxLayout(self.advanced_filters)
+        advanced.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.advanced_filters)
+        self.more_filters.toggled.connect(self.advanced_filters.setVisible)
+        self.advanced_filters.hide()
+        flags = QGridLayout()
+        advanced.addLayout(flags)
         self.match_case_cb = QCheckBox(tr("区分大小写"))
         self.match_case_cb.setToolTip(tr("区分大小写匹配文件名和文件内容"))
-        type_options.addWidget(self.match_case_cb)
+        flags.addWidget(self.match_case_cb, 0, 0)
 
         self.match_whole_word_cb = QCheckBox(tr("全词匹配"))
         self.match_whole_word_cb.setToolTip(tr("仅匹配完整单词，避免命中更长字符串的一部分"))
-        type_options.addWidget(self.match_whole_word_cb)
+        flags.addWidget(self.match_whole_word_cb, 0, 1)
 
         self.use_regex_cb = QCheckBox(tr("正则"))
         self.use_regex_cb.setToolTip(tr("按正则表达式匹配文件名和文件内容（Python 语法）"))
-        type_options.addWidget(self.use_regex_cb)
+        flags.addWidget(self.use_regex_cb, 1, 0)
         
         # Everything搜索选项
-        self.use_everything_cb = QCheckBox(tr("使用 Everything（不支持搜索文件内容）"))
+        self.use_everything_cb = QCheckBox("Everything")
         if self.everything_path:
             self.use_everything_cb.setChecked(True)  # 如果有Everything，默认启用
             self.use_everything_cb.setToolTip(tr("使用Everything搜索引擎\n路径: {}\n仅支持搜索文件名，不支持搜索文件内容").format(self.everything_path))
@@ -950,15 +970,7 @@ class SearchDialog(QDialog):
             self.use_everything_cb.setToolTip(tr("未检测到Everything，请从 https://www.voidtools.com/ 下载安装"))
         self.use_everything_cb.stateChanged.connect(self.on_everything_toggled)
         self.on_everything_toggled(self.use_everything_cb.isChecked())
-        type_options.addWidget(self.use_everything_cb)
-
-        # 手动轻量模式已移除；队列高压时仍自动降级元数据
-        type_options.addStretch(1)
-        # 窄窗口下允许复选框文字被压缩，而不是撑宽整个对话框
-        for checkbox in (self.search_filename_cb, self.search_content_cb, self.match_case_cb,
-                         self.match_whole_word_cb, self.use_regex_cb, self.use_everything_cb):
-            checkbox.setMinimumWidth(24)
-        layout.addLayout(type_options)
+        flags.addWidget(self.use_everything_cb, 1, 1)
         
         # 文件类型过滤
         file_type_layout = QHBoxLayout()
@@ -966,10 +978,9 @@ class SearchDialog(QDialog):
         self.file_type_input = QLineEdit()
         self.file_type_input.setClearButtonEnabled(True)
         self.file_type_input.setPlaceholderText(tr("例如: *.c,*.h,*.xml (留空表示搜索所有类型)"))
-        self.file_type_input.setText("*.c,*.h,*.xdm,*.arxml,*.xml")  # 默认值
         self.file_type_input.setStyleSheet("QLineEdit { padding: 5px; }")
         file_type_layout.addWidget(self.file_type_input)
-        layout.addLayout(file_type_layout)
+        advanced.addLayout(file_type_layout)
 
         scope_layout = QHBoxLayout()
         scope_layout.addWidget(QLabel(tr("搜索范围:")))
@@ -981,7 +992,7 @@ class SearchDialog(QDialog):
         self.exclusions_input.setPlaceholderText(tr("排除规则，如 build/;*.log;vendor/**"))
         self.exclusions_input.setClearButtonEnabled(True)
         scope_layout.addWidget(self.exclusions_input, 1)
-        layout.addLayout(scope_layout)
+        advanced.addLayout(scope_layout)
         self.scope_combo.setToolTip(tr("工程模式遵守 Git/ripgrep 忽略规则，排除隐藏项、依赖和构建目录；只返回文件"))
         self.exclusions_input.setToolTip(tr("规则相对于搜索目录；启用排除规则后只返回文件，需要 ripgrep"))
         self.scope_combo.currentIndexChanged.connect(self.on_scope_changed)
@@ -1014,8 +1025,15 @@ class SearchDialog(QDialog):
         self.presets_menu = QMenu(self.presets_btn)
         self.presets_menu.aboutToShow.connect(self._rebuild_presets_menu)
         self.presets_btn.setMenu(self.presets_menu)
-        filter_layout.addWidget(self.presets_btn)
-        layout.addLayout(filter_layout)
+        path_layout.addWidget(self.presets_btn)
+        advanced.addLayout(filter_layout)
+        for check in (self.use_regex_cb, self.match_case_cb, self.match_whole_word_cb, self.use_everything_cb):
+            check.toggled.connect(self._update_filter_summary)
+        for edit in (self.file_type_input, self.exclusions_input, self.min_size_input, self.max_size_input):
+            edit.textChanged.connect(self._update_filter_summary)
+        for combo in (self.scope_combo, self.modified_combo):
+            combo.currentIndexChanged.connect(self._update_filter_summary)
+        self._update_filter_summary()
         
         # 状态标签
         self.status_label = QLabel(tr("就绪"))
@@ -1070,6 +1088,7 @@ class SearchDialog(QDialog):
         self.match_preview.setMaximumHeight(110)
         self.match_preview.setPlaceholderText(tr("选择内容搜索结果查看匹配行"))
         layout.addWidget(self.match_preview)
+        self.match_preview.hide()
         self.open_match_button = QPushButton(tr("在 VS Code 中打开匹配行"), self)
         self.open_match_button.setEnabled(False)
         self.open_match_button.clicked.connect(self.open_match_in_editor)
@@ -1106,6 +1125,7 @@ class SearchDialog(QDialog):
         preview = result.get('preview', '')
         self.match_preview.setPlainText(
             (tr("第 {} 行").format(line) + '\n' if line else '') + preview)
+        self.match_preview.setVisible(bool(line or preview))
         self.open_match_button.setEnabled(bool(line))
 
     def open_match_in_editor(self):
@@ -1304,6 +1324,24 @@ class SearchDialog(QDialog):
         _search_cache.clear()
         debug_print(tr("[Search] 搜索缓存已清除"))
 
+    def _update_filter_summary(self):
+        parts = [self.file_type_input.text().strip() or tr("所有文件")]
+        if self.scope_combo.currentData():
+            parts.append(self.scope_combo.currentText())
+        if self.exclusions_input.text().strip():
+            parts.append(tr("排除：{}").format(self.exclusions_input.text().strip()))
+        for check in (self.match_case_cb, self.match_whole_word_cb, self.use_regex_cb, self.use_everything_cb):
+            if check.isChecked():
+                parts.append(check.text())
+        for prefix, edit in (('≥', self.min_size_input), ('≤', self.max_size_input)):
+            if edit.text().strip():
+                parts.append(prefix + edit.text().strip())
+        if self.modified_combo.currentData():
+            parts.append(self.modified_combo.currentText())
+        text = ' · '.join(parts)
+        self.filter_summary.setText(text)
+        self.filter_summary.setToolTip(Qt.convertFromPlainText(text))
+
     def _collect_search_filters(self):
         """读取大小/修改时间筛选；没有任何筛选时返回 None，大小无法识别时抛出 ValueError。"""
         min_size = parse_size_text(self.min_size_input.text())
@@ -1384,6 +1422,9 @@ class SearchDialog(QDialog):
     def _rebuild_presets_menu(self):
         menu = self.presets_menu
         clear_menu(menu)
+        menu.addAction(tr("所有文件"), lambda: self.file_type_input.clear())
+        menu.addAction(tr("工程源码（文件类型）"), lambda: self.file_type_input.setText('*.c,*.h,*.xdm,*.arxml,*.xml'))
+        menu.addSeparator()
         presets = self._search_presets()
         save_action = menu.addAction(tr("保存当前条件..."), self.save_search_preset)
         save_action.setEnabled(presets is not None)

@@ -622,9 +622,9 @@ class NavigationMixin:
         else:
             debug_print(f"[navigate_to] Path does not exist: {path}")
             self._sync_follow_target = None
-            if is_network_path(path):
-                # 盘符仍记录为网络驱动器但当前未连接
-                self._show_network_error(path, ERROR_CONNECTION_UNAVAIL)
+            # No Shell navigation was issued, so no failure callback will display the retry banner.
+            self._hide_loading_indicator()
+            self._show_network_error(path, ERROR_CONNECTION_UNAVAIL if is_network_path(path) else 0)
 
     def _is_slow_path(self, path):
         """检测OneDrive/网络/映射网络驱动器路径——这类路径上os.scandir()可能阻塞UI线程"""

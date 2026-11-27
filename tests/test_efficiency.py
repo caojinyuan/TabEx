@@ -71,6 +71,47 @@ class ProjectSearchTests(QtTests):
         all_files, _messages = self.run_search()
         self.assertEqual(all_files, set(self.names) - {'keep.log'})
 
+    def test_fresh_search_finds_firmware_logs_and_documents_and_preset_is_opt_in(self):
+        for ext in ('bin', 's19', 'pdf', 'log', 'c'):
+            (self.root / ('board.' + ext)).write_bytes(b'sample')
+        with patch.object(search, 'detect_everything', return_value=None):
+            dialog = search.SearchDialog(str(self.root))
+        self.addCleanup(dialog.close)
+        dialog.search_input.setCurrentText('board')
+        dialog.start_search()
+        self.wait_for(lambda: not dialog.is_searching)
+        self.assertEqual({Path(row['path']).suffix for row in dialog.result_model.snapshot_rows()},
+                         {'.bin', '.s19', '.pdf', '.log', '.c'})
+        dialog._rebuild_presets_menu()
+        next(a for a in dialog.presets_menu.actions() if a.text() == search.tr("工程源码（文件类型）")).trigger()
+        self.assertEqual(dialog.search_input.currentText(), 'board')
+        dialog.start_search()
+        self.wait_for(lambda: not dialog.is_searching)
+        self.assertEqual([Path(row['path']).suffix for row in dialog.result_model.snapshot_rows()], ['.c'])
+
+    def test_compact_search_keeps_room_for_results_and_full_labels_in_large_english_font(self):
+        old_font, old_language = self.qt.font(), i18n._app_language
+        self.addCleanup(self.qt.setFont, old_font)
+        self.addCleanup(i18n._set_app_language, old_language)
+        i18n._set_app_language('en')
+        self.qt.setFont(QFont('Microsoft YaHei UI', 14))
+        with patch.object(search, 'detect_everything', return_value=None):
+            dialog = search.SearchDialog(str(self.root))
+        self.addCleanup(dialog.close)
+        dialog.resize(640, 520)
+        dialog.show()
+        self.qt.processEvents()
+        self.assertEqual(dialog.width(), 640)
+        self.assertGreaterEqual(dialog.result_list.viewport().height(),
+                                4 * dialog.result_list.verticalHeader().defaultSectionSize())
+        dialog.more_filters.click()
+        self.qt.processEvents()
+        self.assertEqual(dialog.width(), 640)
+        for check in (dialog.search_filename_cb, dialog.search_content_cb, dialog.match_case_cb,
+                      dialog.match_whole_word_cb, dialog.use_regex_cb, dialog.use_everything_cb):
+            self.assertTrue(check.isVisible())
+            self.assertGreaterEqual(check.width(), check.sizeHint().width(), check.text())
+
     def test_exclusions_override_extension_include_in_all_mode(self):
         exclusions = search.parse_search_exclusions('build/;node_modules/;ignored.txt')
         files, _messages = self.run_search(exclusions=exclusions)
@@ -204,6 +245,7 @@ class CompareAndBasketTests(QtTests):
     def test_compare_filters_and_opens_exact_file_pair_without_copying(self):
         dialog = DirectoryCompareDialog(self.owner, str(self.left), str(self.right))
         self.addCleanup(dialog.deleteLater)
+        dialog._compared_roots = (str(self.left), str(self.right))  # fixture rows from a completed scan
         rows = [
             QTreeWidgetItem(['same.txt', search.tr('内容不同'), str(self.left / 'same.txt'), str(self.right / 'same.txt')]),
             QTreeWidgetItem(['only.txt', search.tr('仅左侧'), str(self.left / 'only.txt'), '']),
@@ -237,6 +279,86 @@ class CompareAndBasketTests(QtTests):
         self.panel._prune_finished_records(keep=records[3])
         self.assertEqual(self.panel.records, [records[1], records[2], records[3]])
         self.assertEqual(self.panel.table.topLevelItemCount(), 3)
+
+    def test_comparison_roots_stay_bound_through_confirmation_and_restart(self):
+        d = DirectoryCompareDialog(self.owner, str(self.left), str(self.right))
+        self.addCleanup(d.close)
+        d.start_compare()
+        self.wait_for(lambda: not d.running)
+        def select():
+            row = next(d.table.topLevelItem(i) for i in range(d.table.topLevelItemCount())
+                       if d.table.topLevelItem(i).text(0) == 'same.txt')
+            d.table.setCurrentItem(row)
+            self.assertTrue(d.copy_right_button.isEnabled())
+        select()
+        with patch.object(self.panel, 'start_task') as task, \
+                patch.object(QMessageBox, 'question', side_effect=lambda *a: (
+                    d.paths[1].setText(str(self.target)), QMessageBox.Yes)[1]):
+            d.copy_selected(True)
+            self.assertFalse(d.copy_right_button.isEnabled())
+            self.assertEqual(d.table.topLevelItemCount(), 0)
+            d.paths[1].setText(str(self.right))
+            d.copy_selected(True)
+            task.assert_not_called()
+        d.start_compare()
+        self.wait_for(lambda: not d.running)
+        select()
+
+    def test_repeat_compare_detects_changed_bytes_with_preserved_size_and_time(self):
+        from tabexplorer.fileops import _compare_directories
+        a, b = self.left / 'same.txt', self.right / 'same.txt'
+        for p in (a, b):
+            p.write_bytes(b'AAAA')
+        def changes():
+            rows = []
+            _compare_directories(str(self.left), str(self.right), threading.Event(), rows.append)
+            return {r[0] for r in rows}
+        self.assertNotIn(a.name, changes())
+        old = b.stat()
+        b.write_bytes(b'BBBB')
+        os.utime(b, ns=(old.st_atime_ns, old.st_mtime_ns))
+        self.assertIn(a.name, changes())
+
+    def test_checksum_ui_exports_relative_names_and_reports_changes_and_missing_files(self):
+        import hashlib
+        basket = FileBasketDialog(self.owner)
+        manifest = self.root / 'checksums.json'
+        paths = [self.left / 'same.txt', self.right / 'same.txt', self.left / 'only.txt']
+        paths[2].write_bytes(b'unchanged')
+        basket.add_paths([str(p) for p in paths])
+        self.assertFalse(manifest.exists())
+        with patch('tabexplorer.file_basket.QFileDialog.getSaveFileName', return_value=(str(manifest), '')):
+            basket.export_button.click()
+            self.wait_for(lambda: basket._checksum_worker is None)
+        self.assertTrue(manifest.is_file(), basket.checksum_report.toPlainText())
+        data = json.loads(manifest.read_bytes())
+        self.assertEqual(data['files'][0], {'path': 'left/same.txt', 'size': 4,
+                                           'sha256': hashlib.sha256(b'left').hexdigest()})
+        paths[0].write_bytes(b'LEFT')
+        paths[1].unlink()
+        with patch('tabexplorer.file_basket.QFileDialog.getOpenFileName', return_value=(str(manifest), '')):
+            basket.verify_button.click()
+            self.wait_for(lambda: basket._checksum_worker is None)
+        report = basket.checksum_report.toPlainText()
+        self.assertIn(search.tr("校验完成：通过 {}，失败 {}。").format(1, 2), report)
+        self.assertIn('left/same.txt', report)
+        self.assertIn('right/same.txt', report)
+
+    def test_cancelled_checksum_keeps_manifest_and_invalid_paths_are_rejected(self):
+        from tabexplorer import checksums
+        manifest = self.root / 'manifest.json'
+        manifest.write_bytes(b'previous manifest')
+        with self.assertRaises(InterruptedError):
+            checksums.export_manifest(manifest, [self.left / 'same.txt'], cancelled=lambda: True)
+        self.assertEqual(manifest.read_bytes(), b'previous manifest')
+        with self.assertRaises(ValueError):
+            checksums.export_manifest(manifest, [manifest])
+        with self.assertRaises(ValueError):
+            checksums.export_manifest(self.right / 'report.json', [self.left / 'same.txt'])
+        manifest.write_text(json.dumps({'format': checksums.FORMAT, 'files': [
+            {'path': '../out.txt', 'size': 0, 'sha256': 'a' * 64}]}))
+        with self.assertRaises(ValueError), patch.object(checksums, '_digest', side_effect=AssertionError):
+            checksums.verify_manifest(manifest)
 
     def test_basket_deduplicates_references_and_removal_never_deletes_files(self):
         basket = FileBasketDialog(self.owner)

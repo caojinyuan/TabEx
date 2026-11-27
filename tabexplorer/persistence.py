@@ -96,6 +96,7 @@ class ConfigStore(JsonFileStore):
             "pinned_tabs": [],  # 默认没有固定标签页
             "enable_cache_tabs": True,  # 默认启用缓存标签功能
             "cached_tabs": [],  # 缓存的非固定标签页
+            "tab_session": {},  # 按面板和索引保存的完整布局；空值回退到旧布局
             "last_active_tab_path": "",  # 最近一次激活的标签页路径
             "split_session": {"active": False, "tabs": [], "active_index": 0},  # 右侧分屏组会话（用于重启/崩溃恢复分屏）
             "enable_tortoisegit_buttons": False,  # 默认关闭TortoiseGit按钮
@@ -196,12 +197,18 @@ class SessionController:
     def _capture_named_workspace(self):
         window = self.window
         groups = []
+        active_group = 0
         for tab_widget, content_stack in window._all_groups():
             tabs = []
+            selected = 0
             for index in range(content_stack.count()):
                 tab = content_stack.widget(index)
                 if not getattr(tab, 'current_path', ''):
                     continue
+                if index == tab_widget.currentIndex():
+                    selected = len(tabs)
+                if tab is getattr(window, '_active_pane', None):
+                    active_group = len(groups)
                 tabs.append({
                     'path': tab.current_path,
                     'is_shell': tab.current_path.startswith('shell:'),
@@ -214,8 +221,20 @@ class SessionController:
                     'tab_group_collapsed': bool(getattr(tab, 'tab_group_collapsed', False)),
                 })
             if tabs:
-                groups.append({'tabs': tabs, 'active_index': tab_widget.currentIndex()})
-        return {'version': 1, 'groups': groups}
+                groups.append({'tabs': tabs, 'active_index': selected})
+        return {'version': 1, 'groups': groups, 'active_group': active_group}
+
+    @staticmethod
+    def valid_workspace(state):
+        if not isinstance(state, dict) or state.get('version', 1) != 1:
+            return False
+        groups = state.get('groups')
+        return (isinstance(groups, list) and 1 <= len(groups) <= 2
+                and all(isinstance(g, dict) and isinstance(g.get('tabs'), list)
+                        and isinstance(g.get('active_index', 0), int)
+                        and all(isinstance(t, dict) and isinstance(t.get('path'), str) and t['path'].strip()
+                                for t in g['tabs']) for g in groups)
+                and any(g['tabs'] for g in groups))
 
     def _get_pinned_paths_from_config(self):
         """兼容 pinned_tabs 的新旧格式，统一提取路径列表。"""
@@ -230,97 +249,17 @@ class SessionController:
                 paths.append(p)
         return paths
 
-    def _collect_cached_tabs(self):
-        window = self.window
-        cached_tabs = []
-        pinned_paths = window._get_pinned_paths_from_config()
-        pinned_norm = {
-            window._normalize_path_for_compare(p)
-            for p in pinned_paths if p
-        }
-
-        if not hasattr(window, 'tab_widget'):
-            return cached_tabs
-
-        # 仅收集左侧主标签组的非固定标签（右侧分屏组由 split_session 单独持久化，避免重复恢复）
-        cs = getattr(window, 'content_stack', None)
-        if cs is None:
-            return cached_tabs
-        for i in range(cs.count()):
-            tab = cs.widget(i)
-            if not tab or not hasattr(tab, 'current_path'):
-                continue
-            if getattr(tab, 'is_pinned', False):
-                continue
-
-            current_path = getattr(tab, 'current_path', '')
-            if not current_path:
-                continue
-
-            norm = window._normalize_path_for_compare(current_path)
-            if norm in pinned_norm:
-                continue
-            cached_tabs.append({
-                'path': current_path,
-                'is_shell': current_path.startswith('shell:'),
-                'bookmark_group_color': str(getattr(tab, 'bookmark_group_color', '') or ''),
-                'tab_group_separator_after': bool(getattr(tab, 'tab_group_separator_after', False)),
-                'tab_group_separator_color': str(getattr(tab, 'tab_group_separator_color', '') or ''),
-                'tab_group_separator_name': str(getattr(tab, 'tab_group_separator_name', '') or ''),
-                'tab_group_name': str(getattr(tab, 'tab_group_name', '') or ''),
-                'tab_group_collapsed': bool(getattr(tab, 'tab_group_collapsed', False)),
-            })
-
-        return cached_tabs
-
-    def _collect_split_session(self):
-        """收集右侧分屏组会话状态用于持久化恢复。
-
-        仅记录右侧组的非固定标签（固定标签统一在左侧恢复）。返回结构：
-        {"active": bool, "tabs": [{"path", "is_shell"}], "active_index": int}。"""
-        window = self.window
-        state = {"active": False, "tabs": [], "active_index": 0}
-        if not getattr(window, '_split_active', False):
-            return state
-        scs = getattr(window, 'split_content_stack', None)
-        stw = getattr(window, 'split_tab_widget', None)
-        if scs is None or stw is None or stw.count() == 0:
-            return state
-        pinned_paths = window._get_pinned_paths_from_config()
-        pinned_norm = {
-            window._normalize_path_for_compare(p)
-            for p in pinned_paths if p
-        }
-        tabs = []
-        for i in range(scs.count()):
-            tab = scs.widget(i)
-            if not tab or not hasattr(tab, 'current_path'):
-                continue
-            if getattr(tab, 'is_pinned', False):
-                continue
-            current_path = getattr(tab, 'current_path', '')
-            if not current_path:
-                continue
-            norm = window._normalize_path_for_compare(current_path)
-            if norm in pinned_norm:
-                continue
-            tabs.append({
-                'path': current_path,
-                'is_shell': current_path.startswith('shell:'),
-                'bookmark_group_color': str(getattr(tab, 'bookmark_group_color', '') or ''),
-                'tab_group_separator_after': bool(getattr(tab, 'tab_group_separator_after', False)),
-                'tab_group_separator_color': str(getattr(tab, 'tab_group_separator_color', '') or ''),
-                'tab_group_separator_name': str(getattr(tab, 'tab_group_separator_name', '') or ''),
-                'tab_group_name': str(getattr(tab, 'tab_group_name', '') or ''),
-                'tab_group_collapsed': bool(getattr(tab, 'tab_group_collapsed', False)),
-            })
-        if not tabs:
-            return state
-        state["active"] = True
-        state["tabs"] = tabs
-        idx = stw.currentIndex()
-        state["active_index"] = max(0, min(idx, len(tabs) - 1))
-        return state
+    @staticmethod
+    def _legacy_pane(groups, index):
+        tabs, selected = [], 0
+        if index < len(groups):
+            group = groups[index]
+            for i, tab in enumerate(group['tabs']):
+                if not tab['is_pinned']:
+                    if i == group['active_index']:
+                        selected = len(tabs)
+                    tabs.append({k: v for k, v in tab.items() if k != 'is_pinned'})
+        return {'active': bool(tabs), 'tabs': tabs, 'active_index': selected}
 
     def _get_last_active_tab_path(self):
         window = self.window
@@ -399,30 +338,30 @@ class SessionController:
         window = self.window
         if not hasattr(window, 'config') or not hasattr(window, 'tab_widget'):
             return
+        if getattr(window, '_startup_session_pending', False) or getattr(window, '_restoring_tab_batch', False):
+            return
 
         try:
             import time
             window._last_snapshot_save_time_ms = int(time.monotonic() * 1000)
-            cached_tabs = []
-            split_session = {"active": False, "tabs": [], "active_index": 0}
-            if window.config.get("enable_cache_tabs", True):
-                cached_tabs = window._collect_cached_tabs()
-                split_session = window._collect_split_session()
+            session = self._capture_named_workspace() if window.config.get("enable_cache_tabs", True) else {}
 
             new_active = window._get_last_active_tab_path()
 
             # 快照内容无变化时跳过写盘，避免无意义IO和日志刷屏
             # 使用 JSON 签名比较，避免 list/dict 对象引用差异导致误判
             import json as _json
-            _sig = (_json.dumps(cached_tabs, sort_keys=True, ensure_ascii=False)
-                    + '|' + new_active
-                    + '|' + _json.dumps(split_session, sort_keys=True, ensure_ascii=False))
+            _sig = _json.dumps(session, sort_keys=True, ensure_ascii=False) + '|' + new_active
             # immediate=True 用于关闭/初始化等关键时机，必须确保落盘，因此绕过签名去重
             if not immediate and _sig == getattr(window, '_last_snapshot_sig', ''):
                 return
             window._last_snapshot_sig = _sig
 
-            window.config["cached_tabs"] = cached_tabs
+            groups = session.get('groups', [])
+            cached_tabs = self._legacy_pane(groups, 0)['tabs']
+            split_session = self._legacy_pane(groups, 1)
+            window.config["tab_session"] = session
+            window.config["cached_tabs"] = cached_tabs  # projection for older versions
             window.config["last_active_tab_path"] = new_active
             window.config["split_session"] = split_session
             window.save_config(immediate=immediate)

@@ -406,6 +406,21 @@ def _media_information(path):
     return fields + extra, notice
 
 
+def _read_image(path, original=False):
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.isValid() and size.width() * size.height() > 80_000_000:
+        raise PreviewError(tr("图片过大，无法预览。"))
+    if not original and size.isValid() and max(size.width(), size.height()) > 3000:
+        size.scale(QSize(3000, 3000), Qt.KeepAspectRatio)
+        reader.setScaledSize(size)
+    image = reader.read()
+    if image.isNull():
+        raise PreviewError(tr("无法读取图片：{}").format(reader.errorString()))
+    return image
+
+
 def load_preview(path):
     """Return (kind, content, notice); never execute or modify the selected file."""
     if os.path.isdir(path):
@@ -431,18 +446,7 @@ def load_preview(path):
         rows, notice = read_records(path, ext in SREC_EXTENSIONS)
         return 'records', rows, notice
     if ext in IMAGE_EXTENSIONS:
-        reader = QImageReader(path)
-        reader.setAutoTransform(True)
-        size = reader.size()
-        if size.isValid() and size.width() * size.height() > 80_000_000:
-            raise PreviewError(tr("图片过大，无法预览。"))
-        if size.isValid() and max(size.width(), size.height()) > 3000:
-            size.scale(QSize(3000, 3000), Qt.KeepAspectRatio)
-            reader.setScaledSize(size)
-        image = reader.read()
-        if image.isNull():
-            raise PreviewError(tr("无法读取图片：{}").format(reader.errorString()))
-        return 'image', image, ''
+        return 'image', _read_image(path), ''
     if ext in ('.xls', '.xlsx', '.xlsm', '.xltx', '.xltm'):
         return 'sheet', _spreadsheet(path, ext), tr("只显示单元格内容；样式、图表和图片可能不同。")
     if ext == '.xlsb':
@@ -693,6 +697,10 @@ class PreviewDialog(QDialog):
         self.hex_offset.returnPressed.connect(self._jump_hex)
         go.clicked.connect(self._jump_hex)
         controls.addWidget(self.hex_tools)
+        self.image_zoom = QPushButton('100%', self.controls)
+        self.image_zoom.setToolTip(tr("双击图片切换适应窗口与原始大小"))
+        self.image_zoom.clicked.connect(self._toggle_image_zoom)
+        controls.addWidget(self.image_zoom)
         controls.addStretch()
         layout.addWidget(self.controls)
         self.controls.hide()
@@ -767,6 +775,12 @@ class PreviewDialog(QDialog):
         self._thread.start()
 
     def eventFilter(self, obj, event):
+        if self._kind == 'image' and obj in (self.image, self.image_scroll.viewport()):
+            if event.type() == QEvent.MouseButtonDblClick and event.button() == Qt.LeftButton:
+                self._toggle_image_zoom()
+                return True
+            if event.type() == QEvent.Resize and obj is self.image_scroll.viewport():
+                self._size_image()
         if event.type() == QEvent.KeyPress:
             if event.key() == Qt.Key_Escape:
                 self.close()
@@ -801,7 +815,8 @@ class PreviewDialog(QDialog):
         self.wrap.setVisible(kind in ('text', 'code'))
         self.wrap.setChecked(kind == 'text')
         self.errors_only.setVisible(kind == 'records')
-        self.controls.setVisible(kind in ('hex', 'sheet', 'pdf'))
+        self.controls.setVisible(kind in ('hex', 'sheet', 'pdf', 'image'))
+        self.image_zoom.setVisible(kind == 'image')
         self.hex_tools.setVisible(kind == 'hex')
         self.sheets.setVisible(kind == 'sheet')
         for widget in (self.pdf_previous, self.pdf_page, self.pdf_next, self.pdf_smaller,
@@ -814,7 +829,15 @@ class PreviewDialog(QDialog):
                 image, self._pdf_count, actual_zoom = content
                 self._update_pdf_page_label(actual_zoom)
             self.image.setPixmap(QPixmap.fromImage(image))
+            if kind == 'image':
+                self._image_fitted = True
+                self._image_full_size = max(image.width(), image.height()) < 3000
+                self.image_scroll.setWidgetResizable(False)
+                self.image_scroll.setAlignment(Qt.AlignCenter)
+                self.image.setScaledContents(True)
             self.image_scroll.show()
+            if kind == 'image':
+                self._size_image()
         elif kind == 'sheet':
             self.text.hide()
             self._sheets = content
@@ -861,6 +884,47 @@ class PreviewDialog(QDialog):
             self.info_panel.show()
         else:
             self.text.setPlainText(content)
+
+    def _size_image(self):
+        pixmap = self.image.pixmap()
+        if pixmap is None:
+            return
+        fit = self._image_fitted
+        policy = Qt.ScrollBarAlwaysOff if fit else Qt.ScrollBarAsNeeded
+        self.image_scroll.setHorizontalScrollBarPolicy(policy)
+        self.image_scroll.setVerticalScrollBarPolicy(policy)
+        size = pixmap.size()
+        viewport = self.image_scroll.viewport().size()
+        if fit and (size.width() > viewport.width() or size.height() > viewport.height()):
+            size.scale(viewport, Qt.KeepAspectRatio)
+        self.image.resize(size)
+        self.image_zoom.setText('100%' if fit else tr("适应窗口"))
+
+    def _toggle_image_zoom(self):
+        if not self.image_zoom.isEnabled():
+            return
+        if self._image_fitted and not self._image_full_size:
+            self.image_zoom.setEnabled(False)
+            self.status.setText(tr("正在加载预览…"))
+            self._original_loader = _PageLoader()
+            self._original_loader.completed.connect(self._original_ready)
+            self._original_loader.failed.connect(self._original_failed)
+            threading.Thread(target=self._original_loader.run, args=(_read_image, self._path, (True,)), daemon=True).start()
+        else:
+            self._image_fitted = not self._image_fitted
+            self._size_image()
+
+    def _original_ready(self, _request, image):
+        self.image.setPixmap(QPixmap.fromImage(image))
+        self._image_full_size = True
+        self._image_fitted = False
+        self.image_zoom.setEnabled(True)
+        self._size_image()
+        self.status.setText('')
+
+    def _original_failed(self, _request, error):
+        self.image_zoom.setEnabled(True)
+        self.status.setText(tr("预览失败：{}").format(error))
 
     def _show_records(self, rows):
         self.text.hide()

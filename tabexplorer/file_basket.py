@@ -2,14 +2,41 @@
 
 import os
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
-    QApplication, QDialog, QGridLayout, QLabel, QMessageBox, QPushButton, QTreeWidget,
+    QApplication, QDialog, QFileDialog, QGridLayout, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout,
 )
 
 from .i18n import tr
 from .widgets import show_toast
+from .checksums import export_manifest, verify_manifest
+from .system import _retain_thread_until_finished
+
+
+class _ChecksumWorker(QThread):
+    result = pyqtSignal(str)
+
+    def __init__(self, manifest, paths):
+        super().__init__()
+        self.manifest = manifest
+        self.paths = paths
+
+    def run(self):
+        try:
+            if self.paths is not None:
+                count = export_manifest(self.manifest, self.paths, self.isInterruptionRequested)
+                message = tr("已导出 {} 个文件：{}").format(count, self.manifest)
+            else:
+                count, failures = verify_manifest(self.manifest, self.isInterruptionRequested)
+                message = tr("校验完成：通过 {}，失败 {}。").format(count - len(failures), len(failures))
+                if failures:
+                    message += '\n' + '\n'.join(failures)
+        except InterruptedError:
+            message = tr("已取消")
+        except (OSError, ValueError, RecursionError) as error:
+            message = tr("校验清单操作失败：{}").format(error)
+        self.result.emit(message)
 
 
 class FileBasketDialog(QDialog):
@@ -41,6 +68,21 @@ class FileBasketDialog(QDialog):
             controls.addWidget(button, index // 2, index % 2)
             setattr(self, attr, button)
         layout.addLayout(controls)
+        self._checksum_worker = None
+        self.export_button = QPushButton(tr("导出 SHA-256 清单…"), self)
+        self.verify_button = QPushButton(tr("校验 SHA-256 清单…"), self)
+        self.cancel_hash = QPushButton(tr("取消校验"), self)
+        self.export_button.clicked.connect(self._choose_export)
+        self.verify_button.clicked.connect(self._choose_verify)
+        self.cancel_hash.clicked.connect(self.cancel_checksum)
+        controls.addWidget(self.export_button, 2, 0)
+        controls.addWidget(self.verify_button, 2, 1)
+        controls.addWidget(self.cancel_hash, 3, 0, 1, 2)
+        self.checksum_report = QPlainTextEdit(self)
+        self.checksum_report.setReadOnly(True)
+        self.checksum_report.setMaximumHeight(120)
+        self.checksum_report.hide()
+        layout.addWidget(self.checksum_report)
         self.table.itemSelectionChanged.connect(self.update_controls)
         self.update_controls()
 
@@ -81,6 +123,49 @@ class FileBasketDialog(QDialog):
         for button in (self.copy_button, self.paths_button, self.clear_button):
             button.setEnabled(count > 0)
         self.remove_button.setEnabled(selected > 0)
+        busy = self._checksum_worker is not None
+        self.export_button.setEnabled(not busy and count > 0)
+        self.verify_button.setEnabled(not busy)
+        self.cancel_hash.setVisible(busy)
+
+    def _choose_export(self):
+        paths = self.selected_or_all_paths()
+        try:
+            parent = os.path.commonpath([os.path.dirname(p) for p in paths])
+        except ValueError:
+            show_toast(self, tr("文件收集篮"), tr("请将清单保存到所有所选文件的共同上级目录。"), level='warning')
+            return
+        name, _ = QFileDialog.getSaveFileName(self, tr("导出 SHA-256 清单…"),
+                                              os.path.join(parent, 'SHA256.json'), 'JSON (*.json)')
+        if name:
+            self._start_checksum(name, paths)
+
+    def _choose_verify(self):
+        name, _ = QFileDialog.getOpenFileName(self, tr("校验 SHA-256 清单…"), '', 'JSON (*.json)')
+        if name:
+            self._start_checksum(name, None)
+
+    def _start_checksum(self, manifest, paths):
+        if self._checksum_worker is not None:
+            return
+        worker = self._checksum_worker = _ChecksumWorker(manifest, paths)
+        worker.result.connect(self.checksum_report.setPlainText)
+        worker.finished.connect(self._checksum_finished)
+        self.checksum_report.setPlainText(tr("正在计算 SHA-256…"))
+        self.checksum_report.show()
+        self.update_controls()
+        worker.start()
+        _retain_thread_until_finished(worker)
+
+    def _checksum_finished(self):
+        self._checksum_worker = None
+        self.update_controls()
+
+    def cancel_checksum(self):
+        if self._checksum_worker is not None:
+            self._checksum_worker.requestInterruption()
+            return True
+        return False
 
     def remove_selected(self):
         for item in self.table.selectedItems():

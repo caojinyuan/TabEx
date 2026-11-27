@@ -927,7 +927,15 @@ def _swap_filenames(paths):
 
 
 def _compare_directories(left_root, right_root, cancel_event, emit):
-    import filecmp
+    def equal_contents(left, right):
+        with open(left, 'rb') as a, open(right, 'rb') as b:
+            while not cancel_event.is_set():
+                chunk = a.read(1024 * 1024)
+                if chunk != b.read(1024 * 1024):
+                    return False
+                if not chunk:
+                    return True
+        return False
 
     def scan(root):
         if not os.path.isdir(root):
@@ -976,7 +984,9 @@ def _compare_directories(left_root, right_root, cancel_event, emit):
         else:
             try:
                 before_left, before_right = os.stat(left[2]), os.stat(right[2])
-                same = filecmp.cmp(left[2], right[2], shallow=False)
+                same = before_left.st_size == before_right.st_size and equal_contents(left[2], right[2])
+                if cancel_event.is_set():
+                    return
                 after_left, after_right = os.stat(left[2]), os.stat(right[2])
                 signatures = lambda info: (info.st_size, info.st_mtime_ns)
                 if signatures(before_left) != signatures(after_left) or signatures(before_right) != signatures(after_right):
@@ -1059,6 +1069,8 @@ class DirectoryCompareDialog(QDialog):
         self.resize(900, 500)
         self.cancel_event = threading.Event()
         self.results = None
+        self._compared_roots = None
+        self._scan_roots = None
         self.running = False
         layout = QVBoxLayout(self)
         self.paths = []
@@ -1132,6 +1144,17 @@ class DirectoryCompareDialog(QDialog):
         self.timer = QTimer(self)
         self.timer.setInterval(60)
         self.timer.timeout.connect(self.consume_results)
+        for edit in self.paths:
+            edit.textChanged.connect(self._invalidate_comparison)
+        self.update_diff_action()
+
+    def _invalidate_comparison(self):
+        if self.running:
+            self.stop_compare()
+        self._scan_roots = self._compared_roots = None
+        self.table.clear()
+        self.status.setText(tr("目录已更改，请重新比较。"))
+        self.update_diff_action()
 
     def browse(self, target):
         from PyQt5.QtWidgets import QFileDialog
@@ -1145,6 +1168,9 @@ class DirectoryCompareDialog(QDialog):
         left, right = [edit.text().strip() for edit in self.paths]
         if not left or not right:
             return
+        left, right = os.path.abspath(left), os.path.abspath(right)
+        self._compared_roots = None
+        self._scan_roots = (left, right)
         self.cancel_event = threading.Event()
         self.results = _SearchResultQueue(self.cancel_event)
         cancel_event, results = self.cancel_event, self.results
@@ -1171,6 +1197,8 @@ class DirectoryCompareDialog(QDialog):
         self.timer.start()
 
     def consume_results(self):
+        if not self.running:
+            return
         for _index in range(100):
             try:
                 kind, payload = self.results.get_nowait()
@@ -1183,6 +1211,7 @@ class DirectoryCompareDialog(QDialog):
                 self.table.addTopLevelItem(row)
                 row.setHidden(not self._matches_difference(row))
             else:
+                self._compared_roots = self._scan_roots if kind == 'done' else None
                 self.running = False
                 self.timer.stop()
                 self.start_button.setEnabled(True)
@@ -1193,6 +1222,7 @@ class DirectoryCompareDialog(QDialog):
 
     def stop_compare(self):
         self.cancel_event.set()
+        self._compared_roots = None
         self.running = False
         self.timer.stop()
         self.start_button.setEnabled(True)
@@ -1215,7 +1245,10 @@ class DirectoryCompareDialog(QDialog):
 
     def update_diff_action(self):
         rows = [item for item in self.table.selectedItems() if not item.isHidden()]
-        available = (not self.running and len(rows) == 1 and rows[0].text(1) == tr("内容不同")
+        valid = self._compared_roots is not None and not self.running
+        self.copy_left_button.setEnabled(valid and any(r.text(1) in (tr("仅右侧"), tr("内容不同")) for r in rows))
+        self.copy_right_button.setEnabled(valid and any(r.text(1) in (tr("仅左侧"), tr("内容不同")) for r in rows))
+        available = (valid and len(rows) == 1 and rows[0].text(1) == tr("内容不同")
                      and bool(rows[0].text(2) and rows[0].text(3)))
         self.view_diff_button.setEnabled(available)
         self.view_diff_button.setToolTip(tr("选择一个两侧均存在且内容不同的文件") if not available
@@ -1229,7 +1262,7 @@ class DirectoryCompareDialog(QDialog):
         row = next(item for item in self.table.selectedItems() if not item.isHidden())
         launch_context_tool(self, self.compare_tool_combo.currentData(), ToolContext(
             cwd=os.path.dirname(row.text(2)), selected=(row.text(2), row.text(3)),
-            left=self.paths[0].text(), right=self.paths[1].text()))
+            left=self._compared_roots[0], right=self._compared_roots[1]))
 
     def open_item(self, item, column):
         path = item.text(3 if column == 3 else 2) or item.text(3)
@@ -1239,14 +1272,15 @@ class DirectoryCompareDialog(QDialog):
     def copy_selected(self, to_right):
         """把选中的差异项复制到另一侧：内容不同的先把目标旧文件移入回收站，再复制。"""
         from PyQt5.QtWidgets import QMessageBox
-        if self.running:
+        roots = self._compared_roots
+        if self.running or roots is None:
             return
         rows = [tuple(item.text(column) for column in range(4))
                 for item in self.table.selectedItems() if not item.isHidden()]
         if not rows:
             show_toast(self, tr("目录同步"), tr("请先在比较结果中选择要复制的项"), level="info")
             return
-        left, right = [edit.text().strip() for edit in self.paths]
+        left, right = roots
         copies, replaced, skipped = plan_compare_copy(rows, left, right, to_right)
         total = sum(len(sources) for sources in copies.values())
         if not total:
@@ -1261,6 +1295,8 @@ class DirectoryCompareDialog(QDialog):
         if QMessageBox.question(self, tr("目录同步"), message + '\n' + tr("是否继续？"),
                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
+        if self._compared_roots is not roots:
+            return  # The confirmation runs a nested event loop.
         owner = self.parent()
         if replaced:
             worker = owner.get_file_task_panel().start_task('delete', replaced)

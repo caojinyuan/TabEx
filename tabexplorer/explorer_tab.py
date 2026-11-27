@@ -43,12 +43,12 @@ if HAS_PYWIN:
 DIR_SNAPSHOT_MAX_ENTRIES = 5000
 
 
-def _compute_dir_snapshot(path, ignore_check=None):
+def _compute_dir_snapshot(path):
     """计算目录轻量元数据快照 (count, latest_mtime_ns, size_sum, name_hash)，失败返回 None。
 
-    纯 I/O + 计算，不触碰任何 Qt 对象，可安全在后台线程（QRunnable）中执行。
-    ignore_check(path, name) 用于忽略应用自身写出的配置/日志文件（可为 None）。"""
+    纯 I/O + 计算，不触碰任何 Qt 对象，可安全在后台线程（QRunnable）中执行。"""
     try:
+        internal_dir = os.path.normcase(os.path.normpath(path)) == os.path.normcase(os.path.normpath(get_app_base_dir()))
         count = 0
         latest_mtime_ns = 0
         size_sum = 0
@@ -56,8 +56,10 @@ def _compute_dir_snapshot(path, ignore_check=None):
         truncated = False
         with os.scandir(path) as entries:
             for entry in entries:
-                if ignore_check is not None and ignore_check(path, entry.name):
-                    continue
+                if internal_dir:
+                    name = entry.name.lower()
+                    if name in APP_INTERNAL_CHANGE_FILENAMES or name.startswith('config.json.'):
+                        continue
                 count += 1
                 if count > DIR_SNAPSHOT_MAX_ENTRIES:
                     # 超大目录：停止逐项 stat，仍继续累计总数，配合目录自身 mtime 兜底
@@ -98,15 +100,14 @@ class _DirSnapshotRunnable(QRunnable):
     """在 QThreadPool 后台线程计算目录快照，完成后经信号回到 UI 线程比较。
 
     用于 FileExplorerTab 的 8 秒兜底轮询，避免在 UI 线程逐项 stat 造成周期性卡顿。"""
-    def __init__(self, path, ignore_check, signals, generation=0):
+    def __init__(self, path, signals, generation=0):
         super().__init__()
         self._path = path
-        self._ignore_check = ignore_check
         self._signals = signals
         self._generation = generation
 
     def run(self):
-        snap = _compute_dir_snapshot(self._path, self._ignore_check)
+        snap = _compute_dir_snapshot(self._path)
         try:
             self._signals.done.emit(self._path, snap, self._generation)
         except RuntimeError:
@@ -159,26 +160,9 @@ class FileExplorerTab(QWidget, NavigationMixin):
         try:
             if not path or self._is_slow_path(path):
                 return None
-            return _compute_dir_snapshot(path, self._should_ignore_internal_dir_entry)
+            return _compute_dir_snapshot(path)
         except Exception:
             return None
-
-    def _should_ignore_internal_dir_entry(self, dir_path, entry_name):
-        try:
-            if not dir_path or not entry_name:
-                return False
-            app_base_dir = os.path.normcase(os.path.normpath(get_app_base_dir()))
-            current_dir = os.path.normcase(os.path.normpath(dir_path))
-            if current_dir != app_base_dir:
-                return False
-            entry_name_lower = str(entry_name).lower()
-            if entry_name_lower in APP_INTERNAL_CHANGE_FILENAMES:
-                return True
-            if entry_name_lower.startswith('config.json.'):
-                return True
-        except Exception:
-            return False
-        return False
 
     def _refresh_file_watch_paths(self, path):
         """同步当前目录下的文件 watcher，提升对文件内容修改的检测能力。"""
@@ -3004,7 +2988,7 @@ class FileExplorerTab(QWidget, NavigationMixin):
                 self._snapshot_signals.done.connect(self._on_dir_snapshot_ready)
             self._snapshot_inflight = True
             runnable = _DirSnapshotRunnable(
-                path, self._should_ignore_internal_dir_entry, self._snapshot_signals,
+                path, self._snapshot_signals,
                 getattr(self, '_snapshot_generation', 0))
             QThreadPool.globalInstance().start(runnable)
         except Exception as e:
