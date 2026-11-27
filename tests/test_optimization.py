@@ -11,7 +11,7 @@ import zipfile
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QEvent, Qt, QTimer
 from PyQt5.QtWidgets import QApplication, QWidget
 
 from tabexplorer.bookmarks import BookmarkManager
@@ -20,6 +20,7 @@ from tabexplorer.frequent import FrequentDirs
 from tabexplorer.json_store import JsonFileStore, _preserve_unreadable_file
 from tabexplorer.persistence import ConfigStore
 from tabexplorer.explorer_tab import FileExplorerTab
+from tabexplorer.mainwindow import MainWindow
 from tabexplorer.paths import translate_common_path
 from tabexplorer.shellview import IExplorerBrowserWidget
 from tabexplorer import debuglog
@@ -192,7 +193,8 @@ class NavigationOrderingTests(unittest.TestCase):
         host.explorer = Mock()
         host._is_mycomputer_shell_target = lambda _path: False
         for name in ('_show_loading_indicator', '_hide_loading_indicator', '_show_network_error',
-                     '_mark_expected_navigation', 'update_tab_title', '_add_to_history', 'update_explorer_status'):
+                     '_mark_expected_navigation', '_resume_path_sync_after_navigation', 'update_tab_title',
+                     '_add_to_history', 'update_explorer_status'):
             setattr(host, name, Mock())
         for name in ('_normalize_local_path', '_release_folder_checker', '_check_folder_size_async',
                      '_on_folder_size_checked', '_is_slow_path', 'navigate_to', '_on_navigation_failed',
@@ -296,6 +298,97 @@ class NavigationOrderingTests(unittest.TestCase):
                 FileExplorerTab.on_path_bar_changed(host, path)
                 host.navigate_to.assert_called_once_with(path)
                 self.assertEqual(translate_common_path(path), path)
+
+
+class SessionRestoreWorkTests(unittest.TestCase):
+    """真实标签栈与导航流程；拦截原生浏览、Git 查询和目录快照，不接管桌面或读取用户配置。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.qt = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        stack.enter_context(patch.dict(os.environ, TABEX_DATA_DIR=str(root)))
+        self.paths = [str(root / f'work-{i}') for i in range(18)]
+        for path in self.paths:
+            Path(path).mkdir()
+        self.left = self.paths[1:] + [self.paths[1]]
+        self.right = ['shell:RecycleBinFolder', 'shell:Desktop']
+        config = {
+            'pinned_tabs': [self.paths[0]], 'enable_cache_tabs': True,
+            'cached_tabs': [{'path': p, 'bookmark_group_color': '#64B5F6'} for p in self.left],
+            'last_active_tab_path': self.paths[-1],
+            'split_session': {'active': True, 'active_index': 1, 'tabs': [
+                {'path': p, 'is_shell': True} for p in self.right]},
+            'auto_update_check': False, 'enable_explorer_monitor': False,
+            'enable_title_shortcuts': False, 'hotkeys': {'screenshot': False}, 'named_workspaces': {},
+        }
+        (root / 'config').mkdir()
+        (root / 'config' / 'config.json').write_text(json.dumps(config), encoding='utf-8')
+        stack.enter_context(patch.object(BookmarkManager, 'save_bookmarks', return_value=True))
+        stack.enter_context(patch.object(MainWindow, '_start_shortcut_listener'))
+        stack.enter_context(patch.object(MainWindow, '_repair_startup_shortcut'))
+        stack.enter_context(patch('tabexplorer.navigation.ASYNC_LOAD_ENABLED', False))
+        stack.enter_context(patch.object(FileExplorerTab, '_request_dir_snapshot'))
+        self.browse = stack.enter_context(patch.object(IExplorerBrowserWidget, '_navigate', autospec=True))
+        self.git = stack.enter_context(patch.object(FileExplorerTab, '_request_git_status_async', autospec=True))
+        # Drive initialization explicitly, both before and after the window is shown.
+        with patch.object(MainWindow, '_delayed_initialization', lambda self: None):
+            self.window = MainWindow()
+        self.window.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.addCleanup(self.dispose)
+
+    def dispose(self):
+        self.window.close()
+        self.window.deleteLater()
+        self.qt.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def browsed(self):
+        return [call.args[1] for call in self.browse.call_args_list]
+
+    def test_restore_loads_only_selected_pages_then_browses_once_on_first_switch(self):
+        w = self.window
+        w.show()
+        with patch.object(w, 'populate_bookmark_bar_menu', wraps=w.populate_bookmark_bar_menu) as menu:
+            w._delayed_initialization()
+            menu.assert_called_once()
+        self.assertEqual(self.browsed(), [self.paths[-1], self.right[1]])
+        self.assertEqual({call.args[1] for call in self.git.call_args_list}, {self.paths[-1]})
+        saved = w._capture_named_workspace()['groups']
+        self.assertEqual([t['path'] for t in saved[0]['tabs']], [self.paths[0], *self.left])
+        self.assertEqual([t['path'] for t in saved[1]['tabs']], self.right)
+        self.assertTrue(saved[0]['tabs'][0]['is_pinned'])
+        self.assertEqual(saved[0]['tabs'][1]['bookmark_group_color'], '#64B5F6')
+        self.assertEqual([g['active_index'] for g in saved], [len(self.paths) - 1, 1])
+        w.tab_widget.setCurrentIndex(0)
+        w.tab_widget.setCurrentIndex(2)
+        w.tab_widget.setCurrentIndex(0)
+        self.assertEqual(self.browsed()[2:], [self.paths[0], self.paths[2]])
+        unused = w.content_stack.widget(3)
+        self.assertFalse(hasattr(unused, 'explorer'))
+        w.close_tab(3)
+        self.assertNotIn(self.paths[3], self.browsed())
+
+    def test_hidden_restore_fallback_and_workspace_switch_skip_transient_pages(self):
+        w = self.window
+        w.config['last_active_tab_path'] = ''
+        w._delayed_initialization()
+        self.browse.assert_not_called()
+        self.git.assert_not_called()
+        w.show()
+        self.assertCountEqual(self.browsed(), [self.paths[0], self.right[1]])
+        w.config['named_workspaces']['two'] = {'groups': [
+            {'active_index': 2, 'tabs': [{'path': p} for p in self.paths[:5]]},
+            {'active_index': 1, 'tabs': [{'path': p} for p in self.paths[5:8]]}]}
+        self.browse.reset_mock()
+        with patch.object(w, 'populate_bookmark_bar_menu', wraps=w.populate_bookmark_bar_menu) as menu:
+            self.assertTrue(w.switch_named_workspace('two'))
+            menu.assert_called_once()
+        self.assertEqual(self.browsed(), [self.paths[2], self.paths[6]])
+        self.assertEqual((w.tab_widget.count(), w.split_tab_widget.count()), (5, 3))
 
 
 class DebugLogRotationTests(unittest.TestCase):

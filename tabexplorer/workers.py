@@ -92,7 +92,8 @@ class GitStatusWorker(QThread):
     def run(self):
         try:
             result = subprocess.run(
-                [self.git_exe, 'status', '--porcelain=v1', '-b', '--untracked-files=normal'],
+                # 状态栏仅读状态，不写回索引触发 TortoiseGit 等文件监听器。
+                [self.git_exe, '--no-optional-locks', 'status', '--porcelain=v1', '-b', '--untracked-files=normal'],
                 cwd=self.repo_root,
                 capture_output=True, text=True, timeout=3,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000),

@@ -530,6 +530,15 @@ class NavigationMixin:
             pass
 
     def navigate_to(self, path, is_shell=False, add_to_history=True, skip_async_check=False):
+        deferred = getattr(self, '_deferred_nav', None)
+        if deferred is not None:
+            # 原生子控件的构造可能触发 showEvent；先消费请求，避免首次导航重入。
+            self._deferred_nav = None
+            try:
+                self.setup_ui()
+            except RuntimeError:
+                self._deferred_nav = deferred
+                raise
         if not is_shell:
             path = self._normalize_local_path(path)
         debug_print(f"[navigate_to] To '{path}' (is_shell={is_shell}, skip_async={skip_async_check})")
@@ -578,6 +587,7 @@ class NavigationMixin:
             self._mark_expected_navigation(path, is_shell=True)
             self._hide_loading_indicator()
             self.explorer.dynamicCall("Navigate(const QString&)", path)
+            self._resume_path_sync_after_navigation()
             self.current_path = path
             if hasattr(self, 'path_bar'):
                 self.path_bar.set_path(path)

@@ -2,7 +2,7 @@
 
 面向 **Windows x64** 的多标签页文件浏览器，类似 Clover。保留原生 Windows 文件视图，并提供标签管理、左右分屏、搜索和常用工具。
 
-**当前版本：v4.20**。截图支持默认保存并复制文件路径；文件预览支持置顶及顺序循环搜索。详见[更新记录](docs/DESIGN.md#changes)。
+**当前版本：v4.21**。恢复大量标签时，只加载当前可见的目录（分屏时每侧一个）；其他标签在首次切换时才加载，减少启动时的 CPU 占用，无需关闭 TortoiseGit 图标覆盖。详见[更新记录](docs/DESIGN.md#changes)。
 
 [下载发布版](https://github.com/caojinyuan/TabEx/releases/latest) · [功能动图](#demos) · [快速开始](#quickstart) · [使用说明](#usage) · [快捷键](#shortcuts) · [设计文档](docs/DESIGN.md)
 

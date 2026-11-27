@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 
 from PyQt5.QtCore import pyqtSignal, pyqtSlot, QDir, QEvent, Qt, QTimer
 from PyQt5.QtGui import QIcon
@@ -1392,6 +1393,8 @@ class MainWindow(QMainWindow):
         return released
 
     def _schedule_tab_labels(self):
+        if getattr(self, '_restoring_tab_batch', False):
+            return
         if not hasattr(self, '_tab_labels_timer'):
             self._tab_labels_timer = QTimer(self)
             self._tab_labels_timer.setSingleShot(True)
@@ -2311,8 +2314,13 @@ class MainWindow(QMainWindow):
         tab.tab_group_collapsed = bool(tab_group_collapsed)
         
         # 同时添加到 tab_widget（占位标签）和 content_stack（实际内容）
-        tab_index = tab_widget.addTab(QWidget(), "")
         content_stack.addWidget(tab)
+        tab_index = tab_widget.addTab(QWidget(), "")
+        if getattr(self, '_restoring_tab_batch', False):
+            if activate:
+                tab_widget.setCurrentIndex(tab_index)
+            return tab_index
+
         # 启动恢复时也立即用统一逻辑生成短标题，避免显示全路径。
         try:
             tab.update_tab_title()
@@ -4074,6 +4082,26 @@ class MainWindow(QMainWindow):
         name, accepted = QInputDialog.getItem(self, tr("工作区"), tr("名称"), sorted(workspaces), 0, False)
         return name if accepted else None
 
+    @contextmanager
+    def _batch_tab_restore(self):
+        if getattr(self, '_restoring_tab_batch', False):
+            yield  # 切换工作区时会嵌套调用 open_named_workspace。
+            return
+        self._restoring_tab_batch = True
+        try:
+            yield
+        finally:
+            self._restoring_tab_batch = False
+            self._refresh_tab_labels()
+            for tabs, stack in self._all_groups():
+                self._apply_tab_grouping_for_pane(tabs)
+                # QStackedWidget 在插入第一页时会临时显示它；只加载最终选中的页。
+                tab = stack.currentWidget()
+                if tab is not None:
+                    tab.load_if_visible()
+            self.populate_bookmark_bar_menu()
+            self.update_navigation_buttons()
+
     def open_named_workspace(self, name=None):
         if name is None:
             name = self._choose_named_workspace()
@@ -4083,6 +4111,14 @@ class MainWindow(QMainWindow):
         groups = state.get('groups', [])
         if not isinstance(groups, list) or not groups:
             return
+        with self._batch_tab_restore():
+            failures = self._append_workspace_groups(groups)
+        self.save_pinned_tabs()
+        self._schedule_session_snapshot()
+        if failures:
+            show_toast(self, tr("工作区"), tr("部分目录无法打开") + ': ' + '\n'.join(failures), level="warning")
+
+    def _append_workspace_groups(self, groups):
         failures = []
         for group_index, group in enumerate(groups[:2]):
             if group_index == 1 and not getattr(self, '_split_active', False):
@@ -4108,17 +4144,12 @@ class MainWindow(QMainWindow):
                     continue
                 tab = stack.widget(index)
                 tab.is_pinned = bool(entry.get('is_pinned', False))
-                tab.update_tab_title()
             selected = int(group.get('active_index', 0))
             if opened:
                 selected = max(0, min(selected, len(opened) - 1))
                 if opened[selected] >= 0:
                     target.setCurrentIndex(opened[selected])
-            self._apply_tab_grouping_for_pane(target)
-        self.save_pinned_tabs()
-        self._schedule_session_snapshot()
-        if failures:
-            show_toast(self, tr("工作区"), tr("部分目录无法打开") + ': ' + '\n'.join(failures), level="warning")
+        return failures
 
     def _clear_tabs_for_workspace_switch(self):
         for tab_widget, content_stack in self._all_groups():
@@ -4148,10 +4179,11 @@ class MainWindow(QMainWindow):
         if not isinstance(state, dict) or not isinstance(state.get('groups', []), list):
             show_toast(self, tr("工作区"), tr("工作区数据无效"), level="warning")
             return False
-        self._clear_tabs_for_workspace_switch()
-        self.open_named_workspace(name)
-        if self.tab_widget.count() == 0:
-            self.add_new_tab()
+        with self._batch_tab_restore():
+            self._clear_tabs_for_workspace_switch()
+            self.open_named_workspace(name)
+            if self.tab_widget.count() == 0:
+                self.add_new_tab()
         if not state.get('groups'):
             self.save_pinned_tabs()
         self._schedule_session_snapshot()
@@ -5023,22 +5055,10 @@ class MainWindow(QMainWindow):
                     is_shell = str(path).startswith('shell:')
                 if path.startswith('shell:') or _tab_target_available(path):
                     try:
-                        # 懒加载：固定标签也延迟首次导航，避免启动瞬间多个 Shell 视图同时创建
-                        tab = FileExplorerTab(self, path, is_shell=is_shell, defer_nav=True)
-                        if hasattr(tab, 'set_bottom_statusbar_visible'):
-                            tab.set_bottom_statusbar_visible(self.config.get("show_bottom_statusbar", True))
-                        tab.is_pinned = True
-                        tab.tab_group_separator_after = False
-                        tab.tab_group_separator_color = ""
-                        tab.tab_group_separator_name = ""
-                        tab.bookmark_group_color = ""
-                        # 同时添加到 tab_widget 和 content_stack
-                        self.tab_widget.addTab(QWidget(), "")  # tab_widget 只显示标签，内容用占位widget
-                        self.content_stack.addWidget(tab)  # 实际内容添加到 content_stack
-                        try:
-                            tab.update_tab_title()
-                        except Exception:
-                            pass
+                        index = self.add_new_tab(path, is_shell=is_shell, activate=False)
+                        if index < 0:
+                            continue
+                        self.content_stack.widget(index).is_pinned = True
                         has_pinned = True
                         print(f"[Config] ✓ Loaded pinned tab: {path}")
                     except Exception as e:
@@ -5048,8 +5068,6 @@ class MainWindow(QMainWindow):
         else:
             print("[Config] No pinned tabs found in config.json")
 
-        self._apply_tab_grouping_for_pane(self.tab_widget)
-        
         return has_pinned
 
     def __init__(self, parent=None):
@@ -5851,14 +5869,7 @@ class MainWindow(QMainWindow):
         # 强制置顶窗口（使用 Win32 API 绕过 Windows 偷焦保护）
         self._bring_to_front()
     
-    def _delayed_initialization(self):
-        """延迟初始化非关键功能（性能优化）"""
-        debug_print("[Performance] Starting delayed initialization...")
-        # 进入恢复状态：在标题上显示提示
-        self.is_restoring = True
-        # 初次更新标题（无路径）
-        self._update_window_title()
-        
+    def _restore_startup_tabs(self):
         debug_print(f"[App] 启动时标签页数: {self.tab_widget.count()}")
         
         # 延迟加载固定标签页
@@ -5892,7 +5903,7 @@ class MainWindow(QMainWindow):
                             # 懒加载：恢复的缓存标签不逐个激活，后台标签首次可见时才导航
                             self.add_new_tab(
                                 path,
-                                activate=False,
+                                is_shell=tab_info.get('is_shell', False), activate=False,
                                 bookmark_group_color=(
                                     tab_info.get('bookmark_group_color', '')
                                     or tab_info.get('tab_group_separator_color', '')
@@ -5922,6 +5933,17 @@ class MainWindow(QMainWindow):
         except Exception as e:
             debug_print(f"[Performance] Failed to restore split session: {e}")
 
+        if self._restore_last_active_tab():
+            debug_print(tr("[App] 已恢复上次激活的标签页"))
+
+    def _delayed_initialization(self):
+        """延迟初始化非关键功能（性能优化）"""
+        debug_print("[Performance] Starting delayed initialization...")
+        self.is_restoring = True
+        self._update_window_title()
+        with self._batch_tab_restore():
+            self._restore_startup_tabs()
+
         # 延迟启动实例服务器
         try:
             self.start_instance_server()
@@ -5937,32 +5959,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             debug_print(f"[Performance] Failed to start explorer monitor: {e}")
 
-        restored_active = self._restore_last_active_tab()
-        if restored_active:
-            debug_print(tr("[App] 已恢复上次激活的标签页"))
-        self._apply_tab_grouping_for_pane(self.tab_widget)
-        self._apply_tab_grouping_for_pane(getattr(self, 'split_tab_widget', None))
-        # 兜底：懒加载下所有恢复标签均未激活时，_restore_last_active_tab 可能未选中任何标签，
-        # 导致左侧当前标签仍处于延迟态（界面空白）。这里强制激活一次左侧当前标签，
-        # 触发其 showEvent → 首次导航，保证启动后左侧有一个已加载的可见标签。
-        try:
-            if self.tab_widget.count() > 0:
-                cur = self.tab_widget.currentIndex()
-                if cur < 0:
-                    cur = 0
-                    self.tab_widget.setCurrentIndex(0)
-                cur_tab = self.get_tab_widget(cur)
-                if cur_tab is not None and getattr(cur_tab, '_deferred_nav', None) is not None:
-                    # 已是当前项但 showEvent 可能未触发（内容栈未切换）：显式同步并激活
-                    self.on_tab_changed(cur)
-                    if cur_tab.isVisible():
-                        # 直接消费延迟导航，避免依赖 showEvent 时序
-                        deferred = cur_tab._deferred_nav
-                        cur_tab._deferred_nav = None
-                        p, ish = deferred
-                        cur_tab.navigate_to(p, is_shell=ish)
-        except Exception as e:
-            debug_print(f"[App] 兜底激活当前标签失败: {e}")
         self.save_session_snapshot(immediate=True)
         
         # 恢复 AI 聊天面板的显示状态（如果配置为显示）

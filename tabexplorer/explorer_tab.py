@@ -220,6 +220,8 @@ class FileExplorerTab(QWidget, NavigationMixin):
 
     def set_refresh_active(self, active: bool):
         """设置当前标签的刷新活跃态：仅当前可见标签执行高频刷新。"""
+        if getattr(self, '_deferred_nav', None) is not None:
+            return  # 批量恢复期间短暂成为当前页，不应启动该目录的轮询。
         self._refresh_active = bool(active)
         self._last_active_at = time.monotonic()
         current_path = getattr(self, 'current_path', '')
@@ -875,6 +877,26 @@ class FileExplorerTab(QWidget, NavigationMixin):
 
     def setup_ui(self):
         from PyQt5.QtWidgets import QLabel
+        # 首次导航才创建原生宿主；ActiveX 的 setControl 本身就会启动 COM。
+        if _COMTYPES_AVAILABLE:
+            try:
+                self.explorer = IExplorerBrowserWidget(self)
+                debug_print("[WindowsShellExplorer] Using IExplorerBrowser (TortoiseGit overlay supported)")
+            except (OSError, RuntimeError) as error:
+                debug_print(f"[WindowsShellExplorer] IExplorerBrowserWidget failed: {error}")
+        if not hasattr(self, 'explorer'):
+            from PyQt5.QAxContainer import QAxWidget
+            host = QAxWidget(self)
+            if not host.setControl("Shell.Explorer"):
+                host.deleteLater()
+                raise RuntimeError("Shell.Explorer control initialization failed")
+            self.explorer = host
+            debug_print("[WindowsShellExplorer] Using Shell.Explorer (no TortoiseGit overlay support)")
+
+        self.notepad_plus_plus_path = detect_notepad_plus_plus()
+        self.file_watcher = QFileSystemWatcher(self)
+        self.file_watcher.directoryChanged.connect(self.on_directory_changed)
+        self.file_watcher.fileChanged.connect(self.on_file_changed)
         # 设置FileExplorerTab背景为白色
         _theme.bind_style(self, "background: @editor-bg;")
         self.setAutoFillBackground(True)
@@ -904,23 +926,6 @@ class FileExplorerTab(QWidget, NavigationMixin):
         self.loading_bar.setFixedHeight(20)
         self.loading_bar.hide()
 
-        # 优先使用 IExplorerBrowser（真实 Windows 资源管理器外壳，支持 TortoiseGit 图标覆盖）
-        # 回退到 Shell.Explorer（IE/WebBrowser ActiveX，不支持 TortoiseGit 图标覆盖）
-        _ieb_ok = False
-        if _COMTYPES_AVAILABLE:
-            try:
-                self.explorer = IExplorerBrowserWidget(self)
-                _ieb_ok = True
-                debug_print("[WindowsShellExplorer] Using IExplorerBrowser (TortoiseGit overlay supported)")
-            except Exception as _ieb_err:
-                debug_print(f"[WindowsShellExplorer] IExplorerBrowserWidget failed: {_ieb_err}")
-        if not _ieb_ok:
-            from PyQt5.QAxContainer import QAxWidget
-            self.explorer = QAxWidget(self)
-            if not self.explorer.setControl("Shell.Explorer"):
-                raise RuntimeError("Shell.Explorer control initialization failed")
-            debug_print("[WindowsShellExplorer] Using Shell.Explorer (no TortoiseGit overlay support)")
-        
         # 设置为NoFocus，防止QAxWidget拦截键盘事件
         self.explorer.setFocusPolicy(Qt.NoFocus)
         # 允许Explorer控件横向压缩，减小右侧面板最小宽度
@@ -1031,6 +1036,7 @@ class FileExplorerTab(QWidget, NavigationMixin):
         layout.addWidget(self.blank)
 
         # 安装事件过滤器以捕获 Explorer 的鼠标按下与双击事件
+        self.installEventFilter(self)
         try:
             self.explorer.installEventFilter(self)
         except Exception:
@@ -1055,13 +1061,8 @@ class FileExplorerTab(QWidget, NavigationMixin):
         if hasattr(self, 'path_bar'):
             self.path_bar.set_path(self.current_path)
         
-        # 启动路径同步定时器
-        self.start_path_sync_timer()
-
-        self.update_explorer_status()
-        
-        # 初始导航到当前路径（在setup_ui最后调用，确保所有设置已应用）
-        self.explorer.dynamicCall('Navigate(const QString&)', QDir.toNativeSeparators(self.current_path))
+        if self.select_file:
+            QTimer.singleShot(1500, lambda: self.select_file_in_explorer(self.select_file))
 
     def set_bottom_statusbar_visible(self, visible):
         """显示/隐藏标签页底部状态栏（状态文本、取消按钮、资源信息）。"""
@@ -2497,10 +2498,7 @@ class FileExplorerTab(QWidget, NavigationMixin):
         initial_path = path if path else QDir.homePath()
         self.current_path = self._normalize_local_path(initial_path)
         self.select_file = select_file  # 要选中的文件名
-        # 延迟首次导航：会话恢复时后台标签用此模式，避免启动瞬间 N 个 IExplorerBrowser
-        # 同时创建 COM/导航/overlay 预加载/scandir 造成的 CPU 洪峰。首次可见（showEvent）时才导航。
-        self._deferred_nav = None  # (path, is_shell) 待首次可见时执行；None 表示无待处理导航
-        self.notepad_plus_plus_path = detect_notepad_plus_plus()
+        self._deferred_nav = (self.current_path, bool(is_shell or self.current_path.lower().startswith('shell:')))
         # 浏览历史记录
         self.history = []
         self.history_index = -1
@@ -2517,10 +2515,6 @@ class FileExplorerTab(QWidget, NavigationMixin):
         self._lv_hook_handle  = None   # HHOOK handle returned by SetWindowsHookExW
         self._is_cleaning_up = False
         
-        # 文件系统监控（监控当前路径的变化）
-        self.file_watcher = QFileSystemWatcher(self)
-        self.file_watcher.directoryChanged.connect(self.on_directory_changed)
-        self.file_watcher.fileChanged.connect(self.on_file_changed)
         # 延迟刷新定时器（避免频繁刷新）
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setSingleShot(True)
@@ -2564,35 +2558,8 @@ class FileExplorerTab(QWidget, NavigationMixin):
         self.dir_poll_timer.setInterval(8000)  # 8s 低频轮询，后台标签降低I/O开销
         self.dir_poll_timer.timeout.connect(self._poll_directory_changes)
         
-        self.setup_ui()
-        
-        # 安装事件过滤器来处理快捷键（让Ctrl键能穿透到主窗口）
-        self.installEventFilter(self)
-        if hasattr(self, 'explorer'):
-            self.explorer.installEventFilter(self)
-        
-        if defer_nav:
-            # 延迟首次导航：仅在路径栏显示占位路径，暂存导航参数；
-            # 不创建 IExplorerBrowser、不导航、不 scandir、不 overlay 预加载，
-            # 直到该标签首次可见（showEvent）时才真正导航。
-            deferred_is_shell = bool(
-                is_shell or str(self.current_path).lower().startswith('shell:')
-            )
-            self._deferred_nav = (self.current_path, deferred_is_shell)
-            if hasattr(self, 'path_bar') and self.path_bar:
-                try:
-                    self.path_bar.set_path(self.current_path)
-                except Exception:
-                    pass
-            self.update_tab_title()
-        else:
-            self.navigate_to(self.current_path, is_shell=is_shell)
-        # 路径同步定时器已在setup_ui中启动，这里不需要重复启动
-        
-        # 如果指定了要选中的文件，延迟选中（等待导航完成）
-        # 增加延迟时间确保文件夹完全加载
-        if self.select_file:
-            QTimer.singleShot(1500, lambda: self.select_file_in_explorer(self.select_file))
+        if not defer_nav:
+            self.navigate_to(*self._deferred_nav)
 
     def cleanup(self):
         if self._is_cleaning_up:
@@ -2719,20 +2686,21 @@ class FileExplorerTab(QWidget, NavigationMixin):
         return filenames
 
     def showEvent(self, event):
-        """标签首次可见时消费延迟导航：真正创建 IExplorerBrowser 并导航。
-
-        会话恢复时后台标签以 defer_nav 模式创建（不导航），切换过去首次可见即在此导航，
-        从而把 N 个 Shell 视图的创建/导航分摊到用户实际访问时，消除启动 CPU 洪峰。"""
         super().showEvent(event)
-        deferred = getattr(self, '_deferred_nav', None)
-        if deferred is not None:
-            self._deferred_nav = None
-            path, is_shell = deferred
-            debug_print(f"[navigate_to] Deferred first navigation on show: '{path}' (is_shell={is_shell})")
-            try:
-                self.navigate_to(path, is_shell=is_shell)
-            except Exception as e:
-                debug_print(f"[navigate_to] Deferred navigation failed: {e}")
+        if not getattr(self.main_window, '_restoring_tab_batch', False):
+            self.load_if_visible()
+
+    def load_if_visible(self):
+        if self._deferred_nav is None or self._is_cleaning_up or not self.isVisible():
+            return
+        path, is_shell = self._deferred_nav
+        try:
+            self.navigate_to(path, is_shell=is_shell)
+        except RuntimeError as error:
+            debug_print(f"[navigate_to] Deferred navigation failed for '{path}': {error}")
+            show_toast(self, tr("打开失败"), tr("无法打开路径: {}").format(f"{path}\n{error}"), level="error")
+            return
+        self.set_refresh_active(True)
 
     def rebuild_shell_view(self):
         """切换深浅色后重建 Shell 视图（原生视图只在新建时完整应用配色）。不可见的标签延迟到下次显示。

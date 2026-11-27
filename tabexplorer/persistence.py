@@ -393,7 +393,6 @@ class SessionController:
         active_index = state.get("active_index", 0)
         if 0 <= active_index < window.split_tab_widget.count():
             window.split_tab_widget.setCurrentIndex(active_index)
-        window._apply_tab_grouping_for_pane(window.split_tab_widget)
         return True
 
     def save_session_snapshot(self, immediate=False):

@@ -14,7 +14,7 @@ setUp：每个用例执行前准备环境；setUpClass：同一组用例共用�
 
 import ast
 from collections import OrderedDict
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import hashlib
 import json
 import os
@@ -662,6 +662,7 @@ class IntegrationTests(unittest.TestCase):
             {'tabs': [{'path': 'right-one'}], 'active_index': 0}]}
         owner = types.SimpleNamespace(
             config={'named_workspaces': {'test': state}}, _choose_named_workspace=lambda: 'test',
+            _batch_tab_restore=nullcontext,
             _split_active=False, tab_widget=left, split_tab_widget=right,
             _content_stack_for=lambda target: target,
             _apply_tab_grouping_for_pane=lambda target: None,
@@ -674,6 +675,7 @@ class IntegrationTests(unittest.TestCase):
             return len(target_tabwidget.items) - 1
 
         owner.add_new_tab = add_tab
+        owner._append_workspace_groups = types.MethodType(self.module.MainWindow._append_workspace_groups, owner)
         self.module.MainWindow.open_named_workspace(owner)
         self.assertEqual([tab.current_path for tab in left.items], ['existing', 'left-one', 'left-two'])
         self.assertTrue(left.items[1].is_pinned)
@@ -704,6 +706,7 @@ class IntegrationTests(unittest.TestCase):
         sequence = []
         owner = types.SimpleNamespace(
             config={'named_workspaces': {'target': {'groups': [{'tabs': []}]}}},
+            _batch_tab_restore=nullcontext,
             _clear_tabs_for_workspace_switch=lambda: sequence.append('clear'),
             open_named_workspace=lambda name: sequence.append(('open', name)),
             tab_widget=types.SimpleNamespace(count=lambda: 1),
@@ -2245,8 +2248,9 @@ class InterfaceTests(unittest.TestCase):
         worker = self.module.GitStatusWorker(r'C:\code\R&D\src', r'C:\code\R&D', 'git')
         results = []
         worker.completed.connect(lambda *values: results.append(values))
-        with patch.object(subprocess, 'run', return_value=output):
+        with patch.object(subprocess, 'run', return_value=output) as run:
             worker.run()
+        self.assertEqual(run.call_args.args[0][:3], ['git', '--no-optional-locks', 'status'])
         summary = results[0][2]
         name = '<span style="color:' + self.module.color('statusbar-emphasis-fg') + ';font-weight:bold">{}</span>'
         self.assertTrue(summary.startswith(
